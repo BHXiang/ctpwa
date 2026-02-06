@@ -1,0 +1,11 @@
+*
+.vscode
+.vscode/*
+!src/
+!src/**
+!include/
+!include/**
+!setup.py
+!example/
+!example/**
+!.gitignore
