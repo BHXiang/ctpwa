@@ -9,3 +9,5 @@
 !example/
 !example/**
 !.gitignore
+!README.md
+!LICENSE

@@ -1,5 +1,5 @@
 #include <Figure.cuh>
-#include <Amplitude.cuh>
+// #include <Amplitude.cuh>
 
 // CUDA核函数：填充直方图（有权重）
 __global__ void fillHistogramKernel(
