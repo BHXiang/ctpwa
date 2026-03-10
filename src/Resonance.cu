@@ -60,6 +60,115 @@ void Resonance::setParamsByModelType(const std::vector<double> &params)
     }
 }
 
+// int Resonance::setParamsByModelType(const std::vector<double> &params, const int site, const std::vector<int> &free)
+// {
+//     switch (modelType_)
+//     {
+//     case ResModelType::BWR:
+//         if (params.size() < 2)
+//         {
+//             throw std::runtime_error("BWR model requires at least mass and width parameters");
+//         }
+//         params_ = {{"mass", params[0]}, {"width", params[1]}};
+//         if (params.size() > 2)
+//         {
+//             params_["r"] = params[2]; // Blatt-Weisskopf半径
+//         }
+
+//         // 设置自由参数
+//         if (free[0] == -1)
+//         {
+//             free_params_ = {{"mass", site}, {"width", site + 1}};
+//             return 2;
+//         }
+//         else
+//         {
+//             int num_params = 0;
+//             for (const auto &f : free)
+//             {
+//                 if (f == 0)
+//                 {
+//                     free_params_["mass"] = site + num_params;
+//                     num_params++;
+//                 }
+//                 else if (f == 1)
+//                 {
+//                     free_params_["width"] = site + num_params;
+//                     num_params++;
+//                 }
+//                 else if (f == 2)
+//                 {
+//                     free_params_["r"] = site + num_params;
+//                     num_params++;
+//                 }
+//             }
+//             return num_params;
+//         }
+
+//         break;
+
+//     case ResModelType::ONE:
+//         if (params.size() < 1)
+//         {
+//             throw std::runtime_error("One parameter model requires mass parameter");
+//         }
+//         params_ = {{"mass", params[0]}};
+//         free_params_ = {{"mass", site}};
+//         return 1;
+//         break;
+//     }
+// }
+
+// void Resonance::setFreeParams(const int site, const std::vector<int> &free)
+// {
+//     if (modelType_ == ResModelType::BWR)
+//     {
+//         if (free[0] == -1)
+//         {
+//             free_params_ = {{"mass", site + 1}, {"width", site + 2}};
+//             site += 2;
+//         }
+//         else
+//         {
+//             for (const auto &f : free)
+//             {
+//                 if (f == 0)
+//                 {
+//                     free_params_["mass"] = site + 1;
+//                     site += 1;
+//                 }
+//                 else if (f == 1)
+//                 {
+//                     free_params_["width"] = site + 2;
+//                     site += 1;
+//                 }
+//                 else if (f == 2)
+//                 {
+//                     free_params_["r"] = site + 3;
+//                     site += 1;
+//                 }
+//             }
+//         }
+//     }
+//     else if (modelType_ == ResModelType::ONE)
+//     {
+//         free_params_ = {{"mass", site + 1}};
+//         site += 1;
+//     }
+// }
+
+// void Resonance::UpdateFreeParams(const std::vector<double> &newParams)
+// {
+//     // 更新自由参数
+//     for (const auto &param : free_params_)
+//     {
+//         if (param.second < newParams.size())
+//         {
+//             params_[param.first] = newParams[param.second];
+//         }
+//     }
+// }
+
 // 设备端函数实现
 __device__ inline double BlattWeisskopf(int L, double q, double q0)
 {
