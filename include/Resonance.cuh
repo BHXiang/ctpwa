@@ -55,8 +55,12 @@ public:
     std::string getConjugatePartner() const { return conjugate_partner_; }
     bool hasConjugatePartner() const { return !conjugate_partner_.empty(); }
 
+    void setFreeParams(const std::vector<double> &freeParams);
+    const std::map<std::string, double> &getFreeParams() const { return free_params_; }
+
 private:
     void setParamsByModelType(const std::vector<double> &params);
+    void UpdateFreeParams(const std::vector<double> &newParams);
 
     std::string name_;
     std::string tag_;
@@ -65,6 +69,7 @@ private:
     ResModelType modelType_;
     std::string conjugate_partner_;
     std::map<std::string, double> params_;
+    std::map<std::string, double> free_params_;
 };
 
 // 设备端函数声明

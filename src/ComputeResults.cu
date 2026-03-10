@@ -52,8 +52,8 @@ template <int N_PARTIALS>
 __global__ void computeModWithInterference(
     const cuComplex *__restrict__ result_matrix,
     double *__restrict__ final_result,
-    double *__restrict__ interference_matrix, // 干涉矩阵，大小为ninterference（对所有事件求和）
-    double *__restrict__ event_interference,  // 新增：每个事件的干涉矩阵，大小为nEvents * ninterference
+    double *__restrict__ interference_matrix,
+    // double *__restrict__ event_interference,
     int *d_nSLvectors,
     double *total_result,
     int npartials,
@@ -158,11 +158,11 @@ __global__ void computeModWithInterference(
         }
     }
 
-    // 将干涉矩阵累加器写入event_interference
-    for (int k = 0; k < ninterference; k++)
-    {
-        event_interference[event_idx + nEvents * k] = total_result_value * interference_accumulator[k];
-    }
+    // // 将干涉矩阵累加器写入event_interference
+    // for (int k = 0; k < ninterference; k++)
+    // {
+    //     event_interference[event_idx + nEvents * k] = total_result_value * interference_accumulator[k];
+    // }
 }
 
 // 主计算函数
@@ -173,8 +173,8 @@ void computeResults(
     double *d_total_integral,
     double *d_partial_result,
     // double *d_partial_sums,
-    double *d_interference_matrix, // 干涉矩阵输出（对所有事件求和）
-    double *d_event_interference,  // 新增：每个事件的干涉矩阵，大小为nEvents * ninterference
+    double *d_interference_matrix,
+    // double *d_event_interference,
     int *d_nSLvectors,
     int npartials, int nEvents, int ngls, int npolar)
 {
@@ -224,11 +224,20 @@ void computeResults(
     // size_t shared_mem_size = blockSize * (2 * npartials + ninterference) * sizeof(double);
 
     if (npartials <= 50)
-        computeModWithInterference<50><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    {
+        // computeModWithInterference<50><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+        computeModWithInterference<50><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    }
     else if (npartials <= 200)
-        computeModWithInterference<200><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    {
+        // computeModWithInterference<200><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+        computeModWithInterference<200><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    }
     else
-        computeModWithInterference<1000><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    {
+        // computeModWithInterference<1000><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+        computeModWithInterference<1000><<<gridSize, blockSize>>>(d_result_matrix, d_partial_result, d_interference_matrix, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
+    }
     // computeModWithInterference<<<gridSize, blockSize, shared_mem_size>>>(d_result_matrix, d_partial_result, d_partial_sums, d_interference_matrix, d_event_interference, d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
 
     // 检查核函数执行

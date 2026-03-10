@@ -922,12 +922,13 @@ public:
 		double *d_interference_matrix;
 		cudaMalloc(&d_interference_matrix, npartials * npartials * sizeof(double));
 		cudaMemset(d_interference_matrix, 0, npartials * npartials * sizeof(double));
-		double *d_event_interference;
-		cudaMalloc(&d_event_interference, n_events * npartials * npartials * sizeof(double));
-		cudaMemset(d_event_interference, 0, n_events * npartials * npartials * sizeof(double));
+		// double *d_event_interference;
+		// cudaMalloc(&d_event_interference, n_events * npartials * npartials * sizeof(double));
+		// cudaMemset(d_event_interference, 0, n_events * npartials * npartials * sizeof(double));
 
 		// 计算权重
-		computeResults(phsp_fix_, reinterpret_cast<const cuComplex *>(extended_vector.data_ptr()), d_final_result, d_total_integral, d_partial_result, d_interference_matrix, d_event_interference, d_nSLvectors, npartials, n_events, n_gls_, n_polar_);
+		// computeResults(phsp_fix_, reinterpret_cast<const cuComplex *>(extended_vector.data_ptr()), d_final_result, d_total_integral, d_partial_result, d_interference_matrix, nullptr, d_nSLvectors, npartials, n_events, n_gls_, n_polar_);
+		computeResults(phsp_fix_, reinterpret_cast<const cuComplex *>(extended_vector.data_ptr()), d_final_result, d_total_integral, d_partial_result, d_interference_matrix, d_nSLvectors, npartials, n_events, n_gls_, n_polar_);
 		// computeWeightResult(phsp_fix_, reinterpret_cast<const cuComplex *>(extended_vector.data_ptr()), d_final_result, d_total_integral, d_partial_result, d_nSLvectors, npartials, n_events, n_gls_, n_polar_);
 
 		double *h_total_results = new double[n_events];
@@ -940,6 +941,16 @@ public:
 		cudaMemcpy(&h_phsp_integral, d_total_integral, sizeof(double), cudaMemcpyDeviceToHost);
 		double *h_interference_matrix = new double[npartials * npartials];
 		cudaMemcpy(h_interference_matrix, d_interference_matrix, npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
+
+		// bkg weights积分
+		double h_bkg_integral = 0.0;
+		if (bkg_weights_ != nullptr && bkg_length > 0)
+		{
+			thrust::device_ptr<double> d_ptr(bkg_weights_);
+			std::cout << "Calculating background integral with " << bkg_length / n_polar_ << " events..." << std::endl;
+			h_bkg_integral = thrust::reduce(d_ptr, d_ptr + bkg_length / n_polar_);
+			// h_bkg_integral = thrust::reduce(d_ptr, d_ptr + bkg_length / n_polar_, 0.0, thrust::plus<double>());
+		}
 
 		///////////////////////////////////////////////////
 		// truth phase space for branching fraciton
@@ -981,7 +992,14 @@ public:
 		int dataIntegral = data_length / n_polar_;
 		if (bkg_fix_ != nullptr && bkg_length > 0)
 		{
-			dataIntegral -= bkg_length / n_polar_;
+			if (h_bkg_integral > 0)
+			{
+				dataIntegral -= h_bkg_integral;
+			}
+			else
+			{
+				dataIntegral -= bkg_length / n_polar_;
+			}
 		}
 		double normFactor = static_cast<double>(dataIntegral) / h_phsp_integral;
 
@@ -1042,29 +1060,29 @@ public:
 			}
 
 			// 干涉项分支
-			double *h_event_interference = new double[n_events * npartials * npartials];
-			cudaMemcpy(h_event_interference, d_event_interference, n_events * npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
-			std::vector<std::vector<double>> interference_terms(npartials, std::vector<double>(npartials));
-			for (int i = 0; i < npartials; ++i)
-			{
-				for (int j = 0; j < npartials; ++j)
-				{
-					std::string branch_name = "inter_" + resonance_names_[i] + "_" + resonance_names_[j];
-					phspTree->Branch(branch_name.c_str(), &interference_terms[i][j]);
-				}
-			}
+			// double *h_event_interference = new double[n_events * npartials * npartials];
+			// cudaMemcpy(h_event_interference, d_event_interference, n_events * npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
+			// std::vector<std::vector<double>> interference_terms(npartials, std::vector<double>(npartials));
+			// for (int i = 0; i < npartials; ++i)
+			// {
+			// 	for (int j = 0; j < npartials; ++j)
+			// 	{
+			// 		std::string branch_name = "inter_" + resonance_names_[i] + "_" + resonance_names_[j];
+			// 		phspTree->Branch(branch_name.c_str(), &interference_terms[i][j]);
+			// 	}
+			// }
 
-			for (int evt = 0; evt < n_events; ++evt)
-			{
-				for (int i = 0; i < npartials; ++i)
-				{
-					for (int j = 0; j < npartials; ++j)
-					{
-						interference_terms[i][j] = h_event_interference[evt * npartials * npartials + i * npartials + j] * normFactor;
-					}
-				}
-				phspTree->Fill();
-			}
+			// for (int evt = 0; evt < n_events; ++evt)
+			// {
+			// 	for (int i = 0; i < npartials; ++i)
+			// 	{
+			// 		for (int j = 0; j < npartials; ++j)
+			// 		{
+			// 			interference_terms[i][j] = h_event_interference[evt * npartials * npartials + i * npartials + j] * normFactor;
+			// 		}
+			// 	}
+			// 	phspTree->Fill();
+			// }
 
 			phspTree->Write();
 			delete phspTree;
@@ -1419,81 +1437,10 @@ public:
 		cudaFree(d_nSLvectors);
 		cudaFree(d_total_integral);
 		cudaFree(d_interference_matrix);
-		cudaFree(d_event_interference);
+		// cudaFree(d_event_interference);
 		delete[] h_total_results;
 		delete[] h_partial_results;
 	}
-
-	// void writeInterference(torch::Tensor &vector, torch::Tensor &covMatrix, const std::string &filename)
-	// {
-	// 	TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-	// 	TORCH_CHECK(vector.dtype() == torch::kComplexFloat, "vector must be complex128");
-	// 	TORCH_CHECK(covMatrix.is_cuda(), "covMatrix must be on CUDA");
-	// 	TORCH_CHECK(covMatrix.dtype() == torch::kComplexFloat, "covMatrix must be complex128");
-
-	// 	const int target_dev = vector.get_device();
-	// 	torch::Device dev(torch::kCUDA, target_dev);
-	// 	cudaSetDevice(target_dev);
-
-	// 	int npartials = nSLvectors_.size();
-
-	// 	int *d_nSLvectors;
-	// 	cudaMalloc(&d_nSLvectors, nSLvectors_.size() * sizeof(int));
-	// 	cudaMemcpy(d_nSLvectors, nSLvectors_.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);
-
-	// 	// 分配干涉矩阵的设备内存
-	// 	double *d_interference_matrix;
-	// 	cudaMalloc(&d_interference_matrix, npartials * npartials * sizeof(double));
-	// 	cudaMemset(d_interference_matrix, 0, npartials * npartials * sizeof(double));
-	// 	double *d_interference_errors;
-	// 	cudaMalloc(&d_interference_errors, npartials * npartials * sizeof(double));
-	// 	cudaMemset(d_interference_errors, 0, npartials * npartials * sizeof(double));
-
-	// 	std::cout << "vector size: " << vector.numel() << std::endl;
-	// 	std::cout << "vector: " << torch::real(vector) << " " << torch::imag(vector) << std::endl;
-
-	// 	// 计算干涉矩阵
-	// 	// void computeInterference(
-	// 	// 	const cuComplex *d_M,		   // 矩阵 M [ngls][nEvents*npolar]
-	// 	// 	const cuComplex *d_v,		   // 参数向量 v [ngls]
-	// 	// 	const cuComplex *d_Cov_v,	   // v的协方差矩阵 [ngls][ngls]
-	// 	// 	double *d_interference_matrix, // 输出干涉矩阵 [ninterference]
-	// 	// 	double *d_interference_errors, // 输出干涉矩阵标准差 [ninterference]
-	// 	// 	int *d_nSLvectors,
-	// 	// 	int npartials, int nEvents, int ngls, int npolar);
-	// 	computeInterference(phsp_fix_, reinterpret_cast<const cuComplex *>(vector.data_ptr()), reinterpret_cast<const cuComplex *>(covMatrix.data_ptr()), d_interference_matrix, d_interference_errors, d_nSLvectors, npartials, phsp_length / n_polar_, n_gls_, n_polar_);
-
-	// 	double *h_interference_matrix = new double[npartials * npartials];
-	// 	cudaMemcpy(h_interference_matrix, d_interference_matrix, npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
-	// 	double *h_interference_errors = new double[npartials * npartials];
-	// 	cudaMemcpy(h_interference_errors, d_interference_errors, npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
-
-	// 	// 写入文件
-	// 	std::ofstream outfile(filename);
-	// 	if (outfile.is_open())
-	// 	{
-	// 		for (int i = 0; i < npartials; ++i)
-	// 		{
-	// 			for (int j = 0; j < npartials; ++j)
-	// 			{
-	// 				outfile << h_interference_matrix[i * npartials + j];
-	// 				if (j < npartials - 1)
-	// 					outfile << ", ";
-	// 			}
-	// 			outfile << std::endl;
-	// 		}
-	// 		outfile.close();
-	// 		std::cout << "Interference matrix written to " << filename << std::endl;
-	// 	}
-	// 	else
-	// 	{
-	// 		std::cerr << "Unable to open file: " << filename << std::endl;
-	// 	}
-
-	// 	// 释放设备内存
-	// 	cudaFree(d_interference_matrix);
-	// 	delete[] h_interference_matrix;
-	// }
 
 	torch::Tensor getDataTensor() const
 	{
