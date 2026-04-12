@@ -1,18 +1,19 @@
 #ifndef AMPLITUDE_CUH
 #define AMPLITUDE_CUH
 
+#include <thrust/complex.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/complex.h>
 
 // 四矢量结构体
-struct LorentzVector
-{
+struct LorentzVector {
     double E, Px, Py, Pz;
 
     __device__ __host__ LorentzVector() : E(0), Px(0), Py(0), Pz(0) {}
     __device__ __host__ LorentzVector(double e, double px, double py, double pz)
-        : E(e), Px(px), Py(py), Pz(pz) {}
+        : E(e), Px(px), Py(py), Pz(pz)
+    {
+    }
 
     __device__ __host__ double P() const
     {
@@ -36,12 +37,16 @@ struct LorentzVector
         return E * other.E - (Px * other.Px + Py * other.Py + Pz * other.Pz);
     }
 
-    __device__ __host__ LorentzVector operator+(const LorentzVector &other) const
+    __device__ __host__ LorentzVector
+    operator+(const LorentzVector &other) const
     {
-        return LorentzVector(E + other.E, Px + other.Px, Py + other.Py, Pz + other.Pz);
+        return LorentzVector(E + other.E, Px + other.Px, Py + other.Py,
+                             Pz + other.Pz);
     }
 };
 
-__device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1, int dim_j1, LorentzVector p2, int dim_j2, int dim_j, float dS, int dL);
+__device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
+                        int dim_j1, LorentzVector p2, int dim_j2, int dim_j,
+                        float dS, int dL, thrust::complex<double> *shared_buf);
 
 #endif // AMPLITUDE_CUH

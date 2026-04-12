@@ -1,15 +1,14 @@
 #include <Config.cuh>
-#include <iostream>
-#include <fstream>
 #include <algorithm>
+#include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 
 float transJValue(const std::string &str)
 {
     // 先检查是否有斜杠
-    if (str.find('/') != std::string::npos)
-    {
+    if (str.find('/') != std::string::npos) {
         size_t slash_pos = str.find('/');
         float num = std::stof(str.substr(0, slash_pos));
         float den = std::stof(str.substr(slash_pos + 1));
@@ -19,8 +18,7 @@ float transJValue(const std::string &str)
     // 尝试直接转换为浮点数
     std::stringstream ss(str);
     float value;
-    if (ss >> value)
-    {
+    if (ss >> value) {
         return value;
     }
 
@@ -29,8 +27,7 @@ float transJValue(const std::string &str)
 
 ConfigParser::ConfigParser(const std::string &config_file)
 {
-    try
-    {
+    try {
         YAML::Node config = YAML::LoadFile(config_file);
 
         if (config["Particles"])
@@ -50,9 +47,7 @@ ConfigParser::ConfigParser(const std::string &config_file)
 
         if (config["Plot"])
             parsePlotConfig(config["Plot"]);
-    }
-    catch (const YAML::Exception &e)
-    {
+    } catch (const YAML::Exception &e) {
         std::cerr << "Error parsing config file: " << e.what() << std::endl;
         throw;
     }
@@ -62,12 +57,9 @@ std::vector<std::string> ConfigParser::getLegends() const
 {
     std::vector<std::string> legends;
 
-    for (const auto &chain : decay_chains_)
-    {
-        if (!chain.legend_template.empty())
-        {
-            struct PlaceholderInfo
-            {
+    for (const auto &chain : decay_chains_) {
+        if (!chain.legend_template.empty()) {
+            struct PlaceholderInfo {
                 std::string full_name;
                 std::string base_name;
                 int index;
@@ -77,37 +69,33 @@ std::vector<std::string> ConfigParser::getLegends() const
             std::vector<std::string> template_items;
 
             // 首先，收集所有唯一的占位符基础名
-            std::map<std::string, std::vector<std::string>> placeholder_resonances;
-            std::map<std::string, PlaceholderInfo> placeholder_info_map; // full_name -> PlaceholderInfo
+            std::map<std::string, std::vector<std::string>>
+                placeholder_resonances;
+            std::map<std::string, PlaceholderInfo>
+                placeholder_info_map; // full_name -> PlaceholderInfo
 
-            for (const auto &item : chain.legend_template)
-            {
+            for (const auto &item : chain.legend_template) {
                 template_items.push_back(item);
 
                 // 检查是否是中间态占位符（包含"R_"）
-                if (item.find("R_") != std::string::npos)
-                {
+                if (item.find("R_") != std::string::npos) {
                     PlaceholderInfo info;
                     info.full_name = item;
 
                     // 解析索引语法：R_Kpeta[0]
                     size_t bracket_pos = item.find('[');
-                    if (bracket_pos != std::string::npos && item.back() == ']')
-                    {
+                    if (bracket_pos != std::string::npos &&
+                        item.back() == ']') {
                         // 带有索引
                         info.base_name = item.substr(0, bracket_pos);
-                        std::string index_str = item.substr(bracket_pos + 1, item.length() - bracket_pos - 2);
-                        try
-                        {
+                        std::string index_str = item.substr(
+                            bracket_pos + 1, item.length() - bracket_pos - 2);
+                        try {
                             info.index = std::stoi(index_str);
-                        }
-                        catch (...)
-                        {
+                        } catch (...) {
                             info.index = -1; // 索引解析失败
                         }
-                    }
-                    else
-                    {
+                    } else {
                         // 无索引
                         info.base_name = item;
                         info.index = -1;
@@ -117,18 +105,17 @@ std::vector<std::string> ConfigParser::getLegends() const
                     placeholder_info_map[info.full_name] = info;
 
                     // 如果这个基础占位符还没有处理过，收集对应的共振态
-                    if (placeholder_resonances.find(info.base_name) == placeholder_resonances.end())
-                    {
+                    if (placeholder_resonances.find(info.base_name) ==
+                        placeholder_resonances.end()) {
                         std::vector<std::string> resonances;
-                        for (const auto &res_chain : chain.resonance_chains)
-                        {
-                            if (res_chain.intermediate == info.base_name)
-                            {
-                                for (const auto &spin_chain : res_chain.spin_chains)
-                                {
-                                    resonances.insert(resonances.end(),
-                                                      spin_chain.resonances.begin(),
-                                                      spin_chain.resonances.end());
+                        for (const auto &res_chain : chain.resonance_chains) {
+                            if (res_chain.intermediate == info.base_name) {
+                                for (const auto &spin_chain :
+                                     res_chain.spin_chains) {
+                                    resonances.insert(
+                                        resonances.end(),
+                                        spin_chain.resonances.begin(),
+                                        spin_chain.resonances.end());
                                 }
                                 break;
                             }
@@ -139,37 +126,27 @@ std::vector<std::string> ConfigParser::getLegends() const
             }
 
             // 如果没有占位符，直接生成legend
-            if (placeholder_infos.empty())
-            {
+            if (placeholder_infos.empty()) {
                 std::string legend;
-                for (const auto &item : chain.legend_template)
-                {
+                for (const auto &item : chain.legend_template) {
                     // 检查是否是粒子
-                    auto particle_it = std::find_if(particles_.begin(), particles_.end(),
-                                                    [&](const Particle &p)
-                                                    { return p.name == item; });
-                    if (particle_it != particles_.end())
-                    {
+                    auto particle_it = std::find_if(
+                        particles_.begin(), particles_.end(),
+                        [&](const Particle &p) { return p.name == item; });
+                    if (particle_it != particles_.end()) {
                         // 粒子，使用其tex（如果是数组，使用所有部分）
-                        for (const auto &tex_part : particle_it->tex)
-                        {
+                        for (const auto &tex_part : particle_it->tex) {
                             legend += tex_part;
                         }
-                    }
-                    else
-                    {
+                    } else {
                         // 检查是否是共振态
                         auto res_it = resonances_.find(item);
-                        if (res_it != resonances_.end())
-                        {
+                        if (res_it != resonances_.end()) {
                             // 共振态，使用所有tex部分
-                            for (const auto &tex_part : res_it->second.tex)
-                            {
+                            for (const auto &tex_part : res_it->second.tex) {
                                 legend += tex_part;
                             }
-                        }
-                        else
-                        {
+                        } else {
                             // 字符串字面量，直接添加
                             legend += item;
                         }
@@ -182,33 +159,31 @@ std::vector<std::string> ConfigParser::getLegends() const
             // 按基础名分组：相同基础名的占位符使用同一个共振态
             // 收集唯一的基础名
             std::vector<std::string> unique_base_names;
-            for (const auto &info : placeholder_infos)
-            {
-                if (std::find(unique_base_names.begin(), unique_base_names.end(), info.base_name) == unique_base_names.end())
-                {
+            for (const auto &info : placeholder_infos) {
+                if (std::find(unique_base_names.begin(),
+                              unique_base_names.end(),
+                              info.base_name) == unique_base_names.end()) {
                     unique_base_names.push_back(info.base_name);
                 }
             }
 
             // 为每个基础名生成共振态选择（所有共振态）
             std::map<std::string, std::vector<std::string>> base_name_choices;
-            for (const auto &base_name : unique_base_names)
-            {
-                base_name_choices[base_name] = placeholder_resonances[base_name];
+            for (const auto &base_name : unique_base_names) {
+                base_name_choices[base_name] =
+                    placeholder_resonances[base_name];
             }
 
             // 生成组合：每个基础名选择一个共振态
             std::vector<std::vector<std::string>> combinations = {{}};
-            for (const auto &base_name : unique_base_names)
-            {
+            for (const auto &base_name : unique_base_names) {
                 const auto &choices = base_name_choices[base_name];
                 std::vector<std::vector<std::string>> temp;
-                for (const auto &current_combo : combinations)
-                {
-                    for (const auto &choice : choices)
-                    {
+                for (const auto &current_combo : combinations) {
+                    for (const auto &choice : choices) {
                         std::vector<std::string> new_combo = current_combo;
-                        new_combo.push_back(choice); // 这个choice是该基础名选择的共振态
+                        new_combo.push_back(
+                            choice); // 这个choice是该基础名选择的共振态
                         temp.push_back(new_combo);
                     }
                 }
@@ -216,88 +191,70 @@ std::vector<std::string> ConfigParser::getLegends() const
             }
 
             // 为每个组合生成legend
-            for (const auto &combo : combinations)
-            {
+            for (const auto &combo : combinations) {
                 // 创建基础名到共振态的映射
                 std::map<std::string, std::string> base_name_to_resonance;
-                for (size_t i = 0; i < unique_base_names.size(); ++i)
-                {
+                for (size_t i = 0; i < unique_base_names.size(); ++i) {
                     base_name_to_resonance[unique_base_names[i]] = combo[i];
                 }
 
                 // 创建占位符到共振态的映射（通过基础名）
                 std::map<std::string, std::string> placeholder_to_resonance;
-                for (const auto &info : placeholder_infos)
-                {
+                for (const auto &info : placeholder_infos) {
                     auto it = base_name_to_resonance.find(info.base_name);
-                    if (it != base_name_to_resonance.end())
-                    {
+                    if (it != base_name_to_resonance.end()) {
                         placeholder_to_resonance[info.full_name] = it->second;
                     }
                 }
 
                 // 直接构建legend字符串
                 std::string legend;
-                for (const auto &item : template_items)
-                {
-                    if (item.find("R_") != std::string::npos)
-                    {
+                for (const auto &item : template_items) {
+                    if (item.find("R_") != std::string::npos) {
                         // 是占位符
                         auto it_placeholder = placeholder_info_map.find(item);
                         auto it_resonance = placeholder_to_resonance.find(item);
 
-                        if (it_placeholder != placeholder_info_map.end() && it_resonance != placeholder_to_resonance.end())
-                        {
-                            const PlaceholderInfo &info = it_placeholder->second;
-                            const std::string &resonance_name = it_resonance->second;
+                        if (it_placeholder != placeholder_info_map.end() &&
+                            it_resonance != placeholder_to_resonance.end()) {
+                            const PlaceholderInfo &info =
+                                it_placeholder->second;
+                            const std::string &resonance_name =
+                                it_resonance->second;
 
                             // 查找共振态的tex数组
                             auto res_it = resonances_.find(resonance_name);
-                            if (res_it != resonances_.end())
-                            {
+                            if (res_it != resonances_.end()) {
                                 const auto &tex_parts = res_it->second.tex;
-                                if (info.index >= 0 && info.index < (int)tex_parts.size())
-                                {
+                                if (info.index >= 0 &&
+                                    info.index < (int)tex_parts.size()) {
                                     // 有索引，选择对应的tex部分
                                     legend += tex_parts[info.index];
-                                }
-                                else if (info.index == -1)
-                                {
+                                } else if (info.index == -1) {
                                     // 无索引，使用所有tex部分
-                                    for (const auto &tex_part : tex_parts)
-                                    {
+                                    for (const auto &tex_part : tex_parts) {
                                         legend += tex_part;
                                     }
                                 }
-                            }
-                            else
-                            {
+                            } else {
                                 // 共振态未找到，使用名称
                                 legend += resonance_name;
                             }
-                        }
-                        else
-                        {
+                        } else {
                             legend += item;
                         }
-                    }
-                    else
-                    {
+                    } else {
                         // 普通字符串或粒子名
                         // 检查是否是粒子
-                        auto particle_it = std::find_if(particles_.begin(), particles_.end(),
-                                                        [&](const Particle &p)
-                                                        { return p.name == item; });
-                        if (particle_it != particles_.end())
-                        {
+                        auto particle_it = std::find_if(
+                            particles_.begin(), particles_.end(),
+                            [&](const Particle &p) { return p.name == item; });
+                        if (particle_it != particles_.end()) {
                             // 粒子，使用其tex（如果是数组，使用所有部分）
-                            for (const auto &tex_part : particle_it->tex)
-                            {
+                            for (const auto &tex_part : particle_it->tex) {
                                 legend += tex_part;
                             }
-                        }
-                        else
-                        {
+                        } else {
                             // 字符串字面量，直接添加
                             legend += item;
                         }
@@ -314,8 +271,7 @@ std::vector<std::string> ConfigParser::getLegends() const
 
 void ConfigParser::parseParticles(const YAML::Node &node)
 {
-    for (const auto &particle_node : node)
-    {
+    for (const auto &particle_node : node) {
         std::string name = particle_node.first.as<std::string>();
         const auto &props = particle_node.second;
 
@@ -329,16 +285,12 @@ void ConfigParser::parseParticles(const YAML::Node &node)
         particle.mass = props["mass"].as<double>();
 
         // 处理tex字段，可能是字符串或字符串数组
-        if (props["tex"].IsSequence())
-        {
+        if (props["tex"].IsSequence()) {
             // tex是数组
-            for (const auto &tex_part : props["tex"])
-            {
+            for (const auto &tex_part : props["tex"]) {
                 particle.tex.push_back(tex_part.as<std::string>());
             }
-        }
-        else
-        {
+        } else {
             // 单个字符串，放入向量中
             particle.tex.push_back(props["tex"].as<std::string>());
         }
@@ -359,19 +311,20 @@ void ConfigParser::parseData(const YAML::Node &node)
         data_files_["phsp"] = node["phsp"].as<std::vector<std::string>>();
 
     if (node["phsp_truth"])
-        data_files_["phsp_truth"] = node["phsp_truth"].as<std::vector<std::string>>();
+        data_files_["phsp_truth"] =
+            node["phsp_truth"].as<std::vector<std::string>>();
 
     if (node["bkg"])
         data_files_["bkg"] = node["bkg"].as<std::vector<std::string>>();
 
     if (node["bkg_weights"])
-        data_files_["bkg_weights"] = node["bkg_weights"].as<std::vector<std::string>>();
+        data_files_["bkg_weights"] =
+            node["bkg_weights"].as<std::vector<std::string>>();
 }
 
 void ConfigParser::parseDecayChains(const YAML::Node &node)
 {
-    for (const auto &chain_node : node)
-    {
+    for (const auto &chain_node : node) {
         std::string chain_name = chain_node.first.as<std::string>();
         const auto &chain_data = chain_node.second;
 
@@ -379,52 +332,47 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
         chain.name = chain_name;
 
         // 解析衰变步骤
-        if (chain_data["decay"])
-        {
-            for (const auto &step_node : chain_data["decay"])
-            {
-                for (const auto &decay_pair : step_node)
-                {
+        if (chain_data["decay"]) {
+            for (const auto &step_node : chain_data["decay"]) {
+                for (const auto &decay_pair : step_node) {
                     DecayStep step;
                     step.mother = decay_pair.first.as<std::string>();
-                    step.daughters = decay_pair.second.as<std::vector<std::string>>();
+                    step.daughters =
+                        decay_pair.second.as<std::vector<std::string>>();
                     chain.decay_steps.push_back(step);
                 }
             }
         }
 
         // 解析共振态链
-        for (const auto &res_node : chain_data)
-        {
+        for (const auto &res_node : chain_data) {
             std::string key = res_node.first.as<std::string>();
-            if (key != "decay" && key != "legend")
-            {
+            if (key != "decay" && key != "legend") {
                 ResonanceChainConfig res_chain;
                 res_chain.intermediate = key;
 
-                for (const auto &spin_node : res_node.second)
-                {
-                    for (const auto &spin_pair : spin_node)
-                    {
+                for (const auto &spin_node : res_node.second) {
+                    for (const auto &spin_pair : spin_node) {
                         SpinChainConfig spin_chain;
 
                         // 解析自旋宇称 [J, P]
-                        if (spin_pair.first.IsSequence())
-                        {
-                            for (const auto &jp : spin_pair.first)
-                            {
-                                if (jp["J"])
-                                {
-                                    std::string j_str = jp["J"].as<std::string>();
-                                    spin_chain.spin_parity.push_back(2 * transJValue(j_str) + 1);
+                        if (spin_pair.first.IsSequence()) {
+                            for (const auto &jp : spin_pair.first) {
+                                if (jp["J"]) {
+                                    std::string j_str =
+                                        jp["J"].as<std::string>();
+                                    spin_chain.spin_parity.push_back(
+                                        2 * transJValue(j_str) + 1);
                                 }
                                 if (jp["P"])
-                                    spin_chain.spin_parity.push_back(jp["P"].as<int>());
+                                    spin_chain.spin_parity.push_back(
+                                        jp["P"].as<int>());
                             }
                         }
 
                         // 解析共振态列表
-                        spin_chain.resonances = spin_pair.second.as<std::vector<std::string>>();
+                        spin_chain.resonances =
+                            spin_pair.second.as<std::vector<std::string>>();
                         res_chain.spin_chains.push_back(spin_chain);
                     }
                 }
@@ -434,7 +382,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
 
         // 解析legend模板
         if (chain_data["legend"])
-            chain.legend_template = chain_data["legend"].as<std::vector<std::string>>();
+            chain.legend_template =
+                chain_data["legend"].as<std::vector<std::string>>();
 
         decay_chains_.push_back(chain);
     }
@@ -442,30 +391,26 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
 
 void ConfigParser::parseResonances(const YAML::Node &node)
 {
-    for (const auto &res_node : node)
-    {
+    for (const auto &res_node : node) {
         std::string name = res_node.first.as<std::string>();
         const auto &props = res_node.second;
 
         ResonanceConfig res;
         res.name = name;
         // res.J = props["J"].as<int>();
-        res.J = static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
+        res.J =
+            static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
         res.P = props["P"].as<int>();
         res.type = props["model"].as<std::string>();
         res.parameters = props["parameters"].as<std::vector<double>>();
 
         // 处理tex字段，可能是字符串或字符串数组
-        if (props["tex"].IsSequence())
-        {
+        if (props["tex"].IsSequence()) {
             // tex是数组
-            for (const auto &tex_part : props["tex"])
-            {
+            for (const auto &tex_part : props["tex"]) {
                 res.tex.push_back(tex_part.as<std::string>());
             }
-        }
-        else
-        {
+        } else {
             // 单个字符串，放入向量中
             res.tex.push_back(props["tex"].as<std::string>());
         }
@@ -479,12 +424,9 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
     constraints_.clear();
 
     // 解析 full 约束（同时包含实部和虚部）
-    if (node["trans"])
-    {
-        for (const auto &constraint_list : node["trans"])
-        {
-            for (const auto &pair : constraint_list)
-            {
+    if (node["trans"]) {
+        for (const auto &constraint_list : node["trans"]) {
+            for (const auto &pair : constraint_list) {
                 ConstraintConfig constraint;
                 constraint.type = "trans";
 
@@ -493,16 +435,15 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
 
                 // 解析约束值
                 const YAML::Node &values = pair.second;
-                if (values.IsSequence())
-                {
-                    for (const auto &row : values)
-                    {
-                        if (row.IsSequence() && row.size() >= 2)
-                        {
+                if (values.IsSequence()) {
+                    for (const auto &row : values) {
+                        if (row.IsSequence() && row.size() >= 2) {
                             double real_val = row[0].as<double>();
                             double imag_val = row[1].as<double>();
-                            // constraint.constraints.emplace_back(real_val, imag_val);
-                            constraint.values.push_back(std::complex<double>(real_val, imag_val));
+                            // constraint.constraints.emplace_back(real_val,
+                            // imag_val);
+                            constraint.values.push_back(
+                                std::complex<double>(real_val, imag_val));
                         }
                     }
                 }
@@ -518,41 +459,33 @@ void ConfigParser::parsePlotConfig(const YAML::Node &node)
     plot_configs_.clear();
 
     // 解析mass图配置
-    if (node["mass"])
-    {
-        for (const auto &plot_item : node["mass"])
-        {
+    if (node["mass"]) {
+        for (const auto &plot_item : node["mass"]) {
             PlotConfig config;
             config.type = "mass";
 
             // 解析particles
-            if (plot_item["input"])
-            {
+            if (plot_item["input"]) {
                 const YAML::Node &particles_node = plot_item["input"];
-                if (particles_node.IsSequence())
-                {
+                if (particles_node.IsSequence()) {
                     // 检查是否是一维序列
                     bool is_2d = false;
-                    for (const auto &elem : particles_node)
-                    {
-                        if (elem.IsSequence())
-                        {
+                    for (const auto &elem : particles_node) {
+                        if (elem.IsSequence()) {
                             is_2d = true;
                             break;
                         }
                     }
-                    if (is_2d)
-                    {
+                    if (is_2d) {
                         // 二维序列
-                        for (const auto &group : particles_node)
-                        {
-                            config.particles.push_back(group.as<std::vector<std::string>>());
+                        for (const auto &group : particles_node) {
+                            config.particles.push_back(
+                                group.as<std::vector<std::string>>());
                         }
-                    }
-                    else
-                    {
+                    } else {
                         // 一维序列，包装成二维
-                        config.particles.push_back(particles_node.as<std::vector<std::string>>());
+                        config.particles.push_back(
+                            particles_node.as<std::vector<std::string>>());
                     }
                 }
             }
@@ -561,31 +494,30 @@ void ConfigParser::parsePlotConfig(const YAML::Node &node)
             config.bins = {plot_item["bins"].as<int>()};
 
             // range: 一维数组，转换为二维数组
-            std::vector<double> range = plot_item["range"].as<std::vector<double>>();
+            std::vector<double> range =
+                plot_item["range"].as<std::vector<double>>();
             config.ranges = {range};
 
             // display: 一维数组（两个字符串）
-            config.display = plot_item["display"].as<std::vector<std::string>>();
+            config.display =
+                plot_item["display"].as<std::vector<std::string>>();
 
             plot_configs_.push_back(config);
         }
     }
 
     // 解析cosbeta图配置
-    if (node["cosbeta"])
-    {
-        for (const auto &plot_item : node["cosbeta"])
-        {
+    if (node["cosbeta"]) {
+        for (const auto &plot_item : node["cosbeta"]) {
             PlotConfig config;
             config.type = "cosbeta";
 
             // 解析particles（二维列表）
-            if (plot_item["input"])
-            {
+            if (plot_item["input"]) {
                 const YAML::Node &particles_node = plot_item["input"];
-                for (const auto &group : particles_node)
-                {
-                    config.particles.push_back(group.as<std::vector<std::string>>());
+                for (const auto &group : particles_node) {
+                    config.particles.push_back(
+                        group.as<std::vector<std::string>>());
                 }
             }
 
@@ -593,31 +525,30 @@ void ConfigParser::parsePlotConfig(const YAML::Node &node)
             config.bins = {plot_item["bins"].as<int>()};
 
             // range: 一维数组，转换为二维数组
-            std::vector<double> range = plot_item["range"].as<std::vector<double>>();
+            std::vector<double> range =
+                plot_item["range"].as<std::vector<double>>();
             config.ranges = {range};
 
             // display: 一维数组（两个字符串）
-            config.display = plot_item["display"].as<std::vector<std::string>>();
+            config.display =
+                plot_item["display"].as<std::vector<std::string>>();
 
             plot_configs_.push_back(config);
         }
     }
 
     // 解析dalitz图配置
-    if (node["dalitz"])
-    {
-        for (const auto &plot_item : node["dalitz"])
-        {
+    if (node["dalitz"]) {
+        for (const auto &plot_item : node["dalitz"]) {
             PlotConfig config;
             config.type = "dalitz";
 
             // 解析particles（二维列表，包含两个粒子组）
-            if (plot_item["input"])
-            {
+            if (plot_item["input"]) {
                 const YAML::Node &particles_node = plot_item["input"];
-                for (const auto &group : particles_node)
-                {
-                    config.particles.push_back(group.as<std::vector<std::string>>());
+                for (const auto &group : particles_node) {
+                    config.particles.push_back(
+                        group.as<std::vector<std::string>>());
                 }
             }
 
@@ -626,13 +557,13 @@ void ConfigParser::parsePlotConfig(const YAML::Node &node)
 
             // range: 二维数组
             const YAML::Node &range_node = plot_item["range"];
-            for (const auto &range : range_node)
-            {
+            for (const auto &range : range_node) {
                 config.ranges.push_back(range.as<std::vector<double>>());
             }
 
             // display: 一维数组（两个字符串）
-            config.display = plot_item["display"].as<std::vector<std::string>>();
+            config.display =
+                plot_item["display"].as<std::vector<std::string>>();
 
             plot_configs_.push_back(config);
         }

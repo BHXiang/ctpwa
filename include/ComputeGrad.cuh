@@ -1,9 +1,9 @@
 #ifndef COMPUTEGRAD_CUH
 #define COMPUTEGRAD_CUH
 
-#include <cuda_runtime.h>
 #include <cuComplex.h>
 #include <cublas_v2.h>
+#include <cuda_runtime.h>
 
 // 包装函数：计算梯度
 // void computeGradient(
@@ -36,16 +36,14 @@
 //     int K, int A, int B, int N,
 //     cuComplex *d_grad); //, cublasHandle_t cublas_handle);
 
-void compute_gradient(
-    const cuComplex *d_D,    // [K, A, B]
-    const cuComplex *d_P,    // [K, N]
-    const cuComplex *d_S,    // [A, B]
-    const double *d_Q,       // [A]
-    const cuComplex *d_B,    // [N]
-    const double *d_weights, // [A]，新增：权重数组
-    double phsp_factor,
-    int K, int A, int B, int N,
-    cuComplex *d_grad, // [K]
-    cublasHandle_t cublas_handle);
+void compute_gradient(const cuComplex *d_D,    // [K, A, B]
+                      const cuComplex *d_P,    // [K, N]
+                      const cuComplex *d_S,    // [A, B]
+                      const double *d_Q,       // [A]
+                      const cuComplex *d_B,    // [N]
+                      const double *d_weights, // [A]，新增：权重数组
+                      double phsp_factor, int K, int A, int B, int N,
+                      cuComplex *d_grad, // [K]
+                      cublasHandle_t cublas_handle);
 
 #endif

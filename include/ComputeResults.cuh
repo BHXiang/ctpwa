@@ -1,12 +1,17 @@
 #ifndef COMPUTERESULTS_CUH
 #define COMPUTERESULTS_CUH
 
-#include <cuda_runtime.h>
 #include <cuComplex.h>
+#include <cuda_runtime.h>
 
-void computeWeightResult(const cuComplex *d_matrix, const cuComplex *d_vector, double *d_total_result, double *d_total_integral, double *d_partial_result, int *d_nSLvectors, int npartials, int nEvents, int ngls, int npolar);
-// void computeWeightResult(const cuComplex *d_matrix, const cuComplex *d_vector, double *d_total_result, double *d_total_integral, double *d_partial_result, double *d_partial_sums, int *d_nSLvectors, int npartials, int nEvents, int ngls, int npolar);
-// void computeResults(
+void computeWeightResult(const cuComplex *d_matrix, const cuComplex *d_vector,
+                         double *d_total_result, double *d_total_integral,
+                         double *d_partial_result, int *d_nSLvectors,
+                         int npartials, int nEvents, int ngls, int npolar);
+// void computeWeightResult(const cuComplex *d_matrix, const cuComplex
+// *d_vector, double *d_total_result, double *d_total_integral, double
+// *d_partial_result, double *d_partial_sums, int *d_nSLvectors, int npartials,
+// int nEvents, int ngls, int npolar); void computeResults(
 //     const cuComplex *d_matrix,
 //     const cuComplex *d_vector,
 //     double *d_total_result,
@@ -16,16 +21,12 @@ void computeWeightResult(const cuComplex *d_matrix, const cuComplex *d_vector, d
 //     double *d_event_interference,
 //     int *d_nSLvectors,
 //     int npartials, int nEvents, int ngls, int npolar);
-void computeResults(
-    const cuComplex *d_matrix,
-    const cuComplex *d_vector,
-    double *d_total_result,
-    double *d_total_integral,
-    double *d_partial_result,
-    double *d_interference_matrix,
-    // double *d_event_interference,
-    int *d_nSLvectors,
-    int npartials, int nEvents, int ngls, int npolar);
+void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
+                    double *d_total_result, double *d_total_integral,
+                    double *d_partial_result, double *d_interference_matrix,
+                    // double *d_event_interference,
+                    int *d_nSLvectors, int npartials, int nEvents, int ngls,
+                    int npolar);
 
 // void computeInterference(
 //     const cuComplex *d_M,          // 矩阵 M [ngls][nEvents*npolar]

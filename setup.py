@@ -107,6 +107,7 @@ extension = CUDAExtension(
         ],
         "nvcc": [
             "-arch=sm_120",  # 根据您的GPU架构调整（A100: sm_80, V100: sm_70, 3090: sm_86）
+            #"-arch=all-major",
             "--expt-relaxed-constexpr",
             "-Xcompiler",
             "-fPIC",
