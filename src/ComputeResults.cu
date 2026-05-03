@@ -19,9 +19,9 @@ __device__ __host__ int getInterferenceIndex(int i, int j, int npartials)
 
 // 核函数：计算复数模平方并按 npolar 分组求和，同时计算总和
 __global__ void
-computeModTotalWeight(const cuComplex *__restrict__ complex_result,
-                      double *__restrict__ final_result,
-                      double *__restrict__ total_sum, int nEvents, int npolar)
+computeModTotalWeight(const cuComplex* __restrict__ complex_result,
+    double* __restrict__ final_result,
+    double* __restrict__ total_sum, int nEvents, int npolar)
 {
     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -47,12 +47,12 @@ computeModTotalWeight(const cuComplex *__restrict__ complex_result,
 // 修改后的部分权重核函数，同时计算干涉矩阵
 template <int N_PARTIALS>
 __global__ void
-computeModWithInterference(const cuComplex *__restrict__ result_matrix,
-                           double *__restrict__ final_result,
-                           double *__restrict__ interference_matrix,
-                           // double *__restrict__ event_interference,
-                           int *d_nSLvectors, double *total_result,
-                           int npartials, int nEvents, int npolar)
+computeModWithInterference(const cuComplex* __restrict__ result_matrix,
+    double* __restrict__ final_result,
+    double* __restrict__ interference_matrix,
+    // double *__restrict__ event_interference,
+    int* d_nSLvectors, double* total_result,
+    int npartials, int nEvents, int npolar)
 {
     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -73,7 +73,7 @@ computeModWithInterference(const cuComplex *__restrict__ result_matrix,
 
     if (npartials > MAX_PARTIALS) {
         printf("Error: npartials=%d exceeds maximum supported value (%d).\n",
-               npartials, MAX_PARTIALS);
+            npartials, MAX_PARTIALS);
         return;
     }
 
@@ -100,7 +100,7 @@ computeModWithInterference(const cuComplex *__restrict__ result_matrix,
         for (int p = 0; p < npartials; p++) {
             for (int s = 0; s < d_nSLvectors[p]; s++) {
                 cuComplex val = result_matrix[(sltotal + s) * nEvents * npolar +
-                                              event_idx * npolar + polar_idx];
+                    event_idx * npolar + polar_idx];
                 partial_real[p] += val.x;
                 partial_imag[p] += val.y;
             }
@@ -110,7 +110,7 @@ computeModWithInterference(const cuComplex *__restrict__ result_matrix,
         // 计算每个部分的模方并累加到final_result
         for (int p = 0; p < npartials; p++) {
             double partial_intensity = partial_real[p] * partial_real[p] +
-                                       partial_imag[p] * partial_imag[p];
+                partial_imag[p] * partial_imag[p];
             final_result[p * nEvents + event_idx] += partial_intensity;
         }
 
@@ -124,7 +124,8 @@ computeModWithInterference(const cuComplex *__restrict__ result_matrix,
                         partial_real[i] * partial_real[i] +
                         partial_imag[i] * partial_imag[i];
                     interference_value = partial_intensity / total_result_value;
-                } else {
+                }
+                else {
                     // 非对角线元素：2 * Re(A_i * A_j^*) / total_result
                     float a = partial_real[i];
                     float b = partial_imag[i];
@@ -155,20 +156,20 @@ computeModWithInterference(const cuComplex *__restrict__ result_matrix,
 }
 
 // 主计算函数
-void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
-                    double *d_total_result, double *d_total_integral,
-                    double *d_partial_result,
-                    // double *d_partial_sums,
-                    double *d_interference_matrix,
-                    // double *d_event_interference,
-                    int *d_nSLvectors, int npartials, int nEvents, int ngls,
-                    int npolar)
+void computeResults(const cuComplex* d_matrix, const cuComplex* d_vector,
+    double* d_total_result, double* d_total_integral,
+    double* d_partial_result,
+    // double *d_partial_sums,
+    double* d_interference_matrix,
+    // double *d_event_interference,
+    int* d_nSLvectors, int npartials, int nEvents, int ngls,
+    int npolar)
 {
     cublasHandle_t handle;
     cublasCreate(&handle);
 
     // 分配设备内存
-    cuComplex *d_complex_result = nullptr;
+    cuComplex* d_complex_result = nullptr;
     cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(cuComplex));
 
     // cuBLAS 矩阵向量乘法
@@ -176,7 +177,7 @@ void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
     const cuComplex beta = make_cuComplex(0.0, 0.0);
 
     cublasCgemv(handle, CUBLAS_OP_N, nEvents * npolar, ngls, &alpha, d_matrix,
-                nEvents * npolar, d_vector, 1, &beta, d_complex_result, 1);
+        nEvents * npolar, d_vector, 1, &beta, d_complex_result, 1);
 
     // 检查 cuBLAS 调用
     cudaError_t cuda_error = cudaGetLastError();
@@ -188,13 +189,13 @@ void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
     int blockSize = 128; // 减小blockSize以减少共享内存使用
     int gridSize = (nEvents + blockSize - 1) / blockSize;
 
-    computeModTotalWeight<<<gridSize, blockSize>>>(
+    computeModTotalWeight << <gridSize, blockSize >> > (
         d_complex_result, d_total_result, d_total_integral, nEvents, npolar);
 
     // 清理中间结果
     cudaFree(d_complex_result);
 
-    cuComplex *d_result_matrix = nullptr;
+    cuComplex* d_result_matrix = nullptr;
     cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(cuComplex));
 
     // 使用 cuBLAS 矩阵乘对角矩阵
@@ -202,8 +203,8 @@ void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
     // d_vector: ngls 向量
     // 计算 d_result_matrix = d_matrix * diag(d_vector)，形状相同
     cublasCdgmm(handle, CUBLAS_SIDE_RIGHT, nEvents * npolar, ngls, d_matrix,
-                nEvents * npolar, d_vector, 1, d_result_matrix,
-                nEvents * npolar);
+        nEvents * npolar, d_vector, 1, d_result_matrix,
+        nEvents * npolar);
 
     // 计算部分权重和干涉矩阵
     // 共享内存用于存储部分振幅的实部和虚部（每个部分2个double）以及干涉矩阵累加器
@@ -217,23 +218,25 @@ void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
         // blockSize>>>(d_result_matrix, d_partial_result,
         // d_interference_matrix, d_event_interference, d_nSLvectors,
         // d_total_integral, npartials, nEvents, npolar);
-        computeModWithInterference<50><<<gridSize, blockSize>>>(
+        computeModWithInterference<50> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
-    } else if (npartials <= 200) {
+    }
+    else if (npartials <= 200) {
         // computeModWithInterference<200><<<gridSize,
         // blockSize>>>(d_result_matrix, d_partial_result,
         // d_interference_matrix, d_event_interference, d_nSLvectors,
         // d_total_integral, npartials, nEvents, npolar);
-        computeModWithInterference<200><<<gridSize, blockSize>>>(
+        computeModWithInterference<200> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
-    } else {
+    }
+    else {
         // computeModWithInterference<1000><<<gridSize,
         // blockSize>>>(d_result_matrix, d_partial_result,
         // d_interference_matrix, d_event_interference, d_nSLvectors,
         // d_total_integral, npartials, nEvents, npolar);
-        computeModWithInterference<1000><<<gridSize, blockSize>>>(
+        computeModWithInterference<1000> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_nSLvectors, d_total_integral, npartials, nEvents, npolar);
     }
@@ -256,169 +259,3 @@ void computeResults(const cuComplex *d_matrix, const cuComplex *d_vector,
     cublasDestroy(handle);
 }
 
-// // 核函数：计算复数模平方并按 npolar 分组求和，同时计算总和
-// __global__ void computeModTotalWeight(
-//     const cuComplex *__restrict__ complex_result,
-//     double *__restrict__ final_result,
-//     double *__restrict__ total_sum,
-//     int nEvents, int npolar)
-// {
-//     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     if (event_idx >= nEvents)
-//         return;
-
-//     double sum = 0.0;
-
-//     // 每个线程处理一个 event，累加对应的 npolar 个元素的模平方
-//     for (int polar_idx = 0; polar_idx < npolar; polar_idx++)
-//     {
-//         int global_idx = event_idx * npolar + polar_idx;
-//         cuComplex val = complex_result[global_idx];
-//         double mod_square = val.x * val.x + val.y * val.y;
-//         sum += mod_square;
-//     }
-
-//     final_result[event_idx] = sum;
-
-//     // 使用原子操作累加总和
-//     atomicAdd(total_sum, sum);
-// }
-
-// __global__ void computeModPartialWeight(
-//     const cuComplex *__restrict__ complex_matrix,
-//     const cuComplex *__restrict__ complex_vector,
-//     double *__restrict__ final_result,
-//     double *__restrict__ partial_sums,
-//     int *d_nSLvectors,
-//     int npartials,
-//     int nEvents, int npolar)
-// {
-//     extern __shared__ double shared_sums[];
-
-//     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
-//     int tid = threadIdx.x;
-
-//     // 初始化共享内存
-//     for (int i = tid; i < npartials; i += blockDim.x)
-//     {
-//         shared_sums[i] = 0.0;
-//     }
-//     __syncthreads();
-
-//     if (event_idx < nEvents)
-//     {
-//         int sltotal = 0;
-
-//         // 为每个部分计算权重
-//         for (int p_idx = 0; p_idx < npartials; p_idx++)
-//         {
-//             int nSL = d_nSLvectors[p_idx];
-//             double partial_sum = 0.0;
-
-//             // 计算当前部分在当前事件上的权重
-//             for (int sl_idx = 0; sl_idx < nSL; sl_idx++)
-//             {
-//                 for (int polar_idx = 0; polar_idx < npolar; polar_idx++)
-//                 {
-//                     int global_idx = sltotal * nEvents * npolar + event_idx *
-//                     npolar + polar_idx; cuComplex val =
-//                     complex_matrix[global_idx]; cuComplex vec_val =
-//                     complex_vector[p_idx * nSL + sl_idx]; cuComplex prod =
-//                     cuCmulf(val, vec_val);
-//                     // printf("Event %d, Partial %d, SL %d, Polar %d: Matrix
-//                     Element = (%f, %f i), Vector Element = (%f, %f i),
-//                     Product = (%f, %f i)\n", event_idx, p_idx, sl_idx,
-//                     polar_idx, val.x, val.y, vec_val.x, vec_val.y, prod.x,
-//                     prod.y); double mod_square = prod.x * prod.x + prod.y *
-//                     prod.y; partial_sum += mod_square;
-//                 }
-//                 sltotal++;
-//             }
-
-//             // 存储当前事件当前部分的结果
-//             // final_result[event_idx * npartials + p_idx] = partial_sum;
-//             final_result[p_idx * nEvents + event_idx] = partial_sum;
-
-//             // printf("Event %d, Partial %d, Partial Sum = %f\n", event_idx,
-//             p_idx, partial_sum);
-
-//             // 累加到共享内存
-//             atomicAdd(&shared_sums[p_idx], partial_sum);
-//         }
-//     }
-
-//     __syncthreads();
-
-//     // 将共享内存中的结果累加到全局内存
-//     for (int i = tid; i < npartials; i += blockDim.x)
-//     {
-//         if (shared_sums[i] != 0.0)
-//         {
-//             atomicAdd(&partial_sums[i], shared_sums[i]);
-//         }
-//     }
-// }
-
-// void computeWeightResult(
-//     const cuComplex *d_matrix,
-//     const cuComplex *d_vector,
-//     double *d_total_result,
-//     double *d_total_integral,
-//     double *d_partial_result,
-//     double *d_partial_sums,
-//     int *d_nSLvectors,
-//     int npartials,
-//     int nEvents, int ngls, int npolar)
-// {
-//     cublasHandle_t handle;
-//     cublasCreate(&handle);
-
-//     // 分配设备内存
-//     cuComplex *d_complex_result = nullptr;
-//     cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(cuComplex));
-
-//     // cuBLAS 矩阵向量乘法
-//     const cuComplex alpha = make_cuComplex(1.0, 0.0);
-//     const cuComplex beta = make_cuComplex(0.0, 0.0);
-
-//     cublasCgemv(handle, CUBLAS_OP_N, nEvents * npolar, ngls, &alpha,
-//                 d_matrix, nEvents * npolar, d_vector, 1, &beta,
-//                 d_complex_result, 1);
-
-//     // 检查 cuBLAS 调用
-//     cudaError_t cuda_error = cudaGetLastError();
-//     if (cuda_error != cudaSuccess)
-//     {
-//         printf("cuBLAS error: %s\n", cudaGetErrorString(cuda_error));
-//     }
-
-//     // 计算总权重
-//     int blockSize = 256;
-//     int gridSize = (nEvents + blockSize - 1) / blockSize;
-
-//     computeModTotalWeight<<<gridSize, blockSize>>>(d_complex_result,
-//     d_total_result, d_total_integral, nEvents, npolar);
-
-//     // 计算部分权重
-//     // computeModPartialWeight<<<gridSize, blockSize>>>(d_matrix, d_vector,
-//     d_partial_result, d_nSLvectors, npartials, nEvents, npolar); size_t
-//     shared_mem_size = npartials * sizeof(double);
-//     computeModPartialWeight<<<gridSize, blockSize,
-//     shared_mem_size>>>(d_matrix, d_vector, d_partial_result, d_partial_sums,
-//     d_nSLvectors, npartials, nEvents, npolar);
-
-//     // 检查核函数执行
-//     cuda_error = cudaGetLastError();
-//     if (cuda_error != cudaSuccess)
-//     {
-//         printf("Kernel error: %s\n", cudaGetErrorString(cuda_error));
-//     }
-
-//     // 同步确保所有操作完成
-//     cudaDeviceSynchronize();
-
-//     // 清理资源
-//     cudaFree(d_complex_result);
-//     cublasDestroy(handle);
-// }
