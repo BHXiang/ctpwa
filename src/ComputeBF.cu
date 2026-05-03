@@ -9,12 +9,12 @@
 // 关键: 不除以total_result（与computeModWithInterference不同），产出原始散射矩阵
 template <int N_PARTIALS>
 __global__ void computeBFKernel(
-    const cuComplex* __restrict__ result_matrix,  // [ngls × nEvents × npolar]
+    const cuComplex* __restrict__ result_matrix,  // [nEvents × npolar × ngls]
     double* __restrict__ d_partial_integral,       // [npartials]
     double* __restrict__ d_scattering_matrix,      // [npartials × npartials]
     double* __restrict__ d_total_integral,         // [1]
     const int* __restrict__ d_nSLvectors,          // [npartials]
-    int npartials, int nEvents, int npolar)
+    int npartials, int nEvents, int ngls, int npolar)
 {
     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (event_idx >= nEvents) return;
@@ -32,8 +32,8 @@ __global__ void computeBFKernel(
         for (int p = 0; p < npartials; p++) {
             for (int s = 0; s < d_nSLvectors[p]; s++) {
                 cuComplex val = result_matrix[
-                    (sltotal + s) * nEvents * npolar +
-                    event_idx * npolar + polar_idx];
+                    event_idx * npolar * ngls +
+                    polar_idx * ngls + (sltotal + s)];
                 partial_real[p] += val.x;
                 partial_imag[p] += val.y;
             }
@@ -90,20 +90,20 @@ void computeBranchingFractions(
     // 1. cuBLAS gemv: 计算 S = A * v
     cuComplex* d_complex_result = nullptr;
     cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(cuComplex));
-    cublasCgemv(handle, CUBLAS_OP_N,
-        nEvents * npolar, ngls,
-        &alpha, d_matrix, nEvents * npolar,
+    cublasCgemv(handle, CUBLAS_OP_T,
+        ngls, nEvents * npolar,
+        &alpha, d_matrix, ngls,
         d_vector, 1,
         &beta, d_complex_result, 1);
 
     // 2. cuBLAS dgmm: A * diag(v) → result_matrix
     cuComplex* d_result_matrix = nullptr;
     cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(cuComplex));
-    cublasCdgmm(handle, CUBLAS_SIDE_RIGHT,
-        nEvents * npolar, ngls,
-        d_matrix, nEvents * npolar,
+    cublasCdgmm(handle, CUBLAS_SIDE_LEFT,
+        ngls, nEvents * npolar,
+        d_matrix, ngls,
         d_vector, 1,
-        d_result_matrix, nEvents * npolar);
+        d_result_matrix, ngls);
 
     cublasDestroy(handle);
 
@@ -115,17 +115,17 @@ void computeBranchingFractions(
         computeBFKernel<50><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_nSLvectors,
-            npartials, nEvents, npolar);
+            npartials, nEvents, ngls, npolar);
     else if (npartials <= 200)
         computeBFKernel<200><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_nSLvectors,
-            npartials, nEvents, npolar);
+            npartials, nEvents, ngls, npolar);
     else
         computeBFKernel<1000><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_nSLvectors,
-            npartials, nEvents, npolar);
+            npartials, nEvents, ngls, npolar);
 
     cudaError_t cuda_error = cudaGetLastError();
     if (cuda_error != cudaSuccess)
