@@ -805,14 +805,17 @@ __global__ void computeSLAmpKernel(
         }
 
         // d_amp按
-        thrust::complex<double>* event_final_amp =
-            &d_amp[slIdx * num_events * num_polar +
-            (start_events + eventIdx) * num_polar];
+        // thrust::complex<double>* event_final_amp =
+        //     &d_amp[slIdx * num_events * num_polar +
+        //     (start_events + eventIdx) * num_polar];
         for (int i = 0; i < num_polar; ++i)
         {
-            event_final_amp[i] = currentAmp[i];
+            int idx = slIdx * num_events * num_polar + (start_events + eventIdx) * num_polar + i;
+            // int idx = (start_events + eventIdx) * num_sl * num_polar + i * num_sl + slIdx;
+            d_amp[idx] = currentAmp[i];
+            // event_final_amp[i] = currentAmp[i];
             // printf("Event %d, sl %d, Final Amp[%d] = (%f, %f i)\n", eventIdx, slIdx, i, event_final_amp[i].real(), event_final_amp[i].imag());
-            // printf("Event %d, sl %d, Final Amp[%d] = (%f, %f i)\n", eventIdx, slIdx, i, currentAmp[i].real(), currentAmp[i].imag());
+            // printf("Event %d, sl %d, k %d, Final Amp[%d] = (%f, %f i)\n", eventIdx, slIdx, i, idx, currentAmp[i].real(), currentAmp[i].imag());
         }
 
         // printf("Event %d: Final amplitude size: %d\n", eventIdx,
@@ -823,6 +826,7 @@ __global__ void computeSLAmpKernel(
 void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
     const std::vector<Resonance>& resonances,
     const int site,
+    const int n_amplitudes,
     const std::vector<std::vector<int>>& event_offsets,
     const std::vector<std::vector<int>>& amp_offsets)
 {
@@ -902,6 +906,7 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
                 d_amp_offsets,      // 振幅偏移量
                 d_event_offsets,    // 事件偏移量
                 num_offsets,        // 偏移量数量
+                n_amplitudes,       // 振幅数量
                 site                // 位置
                 );
 
@@ -933,7 +938,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_offsets, int site)
+    int num_offsets, int n_amplitudes, int site)
 {
     // int event_idx = threadIdx.x * blockDim.x + threadIdx.x;
     int sl_idx = blockIdx.x;
@@ -944,9 +949,6 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // if (event_idx >= nEvents)
         return;
     }
-
-    // for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx)
-    // {
 
     // event_idx处于event_offsets哪个位置
     int offset_idx = 0;
@@ -1074,16 +1076,15 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     for (int k = 0; k < nPolar; ++k)
     {
         int idx = sl_idx * nPolar * nEvents + event_idx * nPolar + k;
+        // int idx = event_idx * nPolar * n_amplitudes + k * n_amplitudes + sl_idx;
         // int amp_idx = site * nEvents * nPolar + idx;
         int amp_idx = 0;
         if (offset_idx < num_offsets)
         {
-            int nEvents =
-                event_offsets[offset_idx + 1] - event_offsets[offset_idx];
+            int nEvents = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
             // int nEvents = event_offsets[offset_idx + 1];
-            amp_idx = amp_offsets[offset_idx] + site * nEvents * nPolar +
-                sl_idx * nPolar * nEvents +
-                (event_idx - event_offsets[offset_idx]) * nPolar + k;
+            // amp_idx = amp_offsets[offset_idx] + site * nEvents * nPolar + sl_idx * nPolar * nEvents + (event_idx - event_offsets[offset_idx]) * nPolar + k;
+            amp_idx = amp_offsets[offset_idx] + (event_idx - event_offsets[offset_idx]) * n_amplitudes * nPolar + k * n_amplitudes + sl_idx + site;
         }
         else
         {
@@ -1099,7 +1100,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // 打印
         // printf("Event %d, sl %d, Amp[%d] = (%f, %f i)\n", event_idx, sl_idx, k, temp.real(), temp.imag());
         // printf("Event %d, sl %d, ResAmp[%d] = (% f, % f i)\n", event_idx, sl_idx, k, resAmp.real(), resAmp.imag());
-        // printf("Event %d, sl %d, amp[%d] = (%f, %f i)\n", event_idx, sl_idx, k, cuCrealf(amplitudes[amp_idx]), cuCimagf(amplitudes[amp_idx]));
+        // printf("Event %d, sl %d, pol %d, slamp[%d] = (%f, %f i), amp[%d] = (%f, %f i)\n", event_idx, sl_idx, k, idx, slamps[idx].real(), slamps[idx].imag(), amp_idx, cuCrealf(amplitudes[amp_idx]), cuCimagf(amplitudes[amp_idx]));
     }
 }
 // }

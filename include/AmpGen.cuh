@@ -138,7 +138,9 @@ public:
     // void getAmps(Resonance &resonance);
     // cuComplex *getAmps(const std::vector<Resonance> &resonances);
     void getAmps(std::vector<cuComplex*>& d_amplitudes,
-        const std::vector<Resonance>& resonances, const int site,
+        const std::vector<Resonance>& resonances,
+        const int site,
+        const int n_amplitudes,
         const std::vector<std::vector<int>>& event_offsets,
         const std::vector<std::vector<int>>& amp_offsets);
 
@@ -168,6 +170,6 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_amp_offsets, int site);
+    int num_amp_offsets, int n_amplitudes, int site);
 
 #endif // AMPGEN_CUH
