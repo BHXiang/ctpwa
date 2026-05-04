@@ -147,8 +147,8 @@ extension = CUDAExtension(
             "-D_GLIBCXX_USE_CXX11_ABI=1",  # 确保与 PyTorch ABI 兼容
         ],
         "nvcc": [
-            #*cuda_gencode_flags,  # 动态检测到的 gencode 选项
-            "-arch=sm_120",
+            *cuda_gencode_flags,  # 动态检测到的 gencode 选项
+            #"-arch=sm_120",
             "--expt-relaxed-constexpr",
             "-Xcompiler",
             "-fPIC",
