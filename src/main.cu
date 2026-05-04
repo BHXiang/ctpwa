@@ -4,7 +4,7 @@
 #include "ComputeHessian.cu"
 
 #include "AmpGen.cu"
-#include "ComputeGrad.cu"
+// #include "ComputeGrad.cu"
 #include "ComputeNLL.cu"
 #include "ComputeResults.cu"
 #include "ComputeBF.cu"

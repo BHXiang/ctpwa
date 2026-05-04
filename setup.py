@@ -11,6 +11,44 @@ cuda_dir = os.environ.get("CUDA_HOME")
 project_dir = os.path.dirname(os.path.abspath(__file__))
 
 
+# 获取当前 CUDA 环境支持的 SM 架构，生成 gencode 编译选项
+def get_cuda_gencode_flags():
+    """检测当前 nvcc 支持的 SM 架构，只对存在的架构生成 -gencode 选项"""
+    # 期望支持的目标架构（主版本号对应 compute capability）
+    desired_sm = [70, 75, 80, 86, 89, 90, 100, 120]
+
+    try:
+        output = subprocess.check_output(
+            ["nvcc", "--list-gpu-arch"], universal_newlines=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # nvcc 不可用时返回空
+        return []
+
+    # 解析 nvcc --list-gpu-arch 输出，提取 compute_XX 中的 XX
+    available = set()
+    for line in output.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("compute_"):
+            try:
+                available.add(int(line.split("_")[1]))
+            except ValueError:
+                continue
+
+    flags = []
+    for sm in desired_sm:
+        if sm in available:
+            flags.append(f"-gencode=arch=compute_{sm},code=sm_{sm}")
+
+    if not flags:
+        # 全部都不支持时，回退到最高的一个可用架构
+        if available:
+            max_sm = max(available)
+            flags.append(f"-gencode=arch=compute_{max_sm},code=sm_{max_sm}")
+
+    return flags
+
+
 # 使用 root-config 获取 ROOT 的编译标志
 def get_root_flags():
     """获取 ROOT 的编译和链接标志"""
@@ -68,6 +106,9 @@ def get_root_flags():
 # 获取 ROOT 标志
 root_flags = get_root_flags()
 
+# 获取 CUDA gencode 编译选项
+cuda_gencode_flags = get_cuda_gencode_flags()
+
 # 定义扩展模块
 extension = CUDAExtension(
     name="ctpwa",
@@ -106,8 +147,8 @@ extension = CUDAExtension(
             "-D_GLIBCXX_USE_CXX11_ABI=1",  # 确保与 PyTorch ABI 兼容
         ],
         "nvcc": [
-            "-arch=sm_120",  # 根据您的GPU架构调整（A100: sm_80, V100: sm_70, 3090: sm_86）
-            #"-arch=all-major",
+            #*cuda_gencode_flags,  # 动态检测到的 gencode 选项
+            "-arch=sm_120",
             "--expt-relaxed-constexpr",
             "-Xcompiler",
             "-fPIC",

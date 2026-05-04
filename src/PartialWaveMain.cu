@@ -11,7 +11,7 @@
 #include <vector>
 
 #include <AmpGen.cuh>
-#include <ComputeGrad.cuh>
+// #include <ComputeGrad.cuh>
 #include <ComputeNLL.cuh>
 #include <ComputeResults.cuh>
 #include <Config.cuh>
@@ -783,7 +783,7 @@ public:
         // }
         // std::cout << std::endl;
 
-        // global_extended_grad = global_extended_grad.conj(); // 转置共轭以匹配PyTorch的梯度定义
+        // global_extended_grad = global_extended_grad * 2; // 转置共轭以匹配PyTorch的梯度定义
 
         ctx->save_for_backward({ vector, extended_vec_per_gpu[0] });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
@@ -3119,126 +3119,6 @@ private:
 
         return d_all_amplitudes_vec;
     }
-
-
-    // double computeNLL(std::vector<std::complex<float>>& params)
-    double computeNLL(std::vector<cuComplex*>& d_params)
-    {
-        int extended_n_gls = n_amplitudes_;
-
-        std::vector<double> local_mc_amp(n_gpus_, 0.0);
-        std::vector<int> local_phsp_events(n_gpus_, 0);
-        std::vector<cuComplex*> d_B_list(n_gpus_, nullptr);
-        std::vector<cuComplex*> d_S_list(n_gpus_, nullptr);
-        std::vector<cuComplex*> d_Q_list(n_gpus_, nullptr);
-        std::vector<cuComplex*> d_bkg_S_list(n_gpus_, nullptr);
-        std::vector<cuComplex*> d_bkg_Q_list(n_gpus_, nullptr);
-        std::vector<double*> d_bkg_nll_list(n_gpus_, nullptr);
-
-        // 临时存储每个 GPU 的 h_phsp_factor（局部，稍后会被全局因子覆盖）
-        std::vector<double> local_h_phsp_factor(n_gpus_, 0.0);
-
-        for (int i = 0; i < n_gpus_; ++i) {
-            cudaSetDevice(i);
-            const auto& events = events_[i];
-            local_phsp_events[i] = events[0];  // 相空间事件数
-            int phsp_len = events[0] * n_polar_;
-
-            // 分配临时缓冲区
-            cuComplex* d_B = nullptr;
-            double* d_mc_amp = nullptr;
-            cudaMalloc(&d_B, phsp_len * sizeof(cuComplex));
-            cudaMalloc(&d_mc_amp, sizeof(double));
-            d_B_list[i] = d_B;
-
-            // 调用内核计算局部振幅平方和
-            computePHSPfactor(d_all_amplitudes_[i],
-                d_params[i],
-                d_B, d_mc_amp, phsp_len, extended_n_gls);
-
-            cudaMemcpy(&local_mc_amp[i], d_mc_amp, sizeof(double), cudaMemcpyDeviceToHost);
-            cudaFree(d_mc_amp);
-
-            // 分配后续 NLL 计算需要的缓冲区（稍后使用）
-            cudaMalloc(&d_S_list[i], events[1] * n_polar_ * sizeof(cuComplex));
-            cudaMalloc(&d_Q_list[i], events[1] * sizeof(cuComplex));
-            if (events[2] > 0) {
-                cudaMalloc(&d_bkg_S_list[i], events[2] * n_polar_ * sizeof(cuComplex));
-                cudaMalloc(&d_bkg_Q_list[i], events[2] * sizeof(cuComplex));
-                cudaMalloc(&d_bkg_nll_list[i], sizeof(double));
-            }
-        }
-
-        // 4. 合并所有 GPU 的分子和事件数，计算全局 phsp_factor
-        double total_mc_amp = 0.0;
-        int total_phsp_events = 0;
-        for (int i = 0; i < n_gpus_; ++i) {
-            total_mc_amp += local_mc_amp[i];
-            total_phsp_events += local_phsp_events[i];
-        }
-        double global_phsp_factor = total_mc_amp / static_cast<double>(total_phsp_events);
-
-        // 5. 每个 GPU 使用全局 phsp_factor 计算各自的 NLL
-        std::vector<double> local_data_nll(n_gpus_, 0.0);
-        std::vector<double> local_bkg_nll(n_gpus_, 0.0);
-
-        for (int i = 0; i < n_gpus_; ++i) {
-            cudaSetDevice(i);
-            const auto& events = events_[i];
-            const auto& amp_offsets = amp_offsets_[i];
-            const auto& events_offsets = events_offsets_[i];  // 若需要
-
-            // 数据部分
-            cuComplex* data_fix = d_all_amplitudes_[i] + amp_offsets[1];
-            double* d_data_nll = nullptr;
-            cudaMalloc(&d_data_nll, sizeof(double));
-            computeNll(data_fix,
-                d_params[i],
-                nullptr, d_S_list[i], d_Q_list[i], d_data_nll,
-                events[1] * n_polar_, extended_n_gls, n_polar_,
-                global_phsp_factor);
-            cudaMemcpy(&local_data_nll[i], d_data_nll, sizeof(double), cudaMemcpyDeviceToHost);
-            cudaFree(d_data_nll);
-
-            // 背景部分
-            if (events[2] > 0) {
-                cuComplex* bkg_fix = d_all_amplitudes_[i] + amp_offsets[2];
-                // 背景权重指针（假设全局传入，实际应每个 GPU 独立）
-                // 这里简化：假设 bkg_weights 已按 GPU 分片，传入一个 std::vector<double*>
-                // double* bkg_weights = nullptr; // 实际应从外部传入每个 GPU 的权重指针
-                computeNll(bkg_fix,
-                    d_params[i],
-                    bkg_weights_[i],
-                    d_bkg_S_list[i], d_bkg_Q_list[i], d_bkg_nll_list[i],
-                    events[2] * n_polar_, extended_n_gls, n_polar_,
-                    global_phsp_factor);
-                cudaMemcpy(&local_bkg_nll[i], d_bkg_nll_list[i], sizeof(double), cudaMemcpyDeviceToHost);
-            }
-        }
-
-        // 6. 合并 NLL
-        double total_data_nll = 0.0, total_bkg_nll = 0.0;
-        for (int i = 0; i < n_gpus_; ++i) {
-            total_data_nll += local_data_nll[i];
-            total_bkg_nll += local_bkg_nll[i];
-        }
-        double loss = total_data_nll - total_bkg_nll;
-
-        for (int i = 0; i < n_gpus_; ++i) {
-            cudaSetDevice(i);
-            cudaFree(d_B_list[i]);
-            cudaFree(d_S_list[i]);
-            cudaFree(d_Q_list[i]);
-            if (events_[i][2] > 0) {
-                cudaFree(d_bkg_S_list[i]);
-                cudaFree(d_bkg_Q_list[i]);
-                cudaFree(d_bkg_nll_list[i]);
-            }
-        }
-
-        return loss;
-    }
-
 
 };
 
