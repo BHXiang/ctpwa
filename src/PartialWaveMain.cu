@@ -527,33 +527,26 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
     // 结果 map
     std::vector<std::map<std::string, std::vector<LorentzVector>>> result;
 
-    for (size_t i = 0; i < events.size(); ++i)
+    // 跟踪每种数据类型在各GPU间的全局偏移
+    int n_types = maps.size();
+    std::vector<int> global_offset(n_types, 0);
+
+    for (size_t gpu = 0; gpu < events.size(); ++gpu)
     {
         std::map<std::string, std::vector<LorentzVector>> tmp;
 
-        // 第一步：预留空间，避免后续插入时多次重新分配
-        // 由于所有 map 的 key 集合相同，可以从第一个 map 获取所有 key
-        const auto& first = maps[0];
-        for (const auto& [key, vec] : first)
-        {
-            size_t total = vec.size(); // 第一个 map 的大小
-            for (size_t i = 1; i < maps.size(); ++i)
-            {
-                auto it = maps[i].find(key);
-                if (it != maps[i].end())
-                    total += it->second.size();
-            }
-            tmp[key].reserve(total); // 一次性预留足够空间
-        }
-
-        // 第二步：将每个 map 中的 vector 追加到结果中
-        for (const auto& m : maps)
-        {
-            for (const auto& [key, vec] : m)
-            {
+        // 为当前GPU切出每种数据类型的对应事件
+        for (int t = 0; t < n_types; ++t) {
+            int n_ev = events[gpu][t];
+            if (n_ev <= 0) continue;
+            const auto& m = maps[t];
+            for (const auto& [key, vec] : m) {
                 auto& target = tmp[key];
-                target.insert(target.end(), vec.begin(), vec.end()); // 批量插入
+                target.insert(target.end(),
+                    vec.begin() + global_offset[t],
+                    vec.begin() + global_offset[t] + n_ev);
             }
+            global_offset[t] += n_ev;
         }
 
         result.push_back(tmp);
@@ -1113,22 +1106,21 @@ public:
         }
 
         const int target_dev = vector.get_device();
-        cudaSetDevice(target_dev);
 
         int npartials = nSLvectors_.size();
-        // 变量多GPU分配和计算
+        // 每个GPU在自己的设备上分配输出缓冲区
         std::vector<double*> d_final_result_vec;
+        std::vector<double*> d_partial_result_vec;
         for (int i = 0; i < d_all_amplitudes_.size(); ++i) {
+            cudaSetDevice(i);
             double* d_final_result;
             cudaMalloc(&d_final_result, events_[i][0] * sizeof(double));
             d_final_result_vec.push_back(d_final_result);
-        }
-        std::vector<double*> d_partial_result_vec;
-        for (int i = 0; i < d_all_amplitudes_.size(); ++i) {
             double* d_partial_result;
             cudaMalloc(&d_partial_result, events_[i][0] * npartials * sizeof(double));
             d_partial_result_vec.push_back(d_partial_result);
         }
+        cudaSetDevice(target_dev);
 
         // 分配nSLvectors_的设备内存
         // int* d_nSLvectors;
@@ -1160,6 +1152,7 @@ public:
         double* h_interference_matrix = new double[nSLvectors_.size() * nSLvectors_.size()];
         double* h_total_results = new double[N_phsp];
         double* h_partial_results = new double[N_phsp * npartials];
+        int ev_cumulative = 0;  // 多GPU累加偏移
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
             int* d_nSLvectors;
@@ -1193,10 +1186,11 @@ public:
             }
             double* h_total_results_gpu = new double[events_[gpu][0]];
             cudaMemcpy(h_total_results_gpu, d_final_result_vec[gpu], events_[gpu][0] * sizeof(double), cudaMemcpyDeviceToHost);
-            std::copy(h_total_results_gpu, h_total_results_gpu + events_[gpu][0], h_total_results + static_cast<int>(N_phsp - events_[gpu][0]));
+            std::copy(h_total_results_gpu, h_total_results_gpu + events_[gpu][0], h_total_results + ev_cumulative);
             double* h_partial_results_gpu = new double[events_[gpu][0] * npartials];
             cudaMemcpy(h_partial_results_gpu, d_partial_result_vec[gpu], events_[gpu][0] * npartials * sizeof(double), cudaMemcpyDeviceToHost);
-            std::copy(h_partial_results_gpu, h_partial_results_gpu + events_[gpu][0] * npartials, h_partial_results + static_cast<int>((N_phsp - events_[gpu][0]) * npartials));
+            std::copy(h_partial_results_gpu, h_partial_results_gpu + events_[gpu][0] * npartials, h_partial_results + ev_cumulative * npartials);
+            ev_cumulative += events_[gpu][0];
             cudaFree(d_total_integral_gpu);
             cudaFree(d_interference_matrix_gpu);
             delete[] h_interference_matrix_gpu;
@@ -2008,26 +2002,30 @@ public:
         torch::Tensor hessian = torch::zeros({ 2 * n_ext, 2 * n_ext }, torch::kDouble).to(dev);
         double* d_hessian = hessian.data_ptr<double>();
 
-        // 多GPU: 累加data和bkg的Hessian贡献
+        // 多GPU: 累加data和bkg的Hessian贡献（每GPU独立分配，P2P累加到GPU 0）
+        int hess_sz = (2 * n_ext) * (2 * n_ext);
         int totalDataEvents = 0;
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
             torch::Tensor vec_gpu = extended_vector.to(torch::Device(torch::kCUDA, gpu));
             const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(vec_gpu.data_ptr());
 
+            // 在当前GPU上分配临时hessian并清零
+            double* d_hess_gpu;
+            cudaMalloc(&d_hess_gpu, hess_sz * sizeof(double));
+            cudaMemset(d_hess_gpu, 0, hess_sz * sizeof(double));
+
             // --- data ---
             int nData = events_[gpu][1];
             if (nData > 0) {
                 totalDataEvents += nData;
                 cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hessian, nData, n_polar_, n_ext);
+                computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
             }
 
             // --- bkg ---
             int nBkg = events_[gpu][2];
             if (nBkg > 0) {
-                // NLL = data_NLL - bkg_NLL, 所以 Hessian = H_data - H_bkg
-                // 传入负权重以实现减法
                 double* d_w_bkg;
                 cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
                 if (bkg_weights_[gpu] != nullptr) {
@@ -2041,10 +2039,30 @@ public:
                     cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
                 }
                 cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hessian, nBkg, n_polar_, n_ext);
+                computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
                 cudaFree(d_w_bkg);
             }
+
+            // P2P累加到GPU 0的主hessian
+            if (gpu == dev.index()) {
+                double one = 1.0;
+                cublasHandle_t h; cublasCreate(&h);
+                cublasDaxpy(h, hess_sz, &one, d_hess_gpu, 1, d_hessian, 1);
+                cublasDestroy(h);
+            } else {
+                double* d_hess_buf;
+                cudaSetDevice(dev.index());
+                cudaMalloc(&d_hess_buf, hess_sz * sizeof(double));
+                cudaMemcpyPeer(d_hess_buf, dev.index(), d_hess_gpu, gpu, hess_sz * sizeof(double));
+                double one = 1.0;
+                cublasHandle_t h; cublasCreate(&h);
+                cublasDaxpy(h, hess_sz, &one, d_hess_buf, 1, d_hessian, 1);
+                cublasDestroy(h);
+                cudaFree(d_hess_buf);
+            }
+            cudaFree(d_hess_gpu);
         }
+        cudaSetDevice(dev.index());
 
         // phsp Hessian贡献
         double phsp_weight = (double)totalDataEvents - bkg_integral_;
