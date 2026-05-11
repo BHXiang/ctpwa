@@ -136,13 +136,18 @@ __host__ __device__ thrust::complex<double> BWR(T &m, T &m0, T &gamma0, int L,
     T y = m0 * gamma;
     T s = x * x + y * y;
 
-    // if (real != nullptr || imag != nullptr)
-    // {
-    //     if (real != nullptr)
-    //         *real = x / s;
-    //     if (imag != nullptr)
-    //         *imag = y / s;
-    // }
+    return thrust::complex<double>(x / s, y / s);
+}
+
+template <typename T>
+__host__ __device__ thrust::complex<double> BW(T& m, T& m0, T& gamma0)
+{
+    // using ::pow;
+
+    // 计算能量依赖的宽度
+    T x = m0 * m0 - m * m;
+    T y = m0 * gamma0;
+    T s = x * x + y * y;
 
     return thrust::complex<double>(x / s, y / s);
 }

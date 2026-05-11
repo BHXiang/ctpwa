@@ -30,8 +30,10 @@ template <typename T> __host__ __device__ T Bf(int L, const T &q, const T &q0);
 template <typename T>
 // __host__ __device__ thrust::complex<double> BWR(T &m, T &m0, T &gamma0, int
 // L, T &q, T &q0, T *real, T *imag)
-__host__ __device__ thrust::complex<double> BWR(T &m, T &m0, T &gamma0, int L,
-                                                T &q, T &q0);
+__host__ __device__ thrust::complex<double> BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0);
+
+template <typename T>
+__host__ __device__ thrust::complex<double> BW(T& m, T& m0, T& gamma0);
 
 __device__ double BlattWeisskopf(int L, double q, double q0);
 

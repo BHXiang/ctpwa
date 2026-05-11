@@ -18,9 +18,10 @@
 // 共振模型类型枚举
 enum class ResModelType : int
 {
-    BWR = 0, // Breit-Wigner
-    ONE = 1,
-    Flatte = 2
+    BWR = 0,
+    BW = 1,
+    ONE = 2,
+    Flatte = 3
 };
 
 // 设备端共振结构体
