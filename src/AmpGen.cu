@@ -1061,7 +1061,9 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             else if (current_res.type == ResModelType::BW)
             {
                 resAmp *= BW<double>(mm, current_res.params[0], current_res.params[1]);
-                resAmp *= Bf<double>(sl.L, qq, q0);
+                // printf("Event %d, sl %d, Node %d: BW Factor=(%f, %f i)\n", event_idx, sl_idx, nodeIdx, resAmp.real(), resAmp.imag());
+                // resAmp *= Bf<double>(sl.L, qq, q0);
+                // printf("Event %d, sl %d, Node %d: L=%d, qq=%f, q0=%f, BW Factor=(%f, %f i)\n", event_idx, sl_idx, nodeIdx, sl.L, qq, q0, resAmp.real(), resAmp.imag());
             }
             else if (current_res.type == ResModelType::ONE)
             {
