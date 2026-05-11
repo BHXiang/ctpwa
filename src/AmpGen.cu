@@ -1055,8 +1055,12 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         {
             if (current_res.type == ResModelType::BWR)
             {
-                resAmp *= BWR<double>(mm, current_res.params[0],
-                    current_res.params[1], sl.L, qq, q0);
+                resAmp *= BWR<double>(mm, current_res.params[0], current_res.params[1], sl.L, qq, q0);
+                resAmp *= Bf<double>(sl.L, qq, q0);
+            }
+            else if (current_res.type == ResModelType::BW)
+            {
+                resAmp *= BW<double>(mm, current_res.params[0], current_res.params[1]);
                 resAmp *= Bf<double>(sl.L, qq, q0);
             }
             else if (current_res.type == ResModelType::ONE)

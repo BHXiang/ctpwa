@@ -15,6 +15,7 @@ ResModelType Resonance::modelTypeFromString(const std::string& modelStr)
 {
     static const std::map<std::string, ResModelType> modelMap = {
         {"BWR", ResModelType::BWR},
+        {"BW", ResModelType::BW},
         {"ONE", ResModelType::ONE},
         {"Flatte", ResModelType::Flatte} };
 
@@ -47,6 +48,14 @@ void Resonance::setParamsByModelType(const std::vector<double>& params)
         if (params.size() > 2) {
             params_["r"] = params[2]; // Blatt-Weisskopf半径
         }
+        break;
+
+    case ResModelType::BW:
+        if (params.size() < 2) {
+            throw std::runtime_error(
+                "BW model requires at least mass and width parameters");
+        }
+        params_ = { {"mass", params[0]}, {"width", params[1]} };
         break;
 
     case ResModelType::ONE:
