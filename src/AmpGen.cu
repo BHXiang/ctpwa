@@ -1067,7 +1067,8 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             }
             else if (current_res.type == ResModelType::ONE)
             {
-                resAmp *= Bf<double>(sl.L, qq, q0);
+                // resAmp *= Bf<double>(sl.L, qq, q0);
+                resAmp *= 1.0;
             }
             else if (current_res.type == ResModelType::Flatte)
             {
