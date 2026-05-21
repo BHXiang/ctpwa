@@ -7,8 +7,11 @@
 // #include <Resonance.cuh>
 
 // Amp2BD 类实现
-Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities)
-    : jvalues_(jvalues), parities_(parities)
+Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
+    bool identical_daughters, bool is_boson, int maxL)
+    : jvalues_(jvalues), parities_(parities),
+    identical_daughters_(identical_daughters), is_boson_(is_boson),
+    maxL_(maxL)
 {
     spinOrbitCombinations_ = ComSL(jvalues, parities);
 }
@@ -73,8 +76,16 @@ std::vector<SL> Amp2BD::ComSL(const std::array<int, 3>& spins, const std::array<
 
             if (p1 == p2 * p3 * sign)
             {
+                // 全同粒子选择定则: (-1)^{L+S} = +1 (Bose) 或 -1 (Fermi)
+                if (identical_daughters_) {
+                    int S = two_S / 2; // 实际的总自旋量子数
+                    int parity_LS = ((L + S) % 2 == 0) ? 1 : -1;
+                    int required = is_boson_ ? 1 : -1;
+                    if (parity_LS != required) continue;
+                }
 
-                // if (L > 3) continue;
+                // 轨道角动量上限截断
+                if (maxL_ > 0 && L > maxL_) continue;
 
                 // 存储实际的自旋量子数（不是两倍值）
                 // int S = two_S / 2; // 实际的总自旋量子数
@@ -105,6 +116,7 @@ AmpCasDecay::AmpCasDecay(const std::vector<Particle>& particles)
         particleNames_.push_back(p.name);
     }
     nSLCombs_ = 1;
+    nPolarizations_total_ = 0;
 }
 
 AmpCasDecay::~AmpCasDecay()
@@ -124,6 +136,11 @@ AmpCasDecay::~AmpCasDecay()
         if (d_slCombination_[i])
             cudaFree(d_slCombination_[i]);
     }
+    for (size_t i = 0; i < d_polarization_map_.size(); ++i)
+    {
+        if (d_polarization_map_[i])
+            cudaFree(d_polarization_map_[i]);
+    }
 }
 
 void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const std::string& daug1, const std::string& daug2)
@@ -137,6 +154,17 @@ void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const s
     addParticleIfNotExists(daug2, jvals[2], pars[2], -1.0);
 
     nSLCombs_ *= amp.getSL().size();
+}
+
+void AmpCasDecay::setPolarizationMap(const std::vector<int>& map)
+{
+    h_polarization_map_ = map; // stored on host, uploaded to GPU in computeSLAmps
+}
+
+void AmpCasDecay::setPermutedMappings(const std::vector<std::map<std::string, int>>& maps, bool is_boson)
+{
+    permuted_mappings_ = maps;
+    identical_boson_ = is_boson;
 }
 
 // AmpCasDecay 私有方法实现
@@ -317,6 +345,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
     d_slamps_.resize(finalMomenta.size(), nullptr);
     d_decayNodes_.resize(finalMomenta.size(), nullptr);
     d_slCombination_.resize(finalMomenta.size(), nullptr);
+    d_polarization_map_.resize(finalMomenta.size(), nullptr);
 
     // 所有粒子及其索引
     std::set<std::string> allParticles;
@@ -405,6 +434,13 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         cudaMalloc(&d_slCombination_[i], host_slCombinations.size() * sizeof(SL));
         cudaMemcpy(d_slCombination_[i], host_slCombinations.data(), host_slCombinations.size() * sizeof(SL), cudaMemcpyHostToDevice);
 
+        // 上传极化 mask 到设备
+        if (!h_polarization_map_.empty()) {
+            cudaMalloc(&d_polarization_map_[i], h_polarization_map_.size() * sizeof(int));
+            cudaMemcpy(d_polarization_map_[i], h_polarization_map_.data(),
+                h_polarization_map_.size() * sizeof(int), cudaMemcpyHostToDevice);
+        }
+
         // 预计算振幅偏移量
         int amp_size = 0;
         for (size_t i = 0; i < decayChain_.size(); ++i)
@@ -425,6 +461,9 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         }
 
         int batch_size = 1000000;
+        int sharedMemSize = 3000 * sizeof(thrust::complex<double>);
+        int blockSize = 256;
+        int numBlocks = (nEvents_[i] + blockSize - 1) / blockSize;
 
         for (int start = 0; start < nEvents_[i]; start += batch_size)
         {
@@ -441,19 +480,14 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             thrust::complex<double>* d_amp_buffer;
             cudaMalloc(&d_amp_buffer, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
             // cudaMalloc(&d_amp_buffer, 1 * sizeof(thrust::complex<double>));
-
-            int sharedMemSize = 3000 * sizeof(thrust::complex<double>);
-            // int sharedMemSize = 1 * sizeof(thrust::complex<double>);
-
-            // 计算振幅
-            int blockSize = 256;
-            int numBlocks = (nEvents_[i] + blockSize - 1) / blockSize;
             // computeSLAmpKernel<<<gridDim, blockDim, sharedMemSize>>>(
             // computeSLAmpKernel<<<gridDim, blockDim>>>(
             computeSLAmpKernel << <numBlocks, blockSize, sharedMemSize >> > (
                 d_slamps_[i], d_amp_buffer, d_momenta_[i], d_decayNodes_[i], d_dimj, d_dimj1,
                 d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
-                decayChain_.size(), amp_size * nSLCombs_, n_events, start);
+                decayChain_.size(), amp_size* nSLCombs_, n_events, start,
+                d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
+                nPolarizations_total_);
 
             cudaDeviceSynchronize();
 
@@ -466,6 +500,53 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             }
 
             cudaFree(d_amp_buffer);
+        }
+
+        // 跨链全同粒子: 对每个交换拓扑计算 SL 振幅并就地累加
+        for (size_t p = 0; p < permuted_mappings_.size(); ++p) {
+            // 用交换后的映射重建 DeviceMomenta（动量位置被交换）
+            auto d_mom_perm = convertToDeviceMomenta(
+                finalMomenta, permuted_mappings_[p], decayChain_);
+
+            double sign = identical_boson_ ? 1.0 : -1.0;
+
+            // 分配全尺寸临时 buffer（kernel 按绝对事件索引写入）
+            size_t full_size = nEvents_[i] * nPolarizations_ * nSLCombs_;
+            thrust::complex<double>* d_temp;
+            cudaMalloc(&d_temp, full_size * sizeof(thrust::complex<double>));
+
+            for (int start = 0; start < nEvents_[i]; start += batch_size) {
+                int n_events = (start + batch_size <= nEvents_[i])
+                    ? batch_size : (nEvents_[i] - start);
+
+                // scratch buffer 按 batch 分配
+                thrust::complex<double>* d_scratch;
+                cudaMalloc(&d_scratch, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
+
+                // 用交换后的动量计算 SL 振幅到临时 buffer
+                computeSLAmpKernel << <numBlocks, blockSize, sharedMemSize >> > (
+                    d_temp, d_scratch, d_mom_perm[i], d_decayNodes_[i],
+                    d_dimj, d_dimj1, d_dimj2, d_slCombination_[i],
+                    nSLCombs_, nEvents_[i], nPolarizations_,
+                    decayChain_.size(), amp_size* nSLCombs_, n_events, start,
+                    d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
+                    nPolarizations_total_);
+                cudaDeviceSynchronize();
+
+                cudaFree(d_scratch);
+            }
+
+            // 一次性累加: d_slamps_[i] += sign * d_temp
+            int blk = 256;
+            int grd = (full_size + blk - 1) / blk;
+            addSLAmpsKernel << <grd, blk >> > (d_slamps_[i], d_temp, full_size, sign);
+            cudaDeviceSynchronize();
+
+            cudaFree(d_temp);
+
+            // 释放交换链的 DeviceMomenta
+            cudaFree(d_mom_perm[i]->momenta);
+            cudaFree(d_mom_perm[i]);
         }
 
         // 清理临时设备内存
@@ -605,7 +686,8 @@ __global__ void computeSLAmpKernel(
     const int* d_dimj, const int* d_dimj1, const int* d_dimj2,
     const SL* d_slCombination, int num_sl, int num_events, int num_polar,
     int decayChain_size, int buffer_size_per_event, int num_batchs,
-    int start_events)
+    int start_events,
+    const int* d_polarization_map, int num_polar_total)
 {
     int eventIdx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -646,17 +728,14 @@ __global__ void computeSLAmpKernel(
             int dim_j2 = d_dimj2[nodeIdx];
 
             // 直接从设备内存获取四动量
-            LorentzVector pDaug1 =
-                d_momenta->getMomentum(start_events + eventIdx, node.daug1_idx);
-            LorentzVector pDaug2 =
-                d_momenta->getMomentum(start_events + eventIdx, node.daug2_idx);
+            LorentzVector pDaug1 = d_momenta->getMomentum(start_events + eventIdx, node.daug1_idx);
+            LorentzVector pDaug2 = d_momenta->getMomentum(start_events + eventIdx, node.daug2_idx);
 
-            // 打印四动量
-            // printf("Event %d, SL %d, Node %d: pDaug1 = (%f, %f, %f, %f),
-            // pDaug2 =
-            // (%f, %f, %f, %f)\n", eventIdx, slIdx, nodeIdx, pDaug1.E,
-            // pDaug1.Px, pDaug1.Py, pDaug1.Pz, pDaug2.E, pDaug2.Px, pDaug2.Py,
-            // pDaug2.Pz);
+            // // 打印四动量
+            // printf("Event %d, SL %d, Node %d: pDaug1 = (%f, %f, %f, %f), pDaug2 = (% f, % f, % f, % f)\n",
+            //     eventIdx, slIdx, nodeIdx,
+            //     pDaug1.E, pDaug1.Px, pDaug1.Py, pDaug1.Pz,
+            //     pDaug2.E, pDaug2.Px, pDaug2.Py, pDaug2.Pz);
 
             // node振幅
             size_t amp_size = dim_j * dim_j1 * dim_j2;
@@ -664,14 +743,18 @@ __global__ void computeSLAmpKernel(
             buffer_used += amp_size;
 
             // 计算振幅
-            pwa_amp(node_amp, pDaug1, dim_j1, pDaug2, dim_j2, dim_j, sl.S, sl.L,
-                &event_buffer[buffer_used]);
-            // int max_dim = max(2 * dj + 1, 2 * dj2 + 1);
-            // shared_used += (2 * dj1 + 1) * (2 * dj1 + 1) + (2 * dj2 + 1) * (2
-            // * dj2
-            // + 1) + 2 * (2 * max_dim + 1) * (2 * max_dim + 1) + 2 * (2 * dj +
-            // 1) * (2 * dj1 + 1) * (2 * dj2 + 1); int dim_j = 2 * dj + 1; int
-            // dim_j1 = 2 * dj1 + 1; int dim_j2 = 2 * dj2 + 1;
+            pwa_amp(node_amp, pDaug1, dim_j1, pDaug2, dim_j2, dim_j, sl.S, sl.L, &event_buffer[buffer_used]);
+
+            // // if (eventIdx == 0 && slIdx == 0) {
+            // for (int i = 0; i < dim_j; i++)
+            //     for (int j = 0; j < dim_j1; j++)
+            //         for (int k = 0; k < dim_j2; k++) {
+            //             int idx = i * dim_j1 * dim_j2 + j * dim_j2 + k;
+            //             printf("Node %d: Amp[%d,%d,%d] = (%f, %f)\n",
+            //                 nodeIdx, i, j, k,
+            //                 node_amp[idx].real(), node_amp[idx].imag());
+            //         }
+            // // }
 
             int total_amp_size = dim_j * dim_j1 * dim_j2;
             int trans1_size = dim_j1 * dim_j1;
@@ -682,23 +765,6 @@ __global__ void computeSLAmpKernel(
 
             buffer_used += 2 * total_amp_size + trans1_size + trans2_size +
                 massive_shared_size;
-
-            // for (int i = 0; i < dim_j; i++)
-            // {
-            //     for (int j = 0; j < dim_j1; j++)
-            //     {
-            //         for (int k = 0; k < dim_j2; k++)
-            //         {
-            //             int idx = i * dim_j1 * dim_j2 + j * dim_j2 + k;
-            //             printf("Event %d, sl %d, Node %d: Amp[%d,%d,%d] =
-            //             (%f, %f i)\n", eventIdx, slIdx, nodeIdx, i, j, k,
-            //             node_amp[idx].real(), node_amp[idx].imag());
-            //             // printf("Event %d, sl %d, Node %d: Amp[%d,%d,%d] =
-            //             (%f, %f i)\n", eventIdx, slIdx, nodeIdx, i, j, k,
-            //             d_amp_buffer[idx].real(), d_amp_buffer[idx].imag());
-            //         }
-            //     }
-            // }
 
             // int nodeAmpShape[3] = {2 * dj + 1, 2 * dj1 + 1, 2 * dj2 + 1};
             int nodeAmpShape[3] = { dim_j, dim_j1, dim_j2 };
@@ -808,14 +874,19 @@ __global__ void computeSLAmpKernel(
         // thrust::complex<double>* event_final_amp =
         //     &d_amp[slIdx * num_events * num_polar +
         //     (start_events + eventIdx) * num_polar];
-        for (int i = 0; i < num_polar; ++i)
-        {
-            int idx = slIdx * num_events * num_polar + (start_events + eventIdx) * num_polar + i;
-            // int idx = (start_events + eventIdx) * num_sl * num_polar + i * num_sl + slIdx;
-            d_amp[idx] = currentAmp[i];
-            // event_final_amp[i] = currentAmp[i];
-            // printf("Event %d, sl %d, Final Amp[%d] = (%f, %f i)\n", eventIdx, slIdx, i, event_final_amp[i].real(), event_final_amp[i].imag());
-            // printf("Event %d, sl %d, k %d, Final Amp[%d] = (%f, %f i)\n", eventIdx, slIdx, i, idx, currentAmp[i].real(), currentAmp[i].imag());
+        // 按极化 mask 选取张量索引写入（Strategy B: kernel 内筛选）
+        if (d_polarization_map != nullptr) {
+            for (int i = 0; i < num_polar; ++i) {
+                int tensor_idx = d_polarization_map[i];
+                int idx = slIdx * num_events * num_polar + (start_events + eventIdx) * num_polar + i;
+                d_amp[idx] = currentAmp[tensor_idx];
+            }
+        }
+        else {
+            for (int i = 0; i < num_polar; ++i) {
+                int idx = slIdx * num_events * num_polar + (start_events + eventIdx) * num_polar + i;
+                d_amp[idx] = currentAmp[i];
+            }
         }
 
         // printf("Event %d: Final amplitude size: %d\n", eventIdx,
@@ -1067,8 +1138,8 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             }
             else if (current_res.type == ResModelType::ONE)
             {
-                // resAmp *= Bf<double>(sl.L, qq, q0);
-                resAmp *= 1.0;
+                resAmp *= Bf<double>(sl.L, qq, q0);
+                // resAmp *= 1.0;
             }
             else if (current_res.type == ResModelType::Flatte)
             {
@@ -1101,13 +1172,29 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // printf("Event %d, SL %d, Polarization %d: amp_idx = %d\n", event_idx,
         // sl_idx, k, amp_idx);
 
-        thrust::complex<float> temp = resAmp * slamps[idx] * 100.0f;
+        thrust::complex<float> temp = resAmp * slamps[idx]; // * 100.0f;
         amplitudes[amp_idx] = make_cuComplex(temp.real(), temp.imag());
 
-        // 打印
-        // printf("Event %d, sl %d, Amp[%d] = (%f, %f i)\n", event_idx, sl_idx, k, temp.real(), temp.imag());
-        // printf("Event %d, sl %d, ResAmp[%d] = (% f, % f i)\n", event_idx, sl_idx, k, resAmp.real(), resAmp.imag());
-        // printf("Event %d, sl %d, pol %d, slamp[%d] = (%f, %f i), amp[%d] = (%f, %f i)\n", event_idx, sl_idx, k, idx, slamps[idx].real(), slamps[idx].imag(), amp_idx, cuCrealf(amplitudes[amp_idx]), cuCimagf(amplitudes[amp_idx]));
+        // printf("Event %d, SL %d, Polarization %d: resAmp = (%f, %f), slamp = (%f, %f), Final Amp = (%f, %f)\n",
+        //     event_idx, sl_idx, k,
+        //     resAmp.real(), resAmp.imag(),
+        //     slamps[idx].real(), slamps[idx].imag(),
+        //     temp.real(), temp.imag());
+
     }
+}
+
+// 跨链全同粒子: 将交换拓扑的 SL 振幅就地累加到原始振幅
+// d_amp += sign * d_add,  sign = +1 (Bose) or -1 (Fermi)
+__global__ void addSLAmpsKernel(
+    thrust::complex<double>* d_amp,
+    const thrust::complex<double>* d_add,
+    int total_size, double sign)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_size) return;
+    d_amp[idx] = thrust::complex<double>(
+        d_amp[idx].real() + sign * d_add[idx].real(),
+        d_amp[idx].imag() + sign * d_add[idx].imag());
 }
 // }

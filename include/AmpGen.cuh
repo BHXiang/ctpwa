@@ -63,7 +63,9 @@ struct DeviceMomenta {
 // 两体衰变振幅类
 class Amp2BD {
 public:
-    Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities);
+    Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
+           bool identical_daughters = false, bool is_boson = true,
+           int maxL = -1);
     const std::vector<SL>& getSL() const { return spinOrbitCombinations_; }
     const std::array<int, 3>& getJValues() const { return jvalues_; }
     const std::array<int, 3>& getParities() const { return parities_; }
@@ -73,6 +75,9 @@ private:
         const std::array<int, 3>& parities);
     std::array<int, 3> jvalues_;
     std::array<int, 3> parities_;
+    bool identical_daughters_;
+    bool is_boson_; // true=boson(symmetric, +), false=fermion(antisymmetric, -)
+    int maxL_;      // max orbital L; -1 = no limit
     std::vector<SL> spinOrbitCombinations_;
 };
 
@@ -100,6 +105,12 @@ private:
     std::vector<DeviceMomenta*> d_momenta_;// = nullptr;
     std::vector<DecayNode*> d_decayNodes_;// = nullptr;
     std::vector<SL*> d_slCombination_;// = nullptr;
+    std::vector<int*> d_polarization_map_;  // GPU polarization mask: output_idx -> tensor_idx
+    std::vector<int> h_polarization_map_;   // host copy, used to upload to GPU in computeSLAmps
+    size_t nPolarizations_total_;           // total tensor polarizations (before masking)
+    // 跨链全同粒子交换拓扑
+    std::vector<std::map<std::string, int>> permuted_mappings_; // exchanged name→idx maps
+    bool identical_boson_ = true;           // Bose(symmetric sum) / Fermi(alternating)
     // // 每批数据大小
     // int* batchSizes_;
 
@@ -132,6 +143,9 @@ public:
     std::vector<std::vector<SL>> getSLCombinations() const;
     // int computeNPolarizations(const std::map<std::string, std::vector<LorentzVector>>& finalMomenta);
     void setNPolarizations(const int nPolarizations) { nPolarizations_ = nPolarizations; }
+    void setNPolarizationsTotal(const int nTotal) { nPolarizations_total_ = nTotal; }
+    void setPolarizationMap(const std::vector<int>& map);
+    void setPermutedMappings(const std::vector<std::map<std::string, int>>& maps, bool is_boson);
     void setBatchSizes(const std::vector<int>& batchSizes);
 
     void computeSLAmps(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta);
@@ -156,9 +170,14 @@ __global__ void computeSLAmpKernel(
     const DeviceMomenta* d_momenta, const DecayNode* d_decayNodes,
     const int* d_dj, const int* d_dj1, const int* d_dj2,
     const SL* d_slCombination, int num_sl, int num_events, int num_polar,
-    // int decayChain_size, int buffer_size_per_event);
     int decayChain_size, int buffer_size_per_event, int num_batchs,
-    int start_event);
+    int start_event,
+    const int* d_polarization_map, int num_polar_total);
+
+__global__ void addSLAmpsKernel(
+    thrust::complex<double>* d_amp,
+    const thrust::complex<double>* d_add,
+    int total_size, double sign);
 
 __global__ void
 computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
