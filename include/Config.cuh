@@ -9,10 +9,14 @@
 
 struct Particle {
   std::string name;
-  int spin;
+  int spin;       // 2J+1
   int parity;
   double mass;
+  std::string identical_group; // non-empty if this particle belongs to an identical group
+  std::vector<int> polarization_2m; // allowed 2m values; empty = all states
   std::vector<std::string> tex;
+  bool is_fermion() const { return (spin - 1) % 2 != 0; } // half-integer spin -> fermion
+  bool is_polarized() const { return !polarization_2m.empty(); }
 };
 
 struct ResonanceConfig {
@@ -44,6 +48,7 @@ struct DecayChainConfig {
   std::vector<DecayStep> decay_steps;
   std::vector<ResonanceChainConfig> resonance_chains;
   std::vector<std::string> legend_template;
+  bool symmetrize = false; // enable identical particle symmetrization for this chain
 };
 
 struct ConstraintConfig {
@@ -78,12 +83,15 @@ public:
   const std::vector<ConstraintConfig> &getConstraints() const {
     return constraints_;
   }
+  int getGlobalMaxL() const { return global_maxL_; }
   const std::vector<PlotConfig> &getPlotConfigs() const {
     return plot_configs_;
   }
 
   std::vector<std::string> getLegends() const;
   std::string generateLegend(const std::vector<std::string> &particles) const;
+  // 返回全同粒子分组: group_name -> {particle_name, ...}
+  std::map<std::string, std::vector<std::string>> getIdenticalGroups() const;
 
 private:
   // 解析函数
@@ -101,6 +109,7 @@ private:
   std::vector<std::string> data_order_;
   std::vector<ConstraintConfig> constraints_;
   std::vector<PlotConfig> plot_configs_;
+  int global_maxL_ = -1; // -1 = no limit; set via Constraints.maxL
 };
 
 #endif // CONFIG_CUH

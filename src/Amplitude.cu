@@ -251,6 +251,7 @@ cmf_element(int sgm_x2, int sgm1_x2, int sgm2_x2, int dim_j, int dim_j1,
     double nsx = (p1.Px - lamb * (p1.Px + p2.Px)) / qs;
     double nsy = (p1.Py - lamb * (p1.Py + p2.Py)) / qs;
     double nsz = (p1.Pz - lamb * (p1.Pz + p2.Pz)) / qs;
+    nsz = fmax(-1.0, fmin(1.0, nsz));
     double theta = acos(nsz);
     double phi = atan2(nsy, nsx);
 
@@ -402,6 +403,100 @@ __device__ void MassiveTrans(thrust::complex<double> *trans, LorentzVector p,
     }
 }
 
+// MasslessTrans: Lorentz transformation for massless particles
+// Computes DFunc[s, 0, 0, -(psi1+psi2)] where psi1, psi2 are spinor phases
+// P = total 4-momentum, p = particle 4-momentum, dim = 2s+1
+__device__ void MasslessTrans(thrust::complex<double>* trans, LorentzVector P,
+    LorentzVector p, int dim,
+    thrust::complex<double>* shared_buf)
+{
+    int matrix_size = dim * dim;
+
+    // Initialize to identity
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < dim; j++) {
+            trans[i * dim + j] = (i == j) ? thrust::complex<double>(1.0, 0.0)
+                : thrust::complex<double>(0.0, 0.0);
+        }
+    }
+
+    double P_mag = P.P();
+    if (P_mag < 1e-10) return;
+
+    double p_mag = p.P();
+    if (p_mag < 1e-10) return;
+
+    // n1 = -P_vec / |P|
+    double n1_x = -P.Px / P_mag;
+    double n1_y = -P.Py / P_mag;
+    double n1_z = -P.Pz / P_mag;
+
+    // n2 = p_vec / |p|
+    double n2_x = p.Px / p_mag;
+    double n2_y = p.Py / p_mag;
+    double n2_z = p.Pz / p_mag;
+
+    double beta1 = P_mag / P.E;
+    double gamma1 = 1.0 / sqrt(1.0 - beta1 * beta1);
+    double sh1 = sqrt((gamma1 - 1.0) / 2.0);
+    double ch1 = sqrt((gamma1 + 1.0) / 2.0);
+
+    double n1_dot_n2 = n1_x * n2_x + n1_y * n2_y + n1_z * n2_z;
+    double cross_z = n1_x * n2_y - n1_y * n2_x;
+
+    double x12 = sh1 * (n1_dot_n2 - n1_z) + ch1 * (1.0 - n2_z);
+    double y12 = sh1 * cross_z;
+    double x22 = sh1 * (n1_dot_n2 + n1_z) + ch1 * (1.0 + n2_z);
+    double y22 = -y12;
+
+    double psi1 = atan2(y12, x12);
+    double psi2 = atan2(y22, x22);
+    double total_psi = -(psi1 + psi2);
+
+    // DFunc[s, 0, 0, total_psi] = diagonal matrix: exp(i * m2 * total_psi) * delta_{m1,m2}
+    for (int i = 0; i < dim; i++) {
+        float m2 = (dim - 1 - 2 * i) / 2.0f;
+        trans[i * dim + i] = thrust::complex<double>(cos(m2 * total_psi),
+            sin(m2 * total_psi));
+    }
+}
+
+// Left-multiply matrix 'mat' by DFunc(alpha, beta, gamma): mat = D * mat
+// shared_buf needs 2 * dim * dim elements
+__device__ void multiplyDFuncLeft(thrust::complex<double>* mat, int dim,
+    double alpha, double beta, double gamma,
+    thrust::complex<double>* shared_buf)
+{
+    int matrix_size = dim * dim;
+    thrust::complex<double>* dmat = shared_buf;
+    thrust::complex<double>* temp = dmat + matrix_size;
+
+    // Compute DFunc matrix
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < dim; j++) {
+            int m1_x2 = dim - 1 - 2 * i;
+            int m2_x2 = dim - 1 - 2 * j;
+            dmat[i * dim + j] =
+                wignerD_element(dim, m1_x2, m2_x2, alpha, beta, gamma);
+        }
+    }
+
+    // temp = dmat * mat
+    for (int i = 0; i < dim; i++) {
+        for (int j = 0; j < dim; j++) {
+            thrust::complex<double> sum(0.0, 0.0);
+            for (int k = 0; k < dim; k++) {
+                sum += dmat[i * dim + k] * mat[k * dim + j];
+            }
+            temp[i * dim + j] = sum;
+        }
+    }
+
+    // Copy back to mat
+    for (int i = 0; i < matrix_size; i++) {
+        mat[i] = temp[i];
+    }
+}
 __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
                         int dim_j1, LorentzVector p2, int dim_j2, int dim_j,
                         int dim_S, int dL, thrust::complex<double> *shared_buf)
@@ -419,7 +514,7 @@ __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
     thrust::complex<double> *shared_trans2 = shared_trans1 + trans1_size;
     thrust::complex<double> *shared_temp = shared_trans2 + trans2_size;
 
-    // MassiveTrans需要的共享内存 (每个需要2倍矩阵大小)
+    // 变换矩阵计算用的共享内存 (每个需要2倍矩阵大小)
     int max_dim = max(dim_j1, dim_j2);
     // int massive_shared_size = 2 * max_dim * max_dim;
     thrust::complex<double> *massive_shared = shared_temp + total_amp_size;
@@ -452,22 +547,50 @@ __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
         }
     }
 
-    // 3. 计算变换矩阵
-    LorentzVector zero_vec;
-    zero_vec.Px = 0;
-    zero_vec.Py = 0;
-    zero_vec.Pz = 0;
-    zero_vec.E = 0;
+    // 3. 计算CM系衰变角度 (与cmf_element中一致)
+    double m1_cm = p1.M();
+    double m2_cm = p2.M();
+    double p1p2_cm = p1.Dot(p2);
+    double m_cm = sqrt(m1_cm * m1_cm + m2_cm * m2_cm + 2 * p1p2_cm);
+    double lamb_cm = (2 * m_cm * p1.E + m_cm * m_cm + m1_cm * m1_cm - m2_cm * m2_cm) /
+        (2 * m_cm * (m_cm + p1.E + p2.E));
+    double qs_cm = sqrt(pow(m_cm, 4) + pow(m1_cm * m1_cm - m2_cm * m2_cm, 2) -
+        2 * m_cm * m_cm * (m1_cm * m1_cm + m2_cm * m2_cm)) /
+        (2 * m_cm);
+    double nsx_cm = (p1.Px - lamb_cm * (p1.Px + p2.Px)) / qs_cm;
+    double nsy_cm = (p1.Py - lamb_cm * (p1.Py + p2.Py)) / qs_cm;
+    double nsz_cm = (p1.Pz - lamb_cm * (p1.Pz + p2.Pz)) / qs_cm;
+    nsz_cm = fmax(-1.0, fmin(1.0, nsz_cm));
+    double theta_cm = acos(nsz_cm);
+    double phi_cm = atan2(nsy_cm, nsx_cm);
 
-    MassiveTrans(shared_trans1, P_total, p1, dim_j1, massive_shared);
-    MassiveTrans(shared_trans2, P_total, p2, dim_j2, massive_shared);
+    // 4. 计算变换矩阵 (有质量/无质量分别处理)
+    const double mass_threshold = 1e-10;
 
-    // 4. 将振幅复制到临时存储
+    if (m1_cm > mass_threshold) {
+        MassiveTrans(shared_trans1, P_total, p1, dim_j1, massive_shared);
+    }
+    else {
+        MasslessTrans(shared_trans1, P_total, p1, dim_j1, massive_shared);
+        multiplyDFuncLeft(shared_trans1, dim_j1, -phi_cm, -theta_cm, 0.0,
+            massive_shared);
+    }
+
+    if (m2_cm > mass_threshold) {
+        MassiveTrans(shared_trans2, P_total, p2, dim_j2, massive_shared);
+    }
+    else {
+        MasslessTrans(shared_trans2, P_total, p2, dim_j2, massive_shared);
+        multiplyDFuncLeft(shared_trans2, dim_j2, -(M_PI + phi_cm),
+            -(M_PI - theta_cm), 0.0, massive_shared);
+    }
+
+    // 5. 将振幅复制到临时存储
     for (int i = 0; i < total_amp_size; i++) {
         shared_temp[i] = shared_amp[i];
     }
 
-    // 5. 矩阵乘法：
+    // 6. 矩阵乘法：
     for (int sgm_idx = 0; sgm_idx < dim_j; sgm_idx++) {
         int base_idx = sgm_idx * kron_dim;
         // 第一步：对trans1进行矩阵乘法
@@ -511,8 +634,9 @@ __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
         }
     }
 
-    // 6. 复制回全局内存
+    // 7. 复制回全局内存
     for (int i = 0; i < total_amp_size; i++) {
-        amp[i] = shared_amp[i];
+        amp[i] = shared_amp[i] * 10.0; // 最终结果乘以10作为示例缩放
     }
 }
+

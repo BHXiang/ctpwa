@@ -1,4 +1,46 @@
 # config.yml
+# ============================================================
+# 新功能说明:
+#
+# 1. 全同粒子:
+#    - Constraints 中新增 `identical` 字段，列出全同粒子组
+#      例如: identical: [[pi0_1, pi0_2], [Ks1, Ks2]]
+#      系统自动分配组名 identical1, identical2 ...
+#    - DecayChain 中新增 `symmetrize: true`，施加 (-1)^{L+S} 选择定则
+#
+# 2. 极化 (Polarization):
+#    - Particle 中新增 `polarization` 字段，指定允许的磁量子数 m
+#    - 例如 e+e- → J/psi 横极化: polarization: [1, -1] (仅 m=±1)
+#    - 缺省为全部 2J+1 个极化态
+#
+# 3. 轨道角动量上限:
+#    - Constraints 中新增 `maxL` 全局设置
+#    - 限制所有衰变步的 L 上限，-1 或不设为无限制
+#
+# 示例（e+e- → J/psi → 3pi0, J/psi横极化, maxL=4, 全同粒子）:
+#   Particles:
+#     Jpsi:
+#       J: 1; P: -1; mass: 3.0969; polarization: [1, -1]; tex: ['J/#psi']
+#     pi0_1:
+#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
+#     pi0_2:
+#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
+#     pi0_3:
+#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
+#   Data:
+#     order: [pi0_1, pi0_2, pi0_3]
+#   Constraints:
+#     maxL: 4
+#     identical: [[pi0_1, pi0_2, pi0_3]]
+#   DecayChains:
+#     chain1:
+#       decay:
+#         - Jpsi: [pi0_1, R_pi0pi0]
+#         - R_pi0pi0: [pi0_2, pi0_3]
+#       symmetrize: true
+#       R_pi0pi0:
+#         - [J: 1, P: -1]: [f0_980, f0_1500]
+# ============================================================
 Particles:
   Jpsi:
     J: 1

@@ -2431,6 +2431,8 @@ public:
 private:
     int n_gls_;
     int n_polar_ = 1;
+    int n_polar_total_ = 1;               // total tensor polarizations (before mask)
+    std::vector<int> polarization_map_;    // output_idx -> tensor_idx for polarization mask
     std::vector<int> nSLvectors_;
 
     // 振幅数据，设备端
@@ -2603,6 +2605,16 @@ private:
             }
         }
 
+        // // 打印d_all_amplitudes_[0]的所有元素，验证数据正确加载
+        // cuComplex* h_amp = new cuComplex[n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1])];
+        // cudaMemcpy(h_amp, d_all_amplitudes_[0], n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1]) * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        // std::cout << "First amplitudes on GPU 0:" << std::endl;
+        // for (int i = 0; i < n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1]); ++i)
+        // {
+        //     std::cout << "  Amplitude[" << i << "] = " << h_amp[i].x << " + " << h_amp[i].y << "i" << std::endl;
+        // }
+        // delete[] h_amp;
+
         // phsp*phsp^T矩阵，大小为 n_amplitudes_ * n_amplitudes_
         // cuComplex* d_phsp;
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
@@ -2630,8 +2642,8 @@ private:
             cublasDestroy(cublas_handle);
             cudaFree(d_phsp_gpu);
         }
-        // cudaFree(d_phsp);
-        // 打印矩阵d_phsp
+        // // cudaFree(d_phsp);
+        // // 打印矩阵d_phsp
         // cuComplex* h_phsp = new cuComplex[n_amplitudes_ * n_amplitudes_];
         // cudaMemcpy(h_phsp, d_phsp_matrix_, n_amplitudes_* n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToHost);
         // std::cout << "Phase space matrix (phsp*phsp^T):" << std::endl;
@@ -2690,18 +2702,77 @@ private:
 
     void initializePolarization()
     {
-        n_polar_ = 1;
+        int n = particles_.size();
 
-        for (const auto& particle : particles_)
-        {
-            if (particle.spin > 0)
-            {
-                // n_polar_ *= (2 * particle.spin + 1);
-                n_polar_ *= particle.spin;
+        // 收集每粒子的维度 (2J+1) 和允许的张量索引列表
+        std::vector<int> dims(n);
+        std::vector<std::vector<int>> keep(n); // 空 = 保留全部
+        bool any_masked = false;
+
+        for (int i = 0; i < n; ++i) {
+            dims[i] = particles_[i].spin;
+            if (particles_[i].is_polarized()) {
+                any_masked = true;
+                int dim_j = dims[i];
+                for (int two_m : particles_[i].polarization_2m) {
+                    keep[i].push_back((dim_j - 1 - two_m) / 2);
+                }
             }
         }
 
-        std::cout << "polarization: " << n_polar_ << std::endl;
+        // 原始 C-order strides: orig_strides[i] = prod_{j>i} dims[j]
+        std::vector<int> orig_strides(n);
+        orig_strides[n - 1] = 1;
+        for (int i = n - 2; i >= 0; --i)
+            orig_strides[i] = orig_strides[i + 1] * dims[i + 1];
+
+        // 总张量极化数
+        n_polar_total_ = 1;
+        for (int d : dims) n_polar_total_ *= d;
+
+        // 有效维度（mask 后）和 masked strides
+        std::vector<int> eff_dims(n);
+        std::vector<int> masked_strides(n);
+        for (int i = 0; i < n; ++i)
+            eff_dims[i] = keep[i].empty() ? dims[i] : (int)keep[i].size();
+        masked_strides[n - 1] = 1;
+        for (int i = n - 2; i >= 0; --i)
+            masked_strides[i] = masked_strides[i + 1] * eff_dims[i + 1];
+
+        // 有效极化态数
+        n_polar_ = 1;
+        for (int d : eff_dims) n_polar_ *= d;
+
+        // 构建完整映射: output_idx → tensor_idx
+        if (any_masked) {
+            polarization_map_.resize(n_polar_);
+            for (int out = 0; out < n_polar_; ++out) {
+                int rem = out;
+                int tensor_idx = 0;
+                for (int p = 0; p < n; ++p) {
+                    int j = rem / masked_strides[p];
+                    rem %= masked_strides[p];
+                    int i = keep[p].empty() ? j : keep[p][j];
+                    tensor_idx += i * orig_strides[p];
+                }
+                polarization_map_[out] = tensor_idx;
+            }
+        }
+        else {
+            polarization_map_.clear();
+        }
+
+        std::cout << "polarization: " << n_polar_
+            << " (total tensor states: " << n_polar_total_ << ")";
+        if (!polarization_map_.empty()) {
+            std::cout << ", map: [";
+            for (size_t i = 0; i < polarization_map_.size(); ++i) {
+                if (i > 0) std::cout << ", ";
+                std::cout << polarization_map_[i];
+            }
+            std::cout << "]";
+        }
+        std::cout << std::endl;
     }
 
     void initializeDecayChains()
@@ -2709,6 +2780,29 @@ private:
         auto chains = config_parser_.getDecayChains();
 
         const auto& config_resonances = config_parser_.getResonances();
+
+        // 输出全同粒子分组信息
+        auto identical_groups = config_parser_.getIdenticalGroups();
+        if (!identical_groups.empty()) {
+            std::cout << "Identical particle groups detected:" << std::endl;
+            for (const auto& [group, particle_names] : identical_groups) {
+                std::cout << "  Group \"" << group << "\": ";
+                std::string stats = "boson";
+                for (size_t i = 0; i < particle_names.size(); ++i) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << particle_names[i];
+                    if (i == 0) {
+                        for (const auto& p : particles_) {
+                            if (p.name == particle_names[i]) {
+                                stats = p.is_fermion() ? "fermion" : "boson";
+                                break;
+                            }
+                        }
+                    }
+                }
+                std::cout << " (" << stats << ")" << std::endl;
+            }
+        }
 
         // 获取总振幅长度
         for (const auto& chain : chains)
@@ -2853,8 +2947,25 @@ private:
                             }
                         }
                     }
-                    cas.addDecay(Amp2BD(spins, parities), step.mother,
-                        step.daughters[0], step.daughters[1]);
+                    // 检查两个子粒子是否全同
+                    bool identical_daughters = false;
+                    bool is_boson = true;
+                    if (chain.symmetrize) {
+                        const Particle* p_d1 = nullptr, * p_d2 = nullptr;
+                        for (const auto& p : particles_) {
+                            if (p.name == step.daughters[0]) p_d1 = &p;
+                            if (p.name == step.daughters[1]) p_d2 = &p;
+                        }
+                        if (p_d1 && p_d2 &&
+                            !p_d1->identical_group.empty() &&
+                            p_d1->identical_group == p_d2->identical_group) {
+                            identical_daughters = true;
+                            is_boson = !p_d1->is_fermion();
+                        }
+                    }
+                    int maxL = config_parser_.getGlobalMaxL();
+                    cas.addDecay(Amp2BD(spins, parities, identical_daughters, is_boson, maxL),
+                        step.mother, step.daughters[0], step.daughters[1]);
 
                     // 输出decay chain结构
                     std::cout << step.mother << "(";
@@ -3051,10 +3162,75 @@ private:
             auto intermediate_resonance_map = chain_info.intermediate_resonance_map;
             auto intermediate_combs = chain_info.intermediate_combs;
 
+            // 跨链全同粒子: 生成交换拓扑的 permuted particleToIndex mappings
+            std::vector<std::map<std::string, int>> permuted_mappings;
+            bool identical_boson = true;
+            if (chain.symmetrize) {
+                // 构建参考 name→idx 映射（与 computeSLAmps 中一致）
+                std::set<std::string> all_particles;
+                for (const auto& step : chain.decay_steps) {
+                    all_particles.insert(step.mother);
+                    for (const auto& d : step.daughters) all_particles.insert(d);
+                }
+                for (const auto& name : config_parser_.getDataOrder())
+                    all_particles.insert(name);
+                std::map<std::string, int> ref_map;
+                int idx = 0;
+                for (const auto& name : all_particles) ref_map[name] = idx++;
+
+                // 找第一步的旁观者（非中间共振态的那个 daughter）
+                std::string spectator;
+                std::set<std::string> intermediates;
+                for (size_t s = 0; s < chain.decay_steps.size(); ++s)
+                    intermediates.insert(chain.decay_steps[s].mother);
+                for (const auto& d : chain.decay_steps[0].daughters) {
+                    if (intermediates.find(d) == intermediates.end()) {
+                        spectator = d;
+                        break;
+                    }
+                }
+
+                // 找旁观者所属的全同组
+                std::string group;
+                for (const auto& p : particles_) {
+                    if (p.name == spectator && !p.identical_group.empty()) {
+                        group = p.identical_group;
+                        identical_boson = !p.is_fermion();
+                        break;
+                    }
+                }
+
+                // 对该组中所有在链中但非旁观者的粒子生成交换映射
+                if (!group.empty()) {
+                    for (const auto& step : chain.decay_steps) {
+                        for (const auto& d : step.daughters) {
+                            if (d == spectator) continue;
+                            for (const auto& p : particles_) {
+                                if (p.name == d && p.identical_group == group) {
+                                    auto perm_map = ref_map;
+                                    std::swap(perm_map[spectator], perm_map[d]);
+                                    permuted_mappings.push_back(perm_map);
+                                    break; // 每个 daughter 只加一次
+                                }
+                            }
+                        }
+                    }
+                    if (!permuted_mappings.empty()) {
+                        std::cout << "  Cross-chain identical: spectator=" << spectator
+                                  << " (" << (identical_boson ? "boson" : "fermion")
+                                  << "), " << permuted_mappings.size()
+                                  << " exchanged topologies" << std::endl;
+                    }
+                }
+            }
+
             for (auto comb : intermediate_combs)
             {
                 AmpCasDecay cas(particles_);
                 cas.setNPolarizations(n_polar_);
+                cas.setNPolarizationsTotal(n_polar_total_);
+                cas.setPolarizationMap(polarization_map_);
+                cas.setPermutedMappings(permuted_mappings, identical_boson);
                 for (const auto& step : chain.decay_steps)
                 {
                     std::array<int, 3> spins = { 0 };
@@ -3093,8 +3269,25 @@ private:
                             }
                         }
                     }
-                    cas.addDecay(Amp2BD(spins, parities), step.mother,
-                        step.daughters[0], step.daughters[1]);
+                    // 检查两个子粒子是否全同
+                    bool identical_daughters2 = false;
+                    bool is_boson2 = true;
+                    if (chain.symmetrize) {
+                        const Particle* p_d1 = nullptr, * p_d2 = nullptr;
+                        for (const auto& p : particles_) {
+                            if (p.name == step.daughters[0]) p_d1 = &p;
+                            if (p.name == step.daughters[1]) p_d2 = &p;
+                        }
+                        if (p_d1 && p_d2 &&
+                            !p_d1->identical_group.empty() &&
+                            p_d1->identical_group == p_d2->identical_group) {
+                            identical_daughters2 = true;
+                            is_boson2 = !p_d1->is_fermion();
+                        }
+                    }
+                    int maxL2 = config_parser_.getGlobalMaxL();
+                    cas.addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2),
+                        step.mother, step.daughters[0], step.daughters[1]);
                 }
 
                 auto slcombs = cas.getSLCombinations();

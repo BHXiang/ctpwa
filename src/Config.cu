@@ -53,6 +53,17 @@ ConfigParser::ConfigParser(const std::string &config_file)
     }
 }
 
+std::map<std::string, std::vector<std::string>> ConfigParser::getIdenticalGroups() const
+{
+    std::map<std::string, std::vector<std::string>> groups;
+    for (const auto& p : particles_) {
+        if (!p.identical_group.empty()) {
+            groups[p.identical_group].push_back(p.name);
+        }
+    }
+    return groups;
+}
+
 std::vector<std::string> ConfigParser::getLegends() const
 {
     std::vector<std::string> legends;
@@ -295,6 +306,17 @@ void ConfigParser::parseParticles(const YAML::Node &node)
             particle.tex.push_back(props["tex"].as<std::string>());
         }
 
+        // 处理极化设置: polarization: [1, -1] 表示仅 m=±1
+        if (props["polarization"]) {
+            if (props["polarization"].IsSequence()) {
+                for (const auto& m_node : props["polarization"]) {
+                    std::string m_str = m_node.as<std::string>();
+                    int two_m = static_cast<int>(2 * transJValue(m_str));
+                    particle.polarization_2m.push_back(two_m);
+                }
+            }
+        }
+
         particles_.push_back(particle);
     }
 }
@@ -385,6 +407,10 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             chain.legend_template =
                 chain_data["legend"].as<std::vector<std::string>>();
 
+        // 解析全同粒子对称化标记
+        if (chain_data["symmetrize"])
+            chain.symmetrize = chain_data["symmetrize"].as<bool>();
+
         decay_chains_.push_back(chain);
     }
 }
@@ -422,6 +448,43 @@ void ConfigParser::parseResonances(const YAML::Node &node)
 void ConfigParser::parseConstraints(const YAML::Node &node)
 {
     constraints_.clear();
+
+    // 解析全局 maxL
+    if (node["maxL"]) {
+        global_maxL_ = node["maxL"].as<int>();
+    }
+
+    // 解析全同粒子分组: identical: [[pi01, pi02], [Ks1, Ks2]]
+    if (node["identical"]) {
+        int group_idx = 1;
+        for (const auto& group : node["identical"]) {
+            auto names = group.as<std::vector<std::string>>();
+            std::string group_name = "identical" + std::to_string(group_idx++);
+            for (auto& p : particles_) {
+                for (const auto& name : names) {
+                    if (p.name == name) {
+                        p.identical_group = group_name;
+                    }
+                }
+            }
+        }
+        // 验证: 同一分组内粒子自旋一致
+        auto groups = getIdenticalGroups();
+        for (const auto& [gname, pnames] : groups) {
+            int ref_spin = -1;
+            for (const auto& p : particles_) {
+                if (p.name == pnames[0]) { ref_spin = p.spin; break; }
+            }
+            for (const auto& nm : pnames) {
+                for (const auto& p : particles_) {
+                    if (p.name == nm && p.spin != ref_spin) {
+                        std::cerr << "Warning: identical group \"" << gname
+                                  << "\" contains particles with different spins" << std::endl;
+                    }
+                }
+            }
+        }
+    }
 
     // 解析 full 约束（同时包含实部和虚部）
     if (node["trans"]) {
