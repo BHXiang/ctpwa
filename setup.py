@@ -169,7 +169,7 @@ extension = CUDAExtension(
 
 setup(
     name="ctpwa",
-    version="0.1.0",
+    version="0.1.1",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
     long_description="A CUDA-Torch partial wave analysis package for high-energy physics",
@@ -182,7 +182,6 @@ setup(
         )
     },
     install_requires=[
-        "torch>=1.9.0",
         "numpy>=1.20.0",
         "pyyaml>=5.4.0",
     ],
@@ -194,6 +193,5 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
         "Programming Language :: C++",
-        "Programming Language :: CUDA",
     ],
 )
