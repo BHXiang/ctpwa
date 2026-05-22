@@ -83,9 +83,21 @@ __global__ void conjugateKernel(cuComplex* __restrict__ data, int N) {
     if (i < N) data[i].y = -data[i].y;
 }
 
+// 小向量axpy: y[i] += alpha * x[i], 单block
+__global__ void axpyComplexKernel(cuComplex* y, const cuComplex* __restrict__ x, cuComplex alpha, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        y[i] = make_cuComplex(
+            y[i].x + alpha.x * x[i].x - alpha.y * x[i].y,
+            y[i].y + alpha.x * x[i].y + alpha.y * x[i].x);
+}
+
+void axpyComplex(cuComplex* y, const cuComplex* x, cuComplex alpha, int n) {
+    axpyComplexKernel << <1, 64 >> > (y, x, alpha, n);
+}
+
 
 // -----------------------------------------------------------------------------
-// 优化后的主函数
+// 优化后的主函数（预分配buffer，消除malloc/free和handle创建开销）
 // -----------------------------------------------------------------------------
 double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_grad_out,
@@ -95,24 +107,36 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     const int nTotal = nEvents * n_polar;
     constexpr int kBlockSize = 256;
 
-    // ----- 创建 cuBLAS 句柄 -----
-    cublasHandle_t handle;
-    cublasCreate(&handle);
+    // ----- 持久化资源（首次分配，之后复用） -----
+    static cuComplex* s_d_S = nullptr;
+    static double* s_d_nll = nullptr;
+    static double* s_pinned_nll = nullptr;  // pinned memory for async copy
+    static int s_maxTotal = 0;
+    static cublasHandle_t s_handle = nullptr;
 
-    // ----- 分配临时缓冲区 -----
-    cuComplex* d_S;
-    cudaMalloc(&d_S, nTotal * sizeof(cuComplex));     // 复用为 S 和 w
-    double* d_nll;
-    cudaMalloc(&d_nll, sizeof(double));               // 全局 NLL 累加器
+    if (s_handle == nullptr) {
+        cublasCreate(&s_handle);
+        cudaMallocHost(&s_pinned_nll, sizeof(double));
+    }
+    if (nTotal > s_maxTotal) {
+        if (s_d_S) cudaFree(s_d_S);
+        cudaMalloc(&s_d_S, nTotal * sizeof(cuComplex));
+        s_maxTotal = nTotal;
+    }
+    if (s_d_nll == nullptr) {
+        cudaMalloc(&s_d_nll, sizeof(double));
+    }
+
+    cuComplex* d_S = s_d_S;
+    double* d_nll = s_d_nll;
+    cublasHandle_t handle = s_handle;
 
     // ----- 第一大步：S = A * v -----
-    // A: nTotal×n_amplitudes行主序 → cuBLAS列主序视作 n_amplitudes×nTotal
-    // CUBLAS_OP_T: y = A_col^T * v_col = (nTotal×n_amplitudes) * (n_amplitudes×1)
     {
         cuComplex alpha = make_cuComplex(1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
         cublasCgemv(handle, CUBLAS_OP_T,
-            n_amplitudes, nTotal,           // m=n_amplitudes, n=nTotal
+            n_amplitudes, nTotal,
             &alpha, d_amp, n_amplitudes,
             d_vector, 1,
             &beta, d_S, 1);
@@ -124,26 +148,13 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
         d_S, d_nll, d_weights, nEvents, n_polar);
 
-    // 拷回 NLL
-    double raw_nll;
-    cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
-
-    // NaN/Inf检测：若NLL异常，清零梯度并返回大值，防止优化器发散
-    // if (isnan(raw_nll) || isinf(raw_nll)) {
-    //     fprintf(stderr, "WARNING: computeFactorNLL produced %s, resetting\n",
-    //             isnan(raw_nll) ? "NaN" : "Inf");
-    //     cudaMemset(d_grad_out, 0, n_amplitudes * sizeof(cuComplex));
-    //     cudaFree(d_S);
-    //     cudaFree(d_nll);
-    //     cublasDestroy(handle);
-    //     return 1e30;  // 返回大值让优化器远离此区域
-    // }
+    // 异步拷回 NLL (不阻塞GPU)
+    cudaMemcpyAsync(s_pinned_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
 
     // ----- 第三大步：梯度 grad = -A^H * w -----
-    // CUBLAS_OP_C: A_col^H (共轭转置), 一步到位不用先conjugateKernel
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
-        conjugateKernel << <gradConj, kBlockSize >> > (d_S, nTotal); // 就地共轭，S现在存w的共轭
+        conjugateKernel << <gradConj, kBlockSize >> > (d_S, nTotal);
 
         cuComplex alpha = make_cuComplex(-1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
@@ -154,13 +165,12 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
             &beta, d_grad_out, 1);
 
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes); // 输出梯度共轭回来
+        conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
     }
 
-    // ----- 清理资源 -----
-    cudaFree(d_S);
-    cudaFree(d_nll);
-    cublasDestroy(handle);
+    // 现在同步并读取NLL值（之前是异步拷贝）
+    cudaDeviceSynchronize();
+    double raw_nll = *s_pinned_nll;
 
     return raw_nll;
 }

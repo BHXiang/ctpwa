@@ -29,6 +29,9 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector, cuCom
 // 就地共轭复数数组
 void conjugateComplexArray(cuComplex* data, int N);
 
+// 向量axpy: y[i] += alpha * x[i], n较小(<~200)，单block完成
+void axpyComplex(cuComplex* y, const cuComplex* x, cuComplex alpha, int n);
+
 // 自定义核计算二次型 v^H·M·v，同时输出d_P_vec = M * v
 // M: n×n Hermitian矩阵(行主序), v: n维向量(已共轭), n: 维度(<~200)
 void computeQuadraticForm(const cuComplex* d_M, const cuComplex* d_v,

@@ -635,84 +635,82 @@ public:
         double total_bkg_nll = 0.0;
         int totalDataEvents = 0;
 
-        cuComplex* d_grad_global;
-        cudaSetDevice(primary_dev);
-        cudaMalloc(&d_grad_global, extended_n_gls * sizeof(cuComplex));
-        cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
+        // 预分配持久化buffer（首次分配，之后复用）
+        static cuComplex* s_d_grad_global = nullptr;
+        static cuComplex* s_d_grad_buf = nullptr;
+        static std::vector<cuComplex*> s_d_grad_per_gpu;
+        static int s_alloc_n = 0;
 
-        // P2P临时缓冲区（复用）
-        cuComplex* d_grad_buf;
+        if (s_alloc_n < extended_n_gls || s_d_grad_per_gpu.size() < (size_t)num_gpus) {
+            if (s_d_grad_global) cudaFree(s_d_grad_global);
+            if (s_d_grad_buf) cudaFree(s_d_grad_buf);
+            for (auto& p : s_d_grad_per_gpu) if (p) cudaFree(p);
+
+            cudaSetDevice(primary_dev);
+            cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(cuComplex));
+            cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(cuComplex));
+            s_d_grad_per_gpu.resize(num_gpus, nullptr);
+            for (int g = 0; g < num_gpus; ++g) {
+                cudaSetDevice(g);
+                cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(cuComplex));
+            }
+            s_alloc_n = extended_n_gls;
+        }
+
+        cuComplex* d_grad_global = s_d_grad_global;
+        cuComplex* d_grad_buf = s_d_grad_buf;
         cudaSetDevice(primary_dev);
-        cudaMalloc(&d_grad_buf, extended_n_gls * sizeof(cuComplex));
+        cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
 
         for (int gpu = 0; gpu < num_gpus; ++gpu) {
             cudaSetDevice(gpu);
             const cuComplex* d_vec_gpu = reinterpret_cast<const cuComplex*>(
                 extended_vec_per_gpu[gpu].data_ptr());
+            cuComplex* d_grad = s_d_grad_per_gpu[gpu];
 
             // --- data ---
             int nData_gpu = events_list[gpu][1];
             if (nData_gpu > 0) {
                 cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][1];
-                cuComplex* d_grad;
-                cudaMalloc(&d_grad, extended_n_gls * sizeof(cuComplex));
 
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
                     d_grad, nData_gpu, n_polar_, n_amplitudes_);
 
                 total_data_nll += nll;
                 totalDataEvents += nData_gpu;
-                // P2P: d_grad → d_grad_global (正号)
+                // P2P累加到global (正号)
                 if (gpu == primary_dev) {
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
-                    cublasHandle_t h; cublasCreate(&h);
-                    cublasCaxpy(h, n_amplitudes_, &one, d_grad, 1, d_grad_global, 1);
-                    cublasDestroy(h);
+                    axpyComplex(d_grad_global, d_grad, make_cuComplex(1.0f, 0.0f), extended_n_gls);
                 }
                 else {
-                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu,
-                        extended_n_gls * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(cuComplex));
                     cudaSetDevice(primary_dev);
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
-                    cublasHandle_t h; cublasCreate(&h);
-                    cublasCaxpy(h, n_amplitudes_, &one, d_grad_buf, 1, d_grad_global, 1);
-                    cublasDestroy(h);
+                    axpyComplex(d_grad_global, d_grad_buf, make_cuComplex(1.0f, 0.0f), extended_n_gls);
                 }
-                cudaFree(d_grad);
             }
 
             // --- bkg ---
             int nBkg_gpu = events_list[gpu][2];
             if (nBkg_gpu > 0) {
+                cudaSetDevice(gpu);
                 cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
-                const double* d_w = d_bkg_weights_list[gpu];  // nullptr=无权重
-                cuComplex* d_grad;
-                cudaMalloc(&d_grad, extended_n_gls * sizeof(cuComplex));
+                const double* d_w = d_bkg_weights_list[gpu];
 
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
                     d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w);
 
                 total_bkg_nll += nll;
-                // P2P: d_grad → d_grad_global (负号，loss = data - bkg)
+                // P2P累加到global (负号，loss = data - bkg)
                 if (gpu == primary_dev) {
-                    cuComplex neg_one = make_cuComplex(-1.0f, 0.0f);
-                    cublasHandle_t h; cublasCreate(&h);
-                    cublasCaxpy(h, n_amplitudes_, &neg_one, d_grad, 1, d_grad_global, 1);
-                    cublasDestroy(h);
+                    axpyComplex(d_grad_global, d_grad, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
                 }
                 else {
-                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu,
-                        extended_n_gls * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(cuComplex));
                     cudaSetDevice(primary_dev);
-                    cuComplex neg_one = make_cuComplex(-1.0f, 0.0f);
-                    cublasHandle_t h; cublasCreate(&h);
-                    cublasCaxpy(h, n_amplitudes_, &neg_one, d_grad_buf, 1, d_grad_global, 1);
-                    cublasDestroy(h);
+                    axpyComplex(d_grad_global, d_grad_buf, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
                 }
-                cudaFree(d_grad);
             }
         }
-        cudaFree(d_grad_buf);
 
         // // 输出d_grad_global检查
         // std::vector<cuComplex> h_grad_global(extended_n_gls);
@@ -750,12 +748,7 @@ public:
         }
         cuComplex scale_phsp = make_cuComplex(
             static_cast<float>(totalDataEvents - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
-        {
-            cublasHandle_t h;
-            cublasCreate(&h);
-            cublasCaxpy(h, n_amplitudes_, &scale_phsp, d_P_vec, 1, d_grad_global, 1);
-            cublasDestroy(h);
-        }
+        axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
         cudaFree(d_P_vec);
 
         // 6. 保存梯度和loss到ctx
@@ -764,7 +757,7 @@ public:
             torch::kComplexFloat).to(vector.device());
         cudaMemcpy(global_extended_grad.data_ptr(), d_grad_global,
             extended_n_gls * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-        cudaFree(d_grad_global);
+        // d_grad_global 是持久化buffer，不释放
 
         // // 输出d_grad_global检查
         // std::vector<cuComplex> h_grad_global(extended_n_gls);
