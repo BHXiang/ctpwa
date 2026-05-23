@@ -200,6 +200,9 @@ public:
         int block_idx;   // 哪个 ResBlock
         int res_idx;     // 该 block 的哪个共振态
         int param_idx;   // params[] 下标 (0=mass, 1=width, 2=r/g_pi, 3=g_K)
+        double init_value;  // 初始值
+        double lower;       // 下界
+        double upper;       // 上界
     };
 
     AmpCalc() = default;
@@ -207,10 +210,12 @@ public:
 
     // 由 calculateAmplitudes 调用：接管 cas 和共振态组合
     // scan_indices: 与 resonances 对应，每个共振态的自由参数下标；空=不扫，{-1}=全扫
+    // scan_ranges:  与 resonances 对应，每个共振态的 [[lower,upper],...]; 空=使用默认
     void addBlock(std::shared_ptr<AmpCasDecay> cas,
                   const std::vector<Resonance>& resonances,
                   int site,
-                  const std::vector<std::vector<int>>& scan_indices);
+                  const std::vector<std::vector<int>>& scan_indices,
+                  const std::vector<std::vector<std::vector<double>>>& scan_ranges);
 
     // 用新参数重算所有振幅
     void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
@@ -223,6 +228,7 @@ public:
 
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
+    const std::vector<ParamSlot>& slots() const { return slots_; }
 
 private:
     std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放

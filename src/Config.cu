@@ -467,6 +467,13 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             res.scan = props["scan"].as<std::vector<int>>();
         }
 
+        // 解析scan_range: 每个scan参数对应的 [lower, upper]
+        if (props["scan_range"]) {
+            for (const auto& range_node : props["scan_range"]) {
+                res.scan_range.push_back(range_node.as<std::vector<double>>());
+            }
+        }
+
         resonances_[name] = res;
     }
 }
