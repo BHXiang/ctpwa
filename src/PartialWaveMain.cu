@@ -746,15 +746,13 @@ public:
 
         // 5. 合并data和bkg的NLL与梯度（loss = data_nll - bkg_nll）
         if (phsp_factor <= 1e-30 || isnan(phsp_factor) || isinf(phsp_factor)) {
-            std::cerr << "WARNING: phsp_factor invalid (" << phsp_factor
-                << "), clamping to 1e-30" << std::endl;
+            // std::cerr << "WARNING: phsp_factor invalid (" << phsp_factor << "), clamping to 1e-30" << std::endl;
             phsp_factor = 1e-30;
         }
         double loss = total_data_nll - total_bkg_nll
             + (totalDataEvents - bkg_integral_) * log(phsp_factor);
         if (isnan(loss) || isinf(loss)) {
-            std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf")
-                << ", resetting to 1e30" << std::endl;
+            // std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf") << ", resetting to 1e30" << std::endl;
             loss = 1e30;
             cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
         }
@@ -2452,7 +2450,20 @@ public:
             config_parser_.getBfD());
     }
 
-    int getNFreeResParams() const { return amp_calc_.nFreeResParams(); }
+    torch::Tensor getFreeResParams() const
+    {
+        const auto& slots = amp_calc_.slots();
+        int n = static_cast<int>(slots.size());
+        auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+        torch::Tensor result = torch::empty({ 3, n }, options);
+        auto acc = result.accessor<double, 2>();
+        for (int i = 0; i < n; ++i) {
+            acc[0][i] = slots[i].init_value;
+            acc[1][i] = slots[i].lower;
+            acc[2][i] = slots[i].upper;
+        }
+        return result;
+    }
 
     std::vector<std::string> getAmplitudeNames() const
     {
@@ -3085,7 +3096,7 @@ private:
                         ++j)
                     {
                         const auto& res_pair = resonance_combinations[k][j];
-                        res_name += "-" + res_pair.first + "-" + res_pair.second;
+                        res_name += "_" + res_pair.first + "_" + res_pair.second;
 
                         std::cout << res_pair.second; // 共振态名称
                         if (j < resonance_combinations[k].size() - 1)
@@ -3098,7 +3109,7 @@ private:
 
                     for (const auto& slcomb : slcombs)
                     {
-                        std::string full_name = res_name + "-" + "SL";
+                        std::string full_name = res_name + "_" + "SL";
                         for (const auto& sl : slcomb)
                         {
                             full_name += "_" + std::to_string(sl.S) + std::to_string(sl.L);
@@ -3371,6 +3382,7 @@ private:
                     {
                         const auto& config_res = config_parser_.getResonances();
                         std::vector<std::vector<int>> all_scan;
+                        std::vector<std::vector<std::vector<double>>> all_ranges;
                         bool has_any = false;
                         for (const auto& res : resonance)
                         {
@@ -3378,16 +3390,18 @@ private:
                             if (it != config_res.end() && !it->second.scan.empty())
                             {
                                 all_scan.push_back(it->second.scan);
+                                all_ranges.push_back(it->second.scan_range);
                                 has_any = true;
                             }
                             else
                             {
                                 all_scan.push_back({});
+                                all_ranges.push_back({});
                             }
                         }
                         if (has_any)
                         {
-                            amp_calc->addBlock(cas, resonance, gls_index, all_scan);
+                            amp_calc->addBlock(cas, resonance, gls_index, all_scan, all_ranges);
                         }
                     }
 
@@ -3424,6 +3438,6 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getAmplitudeNames", &analysis::getAmplitudeNames)
         .def("getNPolarizations", &analysis::getNPolarizations)
         .def("reCalcAmp", &analysis::reCalcAmp)
-        .def("getNFreeResParams", &analysis::getNFreeResParams)
+        .def("getFreeResParams", &analysis::getFreeResParams)
         .def("isValid", &analysis::isValid);
 }

@@ -1286,7 +1286,8 @@ static std::vector<int> expandScanIndices(
 void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        const std::vector<Resonance>& resonances,
                        int site,
-                       const std::vector<std::vector<int>>& scan_indices)
+                       const std::vector<std::vector<int>>& scan_indices,
+                       const std::vector<std::vector<std::vector<double>>>& scan_ranges)
 {
     // 1. 查找或添加 cas 到 cas_list_
     int cas_idx = -1;
@@ -1374,8 +1375,25 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     for (size_t i = 0; i < resonances.size(); ++i) {
         auto ordered_params = resonances[i].getOrderedParams();
         auto expanded = expandScanIndices(ordered_params, scan_indices[i]);
-        for (int p_idx : expanded) {
-            slots_.push_back({block_idx, static_cast<int>(i), p_idx});
+
+        // 获取该共振态的 scan_ranges（可能为空）
+        const auto& ranges = (i < scan_ranges.size()) ? scan_ranges[i]
+                            : std::vector<std::vector<double>>{};
+
+        for (size_t si = 0; si < expanded.size(); ++si) {
+            int p_idx = expanded[si];
+            double val = ordered_params[p_idx];
+            double lower, upper;
+            if (si < ranges.size() && ranges[si].size() >= 2) {
+                lower = ranges[si][0];
+                upper = ranges[si][1];
+            } else {
+                // 默认范围：val ± 50% * |val|，正参数下界不低于 0
+                double half = std::abs(val) * 0.5;
+                lower = val - half;
+                upper = val + half;
+            }
+            slots_.push_back({block_idx, static_cast<int>(i), p_idx, val, lower, upper});
         }
     }
 }
