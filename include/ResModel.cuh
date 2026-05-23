@@ -25,20 +25,18 @@
 //     }
 // }
 
-template <typename T> __host__ __device__ T Bf(int L, const T &q, const T &q0);
+template <typename T> __host__ __device__ T Bf(int L, const T &q, const T &q0, double d);
 
 template <typename T>
-// __host__ __device__ thrust::complex<double> BWR(T &m, T &m0, T &gamma0, int
-// L, T &q, T &q0, T *real, T *imag)
-__host__ __device__ thrust::complex<double> BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0);
+__host__ __device__ thrust::complex<double> BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0, double d);
 
 template <typename T>
 __host__ __device__ thrust::complex<double> BW(T& m, T& m0, T& gamma0);
 
 __device__ double BlattWeisskopf(int L, double q, double q0);
 
-__host__ __device__ thrust::complex<double> Flatte(double x, double m0,
-                                                   double g_pi, double g_K);
+__host__ __device__ thrust::complex<double> Flatte(double m, double m0,
+    int n_channels, const double* g, const double* channel_masses);
 
 // __device__ thrust::complex<double> BWR(double m, double m0, double gamma0,
 // int L, double q, double q0);

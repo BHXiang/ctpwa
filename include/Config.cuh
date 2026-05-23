@@ -25,7 +25,9 @@ struct ResonanceConfig {
   int P;
   std::string type;
   std::vector<double> parameters;
+  std::vector<std::vector<double>> channels; // Flatte: [[m_a, m_b], ...]; 非Flatte为空
   std::vector<std::string> tex;
+  std::vector<int> scan; // 需要scan的参数下标; {-1}=全扫; 空=不扫
 };
 
 struct SpinChainConfig {
@@ -41,6 +43,8 @@ struct ResonanceChainConfig {
 struct DecayStep {
   std::string mother;
   std::vector<std::string> daughters;
+  bool is_bf = true;    // 是否施加势垒因子
+  bool p_break = false; // 是否宇称破缺（如弱衰变）
 };
 
 struct DecayChainConfig {
@@ -67,7 +71,10 @@ struct PlotConfig {
 
 class ConfigParser {
 public:
+  ConfigParser() = default;
   ConfigParser(const std::string &config_file);
+
+  bool isValid() const { return !particles_.empty(); }
 
   const std::vector<Particle> &getParticles() const { return particles_; }
   const std::vector<DecayChainConfig> &getDecayChains() const {
@@ -84,6 +91,7 @@ public:
     return constraints_;
   }
   int getGlobalMaxL() const { return global_maxL_; }
+  double getBfD() const { return global_bf_d_; }
   const std::vector<PlotConfig> &getPlotConfigs() const {
     return plot_configs_;
   }
@@ -110,6 +118,7 @@ private:
   std::vector<ConstraintConfig> constraints_;
   std::vector<PlotConfig> plot_configs_;
   int global_maxL_ = -1; // -1 = no limit; set via Constraints.maxL
+  double global_bf_d_ = 3.0; // barrier factor d; set via Constraints.bf_d
 };
 
 #endif // CONFIG_CUH

@@ -48,8 +48,8 @@ ConfigParser::ConfigParser(const std::string &config_file)
         if (config["Plot"])
             parsePlotConfig(config["Plot"]);
     } catch (const YAML::Exception &e) {
-        std::cerr << "Error parsing config file: " << e.what() << std::endl;
-        throw;
+        std::cerr << "Warning: Failed to parse config file \"" << config_file
+                  << "\": " << e.what() << std::endl;
     }
 }
 
@@ -359,8 +359,22 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 for (const auto &decay_pair : step_node) {
                     DecayStep step;
                     step.mother = decay_pair.first.as<std::string>();
-                    step.daughters =
-                        decay_pair.second.as<std::vector<std::string>>();
+
+                    if (decay_pair.second.IsSequence()) {
+                        // 紧凑格式: mother: [daughter1, daughter2]
+                        step.daughters =
+                            decay_pair.second.as<std::vector<std::string>>();
+                    } else if (decay_pair.second.IsMap()) {
+                        // 扩展格式: mother: { daughters: [...], is_bf: bool, p_break: bool }
+                        step.daughters =
+                            decay_pair.second["daughters"]
+                                .as<std::vector<std::string>>();
+                        if (decay_pair.second["is_bf"])
+                            step.is_bf = decay_pair.second["is_bf"].as<bool>();
+                        if (decay_pair.second["p_break"])
+                            step.p_break =
+                                decay_pair.second["p_break"].as<bool>();
+                    }
                     chain.decay_steps.push_back(step);
                 }
             }
@@ -430,6 +444,13 @@ void ConfigParser::parseResonances(const YAML::Node &node)
         res.type = props["model"].as<std::string>();
         res.parameters = props["parameters"].as<std::vector<double>>();
 
+        // 解析 channels 字段（仅 Flatte 使用）
+        if (props["channels"]) {
+            for (const auto& ch : props["channels"]) {
+                res.channels.push_back(ch.as<std::vector<double>>());
+            }
+        }
+
         // 处理tex字段，可能是字符串或字符串数组
         if (props["tex"].IsSequence()) {
             // tex是数组
@@ -439,6 +460,11 @@ void ConfigParser::parseResonances(const YAML::Node &node)
         } else {
             // 单个字符串，放入向量中
             res.tex.push_back(props["tex"].as<std::string>());
+        }
+
+        // 解析scan字段: [0,1] 扫params[0]和params[1]; [-1] 全扫
+        if (props["scan"]) {
+            res.scan = props["scan"].as<std::vector<int>>();
         }
 
         resonances_[name] = res;
@@ -452,6 +478,11 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
     // 解析全局 maxL
     if (node["maxL"]) {
         global_maxL_ = node["maxL"].as<int>();
+    }
+
+    // 解析全局 barrier factor d
+    if (node["bf_d"]) {
+        global_bf_d_ = node["bf_d"].as<double>();
     }
 
     // 解析全同粒子分组: identical: [[pi01, pi02], [Ks1, Ks2]]

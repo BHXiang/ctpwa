@@ -274,17 +274,27 @@ std::map<std::string, std::vector<LorentzVector>> readMomentaFromDat(
 
 std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinfo, const std::vector<int>& events_per_gpu)
 {
+    // 读取所有权重到主机内存
+    std::vector<double> weights;
+    std::string fileType = fileinfo[0];
+    std::string filename = fileinfo.size() > 1 ? fileinfo[1] : "";
+
+    // 常量权重: 只传入一个值，所有bkg事例乘以这个weight
+    if (fileinfo.size() == 1) {
+        double const_weight = std::stod(fileType);
+        int total_events = 0;
+        for (int ev : events_per_gpu) total_events += ev;
+        weights.resize(total_events, const_weight);
+    }
     // 检查输入参数
-    if (fileinfo.size() < 2)
+    else if (fileinfo.size() < 2)
     {
         std::cerr << "Error: fileinfo must contain at least file type and filename" << std::endl;
         return {};
     }
 
-    // 读取所有权重到主机内存
-    std::vector<double> weights;
-    std::string fileType = fileinfo[0];
-    std::string filename = fileinfo[1];
+    if (weights.empty())
+    {
 
     // 处理DAT文件
     if (fileType == "dat")
@@ -360,6 +370,8 @@ std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinf
         std::cerr << "Error: Unknown file type: " << fileType << std::endl;
         return {};
     }
+
+    } // end if (weights.empty())
 
     // 计算总权重数
     int total_weights = 0;
@@ -1044,9 +1056,15 @@ class analysis
 {
 public:
     analysis(const std::string& config_file = "config.yml")
-        : config_parser_(config_file), n_amplitudes_(0), n_polar_(0), d_all_amplitudes_()
+        : config_parser_(config_file), n_amplitudes_(0), n_polar_(0), d_all_amplitudes_(), initialized_(false)
     {
+        if (!config_parser_.isValid()) {
+            std::cerr << "Warning: Config file \"" << config_file
+                      << "\" is empty or not found. Analysis not initialized." << std::endl;
+            return;
+        }
         initialize();
+        initialized_ = true;
     }
 
     // 析构函数，用于释放 CUDA 内存
@@ -1066,8 +1084,11 @@ public:
         }
     }
 
+    bool isValid() const { return initialized_; }
+
     torch::Tensor getNLL(torch::Tensor& vector)
     {
+        TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
         return NLLFunction::apply(vector, d_all_amplitudes_, d_phsp_matrix_, events_, events_offsets_, amp_offsets_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
@@ -2416,6 +2437,23 @@ public:
 
     int getNPolarizations() const { return n_polar_; }
 
+    void reCalcAmp(torch::Tensor params)
+    {
+        TORCH_CHECK(params.is_cuda(), "params must be on CUDA");
+        TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
+        TORCH_CHECK(params.dim() == 1, "params must be 1-dimensional");
+        TORCH_CHECK(params.numel() == amp_calc_.nFreeResParams(),
+            "params size mismatch: got ", params.numel(),
+            ", expected ", amp_calc_.nFreeResParams());
+
+        amp_calc_.reComputeAmps(d_all_amplitudes_,
+            reinterpret_cast<const double*>(params.data_ptr()),
+            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+            config_parser_.getBfD());
+    }
+
+    int getNFreeResParams() const { return amp_calc_.nFreeResParams(); }
+
     std::vector<std::string> getAmplitudeNames() const
     {
         return amplitude_names_;
@@ -2459,6 +2497,8 @@ private:
     std::unordered_map<std::string, Resonance> resonances_;
     int n_amplitudes_ = 0;
     std::vector<ChainInfo> chains_info_;
+    AmpCalc amp_calc_;
+    bool initialized_ = false;
 
     void initialize(std::string config_file = "config.yml")
     {
@@ -2552,7 +2592,7 @@ private:
             events_offsets_.push_back(ev_offsets);
             amp_offsets_.push_back(amp_offsets);
         }
-        d_all_amplitudes_ = calculateAmplitudes(Vp4_all_);
+        d_all_amplitudes_ = calculateAmplitudes(Vp4_all_, &amp_calc_);
 
         // 输出d_all_amplitudes_[0]所有内容:
         // int Ntotal = 0;
@@ -2833,11 +2873,18 @@ private:
                                 if (res_config.J == spin_chain.spin_parity[0] &&
                                     spin_chain.spin_parity[1])
                                 {
+                                    // 将 channels 从 vector<vector<double>> 转换为 vector<pair<double,double>>
+                                    std::vector<std::pair<double, double>> channels;
+                                    for (const auto& ch : res_config.channels) {
+                                        if (ch.size() >= 2)
+                                            channels.emplace_back(ch[0], ch[1]);
+                                    }
                                     resonance_list.emplace_back(
                                         name, res_chain.intermediate,
                                         intermediate_particle.spin,
                                         intermediate_particle.parity,
-                                        res_config.type, res_config.parameters);
+                                        res_config.type, res_config.parameters,
+                                        channels);
                                     // std::cout << "      Added resonance: " <<
                                     // name << " J: " << res_config.J << " P: "
                                     // << res_config.P << std::endl;
@@ -2890,7 +2937,7 @@ private:
 
             for (auto comb : intermediate_combs)
             {
-                AmpCasDecay cas(particles_);
+                auto cas = std::make_shared<AmpCasDecay>(particles_);
                 for (const auto& step : chain.decay_steps)
                 {
                     std::array<int, 3> spins = { 0 };
@@ -2957,7 +3004,8 @@ private:
                         }
                     }
                     int maxL = config_parser_.getGlobalMaxL();
-                    cas.addDecay(Amp2BD(spins, parities, identical_daughters, is_boson, maxL),
+                    cas->addDecay(Amp2BD(spins, parities, identical_daughters, is_boson, maxL,
+                                        step.p_break, step.is_bf),
                         step.mother, step.daughters[0], step.daughters[1]);
 
                     // 输出decay chain结构
@@ -2986,7 +3034,7 @@ private:
                     std::cout << ", ";
                 }
 
-                auto slcombs = cas.getSLCombinations();
+                auto slcombs = cas->getSLCombinations();
                 std::cout << "SL:";
                 for (auto slcomb : slcombs)
                 {
@@ -3113,7 +3161,7 @@ private:
         }
     }
 
-    std::vector<cuComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4) const
+    std::vector<cuComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
     {
         // 多GPU支持：为每个GPU分配振幅内存
         // int num_gpus = events_.size();
@@ -3219,11 +3267,11 @@ private:
 
             for (auto comb : intermediate_combs)
             {
-                AmpCasDecay cas(particles_);
-                cas.setNPolarizations(n_polar_);
-                cas.setNPolarizationsTotal(n_polar_total_);
-                cas.setPolarizationMap(polarization_map_);
-                cas.setPermutedMappings(permuted_mappings, identical_boson);
+                auto cas = std::make_shared<AmpCasDecay>(particles_);
+                cas->setNPolarizations(n_polar_);
+                cas->setNPolarizationsTotal(n_polar_total_);
+                cas->setPolarizationMap(polarization_map_);
+                cas->setPermutedMappings(permuted_mappings, identical_boson);
                 for (const auto& step : chain.decay_steps)
                 {
                     std::array<int, 3> spins = { 0 };
@@ -3279,11 +3327,12 @@ private:
                         }
                     }
                     int maxL2 = config_parser_.getGlobalMaxL();
-                    cas.addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2),
+                    cas->addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2,
+                                        step.p_break, step.is_bf),
                         step.mother, step.daughters[0], step.daughters[1]);
                 }
 
-                auto slcombs = cas.getSLCombinations();
+                auto slcombs = cas->getSLCombinations();
 
                 std::vector<std::vector<Resonance>> resonance_combinations = {
                     {} };
@@ -3308,15 +3357,41 @@ private:
                 }
 
                 // 计算SL振幅（多GPU版本）
-                cas.computeSLAmps(Vp4);
-                // int nSLcombs = cas.getNSLCombs();
-                // int nEvents = cas.getNEvents();
+                cas->computeSLAmps(Vp4);
+                // int nSLcombs = cas->getNSLCombs();
+                // int nEvents = cas->getNEvents();
 
                 // 调用多GPU版本的getAmps函数
                 for (const auto resonance : resonance_combinations)
                 {
-                    cas.getAmps(d_all_amplitudes_vec, resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_);
-                    gls_index += cas.getNSLCombs();
+                    cas->getAmps(d_all_amplitudes_vec, resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_, config_parser_.getBfD());
+
+                    // 如果有 scan 配置且 amp_calc 非空，注册到 AmpCalc
+                    if (amp_calc)
+                    {
+                        const auto& config_res = config_parser_.getResonances();
+                        std::vector<std::vector<int>> all_scan;
+                        bool has_any = false;
+                        for (const auto& res : resonance)
+                        {
+                            auto it = config_res.find(res.getName());
+                            if (it != config_res.end() && !it->second.scan.empty())
+                            {
+                                all_scan.push_back(it->second.scan);
+                                has_any = true;
+                            }
+                            else
+                            {
+                                all_scan.push_back({});
+                            }
+                        }
+                        if (has_any)
+                        {
+                            amp_calc->addBlock(cas, resonance, gls_index, all_scan);
+                        }
+                    }
+
+                    gls_index += cas->getNSLCombs();
                 }
             }
         }
@@ -3332,7 +3407,7 @@ PYBIND11_MODULE(ctpwa, m)
     m.doc() = "ctpwa";
 
     pybind11::class_<analysis>(m, "analysis")
-        .def(pybind11::init<>())
+        .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
         .def("getNLL", &analysis::getNLL)
         .def("getNVector", &analysis::getNVector)
         .def("getSLVectors", &analysis::getSLVectors)
@@ -3347,5 +3422,8 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getConstraintsIndex", &analysis::getConstraintsIndex)
         .def("getConstraintsValues", &analysis::getConstraintsValues)
         .def("getAmplitudeNames", &analysis::getAmplitudeNames)
-        .def("getNPolarizations", &analysis::getNPolarizations);
+        .def("getNPolarizations", &analysis::getNPolarizations)
+        .def("reCalcAmp", &analysis::reCalcAmp)
+        .def("getNFreeResParams", &analysis::getNFreeResParams)
+        .def("isValid", &analysis::isValid);
 }

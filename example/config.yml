@@ -17,6 +17,18 @@
 #    - Constraints 中新增 `maxL` 全局设置
 #    - 限制所有衰变步的 L 上限，-1 或不设为无限制
 #
+# 4. 子衰变参数 (per-decay-step):
+#    - decay 步支持扩展格式，可对每个顶点单独设置:
+#    - is_bf: 是否施加势垒因子 (Blatt-Weisskopf)，默认 true
+#    - p_break: 是否宇称破缺（弱衰变），默认 false
+#    - 扩展格式示例:
+#      decay:
+#        - Jpsi: [eta, R_KK]                  # 紧凑格式，is_bf=true, p_break=false
+#        - R_KK:
+#            daughters: [Kp, Km]              # 扩展格式
+#            is_bf: false                     # 不放势垒因子
+#            p_break: true                    # 弱衰变，宇称不守恒
+#
 # 示例（e+e- → J/psi → 3pi0, J/psi横极化, maxL=4, 全同粒子）:
 #   Particles:
 #     Jpsi:

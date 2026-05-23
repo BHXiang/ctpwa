@@ -8,10 +8,10 @@
 
 // Amp2BD 类实现
 Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
-    bool identical_daughters, bool is_boson, int maxL)
+    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool is_bf)
     : jvalues_(jvalues), parities_(parities),
     identical_daughters_(identical_daughters), is_boson_(is_boson),
-    maxL_(maxL)
+    maxL_(maxL), p_break_(p_break), is_bf_(is_bf)
 {
     spinOrbitCombinations_ = ComSL(jvalues, parities);
 }
@@ -74,7 +74,8 @@ std::vector<SL> Amp2BD::ComSL(const std::array<int, 3>& spins, const std::array<
             int L = two_L / 2; // 实际的轨道角动量量子数
             const int sign = (L % 2 == 0) ? 1 : -1;
 
-            if (p1 == p2 * p3 * sign)
+            // 宇称条件（若宇称破缺则跳过该条件，如弱衰变）
+            if (p_break_ || p1 == p2 * p3 * sign)
             {
                 // 全同粒子选择定则: (-1)^{L+S} = +1 (Bose) 或 -1 (Fermi)
                 if (identical_daughters_) {
@@ -899,19 +900,23 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
     const int site,
     const int n_amplitudes,
     const std::vector<std::vector<int>>& event_offsets,
-    const std::vector<std::vector<int>>& amp_offsets)
+    const std::vector<std::vector<int>>& amp_offsets,
+    double bf_d)
 {
     for (size_t i = 0; i < d_amplitudes.size(); ++i)
     {
         cudaSetDevice(i);
 
         // 分配设备内存用于共振态数组
-        DeviceResonance* d_resonances;
         size_t resonance_count = resonances.size();
+        DeviceResonance* d_resonances;
         cudaMalloc(&d_resonances, resonance_count * sizeof(DeviceResonance));
 
-        // 将每个共振态转换为设备格式并复制到设备内存
+        // 构建 flat 参数数组和 channel 数组（主机端）
         std::vector<DeviceResonance> host_resonances;
+        std::vector<double> h_all_params;
+        std::vector<double> h_all_channels;
+
         for (auto& resonance : resonances)
         {
             DeviceResonance devRes;
@@ -920,32 +925,46 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
             devRes.particle_idx = particleToIndex_[resonance.getTag()];
             devRes.type = resonance.getModelType();
 
-            const auto& params = resonance.getParams();
-            devRes.param_count = std::min(8, (int)params.size());
-            int i = 0;
-            for (const auto& param : params)
-            {
-                if (i >= 8)
-                    break;
-                devRes.params[i] = param.second;
-                i++;
+            // 自由参数 offset
+            auto ordered_params = resonance.getOrderedParams();
+            devRes.param_offset = static_cast<int>(h_all_params.size());
+            devRes.param_count = static_cast<int>(ordered_params.size());
+            h_all_params.insert(h_all_params.end(),
+                ordered_params.begin(), ordered_params.end());
+
+            // Flatte channel masses
+            const auto& channels = resonance.getChannels();
+            devRes.n_channels = static_cast<int>(channels.size());
+            devRes.channel_offset = static_cast<int>(h_all_channels.size());
+            for (const auto& ch : channels) {
+                h_all_channels.push_back(ch.first);
+                h_all_channels.push_back(ch.second);
             }
+
             host_resonances.push_back(devRes);
         }
 
-        // 将共振态数组复制到设备
+        // 上传 DeviceResonance 数组
         cudaMemcpy(d_resonances, host_resonances.data(),
             resonance_count * sizeof(DeviceResonance),
             cudaMemcpyHostToDevice);
 
-        // 分配设备内存用于输出振幅
-        // cuComplex *d_amplitudes;
-        // size_t total_amplitudes = nSLCombs_ * nEvents_ * nPolarizations_;
-        // cudaMalloc(&d_amplitudes, total_amplitudes * sizeof(cuComplex));
+        // 上传 flat 参数数组
+        double* d_all_params = nullptr;
+        if (!h_all_params.empty()) {
+            cudaMalloc(&d_all_params, h_all_params.size() * sizeof(double));
+            cudaMemcpy(d_all_params, h_all_params.data(),
+                h_all_params.size() * sizeof(double), cudaMemcpyHostToDevice);
+        }
 
-        // std::cout << "SL Combinations: " << nSLCombs_ << ", Events: " << nEvents_
-        // << ", Polarizations: " << nPolarizations_ << ", site: " << site <<
-        // std::endl;
+        // 上传 channel masses 数组
+        double* d_all_channels = nullptr;
+        if (!h_all_channels.empty()) {
+            cudaMalloc(&d_all_channels, h_all_channels.size() * sizeof(double));
+            cudaMemcpy(d_all_channels, h_all_channels.data(),
+                h_all_channels.size() * sizeof(double), cudaMemcpyHostToDevice);
+        }
+
         int* d_amp_offsets;
         cudaMalloc(&d_amp_offsets, amp_offsets[i].size() * sizeof(int));
         cudaMemcpy(d_amp_offsets, amp_offsets[i].data(), amp_offsets[i].size() * sizeof(int), cudaMemcpyHostToDevice);
@@ -955,13 +974,10 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
         int num_offsets = amp_offsets[i].size();
 
         // 设置核函数配置
-        dim3 blockDim(256); // 每个块256个线程
+        dim3 blockDim(256);
         dim3 gridDim(nSLCombs_, (nEvents_[i] + blockDim.x - 1) / blockDim.x);
-        // int blockSize = 256; // 每个块256个线程
-        // int numBlocks = (nEvents_[i] + blockSize - 1) / blockSize;
 
         // 调用核函数计算振幅
-        // computeAmpsKernel<<<numBlocks, blockSize>>>(
         computeAmpsKernel << <gridDim, blockDim >> >
             (d_amplitudes[i],       // 输出振幅
                 d_momenta_[i],         // 四动量数据
@@ -969,6 +985,8 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
                 d_slamps_[i],          // SL振幅
                 d_resonances,       // 共振态数组
                 resonance_count,    // 共振态数量
+                d_all_params,       // flat 自由参数
+                d_all_channels,     // flat channel masses
                 d_decayNodes_[i],      // 衰变链信息
                 decayChain_.size(), // 衰变链长度
                 nEvents_[i],           // 事件数
@@ -978,7 +996,8 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
                 d_event_offsets,    // 事件偏移量
                 num_offsets,        // 偏移量数量
                 n_amplitudes,       // 振幅数量
-                site                // 位置
+                site,               // 位置
+                bf_d                // 势垒因子 d
                 );
 
         cudaDeviceSynchronize();
@@ -989,13 +1008,14 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
         {
             std::cerr << "CUDA error in computeAmps: " << cudaGetErrorString(err)
                 << std::endl;
-            cudaFree(d_resonances);
-            // cudaFree(d_amplitudes);
-            // return nullptr;
         }
 
-        // 释放共振态数组设备内存
+        // 释放临时设备内存
         cudaFree(d_resonances);
+        if (d_all_params) cudaFree(d_all_params);
+        if (d_all_channels) cudaFree(d_all_channels);
+        cudaFree(d_amp_offsets);
+        cudaFree(d_event_offsets);
     }
 }
 
@@ -1006,10 +1026,13 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     const thrust::complex<double>* slamps, // SL振幅
     const DeviceResonance* resonances,     // 共振态数组
     int resonance_count,                   // 共振态数量
+    const double* d_all_params,            // 所有共振态的自由参数（flat）
+    const double* d_all_channels,          // Flatte channel masses（flat）
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_offsets, int n_amplitudes, int site)
+    int num_offsets, int n_amplitudes, int site,
+    double bf_d)
 {
     // int event_idx = threadIdx.x * blockDim.x + threadIdx.x;
     int sl_idx = blockIdx.x;
@@ -1078,7 +1101,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // 更新质量参数
         if (mass_mother == -1 && is_resonance_node)
         {
-            mass_mother = current_res.params[0];
+            mass_mother = d_all_params[current_res.param_offset];
         }
         if (mass_daug1 == -1)
         {
@@ -1086,7 +1109,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             {
                 if (decayChain[nodeIdx].daug1_idx == resonances[i].particle_idx)
                 {
-                    mass_daug1 = resonances[i].params[0];
+                    mass_daug1 = d_all_params[resonances[i].param_offset];
                     break;
                 }
             }
@@ -1097,7 +1120,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             {
                 if (decayChain[nodeIdx].daug2_idx == resonances[i].particle_idx)
                 {
-                    mass_daug2 = resonances[i].params[0];
+                    mass_daug2 = d_all_params[resonances[i].param_offset];
                     break;
                 }
             }
@@ -1113,7 +1136,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         {
             // 第一个节点特殊处理
             // resAmp *= BlattWeisskopf(sl.L, qq, q0);
-            resAmp *= Bf<double>(sl.L, qq, q0);
+            resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
 
             // printf("Event %d, sl %d, First Node: L=%d, qq=%f, q0=%f, BW
             // Factor=(%f, %f i)\n", event_idx, sl_idx, sl.L, qq, q0,
@@ -1124,28 +1147,30 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // 如果是共振态节点，计算相应的振幅因子
         if (is_resonance_node)
         {
+            const double* p = d_all_params + current_res.param_offset;
+            double res_mass = p[0];
+
             if (current_res.type == ResModelType::BWR)
             {
-                resAmp *= BWR<double>(mm, current_res.params[0], current_res.params[1], sl.L, qq, q0);
-                resAmp *= Bf<double>(sl.L, qq, q0);
+                double res_width = p[1];
+                resAmp *= BWR<double>(mm, res_mass, res_width, sl.L, qq, q0, bf_d);
+                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
             }
             else if (current_res.type == ResModelType::BW)
             {
-                resAmp *= BW<double>(mm, current_res.params[0], current_res.params[1]);
-                // printf("Event %d, sl %d, Node %d: BW Factor=(%f, %f i)\n", event_idx, sl_idx, nodeIdx, resAmp.real(), resAmp.imag());
-                // resAmp *= Bf<double>(sl.L, qq, q0);
-                // printf("Event %d, sl %d, Node %d: L=%d, qq=%f, q0=%f, BW Factor=(%f, %f i)\n", event_idx, sl_idx, nodeIdx, sl.L, qq, q0, resAmp.real(), resAmp.imag());
+                double res_width = p[1];
+                resAmp *= BW<double>(mm, res_mass, res_width);
             }
             else if (current_res.type == ResModelType::ONE)
             {
-                resAmp *= Bf<double>(sl.L, qq, q0);
-                // resAmp *= 1.0;
+                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
             }
             else if (current_res.type == ResModelType::Flatte)
             {
-                resAmp *= Flatte(mm, current_res.params[0],
-                    current_res.params[1], current_res.params[2]);
-                resAmp *= Bf<double>(sl.L, qq, q0);
+                // p[0] = mass, p[1..] = couplings; channels in d_all_channels
+                const double* ch = d_all_channels + current_res.channel_offset;
+                resAmp *= Flatte(mm, res_mass, current_res.n_channels, &p[1], ch);
+                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
             }
         }
     }
@@ -1197,4 +1222,302 @@ __global__ void addSLAmpsKernel(
         d_amp[idx].real() + sign * d_add[idx].real(),
         d_amp[idx].imag() + sign * d_add[idx].imag());
 }
+
+// ============================================================
+// AmpCalc 实现
+// ============================================================
+
+// 小 kernel：将自由参数写入 device 端的 d_all_params 数组
+__global__ void updateResonanceParamsKernel(
+    double* d_all_params,               // flat 自由参数数组
+    const DeviceResonance* d_resonances,
+    int resonance_count,
+    const double* d_free_params,        // 全局自由参数数组
+    const int* d_res_idx,               // 每个自由参数 → 共振态索引
+    const int* d_param_idx,             // 每个自由参数 → params[] 下标
+    int n_local_free)                   // 本 block 涉及的自由参数数
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_local_free) return;
+    int r = d_res_idx[i];
+    int p = d_param_idx[i];
+    if (r < resonance_count) {
+        int offset = d_resonances[r].param_offset;
+        d_all_params[offset + p] = d_free_params[i];
+    }
+}
+
+AmpCalc::~AmpCalc()
+{
+    for (auto& block : blocks_) {
+        for (size_t gpu = 0; gpu < block.d_resonances.size(); ++gpu) {
+            cudaSetDevice(static_cast<int>(gpu));
+            if (block.d_resonances[gpu]) cudaFree(block.d_resonances[gpu]);
+            if (block.d_all_params[gpu]) cudaFree(block.d_all_params[gpu]);
+            if (block.d_all_channels[gpu]) cudaFree(block.d_all_channels[gpu]);
+        }
+    }
+    // cas_list_ 由 shared_ptr 自动释放
+}
+
+// 辅助：根据 scan_indices 将自由参数的 params[] 下标展开
+// scan_indices: {-1}=全扫, {0,1}=扫params[0]和[1], 空=不扫
+static std::vector<int> expandScanIndices(
+    const std::vector<double>& params,
+    const std::vector<int>& scan_indices)
+{
+    std::vector<int> result;
+    if (scan_indices.empty()) return result;
+    if (scan_indices.size() == 1 && scan_indices[0] == -1) {
+        // 全扫
+        for (int i = 0; i < static_cast<int>(params.size()); ++i) {
+            result.push_back(i);
+        }
+    } else {
+        for (int idx : scan_indices) {
+            if (idx >= 0 && idx < static_cast<int>(params.size())) {
+                result.push_back(idx);
+            }
+        }
+    }
+    return result;
+}
+
+void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
+                       const std::vector<Resonance>& resonances,
+                       int site,
+                       const std::vector<std::vector<int>>& scan_indices)
+{
+    // 1. 查找或添加 cas 到 cas_list_
+    int cas_idx = -1;
+    for (size_t i = 0; i < cas_list_.size(); ++i) {
+        if (cas_list_[i] == cas) {
+            cas_idx = static_cast<int>(i);
+            break;
+        }
+    }
+    if (cas_idx < 0) {
+        cas_idx = static_cast<int>(cas_list_.size());
+        cas_list_.push_back(cas);
+    }
+
+    // 2. 为每个 GPU 分配持久化 DeviceResonance 和 flat 参数数组
+    int n_gpu = static_cast<int>(cas->getSLAmps().size());
+    ResBlock block;
+    block.cas_idx = cas_idx;
+    block.site = site;
+    block.resonance_count = static_cast<int>(resonances.size());
+    block.d_resonances.resize(n_gpu, nullptr);
+    block.d_all_params.resize(n_gpu, nullptr);
+    block.d_all_channels.resize(n_gpu, nullptr);
+
+    // 构建主机端 DeviceResonance 数组 + flat params + flat channels
+    std::vector<DeviceResonance> h_res;
+    std::vector<double> h_all_params;
+    std::vector<double> h_all_channels;
+
+    for (const auto& res : resonances) {
+        DeviceResonance dr;
+        dr.J = res.getJ();
+        dr.P = res.getP();
+        dr.particle_idx = cas->getParticleIndex(res.getTag());
+        dr.type = res.getModelType();
+
+        auto ordered_params = res.getOrderedParams();
+        dr.param_offset = static_cast<int>(h_all_params.size());
+        dr.param_count = static_cast<int>(ordered_params.size());
+        h_all_params.insert(h_all_params.end(),
+            ordered_params.begin(), ordered_params.end());
+
+        const auto& channels = res.getChannels();
+        dr.n_channels = static_cast<int>(channels.size());
+        dr.channel_offset = static_cast<int>(h_all_channels.size());
+        for (const auto& ch : channels) {
+            h_all_channels.push_back(ch.first);
+            h_all_channels.push_back(ch.second);
+        }
+
+        h_res.push_back(dr);
+    }
+    h_templates_.push_back(h_res);
+    h_param_templates_.push_back(h_all_params);
+    h_channel_templates_.push_back(h_all_channels);
+
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        // DeviceResonance 数组
+        cudaMalloc(&block.d_resonances[gpu],
+                   resonances.size() * sizeof(DeviceResonance));
+        cudaMemcpy(block.d_resonances[gpu], h_res.data(),
+                   resonances.size() * sizeof(DeviceResonance),
+                   cudaMemcpyHostToDevice);
+        // flat 自由参数
+        if (!h_all_params.empty()) {
+            cudaMalloc(&block.d_all_params[gpu],
+                       h_all_params.size() * sizeof(double));
+            cudaMemcpy(block.d_all_params[gpu], h_all_params.data(),
+                       h_all_params.size() * sizeof(double), cudaMemcpyHostToDevice);
+        }
+        // flat channel masses
+        if (!h_all_channels.empty()) {
+            cudaMalloc(&block.d_all_channels[gpu],
+                       h_all_channels.size() * sizeof(double));
+            cudaMemcpy(block.d_all_channels[gpu], h_all_channels.data(),
+                       h_all_channels.size() * sizeof(double), cudaMemcpyHostToDevice);
+        }
+    }
+
+    int block_idx = static_cast<int>(blocks_.size());
+    blocks_.push_back(std::move(block));
+
+    // 3. 记录参数槽映射
+    for (size_t i = 0; i < resonances.size(); ++i) {
+        auto ordered_params = resonances[i].getOrderedParams();
+        auto expanded = expandScanIndices(ordered_params, scan_indices[i]);
+        for (int p_idx : expanded) {
+            slots_.push_back({block_idx, static_cast<int>(i), p_idx});
+        }
+    }
+}
+
+void AmpCalc::reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
+                            const double* d_params,
+                            int n_amplitudes,
+                            const std::vector<std::vector<int>>& event_offsets,
+                            const std::vector<std::vector<int>>& amp_offsets,
+                            size_t n_polar,
+                            double bf_d)
+{
+    int n_gpu = static_cast<int>(d_amplitudes.size());
+    int n_free = nFreeResParams();
+    if (n_free == 0 || blocks_.empty()) return;
+
+    // 1. 把 d_params 广播到所有 GPU
+    std::vector<double*> d_params_per_gpu(n_gpu, nullptr);
+    int primary_dev = 0;
+    cudaGetDevice(&primary_dev);
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        cudaMalloc(&d_params_per_gpu[gpu], n_free * sizeof(double));
+    }
+    // 从 primary GPU 拷贝到各 GPU
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        if (gpu == primary_dev) {
+            cudaSetDevice(primary_dev);
+            cudaMemcpy(d_params_per_gpu[primary_dev], d_params,
+                       n_free * sizeof(double), cudaMemcpyDeviceToDevice);
+        } else {
+            cudaMemcpyPeer(d_params_per_gpu[gpu], gpu,
+                           d_params, primary_dev,
+                           n_free * sizeof(double));
+        }
+    }
+
+    // 2. 构建设备端的 slots 映射数组
+    std::vector<int> h_slot_block(n_free), h_slot_res(n_free), h_slot_param(n_free);
+    for (int i = 0; i < n_free; ++i) {
+        h_slot_block[i] = slots_[i].block_idx;
+        h_slot_res[i] = slots_[i].res_idx;
+        h_slot_param[i] = slots_[i].param_idx;
+    }
+
+    // 3. 每个 GPU: 更新 DeviceResonance 参数 + 重跑 computeAmpsKernel
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        int blockSize = 256;
+
+        // 为每个 block 更新 DeviceResonance 中的自由参数
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            auto& block = blocks_[bi];
+
+            // 收集本 block 涉及的 slots（按原始 slots_ 顺序的子集）
+            std::vector<int> local_res_idx, local_param_idx, local_global_offset;
+            for (int s = 0; s < n_free; ++s) {
+                if (slots_[s].block_idx == static_cast<int>(bi)) {
+                    local_res_idx.push_back(slots_[s].res_idx);
+                    local_param_idx.push_back(slots_[s].param_idx);
+                    local_global_offset.push_back(s);
+                }
+            }
+            int n_local = static_cast<int>(local_res_idx.size());
+            if (n_local == 0) continue;
+
+            int* d_res_idx, * d_param_idx;
+            cudaMalloc(&d_res_idx, n_local * sizeof(int));
+            cudaMalloc(&d_param_idx, n_local * sizeof(int));
+            cudaMemcpy(d_res_idx, local_res_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_param_idx, local_param_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+
+            int grid = (n_local + blockSize - 1) / blockSize;
+            updateResonanceParamsKernel<<<grid, blockSize>>>(
+                block.d_all_params[gpu], block.d_resonances[gpu],
+                block.resonance_count,
+                d_params_per_gpu[gpu], d_res_idx, d_param_idx, n_local);
+
+            cudaDeviceSynchronize();
+            cudaFree(d_res_idx);
+            cudaFree(d_param_idx);
+        }
+
+        // 重跑 computeAmpsKernel
+        for (auto& block : blocks_) {
+            auto& cas = cas_list_[block.cas_idx];
+
+            auto& d_slamps = cas->getSLAmps();
+            auto& d_momenta = cas->getMomenta();
+            auto& d_decayNodes = cas->getDecayNodes();
+            auto& d_slComb = cas->getDeviceSLCombs();
+            auto& nEvents = cas->getNEventsVec();
+
+            // 准备 amp_offsets 和 event_offsets 的设备端数据
+            int* d_amp_offsets;
+            cudaMalloc(&d_amp_offsets, amp_offsets[gpu].size() * sizeof(int));
+            cudaMemcpy(d_amp_offsets, amp_offsets[gpu].data(),
+                       amp_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
+            int* d_event_offsets;
+            cudaMalloc(&d_event_offsets, event_offsets[gpu].size() * sizeof(int));
+            cudaMemcpy(d_event_offsets, event_offsets[gpu].data(),
+                       event_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
+            int num_offsets = static_cast<int>(amp_offsets[gpu].size());
+
+            dim3 gridDim(static_cast<unsigned int>(cas->getNSLCombs()),
+                         (static_cast<unsigned int>(nEvents[gpu]) + 255) / 256);
+
+            computeAmpsKernel<<<gridDim, blockSize>>>(
+                d_amplitudes[gpu],
+                d_momenta[gpu],
+                d_slComb[gpu],
+                d_slamps[gpu],
+                block.d_resonances[gpu],
+                block.resonance_count,
+                block.d_all_params[gpu],
+                block.d_all_channels[gpu],
+                d_decayNodes[gpu],
+                cas->getDecayChainSize(),
+                static_cast<int>(nEvents[gpu]),
+                static_cast<int>(cas->getNSLCombs()),
+                static_cast<int>(n_polar),
+                d_amp_offsets,
+                d_event_offsets,
+                num_offsets,
+                n_amplitudes,
+                block.site,
+                bf_d);
+
+            cudaDeviceSynchronize();
+            cudaFree(d_amp_offsets);
+            cudaFree(d_event_offsets);
+        }
+    }
+
+    // 4. 释放临时的 d_params 副本
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        if (d_params_per_gpu[gpu]) {
+            cudaSetDevice(gpu);
+            cudaFree(d_params_per_gpu[gpu]);
+        }
+    }
+    cudaSetDevice(primary_dev);
+}
+
 // }

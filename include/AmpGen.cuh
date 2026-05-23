@@ -65,10 +65,12 @@ class Amp2BD {
 public:
     Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
            bool identical_daughters = false, bool is_boson = true,
-           int maxL = -1);
+           int maxL = -1, bool p_break = false, bool is_bf = true);
     const std::vector<SL>& getSL() const { return spinOrbitCombinations_; }
     const std::array<int, 3>& getJValues() const { return jvalues_; }
     const std::array<int, 3>& getParities() const { return parities_; }
+    bool getPbreak() const { return p_break_; }
+    bool getIsBf() const { return is_bf_; }
 
 private:
     std::vector<SL> ComSL(const std::array<int, 3>& spins,
@@ -77,7 +79,9 @@ private:
     std::array<int, 3> parities_;
     bool identical_daughters_;
     bool is_boson_; // true=boson(symmetric, +), false=fermion(antisymmetric, -)
-    int maxL_;      // max orbital L; -1 = no limit
+    int maxL_;      // 轨道角动量上限; -1 = 无限制
+    bool p_break_;  // 宇称是否破缺（弱衰变）
+    bool is_bf_;    // 是否施加势垒因子
     std::vector<SL> spinOrbitCombinations_;
 };
 
@@ -156,12 +160,78 @@ public:
         const int site,
         const int n_amplitudes,
         const std::vector<std::vector<int>>& event_offsets,
-        const std::vector<std::vector<int>>& amp_offsets);
+        const std::vector<std::vector<int>>& amp_offsets,
+        double bf_d = 3.0);
 
     // Getter函数
     size_t getNSLCombs() const { return nSLCombs_; }
-    // size_t getNEvents() const { return nEvents_; }
-    // size_t getNPolarizations() const { return nPolarizations_; }
+    size_t getNPolarizations() const { return nPolarizations_; }
+    size_t getNPolarizationsTotal() const { return nPolarizations_total_; }
+    int getDecayChainSize() const { return static_cast<int>(decayChain_.size()); }
+    const std::vector<size_t>& getNEventsVec() const { return nEvents_; }
+    const std::vector<thrust::complex<double>*>& getSLAmps() const { return d_slamps_; }
+    const std::vector<DeviceMomenta*>& getMomenta() const { return d_momenta_; }
+    const std::vector<DecayNode*>& getDecayNodes() const { return d_decayNodes_; }
+    const std::vector<SL*>& getDeviceSLCombs() const { return d_slCombination_; }
+    const std::vector<int*>& getPolarizationMap() const { return d_polarization_map_; }
+    int getParticleIndex(const std::string& tag) const {
+        auto it = particleToIndex_.find(tag);
+        return (it != particleToIndex_.end()) ? it->second : -1;
+    }
+};
+
+// ============================================================
+// AmpCalc: 管理共振态参数扫描
+// ============================================================
+class AmpCalc {
+public:
+    // 一个共振态组合块 = 原来一次 getAmps 调用
+    struct ResBlock {
+        int cas_idx;                                  // 指向 cas_list_[cas_idx]
+        std::vector<DeviceResonance*> d_resonances;   // 每个 GPU 一份，持久化，OWNED
+        std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
+        std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
+        int resonance_count;
+        int site;                                     // gls_index，对应 d_all_amplitudes 的列偏移
+    };
+
+    // 参数槽：一个自由参数 → 对应哪个 block 的哪个共振态的哪个 params 下标
+    struct ParamSlot {
+        int block_idx;   // 哪个 ResBlock
+        int res_idx;     // 该 block 的哪个共振态
+        int param_idx;   // params[] 下标 (0=mass, 1=width, 2=r/g_pi, 3=g_K)
+    };
+
+    AmpCalc() = default;
+    ~AmpCalc();
+
+    // 由 calculateAmplitudes 调用：接管 cas 和共振态组合
+    // scan_indices: 与 resonances 对应，每个共振态的自由参数下标；空=不扫，{-1}=全扫
+    void addBlock(std::shared_ptr<AmpCasDecay> cas,
+                  const std::vector<Resonance>& resonances,
+                  int site,
+                  const std::vector<std::vector<int>>& scan_indices);
+
+    // 用新参数重算所有振幅
+    void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
+                       const double* d_params,             // GPU [nFreeResParams]
+                       int n_amplitudes,
+                       const std::vector<std::vector<int>>& event_offsets,
+                       const std::vector<std::vector<int>>& amp_offsets,
+                       size_t n_polar,
+                       double bf_d = 3.0);
+
+    int nFreeResParams() const { return static_cast<int>(slots_.size()); }
+    bool empty() const { return blocks_.empty(); }
+
+private:
+    std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放
+    std::vector<ResBlock> blocks_;
+    std::vector<ParamSlot> slots_;
+    // 主机端模板（固定参数值用于恢复）
+    std::vector<std::vector<DeviceResonance>> h_templates_;
+    std::vector<std::vector<double>> h_param_templates_;
+    std::vector<std::vector<double>> h_channel_templates_;
 };
 
 // 核函数声明
@@ -186,9 +256,12 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     const thrust::complex<double>* slamps, // SL振幅
     const DeviceResonance* resonances,     // 共振态数组
     int resonance_count,                   // 共振态数量
+    const double* d_all_params,            // 所有共振态的自由参数（flat）
+    const double* d_all_channels,          // Flatte channel masses（flat）
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_amp_offsets, int n_amplitudes, int site);
+    int num_amp_offsets, int n_amplitudes, int site,
+    double bf_d);
 
 #endif // AMPGEN_CUH
