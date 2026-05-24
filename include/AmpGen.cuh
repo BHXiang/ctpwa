@@ -191,6 +191,7 @@ public:
         std::vector<DeviceResonance*> d_resonances;   // 每个 GPU 一份，持久化，OWNED
         std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
+        std::vector<cuComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
         int resonance_count;
         int site;                                     // gls_index，对应 d_all_amplitudes 的列偏移
     };
@@ -209,13 +210,13 @@ public:
     ~AmpCalc();
 
     // 由 calculateAmplitudes 调用：接管 cas 和共振态组合
-    // scan_indices: 与 resonances 对应，每个共振态的自由参数下标；空=不扫，{-1}=全扫
-    // scan_ranges:  与 resonances 对应，每个共振态的 [[lower,upper],...]; 空=使用默认
+    // free_indices: 与 resonances 对应，每个共振态的自由参数下标；空=不拟合，{-1}=全部
+    // free_ranges:  与 resonances 对应，每个共振态的 [[lower,upper],...]; 空=使用默认
     void addBlock(std::shared_ptr<AmpCasDecay> cas,
                   const std::vector<Resonance>& resonances,
                   int site,
-                  const std::vector<std::vector<int>>& scan_indices,
-                  const std::vector<std::vector<std::vector<double>>>& scan_ranges);
+                  const std::vector<std::vector<int>>& free_indices,
+                  const std::vector<std::vector<std::vector<double>>>& free_ranges);
 
     // 用新参数重算所有振幅
     void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
@@ -225,6 +226,18 @@ public:
                        const std::vector<std::vector<int>>& amp_offsets,
                        size_t n_polar,
                        double bf_d = 3.0);
+
+    // 预计算有效耦合 T_{r,e,p} = Σ_i v_i * sl_i （对每个 block）
+    // 必须在 computeResonanceGradient 之前调用，且在耦合向量 v 改变后重新调用
+    void computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes);
+
+    // 计算共振态参数梯度 ∂NLL/∂θ
+    // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
+    // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
+    void computeResonanceGradient(
+        const std::vector<cuComplex*>& d_w,   // 每 GPU 一份
+        double* d_grad_res,                   // 输出，在 GPU 0
+        double sign = 1.0);                   // +1=加, -1=减
 
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
@@ -269,5 +282,24 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     const int* amp_offsets, const int* event_offsets,
     int num_amp_offsets, int n_amplitudes, int site,
     double bf_d);
+
+// 共振态参数梯度 kernel：对单个共振态的 Nfree 个自由参数计算 ∂NLL/∂θ
+template <int Nfree>
+__global__ void resonanceGradientKernel(
+    const cuComplex* d_w,              // [nEvents × nPolar] w = S/I
+    const cuComplex* d_T,              // [nEvents × nPolar] 有效耦合
+    const DeviceMomenta* d_momenta,    // 四动量
+    const DecayNode* d_decayNodes,     // 衰变链
+    const SL* d_slComb,                // SL 组合
+    const DeviceResonance* d_res,      // 共振态数组
+    int res_idx_in_block,              // 目标共振态在 d_res 中的下标
+    const double* d_all_params,        // flat 自由参数数组
+    const int* d_param_map,            // [Nfree]：每个自由参数 → params[] 下标
+    double* d_grad,                    // 输出 [nFreeResParams]（累加到此数组）
+    const int* d_global_idx,           // [Nfree]：每个自由参数在全局 slots_ 中的下标
+    int nEvents, int nPolar,
+    int decayChain_size,
+    double bf_d,
+    double sign = 1.0);                // +1=data, -1=bkg
 
 #endif // AMPGEN_CUH

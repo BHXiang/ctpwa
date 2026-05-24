@@ -43,6 +43,7 @@
 #     order: [pi0_1, pi0_2, pi0_3]
 #   Constraints:
 #     maxL: 4
+#     bf_d: 0.5
 #     identical: [[pi0_1, pi0_2, pi0_3]]
 #   DecayChains:
 #     chain1:

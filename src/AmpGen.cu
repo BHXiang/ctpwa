@@ -1,10 +1,8 @@
 #include <AmpGen.cuh>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-// #include <cuComplex.h>
 #include <cuda_runtime.h>
 #include <iostream>
-// #include <Resonance.cuh>
 
 // Amp2BD 类实现
 Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
@@ -1255,26 +1253,27 @@ AmpCalc::~AmpCalc()
             if (block.d_resonances[gpu]) cudaFree(block.d_resonances[gpu]);
             if (block.d_all_params[gpu]) cudaFree(block.d_all_params[gpu]);
             if (block.d_all_channels[gpu]) cudaFree(block.d_all_channels[gpu]);
+            if (block.d_T.size() > gpu && block.d_T[gpu]) cudaFree(block.d_T[gpu]);
         }
     }
     // cas_list_ 由 shared_ptr 自动释放
 }
 
-// 辅助：根据 scan_indices 将自由参数的 params[] 下标展开
-// scan_indices: {-1}=全扫, {0,1}=扫params[0]和[1], 空=不扫
-static std::vector<int> expandScanIndices(
+// 辅助：根据 free_indices 将自由参数的 params[] 下标展开
+// free_indices: {-1}=全扫, {0,1}=扫params[0]和[1], 空=不拟合
+static std::vector<int> expandFreeIndices(
     const std::vector<double>& params,
-    const std::vector<int>& scan_indices)
+    const std::vector<int>& free_indices)
 {
     std::vector<int> result;
-    if (scan_indices.empty()) return result;
-    if (scan_indices.size() == 1 && scan_indices[0] == -1) {
+    if (free_indices.empty()) return result;
+    if (free_indices.size() == 1 && free_indices[0] == -1) {
         // 全扫
         for (int i = 0; i < static_cast<int>(params.size()); ++i) {
             result.push_back(i);
         }
     } else {
-        for (int idx : scan_indices) {
+        for (int idx : free_indices) {
             if (idx >= 0 && idx < static_cast<int>(params.size())) {
                 result.push_back(idx);
             }
@@ -1286,8 +1285,8 @@ static std::vector<int> expandScanIndices(
 void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        const std::vector<Resonance>& resonances,
                        int site,
-                       const std::vector<std::vector<int>>& scan_indices,
-                       const std::vector<std::vector<std::vector<double>>>& scan_ranges)
+                       const std::vector<std::vector<int>>& free_indices,
+                       const std::vector<std::vector<std::vector<double>>>& free_ranges)
 {
     // 1. 查找或添加 cas 到 cas_list_
     int cas_idx = -1;
@@ -1311,6 +1310,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     block.d_resonances.resize(n_gpu, nullptr);
     block.d_all_params.resize(n_gpu, nullptr);
     block.d_all_channels.resize(n_gpu, nullptr);
+    block.d_T.resize(n_gpu, nullptr);
 
     // 构建主机端 DeviceResonance 数组 + flat params + flat channels
     std::vector<DeviceResonance> h_res;
@@ -1374,10 +1374,10 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     // 3. 记录参数槽映射
     for (size_t i = 0; i < resonances.size(); ++i) {
         auto ordered_params = resonances[i].getOrderedParams();
-        auto expanded = expandScanIndices(ordered_params, scan_indices[i]);
+        auto expanded = expandFreeIndices(ordered_params, free_indices[i]);
 
-        // 获取该共振态的 scan_ranges（可能为空）
-        const auto& ranges = (i < scan_ranges.size()) ? scan_ranges[i]
+        // 获取该共振态的 free_ranges（可能为空）
+        const auto& ranges = (i < free_ranges.size()) ? free_ranges[i]
                             : std::vector<std::vector<double>>{};
 
         for (size_t si = 0; si < expanded.size(); ++si) {
@@ -1538,4 +1538,305 @@ void AmpCalc::reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
     cudaSetDevice(primary_dev);
 }
 
-// }
+// ============================================================
+// 共振态参数梯度
+// ============================================================
+
+// 辅助：破缺动量 q(m, m1, m2)
+__device__ double breakup_momentum(double m, double m1, double m2) {
+    double q_sq = (m*m - (m1+m2)*(m1+m2)) * (m*m - (m1-m2)*(m1-m2));
+    if (q_sq <= 0.0) return 0.0;
+    return sqrt(q_sq) / (2.0 * m);
+}
+
+// 梯度 kernel 模板实现
+template <int Nfree>
+__global__ void resonanceGradientKernel(
+    const cuComplex* d_w,
+    const cuComplex* d_T,
+    const DeviceMomenta* d_momenta,
+    const DecayNode* d_decayNodes,
+    const SL* d_slComb,
+    const DeviceResonance* d_res,
+    int res_idx_in_block,
+    const double* d_all_params,       // flat 自由参数数组
+    const int* d_param_map,
+    double* d_grad,
+    const int* d_global_idx,
+    int nEvents, int nPolar,
+    int decayChain_size,
+    double bf_d,
+    double sign)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+
+    const DeviceResonance& res = d_res[res_idx_in_block];
+    const double* p = d_all_params + res.param_offset;  // 该共振态的参数起始
+
+    // Step 1: 找共振态节点，计算不变质量和破缺动量
+    double mm = 0.0, qq = 0.0, q0 = 0.0;
+    int res_L = 0;
+    bool found = false;
+
+    for (int nodeIdx = 0; nodeIdx < decayChain_size; ++nodeIdx) {
+        const DecayNode& node = d_decayNodes[nodeIdx];
+        if (node.mother_idx != res.particle_idx) continue;
+
+        LorentzVector pMother  = d_momenta->getMomentum(evt, node.mother_idx);
+        LorentzVector pDaug1   = d_momenta->getMomentum(evt, node.daug1_idx);
+        LorentzVector pDaug2   = d_momenta->getMomentum(evt, node.daug2_idx);
+
+        mm = pMother.M();
+
+        double md1 = node.mass[1];
+        double md2 = node.mass[2];
+        if (md1 <= 0) md1 = pDaug1.M();
+        if (md2 <= 0) md2 = pDaug2.M();
+
+        qq = breakup_momentum(mm, md1, md2);
+        q0 = breakup_momentum(p[0], md1, md2);  // p[0] = mass
+        res_L = d_slComb[nodeIdx].L;
+        found = true;
+        break;
+    }
+    if (!found) return;
+
+    // Step 2: 构建 Var 对象，调用 AutoDiff 传播子
+    using AD = Var<double, Nfree, false>;
+    AD m_ad(mm);
+
+    // 确定每个自由参数在 Nfree 中的位置（哪个 grad 下标）
+    int free_to_grad[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    for (int j = 0; j < Nfree; ++j) {
+        int p_idx = d_param_map[j];
+        if (p_idx >= 0 && p_idx < 8) free_to_grad[p_idx] = j;
+    }
+
+    // 质量参数 AD
+    AD m0_ad(p[0]);
+    if (free_to_grad[0] >= 0) m0_ad.grad[free_to_grad[0]] = 1.0;
+
+    // 宽度/耦合参数 AD
+    AD gamma0_ad;
+    if (res.type == ResModelType::BWR || res.type == ResModelType::BW) {
+        gamma0_ad = AD(p[1]);
+        if (free_to_grad[1] >= 0) gamma0_ad.grad[free_to_grad[1]] = 1.0;
+    }
+
+    AD q_ad(qq);
+    AD q0_ad(q0);
+
+    // 调用模板化传播子
+    ComplexVar<double, Nfree, false> R_ad;
+    if (res.type == ResModelType::BWR) {
+        R_ad = BWR<AD>(m_ad, m0_ad, gamma0_ad, res_L, q_ad, q0_ad, bf_d);
+    } else if (res.type == ResModelType::BW) {
+        R_ad = BW<AD>(m_ad, m0_ad, gamma0_ad);
+    } else {
+        return;  // ONE / Flatte 暂不支持
+    }
+
+    // 势垒因子（常数，不需要导数）
+    double bf_val = 1.0;
+    if (res.type == ResModelType::BWR || res.type == ResModelType::ONE) {
+        bf_val = Bf<double>(res_L, qq, q0, bf_d);
+    }
+
+    // Step 3: 累加梯度  -2 * Re( conj(w) * T * ∂R/∂θ_j ) * bf_val
+    for (int p = 0; p < nPolar; ++p) {
+        cuComplex w_val = d_w[evt * nPolar + p];
+        cuComplex T_val = d_T[evt * nPolar + p];
+
+        double c_re = (double)w_val.x * (double)T_val.x + (double)w_val.y * (double)T_val.y;
+        double c_im = (double)w_val.x * (double)T_val.y - (double)w_val.y * (double)T_val.x;
+
+        for (int j = 0; j < Nfree; ++j) {
+            double dR_re = R_ad.real.grad[j];
+            double dR_im = R_ad.imag.grad[j];
+            double contrib = -2.0 * sign * (c_re * dR_re - c_im * dR_im) * bf_val;
+            int global_j = d_global_idx[j];
+            atomicAdd(&d_grad[global_j], contrib);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T 计算 kernel: T[e,p] = Σ_sl v[site+sl] * slamps[sl, e, p]
+// ---------------------------------------------------------------------------
+__global__ void computeEffectiveCouplingKernel(
+    cuComplex* d_T,
+    const thrust::complex<double>* d_slamps,
+    const cuComplex* d_v,
+    int nSL, int nTotal)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nTotal) return;
+
+    double re = 0.0, im = 0.0;
+    for (int sl = 0; sl < nSL; ++sl) {
+        auto sv = d_slamps[sl * nTotal + idx];
+        auto vv = d_v[sl];
+        // (vv.x + i*vv.y) * (sv.real + i*sv.imag)
+        re += (double)vv.x * sv.real() - (double)vv.y * sv.imag();
+        im += (double)vv.x * sv.imag() + (double)vv.y * sv.real();
+    }
+    d_T[idx] = make_cuComplex((float)re, (float)im);
+}
+
+// ---------------------------------------------------------------------------
+// AmpCalc::computeEffectiveCoupling
+// ---------------------------------------------------------------------------
+void AmpCalc::computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes)
+{
+    int n_gpu = static_cast<int>(cas_list_.empty() ? 0 : cas_list_[0]->getSLAmps().size());
+    if (n_gpu == 0 || blocks_.empty()) return;
+
+    constexpr int kBlockSize = 256;
+
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+
+        for (auto& block : blocks_) {
+            auto& cas = cas_list_[block.cas_idx];
+            int nSL = static_cast<int>(cas->getNSLCombs());
+            int nEv  = static_cast<int>(cas->getNEventsVec()[gpu]);
+            int nPol = static_cast<int>(cas->getNPolarizations());
+            int nTotal = nEv * nPol;
+
+            if (block.d_T[gpu] == nullptr) {
+                cudaMalloc(&block.d_T[gpu], nTotal * sizeof(cuComplex));
+            }
+
+            int grid = (nTotal + kBlockSize - 1) / kBlockSize;
+            computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
+                block.d_T[gpu], cas->getSLAmps()[gpu],
+                d_v + block.site, nSL, nTotal);
+            cudaDeviceSynchronize();
+        }
+    }
+}
+
+// 小 kernel：双精度数组累加 y[i] += alpha * x[i]
+__global__ void daxpy_kernel(double* y, const double* x, double alpha, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += alpha * x[i];
+}
+
+// ---------------------------------------------------------------------------
+// AmpCalc::computeResonanceGradient
+// ---------------------------------------------------------------------------
+void AmpCalc::computeResonanceGradient(
+    const std::vector<cuComplex*>& d_w,
+    double* d_grad_res,
+    double sign)
+{
+    int n_gpu = static_cast<int>(d_w.size());
+    int n_free = nFreeResParams();
+    if (n_free == 0 || blocks_.empty()) return;
+
+    constexpr int kBlockSize = 256;
+
+    // 为每 GPU 分配临时梯度 buffer
+    std::vector<double*> d_grad_per_gpu(n_gpu, nullptr);
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        cudaMalloc(&d_grad_per_gpu[gpu], n_free * sizeof(double));
+        cudaMemset(d_grad_per_gpu[gpu], 0, n_free * sizeof(double));
+    }
+
+    for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+        auto& block = blocks_[bi];
+        auto& cas = cas_list_[block.cas_idx];
+
+        for (int r = 0; r < block.resonance_count; ++r) {
+            std::vector<int> local_map, global_idx;
+            for (int s = 0; s < n_free; ++s) {
+                if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
+                    local_map.push_back(slots_[s].param_idx);
+                    global_idx.push_back(s);
+                }
+            }
+            int Nlocal = static_cast<int>(local_map.size());
+            if (Nlocal == 0) continue;
+
+            for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                cudaSetDevice(gpu);
+
+                int *d_param_map, *d_global_idx;
+                cudaMalloc(&d_param_map, Nlocal * sizeof(int));
+                cudaMalloc(&d_global_idx, Nlocal * sizeof(int));
+                cudaMemcpy(d_param_map, local_map.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_global_idx, global_idx.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
+
+                int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
+                int nPol = static_cast<int>(cas->getNPolarizations());
+                int grid = (nEv + kBlockSize - 1) / kBlockSize;
+
+                switch (Nlocal) {
+                case 1:
+                    resonanceGradientKernel<1><<<grid, kBlockSize>>>(
+                        d_w[gpu], block.d_T[gpu],
+                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                        cas->getDeviceSLCombs()[gpu], block.d_resonances[gpu],
+                        r, block.d_all_params[gpu],
+                        d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                        nEv, nPol, cas->getDecayChainSize(), 3.0, sign);
+                    break;
+                case 2:
+                    resonanceGradientKernel<2><<<grid, kBlockSize>>>(
+                        d_w[gpu], block.d_T[gpu],
+                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                        cas->getDeviceSLCombs()[gpu], block.d_resonances[gpu],
+                        r, block.d_all_params[gpu],
+                        d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                        nEv, nPol, cas->getDecayChainSize(), 3.0, sign);
+                    break;
+                case 3:
+                    resonanceGradientKernel<3><<<grid, kBlockSize>>>(
+                        d_w[gpu], block.d_T[gpu],
+                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                        cas->getDeviceSLCombs()[gpu], block.d_resonances[gpu],
+                        r, block.d_all_params[gpu],
+                        d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                        nEv, nPol, cas->getDecayChainSize(), 3.0, sign);
+                    break;
+                default: break;
+                }
+                cudaDeviceSynchronize();
+                cudaFree(d_param_map);
+                cudaFree(d_global_idx);
+            }
+        }
+    }
+
+    // 累加所有 GPU 到 d_grad_res（GPU 0）
+    cudaSetDevice(0);
+    cudaMemset(d_grad_res, 0, n_free * sizeof(double));
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        if (gpu == 0) {
+            cudaMemcpy(d_grad_res, d_grad_per_gpu[0],
+                       n_free * sizeof(double), cudaMemcpyDeviceToDevice);
+        } else {
+            // 通过 host 中转累加（n_free 很小，~几个 double）
+            std::vector<double> h_temp(n_free);
+            cudaSetDevice(gpu);
+            cudaMemcpy(h_temp.data(), d_grad_per_gpu[gpu],
+                       n_free * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaSetDevice(0);
+            double* d_temp;
+            cudaMalloc(&d_temp, n_free * sizeof(double));
+            cudaMemcpy(d_temp, h_temp.data(), n_free * sizeof(double), cudaMemcpyHostToDevice);
+            int grid = (n_free + 255) / 256;
+            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_temp, 1.0, n_free);
+            cudaDeviceSynchronize();
+            cudaFree(d_temp);
+        }
+    }
+
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        cudaFree(d_grad_per_gpu[gpu]);
+    }
+    cudaSetDevice(0);
+}
