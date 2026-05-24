@@ -621,6 +621,7 @@ public:
             amp_calc->reComputeAmps(d_all_amplitudes_list,
                 reinterpret_cast<const double*>(theta.data_ptr()),
                 n_amplitudes_, events_offsets_list, amp_offsets_list, n_polar_);
+            cudaDeviceSynchronize();
 
             // 预计算有效耦合 T（复用各 GPU 上的 extended_vector）
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -628,6 +629,7 @@ public:
                 const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(
                     extended_vec_per_gpu[gpu].data_ptr());
                 amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
+                cudaDeviceSynchronize();
             }
         }
 
@@ -771,9 +773,11 @@ public:
 
             // data 贡献 (sign=+1)
             if (totalDataEvents > 0) {
-                amp_calc->computeResonanceGradient(s_d_w_bufs, d_grad_res, +1.0);
+                // 构建 per-GPU data 事件数
+                std::vector<int> n_data_events(num_gpus);
+                for (int g = 0; g < num_gpus; ++g) n_data_events[g] = events_list[g][1];
+                amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res, +1.0);
             }
-
             // bkg 贡献 (sign=-1)
             // 注：bkg 的 w 需要单独捕获；此处简化为 bkg 与 data 共享 w buffer（后续完善）
             // 当前仅实现 data 贡献

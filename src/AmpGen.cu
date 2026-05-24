@@ -1689,31 +1689,28 @@ __global__ void computeEffectiveCouplingKernel(
 // ---------------------------------------------------------------------------
 void AmpCalc::computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes)
 {
-    int n_gpu = static_cast<int>(cas_list_.empty() ? 0 : cas_list_[0]->getSLAmps().size());
-    if (n_gpu == 0 || blocks_.empty()) return;
+    if (cas_list_.empty() || blocks_.empty()) return;
+    // 仅在当前设备上计算 T（调用者负责 per-GPU 循环）
+    int gpu = 0; cudaGetDevice(&gpu);
 
     constexpr int kBlockSize = 256;
 
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
+    for (auto& block : blocks_) {
+        auto& cas = cas_list_[block.cas_idx];
+        int nSL = static_cast<int>(cas->getNSLCombs());
+        int nEv  = static_cast<int>(cas->getNEventsVec()[gpu]);
+        int nPol = static_cast<int>(cas->getNPolarizations());
+        int nTotal = nEv * nPol;
 
-        for (auto& block : blocks_) {
-            auto& cas = cas_list_[block.cas_idx];
-            int nSL = static_cast<int>(cas->getNSLCombs());
-            int nEv  = static_cast<int>(cas->getNEventsVec()[gpu]);
-            int nPol = static_cast<int>(cas->getNPolarizations());
-            int nTotal = nEv * nPol;
-
-            if (block.d_T[gpu] == nullptr) {
-                cudaMalloc(&block.d_T[gpu], nTotal * sizeof(cuComplex));
-            }
-
-            int grid = (nTotal + kBlockSize - 1) / kBlockSize;
-            computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
-                block.d_T[gpu], cas->getSLAmps()[gpu],
-                d_v + block.site, nSL, nTotal);
-            cudaDeviceSynchronize();
+        if (block.d_T[gpu] == nullptr) {
+            cudaMalloc(&block.d_T[gpu], nTotal * sizeof(cuComplex));
         }
+
+        int grid = (nTotal + kBlockSize - 1) / kBlockSize;
+        computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
+            block.d_T[gpu], cas->getSLAmps()[gpu],
+            d_v + block.site, nSL, nTotal);
+        cudaDeviceSynchronize();
     }
 }
 
@@ -1728,6 +1725,7 @@ __global__ void daxpy_kernel(double* y, const double* x, double alpha, int n) {
 // ---------------------------------------------------------------------------
 void AmpCalc::computeResonanceGradient(
     const std::vector<cuComplex*>& d_w,
+    const std::vector<int>& n_events,
     double* d_grad_res,
     double sign)
 {
@@ -1769,10 +1767,9 @@ void AmpCalc::computeResonanceGradient(
                 cudaMemcpy(d_param_map, local_map.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_global_idx, global_idx.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
 
-                int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
+                int nEv = n_events[gpu];
                 int nPol = static_cast<int>(cas->getNPolarizations());
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
-
                 switch (Nlocal) {
                 case 1:
                     resonanceGradientKernel<1><<<grid, kBlockSize>>>(

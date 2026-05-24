@@ -236,6 +236,7 @@ public:
     // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
     void computeResonanceGradient(
         const std::vector<cuComplex*>& d_w,   // 每 GPU 一份
+        const std::vector<int>& n_events,     // 每 GPU 的事件数（对应 d_w 的大小）
         double* d_grad_res,                   // 输出，在 GPU 0
         double sign = 1.0);                   // +1=加, -1=减
 
