@@ -462,15 +462,15 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             res.tex.push_back(props["tex"].as<std::string>());
         }
 
-        // 解析scan字段: [0,1] 扫params[0]和params[1]; [-1] 全扫
-        if (props["scan"]) {
-            res.scan = props["scan"].as<std::vector<int>>();
+        // 解析free字段: [0,1] 扫params[0]和params[1]; [-1] 全扫
+        if (props["free"]) {
+            res.free = props["free"].as<std::vector<int>>();
         }
 
-        // 解析scan_range: 每个scan参数对应的 [lower, upper]
-        if (props["scan_range"]) {
-            for (const auto& range_node : props["scan_range"]) {
-                res.scan_range.push_back(range_node.as<std::vector<double>>());
+        // 解析free_range: 每个free参数对应的 [lower, upper]
+        if (props["free_range"]) {
+            for (const auto& range_node : props["free_range"]) {
+                res.free_range.push_back(range_node.as<std::vector<double>>());
             }
         }
 

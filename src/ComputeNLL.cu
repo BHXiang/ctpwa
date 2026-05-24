@@ -102,7 +102,8 @@ void axpyComplex(cuComplex* y, const cuComplex* x, cuComplex alpha, int n) {
 double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_grad_out,
     int nEvents, int n_polar, int n_amplitudes,
-    const double* d_weights)
+    const double* d_weights,
+    cuComplex* d_w_out)
 {
     const int nTotal = nEvents * n_polar;
     constexpr int kBlockSize = 256;
@@ -170,8 +171,13 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
 
     // 现在同步并读取NLL值（之前是异步拷贝）
     cudaDeviceSynchronize();
-    double raw_nll = *s_pinned_nll;
 
+    // 若调用者需要 w = S/I（用于共振态梯度），复制到输出 buffer
+    if (d_w_out != nullptr) {
+        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+    }
+
+    double raw_nll = *s_pinned_nll;
     return raw_nll;
 }
 

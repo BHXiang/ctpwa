@@ -24,7 +24,7 @@ void computePHSPfactor(const cuComplex *d_matrix, const cuComplex *d_vector,
 // d_P_vec: n_amplitudes, phsp投影向量
 // d_grad_out: n_amplitudes, 输出梯度 ∂NLL/∂v
 // 返回: NLL = -Σlog(|A_k·v|²) + nEvents·log(phsp_factor)
-double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector, cuComplex* d_grad_out, int nEvents, int n_polar, int n_amplitudes, const double* d_weights = nullptr);
+double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector, cuComplex* d_grad_out, int nEvents, int n_polar, int n_amplitudes, const double* d_weights = nullptr, cuComplex* d_w_out = nullptr);
 
 // 就地共轭复数数组
 void conjugateComplexArray(cuComplex* data, int N);

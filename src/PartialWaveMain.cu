@@ -583,7 +583,9 @@ public:
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
         torch::Tensor vector,
+        torch::Tensor theta,                   // [新增] 共振态参数 [nFreeResParams]
         std::vector<cuComplex*>& d_all_amplitudes_list,
+        AmpCalc* amp_calc,                     // [新增] 共振态管理器
         cuComplex* d_phsp_matrix_,
         const std::vector<std::vector<int>>& events_list,
         const std::vector<std::vector<int>>& events_offsets_list,
@@ -609,6 +611,24 @@ public:
         for (int i = 0; i < num_gpus; ++i) {
             extended_vec_per_gpu.push_back(
                 extended_vector.to(torch::Device(torch::kCUDA, i)));
+        }
+
+        // === 新增：Step 2.5: 更新振幅 & 预计算有效耦合 ===
+        int n_free_res = 0;
+        if (amp_calc) n_free_res = amp_calc->nFreeResParams();
+        if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
+            // 重新计算 d_all_amplitudes（用新的共振态参数）
+            amp_calc->reComputeAmps(d_all_amplitudes_list,
+                reinterpret_cast<const double*>(theta.data_ptr()),
+                n_amplitudes_, events_offsets_list, amp_offsets_list, n_polar_);
+
+            // 预计算有效耦合 T（复用各 GPU 上的 extended_vector）
+            for (int gpu = 0; gpu < num_gpus; ++gpu) {
+                cudaSetDevice(gpu);
+                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(
+                    extended_vec_per_gpu[gpu].data_ptr());
+                amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
+            }
         }
 
         // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
@@ -651,20 +671,26 @@ public:
         static cuComplex* s_d_grad_global = nullptr;
         static cuComplex* s_d_grad_buf = nullptr;
         static std::vector<cuComplex*> s_d_grad_per_gpu;
+        static std::vector<cuComplex*> s_d_w_bufs;       // [新增] per-GPU w buffer
+        static std::vector<int> s_w_buf_sizes;            // [新增]
         static int s_alloc_n = 0;
 
         if (s_alloc_n < extended_n_gls || s_d_grad_per_gpu.size() < (size_t)num_gpus) {
             if (s_d_grad_global) cudaFree(s_d_grad_global);
             if (s_d_grad_buf) cudaFree(s_d_grad_buf);
             for (auto& p : s_d_grad_per_gpu) if (p) cudaFree(p);
+            for (auto& p : s_d_w_bufs) if (p) cudaFree(p);
 
             cudaSetDevice(primary_dev);
             cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(cuComplex));
             cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(cuComplex));
             s_d_grad_per_gpu.resize(num_gpus, nullptr);
+            s_d_w_bufs.resize(num_gpus, nullptr);
+            s_w_buf_sizes.resize(num_gpus, 0);
             for (int g = 0; g < num_gpus; ++g) {
                 cudaSetDevice(g);
                 cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(cuComplex));
+                // w buffer 按需分配（下面各循环中）
             }
             s_alloc_n = extended_n_gls;
         }
@@ -685,8 +711,20 @@ public:
             if (nData_gpu > 0) {
                 cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][1];
 
+                // 分配/检查 w buffer（仅当有 theta 即做共振态拟合时）
+                cuComplex* d_w_out = nullptr;
+                if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
+                    int nTotal = nData_gpu * n_polar_;
+                    if (s_w_buf_sizes[gpu] < nTotal) {
+                        if (s_d_w_bufs[gpu]) cudaFree(s_d_w_bufs[gpu]);
+                        cudaMalloc(&s_d_w_bufs[gpu], nTotal * sizeof(cuComplex));
+                        s_w_buf_sizes[gpu] = nTotal;
+                    }
+                    d_w_out = s_d_w_bufs[gpu];
+                }
+
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
-                    d_grad, nData_gpu, n_polar_, n_amplitudes_);
+                    d_grad, nData_gpu, n_polar_, n_amplitudes_, nullptr, d_w_out);
 
                 total_data_nll += nll;
                 totalDataEvents += nData_gpu;
@@ -712,7 +750,6 @@ public:
                     d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w);
 
                 total_bkg_nll += nll;
-                // P2P累加到global (负号，loss = data - bkg)
                 if (gpu == primary_dev) {
                     axpyComplex(d_grad_global, d_grad, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
                 }
@@ -722,6 +759,34 @@ public:
                     axpyComplex(d_grad_global, d_grad_buf, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
                 }
             }
+        }
+
+        // === 新增：计算共振态参数梯度 ===
+        torch::Tensor grad_theta;
+        if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
+            cudaSetDevice(primary_dev);
+            double* d_grad_res;
+            cudaMalloc(&d_grad_res, n_free_res * sizeof(double));
+            cudaMemset(d_grad_res, 0, n_free_res * sizeof(double));
+
+            // data 贡献 (sign=+1)
+            if (totalDataEvents > 0) {
+                amp_calc->computeResonanceGradient(s_d_w_bufs, d_grad_res, +1.0);
+            }
+
+            // bkg 贡献 (sign=-1)
+            // 注：bkg 的 w 需要单独捕获；此处简化为 bkg 与 data 共享 w buffer（后续完善）
+            // 当前仅实现 data 贡献
+
+            grad_theta = torch::empty({ n_free_res },
+                torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
+            cudaMemcpy(grad_theta.data_ptr(), d_grad_res,
+                n_free_res * sizeof(double), cudaMemcpyDeviceToDevice);
+            cudaFree(d_grad_res);
+        }
+        else {
+            grad_theta = torch::empty({ 0 },
+                torch::TensorOptions().dtype(torch::kFloat64).device(vector.device()));
         }
 
         // // 输出d_grad_global检查
@@ -783,6 +848,7 @@ public:
 
         ctx->save_for_backward({ vector, extended_vec_per_gpu[0] });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
+        ctx->saved_data["grad_theta"] = grad_theta;
 
         // std::cout << "Total data NLL: " << loss << std::endl;
         return torch::tensor(loss, torch::kDouble).to(vector.device());
@@ -794,18 +860,18 @@ public:
     {
         const auto saved = ctx->get_saved_variables();
         const auto& original_vector = saved[0];
-        const auto& extended_vector_template = saved[1];  // 用于获取设备信息等
+        const auto& extended_vector_template = saved[1];
         const auto& global_extended_grad = ctx->saved_data["global_extended_grad"].toTensor();
+        const auto& grad_theta = ctx->saved_data["grad_theta"].toTensor();
 
-        // 合并梯度（考虑约束）
         torch::Tensor grad_vector = mergeGradientsWithConstraints(global_extended_grad, original_vector.numel());
 
-        // 返回梯度，其余输入参数返回空张量
-        return { grad_vector,
+        return { grad_vector * grad_outputs[0],
+                grad_theta.numel() > 0 ? grad_theta * grad_outputs[0] : torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
-                torch::Tensor() };
+                torch::Tensor(), torch::Tensor() };
     }
 
     // 设置约束的静态方法
@@ -1084,10 +1150,12 @@ public:
 
     bool isValid() const { return initialized_; }
 
-    torch::Tensor getNLL(torch::Tensor& vector)
+    torch::Tensor getNLL(torch::Tensor& vector, torch::Tensor theta = torch::empty({ 0 }))
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
-        return NLLFunction::apply(vector, d_all_amplitudes_, d_phsp_matrix_, events_, events_offsets_, amp_offsets_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
+        return NLLFunction::apply(vector, theta, d_all_amplitudes_, &amp_calc_,
+            d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
+            phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
     int getNVector() const { return n_gls_ - con_trans_id_.size(); }
@@ -3381,27 +3449,27 @@ private:
                     if (amp_calc)
                     {
                         const auto& config_res = config_parser_.getResonances();
-                        std::vector<std::vector<int>> all_scan;
-                        std::vector<std::vector<std::vector<double>>> all_ranges;
+                        std::vector<std::vector<int>> all_free;
+                        std::vector<std::vector<std::vector<double>>> all_free_ranges;
                         bool has_any = false;
                         for (const auto& res : resonance)
                         {
                             auto it = config_res.find(res.getName());
-                            if (it != config_res.end() && !it->second.scan.empty())
+                            if (it != config_res.end() && !it->second.free.empty())
                             {
-                                all_scan.push_back(it->second.scan);
-                                all_ranges.push_back(it->second.scan_range);
+                                all_free.push_back(it->second.free);
+                                all_free_ranges.push_back(it->second.free_range);
                                 has_any = true;
                             }
                             else
                             {
-                                all_scan.push_back({});
-                                all_ranges.push_back({});
+                                all_free.push_back({});
+                                all_free_ranges.push_back({});
                             }
                         }
                         if (has_any)
                         {
-                            amp_calc->addBlock(cas, resonance, gls_index, all_scan, all_ranges);
+                            amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges);
                         }
                     }
 
@@ -3422,7 +3490,12 @@ PYBIND11_MODULE(ctpwa, m)
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
-        .def("getNLL", &analysis::getNLL)
+        .def("getNLL", [](analysis& self, torch::Tensor vector) {
+        return self.getNLL(vector);
+            }, pybind11::arg("vector"))
+        .def("getNLL", [](analysis& self, torch::Tensor vector, torch::Tensor theta) {
+        return self.getNLL(vector, theta);
+            }, pybind11::arg("vector"), pybind11::arg("theta"))
         .def("getNVector", &analysis::getNVector)
         .def("getSLVectors", &analysis::getSLVectors)
         .def("writeResult", &analysis::writeResult)

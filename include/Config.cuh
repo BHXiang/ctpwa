@@ -27,8 +27,8 @@ struct ResonanceConfig {
   std::vector<double> parameters;
   std::vector<std::vector<double>> channels; // Flatte: [[m_a, m_b], ...]; 非Flatte为空
   std::vector<std::string> tex;
-  std::vector<int> scan; // 需要scan的参数下标; {-1}=全扫; 空=不扫
-  std::vector<std::vector<double>> scan_range; // 每个scan参数的 [lower, upper]; 空=使用默认
+  std::vector<int> free; // 需要拟合的参数下标; {-1}=全部; 空=不拟合
+  std::vector<std::vector<double>> free_range; // 每个free参数的 [lower, upper]; 空=使用默认
 };
 
 struct SpinChainConfig {

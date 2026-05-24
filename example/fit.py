@@ -19,7 +19,6 @@ amplitude_names = ana.getAmplitudeNames()
 n_gls_total = ana.getNVector()
 
 print(f"总振幅数量: {n_gls_total}")
-print(f"共轭对数量: {len(conjugate_pairs)}")
 print(f"可变参数数量: {n_gls_total - 1}")
 
 # 显示共轭对信息
@@ -27,20 +26,12 @@ print("共轭对信息:")
 for idx1, idx2 in conjugate_pairs:
     print(f"  {amplitude_names[idx1]} ({idx1}) <-> {amplitude_names[idx2]} ({idx2})")
 
-# 获取数据张量
-phsp = ana.getPhspTensor()
-data = ana.getDataTensor()
-bkg = ana.getBkgTensor()
-bkg_wt = ana.getBkgWeightsTensor()
-
 n_polar = ana.getNPolarizations()
 total_gls = n_gls_total + len(conjugate_pairs)
-Ndata = int(len(data) / n_polar / total_gls)
-Nbkg = int(len(bkg) / n_polar / total_gls)
 
 
 def generate_initial_params(
-    n_gls_total, seed=42, device="cuda", initial_params_file=None, amplitude_names=None
+    n_gls_total, seed=44, device="cuda", initial_params_file=None, amplitude_names=None
 ):
     """生成初始参数 - 支持从文件加载或随机生成"""
     # 如果提供了初始参数文件，尝试加载
@@ -92,7 +83,6 @@ class SimplePWAOptimizer:
         self.best_nll = float("inf")
         self.best_params = None
         self.all_results = []  # 存储所有结果
-        self.all_matrices = {}  # 存储所有矩阵结果
         self.n_fixed = 1  # 固定参数数量
         self.n_variable = n_gls_total - self.n_fixed  # 可变参数数量
         self.n_real_variable = 2 * self.n_variable  # 可变实数参数数量 (实部+虚部)
@@ -112,6 +102,10 @@ class SimplePWAOptimizer:
         # 计算梯度
         grad = torch.autograd.grad(nll, params, retain_graph=False)[0]
 
+        # print("Params: ", params)
+        # print("NLL: ", nll)
+        # print("Gradiant: ", grad)
+
         # 确保第一个参数的梯度为0（因为我们固定了它）
         with torch.no_grad():
             grad[0] = torch.complex(
@@ -119,364 +113,29 @@ class SimplePWAOptimizer:
                 torch.tensor(0.0, device=self.device),
             )
 
+        # # 添加L2正则化项（仅对可变参数）
+        # lambda_reg = 1e-4  # 正则化强度，可以根据需要调整
+        # reg_loss = lambda_reg * torch.sum(torch.abs(params[1:]) ** 2)
+        # reg_grad = torch.zeros_like(grad)
+        # reg_grad[1:] = 2 * lambda_reg * params[1:].conj()  # 复数参数的梯度
+
+        # nll = nll + reg_loss
+        # grad = grad + reg_grad
+
         return nll, grad
 
-    def compute_hessian(self, params):
-        """计算Hessian矩阵 - 第一个参数固定为1+0j"""
-        real_origin_vector_without_fixed = torch.view_as_real(params).flatten()
-
-        # 使用 torch.autograd.functional.hessian
-        # 将复数参数转换为实数参数，但排除第一个固定参数
-        def real_loss_fn(real_params):
-            # 第一个参数固定为1+0j，所以从第二个参数开始
-            # 构建完整的参数向量，第一个参数固定为1+0j
-            complex_vector = torch.view_as_complex(
-                torch.cat(
-                    [
-                        torch.tensor([[1.0, 0.0]], device=phsp.device),
-                        real_params.view(-1, 2),
-                    ],
-                    dim=0,
-                )
-            )
-            vector = torch.zeros(
-                n_gls_total + len(conjugate_pairs), dtype=torch.complex64, device="cuda"
-            )
-            # 填充实部和虚部
-            for i in range(len(complex_vector)):
-                # print(f"Index {i}, Value: {origin_vector[i]}")
-                vector[i] = complex_vector[i]
-
-            # 拓展vector以包含共轭对
-            for i in range(n_gls_total - len(conjugate_pairs), n_gls_total):
-                j = conjugate_pairs[i - (n_gls_total - len(conjugate_pairs))][1]
-                # print(f"Index {i} is conjugate of index {j}")
-                vector[j] = -1 * vector[i]
-
-            # 重新计算损失
-            phsp_factor_new = torch.sum(
-                torch.abs(phsp.view(total_gls, -1).t() @ vector) ** 2
-            ) / (len(phsp) / total_gls / n_polar)
-
-            nll_new = -torch.sum(
-                torch.log(
-                    torch.sum(
-                        torch.abs(
-                            torch.sum(
-                                data.view(total_gls, Ndata, n_polar)
-                                * vector.unsqueeze(1).unsqueeze(2),
-                                dim=0,
-                            )
-                        )
-                        ** 2,
-                        dim=1,
-                    )
-                    / phsp_factor_new
-                )
-            )
-            if len(bkg_wt) == Nbkg:
-                nll_bkg_new = -torch.sum(
-                    bkg_wt
-                    * torch.log(
-                        torch.sum(
-                            torch.abs(
-                                torch.sum(
-                                    bkg.view(total_gls, Nbkg, n_polar)
-                                    * vector.unsqueeze(1).unsqueeze(2),
-                                    dim=0,
-                                )
-                            )
-                            ** 2,
-                            dim=1,
-                        )
-                        / phsp_factor_new
-                    )
-                )
-            else:
-                nll_bkg_new = -torch.sum(
-                    torch.log(
-                        torch.sum(
-                            torch.abs(
-                                torch.sum(
-                                    bkg.view(total_gls, Nbkg, n_polar)
-                                    * vector.unsqueeze(1).unsqueeze(2),
-                                    dim=0,
-                                )
-                            )
-                            ** 2,
-                            dim=1,
-                        )
-                        / phsp_factor_new
-                    )
-                )
-
-            return nll_new - nll_bkg_new
-
-        hessian = torch.autograd.functional.hessian(
-            real_loss_fn, real_origin_vector_without_fixed
-        )
-        return hessian
-
-    def check_positive_definite(self, matrix, tol=1e-8):
-        """检查矩阵是否正定"""
-        try:
-            # 计算特征值
-            eigenvalues = torch.linalg.eigvalsh(matrix)  # 使用eigvalsh处理实对称矩阵
-            # 检查所有特征值是否大于0
-            is_positive_definite = torch.all(eigenvalues > tol)
-            min_eigenvalue = torch.min(eigenvalues).item()
-            max_eigenvalue = torch.max(eigenvalues).item()
-            condition_number = (
-                max_eigenvalue / min_eigenvalue if min_eigenvalue > 0 else float("inf")
-            )
-
-            return (
-                is_positive_definite.item(),
-                min_eigenvalue,
-                max_eigenvalue,
-                condition_number,
-            )
-        except Exception as e:
-            print(f"检查正定性时出错: {e}")
-            return False, 0, 0, float("inf")
-
-    def compute_covariance_matrix(self, hessian):
-        """从Hessian矩阵计算协方差矩阵"""
-        try:
-            # 协方差矩阵是Hessian矩阵的逆
-            covariance = torch.linalg.inv(hessian)
-            return covariance
-        except Exception as e:
-            print(f"计算协方差矩阵时出错: {e}")
-            return None
-
-    def compute_correlation_matrix(self, covariance):
-        """从协方差矩阵计算相关系数矩阵"""
-        try:
-            # 获取标准差（协方差矩阵对角线的平方根）
-            std_dev = torch.sqrt(torch.diag(covariance))
-
-            # 计算相关系数矩阵
-            correlation = covariance / torch.outer(std_dev, std_dev)
-
-            # 将对角线设为1（防止数值误差）
-            n = correlation.shape[0]
-            correlation[range(n), range(n)] = 1.0
-
-            return correlation
-        except Exception as e:
-            print(f"计算相关系数矩阵时出错: {e}")
-            return None
-
-    def compute_parameter_errors(self, covariance, params):
-        """计算参数误差"""
-        try:
-            # 获取标准差
-            std_dev = torch.sqrt(torch.diag(covariance))
-
-            # 将实数参数误差映射回复数参数
-            # 实数参数顺序：[实部1, 虚部1, 实部2, 虚部2, ...]
-            n_complex = self.n_variable
-            real_errors = torch.zeros(
-                n_complex, dtype=torch.float32, device=self.device
-            )
-            imag_errors = torch.zeros(
-                n_complex, dtype=torch.float32, device=self.device
-            )
-
-            for i in range(n_complex):
-                real_errors[i] = std_dev[2 * i]
-                imag_errors[i] = std_dev[2 * i + 1]
-
-            # 第一个参数（固定参数）的误差为0
-            full_real_errors = torch.zeros(
-                n_gls_total, dtype=torch.float32, device=self.device
-            )
-            full_imag_errors = torch.zeros(
-                n_gls_total, dtype=torch.float32, device=self.device
-            )
-            full_real_errors[1:] = real_errors
-            full_imag_errors[1:] = imag_errors
-
-            return full_real_errors, full_imag_errors
-        except Exception as e:
-            print(f"计算参数误差时出错: {e}")
-            return None, None
-
     def compute_branching_fractions(self, params=None):
-        """计算并打印分支比率"""
-        print("计算分支比...")
-        total_gls = n_gls_total + len(conjugate_pairs)
+        """使用C++端计算分支比，返回 (中心值, 误差)"""
         if params is None:
             if self.best_params is None:
                 print("没有优化结果!")
-                return
+                return None, None
             params = self.best_params
 
-        slvector = ana.getSLVectors()
-        truth = ana.getTruthTensor()
-
-        vector = torch.zeros(
-            n_gls_total + len(conjugate_pairs),
-            dtype=torch.complex64,
-            device=phsp.device,
-        )
-        # 填充实部和虚部
-        for i in range(len(params)):
-            # print(f"Index {i}, Value: {origin_vector[i]}")
-            vector[i] = params[i]
-
-        # 拓展vector以包含共轭对
-        for i in range(n_gls_total - len(conjugate_pairs), n_gls_total):
-            j = conjugate_pairs[i - (n_gls_total - len(conjugate_pairs))][1]
-            # print(f"Index {i} is conjugate of index {j}")
-            vector[j] = -1 * vector[i]
-
-        def compute_scattering_matrix(total_amp, slvector):
-            """
-            向量化版本计算实数散射矩阵
-
-            Args:
-                total_amp: 形状为 (total_gls, Nphsp*n_polar) 的复数张量
-                slvector: 形状为 (num_particles,) 的张量
-
-            Returns:
-                real_matrix: 形状为 (num_particles, num_particles) 的实数对称矩阵
-            """
-            num_particles = slvector.size(0)
-            total_gls = total_amp.size(0)
-
-            # 1. 构建分波到粒子的映射矩阵
-            wave_to_particle = torch.zeros(
-                num_particles, total_gls, dtype=torch.complex64, device=total_amp.device
-            )
-
-            start_idx = 0
-            for i in range(num_particles):
-                n_waves = int(slvector[i])
-                end_idx = start_idx + n_waves
-                wave_to_particle[i, start_idx:end_idx] = 1.0 + 0j
-                start_idx = end_idx
-
-            # 2. 将振幅按粒子分组
-            # (num_particles, total_gls) × (total_gls, N) → (num_particles, N)
-            particle_amps = wave_to_particle @ total_amp
-
-            # 3. 计算复数散射矩阵 S = A A^†
-            # (num_particles, N) × (N, num_particles) → (num_particles, num_particles)
-            complex_matrix = particle_amps @ particle_amps.conj().t()
-
-            # 4. 转换为实数矩阵: 2 * Re(S)
-            # 注意：由于 S_ij = A_i A_j^†，且 S_ji = S_ij^*，所以 S_ij + S_ij^* = 2 * Re(S_ij)
-            real_matrix = 2 * complex_matrix.real
-
-            return real_matrix
-
-        def compute_branching_fraction(real_params):
-            # 复数参数转换
-            complex_vector = torch.view_as_complex(real_params.view(-1, 2))
-            Ntruth = truth.shape[0] // total_gls // n_polar
-
-            truth_amp = truth.view(
-                total_gls, Ntruth * n_polar
-            ) * complex_vector.unsqueeze(1)
-            # phsp_amp = phsp.view(total_gls, Nphsp*n_polar)*complex_vector.unsqueeze(1)
-
-            inter_truth = compute_scattering_matrix(truth_amp, slvector)
-
-            ############### 计算branching fraction ###############
-            eff_tot = torch.sum(
-                torch.abs(phsp.view(total_gls, -1).t() @ complex_vector) ** 2
-            ) / torch.sum(
-                torch.abs(truth.view(total_gls, -1).t() @ complex_vector) ** 2
-            )
-            bf = (
-                inter_truth.diag()
-                * (Ndata - Nbkg)
-                / eff_tot
-                / torch.sum(
-                    torch.abs(truth.view(total_gls, -1).t() @ complex_vector) ** 2
-                )
-            )
-            return bf
-
-        real_vector = torch.view_as_real(vector).flatten()
-        bf_values = compute_branching_fraction(real_vector)
-        jacobian = torch.autograd.functional.jacobian(
-            compute_branching_fraction, real_vector
-        )
-
-        def real_loss_fn(real_params):
-            # 第一个参数固定为1+0j，所以从第二个参数开始
-            # 构建完整的参数向量，第一个参数固定为1+0j
-            # complex_vector = torch.view_as_complex(torch.cat([torch.tensor([[1.0, 0.0]], device=phsp.device), real_params.view(-1, 2)], dim=0))
-            complex_vector = torch.view_as_complex(real_params.view(-1, 2))
-
-            # 重新计算损失
-            phsp_factor_new = torch.sum(
-                torch.abs(phsp.view(total_gls, -1).t() @ complex_vector) ** 2
-            ) / (len(phsp) / total_gls / n_polar)
-
-            nll_new = -torch.sum(
-                torch.log(
-                    torch.sum(
-                        torch.abs(
-                            torch.sum(
-                                data.view(total_gls, Ndata, n_polar)
-                                * complex_vector.unsqueeze(1).unsqueeze(2),
-                                dim=0,
-                            )
-                        )
-                        ** 2,
-                        dim=1,
-                    )
-                    / phsp_factor_new
-                )
-            )
-            if len(bkg_wt) == Nbkg:
-                nll_bkg_new = -torch.sum(
-                    bkg_wt
-                    * torch.log(
-                        torch.sum(
-                            torch.abs(
-                                torch.sum(
-                                    bkg.view(total_gls, Nbkg, n_polar)
-                                    * complex_vector.unsqueeze(1).unsqueeze(2),
-                                    dim=0,
-                                )
-                            )
-                            ** 2,
-                            dim=1,
-                        )
-                        / phsp_factor_new
-                    )
-                )
-            else:
-                nll_bkg_new = -torch.sum(
-                    torch.log(
-                        torch.sum(
-                            torch.abs(
-                                torch.sum(
-                                    bkg.view(total_gls, Nbkg, n_polar)
-                                    * complex_vector.unsqueeze(1).unsqueeze(2),
-                                    dim=0,
-                                )
-                            )
-                            ** 2,
-                            dim=1,
-                        )
-                        / phsp_factor_new
-                    )
-                )
-
-            return nll_new - nll_bkg_new
-
-        hessian = torch.autograd.functional.hessian(real_loss_fn, real_vector)
-
-        bf_errors = torch.sqrt(
-            torch.diag(jacobian @ torch.linalg.pinv(hessian) @ jacobian.t())
-        )
-
+        bf_result = self.analysis.getBranchFractions(params)
+        # 第一列是中心值，第二列是误差
+        bf_values = bf_result[:, 0]
+        bf_errors = bf_result[:, 1]
         return bf_values, bf_errors
 
     def optimize_single_run(
@@ -500,6 +159,7 @@ class SimplePWAOptimizer:
             tolerance_grad=tolerance_grad,
             tolerance_change=tolerance_change,
             history_size=history_size,
+            line_search_fn="strong_wolfe",
         )
 
         nll_history = []
@@ -519,30 +179,46 @@ class SimplePWAOptimizer:
         final_nll = nll_history[-1] if nll_history else float("inf")
         final_params = params.clone().detach()
 
-        # 计算Hessian矩阵
-        # print(f"计算Hessian矩阵...")
+        # 计算Hessian矩阵 (使用C++端)
         hessian_start = time.time()
-        hessian = self.compute_hessian(final_params[1:])
+        hessian = self.analysis.getHessian(final_params)
         hessian_time = time.time() - hessian_start
-        # print(f"Hessian矩阵计算耗时: {hessian_time:.2f} 秒")
 
-        # 检查Hessian矩阵正定性
-        is_pos_def, min_eig, max_eig, cond_num = self.check_positive_definite(hessian)
+        # 如果Hessian包含固定参数，去除之
+        if hessian.shape[0] == 2 * n_gls_total:
+            hessian = hessian[2:, 2:]
 
-        # 计算协方差矩阵和相关系数矩阵
-        covariance = None
-        correlation = None
+        # 计算特征值，判断正定性
+        try:
+            eigenvalues = torch.linalg.eigvalsh(hessian)
+            is_pos_def = bool(torch.all(eigenvalues > 0).item())
+        except torch._C._LinAlgError:
+            print(f"警告: Hessian矩阵病态，无法计算特征值，视为不正定")
+            eigenvalues = torch.zeros(hessian.shape[0], device=self.device)
+            is_pos_def = False
+        min_eig = eigenvalues[0].item()
+        max_eig = eigenvalues[-1].item()
+        cond_num = max_eig / min_eig if min_eig > 0 else float("inf")
+
+        # 计算参数误差
         real_errors = None
         imag_errors = None
-
         if is_pos_def:
-            # print(f"Hessian矩阵正定，计算协方差矩阵...")
-            covariance = self.compute_covariance_matrix(hessian)
-            if covariance is not None:
-                correlation = self.compute_correlation_matrix(covariance)
-                real_errors, imag_errors = self.compute_parameter_errors(
-                    covariance, final_params
+            try:
+                covariance = torch.linalg.inv(hessian)
+                std_dev = torch.sqrt(torch.diag(covariance))
+
+                real_errors = torch.zeros(
+                    n_gls_total, dtype=torch.float32, device=self.device
                 )
+                imag_errors = torch.zeros(
+                    n_gls_total, dtype=torch.float32, device=self.device
+                )
+                for i in range(self.n_variable):
+                    real_errors[i + 1] = std_dev[2 * i]
+                    imag_errors[i + 1] = std_dev[2 * i + 1]
+            except Exception as e:
+                print(f"计算参数误差时出错: {e}")
 
         # 保存当前运行的结果
         result = {
@@ -559,8 +235,6 @@ class SimplePWAOptimizer:
             "min_eigenvalue": min_eig,
             "max_eigenvalue": max_eig,
             "condition_number": cond_num,
-            "covariance": covariance,
-            "correlation": correlation,
             "real_errors": real_errors,
             "imag_errors": imag_errors,
         }
@@ -569,88 +243,9 @@ class SimplePWAOptimizer:
         if final_nll < self.best_nll:
             self.best_nll = final_nll
             self.best_params = final_params.clone()
-            self.best_result = result  # 保存完整的最佳结果
+            self.best_result = result
 
         return result
-
-    def save_matrices(self, result, cov_file_path, corr_file_path, is_first_run=False):
-        """将协方差矩阵和相关系数矩阵追加保存到文件"""
-        run_id = result["run_id"]
-
-        # 保存协方差矩阵
-        if result["covariance"] is not None:
-            self.save_matrix_to_file(
-                result["covariance"],
-                cov_file_path,
-                f"协方差矩阵 - 第 {run_id} 次运行",
-                run_id,
-                is_first_run,
-                "covariance_matrix.txt",
-            )
-
-        # 保存相关系数矩阵
-        if result["correlation"] is not None:
-            self.save_matrix_to_file(
-                result["correlation"],
-                corr_file_path,
-                f"相关系数矩阵 - 第 {run_id} 次运行",
-                run_id,
-                is_first_run,
-                "correlation_matrix.txt",
-            )
-
-    def save_matrix_to_file(
-        self, matrix, filename, matrix_name, run_id, is_first_run, base_filename
-    ):
-        """保存矩阵到文件（追加模式）"""
-        try:
-            mode = "w" if is_first_run else "a"
-
-            with open(filename, mode) as f:
-                if is_first_run:
-                    # 写入文件头
-                    # f.write("# PWA 矩阵数据\n")
-                    f.write("#" * 80 + "\n")
-                    f.write(f"# 文件: {base_filename}\n")
-                    f.write(f"# 总运行次数: 待定\n")
-                    f.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    # f.write(f"# 可变参数数量: {self.n_variable}\n")
-                    f.write(f"# 实数参数数量: {self.n_real_variable}\n")
-                    f.write("#" * 80 + "\n\n")
-
-                # 写入当前运行的矩阵
-                f.write(f"{matrix_name}\n")
-                f.write("=" * 60 + "\n")
-                f.write(f"运行ID: run_{run_id}\n")
-                f.write(f"矩阵维度: {matrix.shape[0]} × {matrix.shape[1]}\n")
-
-                # 写入Hessian矩阵信息（如果可用）
-                # if hasattr(self, "best_result") and self.best_result is not None:
-                #     if run_id == self.best_result.get("run_id", -1):
-                f.write(
-                    f"Hessian矩阵正定性: {'是' if self.best_result.get('is_positive_definite', False) else '否'}\n"
-                )
-
-                f.write("=" * 60 + "\n\n")
-
-                # 写入矩阵数据
-                matrix_np = matrix.cpu().numpy()
-                for i in range(matrix_np.shape[0]):
-                    for j in range(matrix_np.shape[1]):
-                        f.write(f"{matrix_np[i, j]:12.6e} ")
-                    f.write("\n")
-
-                f.write("\n" + "#" * 80 + "\n\n")
-
-            if is_first_run:
-                print(f"✅ 创建矩阵文件: {filename}")
-            # else:
-            #     print(f"✅ 追加第 {run_id} 次运行矩阵数据到: {filename}")
-
-            return True
-        except Exception as e:
-            print(f"❌ 保存矩阵到文件 {filename} 失败: {e}")
-            return False
 
     def save_parameters(
         self, params, real_errors, imag_errors, run_id, filename_base, save_txt=True
@@ -724,7 +319,7 @@ class SimplePWAOptimizer:
 
             return True
         except Exception as e:
-            print(f"❌ 保存带误差的参数失败: {e}")
+            print(f"❌ 保存参数失败: {e}")
             return False
 
     def save_nll_history(self, nll_history, run_id, filename_base):
@@ -777,8 +372,6 @@ class SimplePWAOptimizer:
         # 定义统一的输出文件名
         params_filename = os.path.join(output_dir, "parameters.txt")
         nll_filename = os.path.join(output_dir, "nll_history.txt")
-        cov_filename = os.path.join(output_dir, "covariance_matrix.txt")
-        corr_filename = os.path.join(output_dir, "correlation_matrix.txt")
 
         for i in range(num_runs):
             print(f"\n{'='*80}")
@@ -799,40 +392,39 @@ class SimplePWAOptimizer:
             )
 
             # 运行优化
-            result = self.optimize_single_run(initial_params, run_id=i, **kwargs)
-            results.append(result)
-            self.all_results.append(result)
+            try:
+                result = self.optimize_single_run(initial_params, run_id=i, **kwargs)
+                results.append(result)
+                self.all_results.append(result)
 
-            print(f"第 {i} 次优化完成!")
-            print(f"最终NLL: {result['final_nll']:.6f}")
-            print(f"正定性: {result['is_positive_definite']}")
-            print(f"优化耗时: {result['time']:.2f} 秒")
-            print(f"海森耗时: {result['hessian_time']:.2f} 秒")
-            print(f"迭代次数: {result['iterations']}")
+                print(f"第 {i} 次优化完成!")
+                print(f"最终NLL: {result['final_nll']:.6f}")
+                print(f"正定性: {result['is_positive_definite']}")
+                print(f"优化耗时: {result['time']:.2f} 秒")
+                print(f"海森耗时: {result['hessian_time']:.2f} 秒")
+                print(f"迭代次数: {result['iterations']}")
 
-            # 保存带误差的参数
-            self.save_parameters(
-                result["final_params"],
-                result["real_errors"],
-                result["imag_errors"],
-                i,
-                params_filename.replace(".txt", ""),
-                save_txt=True,
-            )
+                # 保存参数（含误差）
+                self.save_parameters(
+                    result["final_params"],
+                    result["real_errors"],
+                    result["imag_errors"],
+                    i,
+                    params_filename.replace(".txt", ""),
+                    save_txt=True,
+                )
 
-            # 保存NLL历史
-            self.save_nll_history(
-                result["nll_history"], i, nll_filename.replace(".txt", "")
-            )
-
-            # 保存协方差和相关系数矩阵到统一文件
-            if result["is_positive_definite"]:
-                is_first_run = i == 0
-                self.save_matrices(result, cov_filename, corr_filename, is_first_run)
+                # 保存NLL历史
+                self.save_nll_history(
+                    result["nll_history"], i, nll_filename.replace(".txt", "")
+                )
+            except Exception as e:
+                print(f"第 {i} 次优化失败: {e}")
+                continue
 
         return results
 
-    def print_optimized_parameters_with_errors(
+    def print_optimized_parameters(
         self, params=None, real_errors=None, imag_errors=None, run_id=None
     ):
         """打印优化后的参数（包含误差）"""
@@ -913,20 +505,17 @@ class SimplePWAOptimizer:
             f.write("=" * 100 + "\n")
             f.write(f"总运行次数: {len(self.all_results)}\n")
             f.write(f"总振幅数: {total_gls}\n")
-            # f.write(f"固定参数: {self.amplitude_names[0]} = 1+0j\n")
             f.write(f"可变参数: {self.n_variable}\n")
             f.write(f"最佳NLL: {self.best_nll:.6f}\n")
             f.write(f"所有参数结果: parameters.txt\n")
-            f.write(f"所有NLL结果: nll_history.txt\n")
-            f.write(f"协方差矩阵: covariance_matrix.txt\n")
-            f.write(f"相关系数矩阵: correlation_matrix.txt\n\n")
+            f.write(f"所有NLL结果: nll_history.txt\n\n")
 
             f.write("=" * 100 + "\n")
             f.write("运行结果 (按NLL排序):\n")
             f.write("=" * 100 + "\n")
             f.write(
                 f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代次数':<8} "
-                f"{'耗时(秒)':<10} {'Hessian耗时':<12} {'正定':<6} \n"
+                f"{'耗时(秒)':<10} {'Hessian耗时':<12} {'正定':<6}\n"
             )
             f.write("-" * 100 + "\n")
 
@@ -934,20 +523,21 @@ class SimplePWAOptimizer:
                 f.write(
                     f"{rank+1:<4} {res['run_id']:<6} {res['final_nll']:<12.6f} "
                     f"{res['iterations']:<8} {res['time']:<10.2f} "
-                    f"{res['hessian_time']:<12.2f} {str(res['is_positive_definite']):<6} \n"
+                    f"{res['hessian_time']:<12.2f} {str(res['is_positive_definite']):<6}\n"
                 )
 
             # 写入最佳结果的分支比
-            # 先判断是否正定
             if self.best_result.get("is_positive_definite", False):
-                Ninit = 2.24e6  # 初始事件数
-                f.write("=" * 100 + "\n")
                 f.write("=" * 100 + "\n")
                 f.write("最佳结果的分支比:\n")
                 f.write("=" * 100 + "\n")
-                bf, bf_err = self.compute_branching_fractions(self.best_params)
-                for i in range(len(bf)):
-                    f.write(f"{i:2d}: {bf[i]/Ninit:.6e} ± {bf_err[i]/Ninit:.6e}\n")
+                try:
+                    bf, bf_err = self.compute_branching_fractions(self.best_params)
+                    if bf is not None:
+                        for i in range(len(bf)):
+                            f.write(f"{i:2d}: {bf[i]:.6e} ± {bf_err[i]:.6e}\n")
+                except Exception as e:
+                    f.write(f"计算分支比失败: {e}\n")
         print(f"✅ 优化结果摘要已保存到: {summary_file}")
 
 
@@ -957,8 +547,8 @@ optimizer = SimplePWAOptimizer(ana, conjugate_pairs, amplitude_names)
 # 运行多次优化
 results = optimizer.run_multiple_optimizations(
     num_runs=10,
-    max_iter=1000,
-    lr=0.9,
+    max_iter=10000,
+    lr=0.5,
     tolerance_grad=1e-5,
     tolerance_change=1e-7,
     history_size=500,
@@ -977,8 +567,7 @@ for i, res in enumerate(sorted_results):
         f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
         f"迭代次数 = {res['iterations']:3d}, "
         f"耗时 = {res['time']:6.2f}s, 海森耗时 = {res['hessian_time']:6.2f}s, "
-        f"正定 = {res['is_positive_definite']}, "
-        # f"最小特征值 = {res['min_eigenvalue']:.2e}"
+        f"正定 = {res['is_positive_definite']}"
     )
 
 print(f"\n{'='*80}")
@@ -987,11 +576,15 @@ print(f"{'='*80}")
 
 best_res = sorted_results[0]
 print(f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)")
-print(f"正定性: {best_res['is_positive_definite']}")
+print(f"Hessian正定性: {best_res['is_positive_definite']}")
+# print(f"Hessian最小特征值: {best_res['min_eigenvalue']:.2e}")
+# print(f"Hessian最大特征值: {best_res['max_eigenvalue']:.2e}")
+# print(f"Hessian条件数: {best_res['condition_number']:.2e}")
+# print(f"Hessian计算耗时: {best_res['hessian_time']:.2f} 秒")
 
-# 打印最佳参数（包含误差）
+# 打印最佳参数（含误差）
 if best_res["is_positive_definite"] and best_res["real_errors"] is not None:
-    optimizer.print_optimized_parameters_with_errors(
+    optimizer.print_optimized_parameters(
         best_res["final_params"],
         best_res["real_errors"],
         best_res["imag_errors"],
@@ -999,7 +592,22 @@ if best_res["is_positive_definite"] and best_res["real_errors"] is not None:
     )
 else:
     print(f"\n⚠️ Hessian矩阵不正定，无法提供参数误差估计")
-    optimizer.print_optimized_parameters_with_errors(best_res["final_params"])
+    optimizer.print_optimized_parameters(best_res["final_params"])
+
+"""
+# 计算并打印分支比
+if best_res["is_positive_definite"]:
+    try:
+        bf_values, bf_errors = optimizer.compute_branching_fractions(best_res["final_params"])
+        if bf_values is not None:
+            print(f"\n{'='*80}")
+            print("最佳结果的分支比:")
+            print(f"{'='*80}")
+            for i in range(len(bf_values)):
+                print(f"{i:2d}: {bf_values[i]:.6e} ± {bf_errors[i]:.6e}")
+    except Exception as e:
+        print(f"计算分支比失败: {e}")
+"""
 
 # 只保存最佳权重文件
 best_weight_file = "results/weight_best.root"
