@@ -155,6 +155,11 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     double raw_nll;
     cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
 
+    // 若调用者需要 w = S/I（用于共振态梯度），在 conjugate 之前复制
+    if (d_w_out != nullptr) {
+        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+    }
+
     // ----- 第三大步：梯度 grad = -A^H * w -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
@@ -172,10 +177,7 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
         conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
     }
 
-    // 若调用者需要 w = S/I（用于共振态梯度），复制到输出 buffer
-    if (d_w_out != nullptr) {
-        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-    }
+    // d_w_out already copied before conjugateKernel (above)
 
     // ----- 清理资源 -----
     cudaFree(d_S);

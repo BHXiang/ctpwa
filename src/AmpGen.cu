@@ -1880,15 +1880,13 @@ void AmpCalc::computeResonanceGradient(
         }
     }
 
-    // 累加所有 GPU 到 d_grad_res（GPU 0）
+    // 将各 GPU 结果通过 daxpy 累加到 d_grad_res
     cudaSetDevice(0);
-    cudaMemset(d_grad_res, 0, n_free * sizeof(double));
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == 0) {
-            cudaMemcpy(d_grad_res, d_grad_per_gpu[0],
-                       n_free * sizeof(double), cudaMemcpyDeviceToDevice);
+            daxpy_kernel<<<1, 64>>>(d_grad_res, d_grad_per_gpu[0], 1.0, n_free);
+            cudaDeviceSynchronize();
         } else {
-            // 通过 host 中转累加（n_free 很小，~几个 double）
             std::vector<double> h_temp(n_free);
             cudaSetDevice(gpu);
             cudaMemcpy(h_temp.data(), d_grad_per_gpu[gpu],
