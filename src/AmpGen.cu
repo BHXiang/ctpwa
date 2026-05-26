@@ -1685,12 +1685,46 @@ __global__ void resonanceGradientKernel(
             node_factor.imag = AD(0.0);
         }
 
+        if (evt == 0 && threadIdx.x == 0) {
+            double bf_ni = Bf<double>(L, qq, q0_ad.val, bf_d);
+            printf("PY_NODE%d L=%d mm=%.10f qq=%.10f q0=%.10f Bf=%.10f\n",
+                ni, L, mm, qq, q0_ad.val, bf_ni);
+        }
         // 乘入总乘积
         // (a+ib)*(c+id) = (ac-bd) + i(ad+bc)
         CV new_R;
         new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
         new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
         R_ad = new_R;
+    }
+
+    // DEBUG: dump data for Python reproduction
+    if (evt == 0 && threadIdx.x == 0) {
+        // SL amps for this event (all SL, all pol)
+        printf("PY_SLAMPS ");
+        for (int sl = 0; sl < 2; ++sl) {
+            for (int p = 0; p < nPolar; ++p) {
+                int idx = sl * d_momenta->n_events * nPolar + global_evt * nPolar + p;
+                auto slv = d_slamps[idx];
+                printf("(%.10f,%.10f)", slv.real(), slv.imag());
+                if (!(sl == 1 && p == nPolar-1)) printf(",");
+            }
+        }
+        printf("\n");
+        printf("PY_DATA sign=%.6f global_evt=%d nPolar=%d\n", sign, global_evt, nPolar);
+        printf("PY_R dR_dmass=(%.10f,%.10f) dR_dwidth=(%.10f,%.10f) R=(%.10f,%.10f)\n",
+            R_ad.real.grad[0], R_ad.imag.grad[0],
+            R_ad.real.grad[1], R_ad.imag.grad[1],
+            R_ad.real.val, R_ad.imag.val);
+        // Print w and T for all 9 polarizations
+        printf("PY_W_T ");
+        for (int p = 0; p < nPolar; ++p) {
+            cuComplex tw = d_w[evt * nPolar + p];
+            cuComplex tT = d_T[global_evt * nPolar + p];
+            printf("(%.10f,%.10f,%.10f,%.10f)", tw.x, tw.y, tT.x, tT.y);
+            if (p < nPolar-1) printf(",");
+        }
+        printf("\n");
     }
 
     for (int pol = 0; pol < nPolar; ++pol) {

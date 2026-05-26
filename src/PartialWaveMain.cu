@@ -893,6 +893,9 @@ public:
             // std::cerr << "WARNING: phsp_factor invalid (" << phsp_factor << "), clamping to 1e-30" << std::endl;
             phsp_factor = 1e-30;
         }
+        printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
+            total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
+
         double loss = total_data_nll - total_bkg_nll
             + (totalDataEvents - bkg_integral_) * log(phsp_factor);
         if (isnan(loss) || isinf(loss)) {
