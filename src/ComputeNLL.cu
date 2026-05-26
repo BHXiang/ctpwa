@@ -129,11 +129,27 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
             &beta, d_S, 1);
     }
 
+    // DEBUG: print raw S before kernel
+    {
+        std::vector<cuComplex> h_s(3);
+        cudaMemcpy(h_s.data(), d_S, 3*sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        printf("DEBUG_RAW_S S0=(%.6f,%.6f) S1=(%.6f,%.6f) S2=(%.6f,%.6f)\n",
+            h_s[0].x, h_s[0].y, h_s[1].x, h_s[1].y, h_s[2].x, h_s[2].y);
+    }
+
     // ----- 第二大步：计算 factor、写入权重 w、同时规约得到 NLL -----
     cudaMemset(d_nll, 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
     computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
         d_S, d_nll, d_weights, nEvents, n_polar);
+
+    // DEBUG: print w after kernel
+    {
+        std::vector<cuComplex> h_w(3);
+        cudaMemcpy(h_w.data(), d_S, 3*sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        printf("DEBUG_W w0=(%.6f,%.6f) w1=(%.6f,%.6f) w2=(%.6f,%.6f)\n",
+            h_w[0].x, h_w[0].y, h_w[1].x, h_w[1].y, h_w[2].x, h_w[2].y);
+    }
 
     // 拷回 NLL
     double raw_nll;
