@@ -18,6 +18,7 @@
 #include <Figure.cuh>
 #include <AutoDiff.cuh>
 #include <ComputeHessian.cuh>
+#include <Parameters.cuh>
 #include <ComputeBF.cuh>
 
 #include <TFile.h>
@@ -572,20 +573,15 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
 ///////////////////////////////////////////////////////////////
 class NLLFunction : public torch::autograd::Function<NLLFunction>
 {
-private:
-    // 私有成员变量，存储约束信息
-    static std::vector<std::vector<int>> con_trans_id_;
-    static std::vector<std::vector<std::complex<double>>> con_trans_values_;
-    static bool constraints_initialized_;
-
 public:
     // 多 GPU 前向传播
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
         torch::Tensor vector,
-        torch::Tensor theta,                   // [新增] 共振态参数 [nFreeResParams]
+        torch::Tensor theta,                   // 共振态参数 [nFreeResParams]
+        Parameters* params,                    // 参数管理器（含约束）
         std::vector<cuComplex*>& d_all_amplitudes_list,
-        AmpCalc* amp_calc,                     // [新增] 共振态管理器
+        AmpCalc* amp_calc,                     // 共振态管理器
         cuComplex* d_phsp_matrix_,
         const std::vector<std::vector<int>>& events_list,
         const std::vector<std::vector<int>>& events_offsets_list,
@@ -599,10 +595,10 @@ public:
         int num_gpus = d_all_amplitudes_list.size();
         TORCH_CHECK(num_gpus > 0, "No GPUs provided");
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(constraints_initialized_, "Constraints not initialized");
+        TORCH_CHECK(params && params->initialized(), "Parameters not initialized");
 
         // 1. 将 vector 扩展向量
-        torch::Tensor extended_vector = extendVectorWithConstraints(vector, vector.device());
+        torch::Tensor extended_vector = params->extendVector(vector, vector.device());
         int extended_n_gls = extended_vector.numel();
         const int primary_dev = vector.get_device();
 
@@ -931,6 +927,7 @@ public:
         ctx->save_for_backward({ vector, extended_vec_per_gpu[0] });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
         ctx->saved_data["grad_theta"] = grad_theta;
+        ctx->saved_data["params_ptr"] = reinterpret_cast<int64_t>(params);
 
         // std::cout << "Total data NLL: " << loss << std::endl;
         return torch::tensor(loss, torch::kDouble).to(vector.device());
@@ -945,254 +942,19 @@ public:
         const auto& extended_vector_template = saved[1];
         const auto& global_extended_grad = ctx->saved_data["global_extended_grad"].toTensor();
         const auto& grad_theta = ctx->saved_data["grad_theta"].toTensor();
+        auto* params = reinterpret_cast<Parameters*>(ctx->saved_data["params_ptr"].toInt());
 
-        torch::Tensor grad_vector = mergeGradientsWithConstraints(global_extended_grad, original_vector.numel());
+        torch::Tensor grad_vector = params->collapseVectorGrad(global_extended_grad, original_vector.numel());
 
         return { grad_vector * grad_outputs[0],
                 grad_theta.numel() > 0 ? grad_theta * grad_outputs[0] : torch::Tensor(),
+                torch::Tensor(),   // params
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor() };
     }
-
-    // 设置约束的静态方法
-    static void setConstraints(
-        const std::vector<std::vector<int>>& con_trans_id,
-        const std::vector<std::vector<std::complex<double>>>& con_trans_values)
-    {
-        con_trans_id_ = con_trans_id;
-        con_trans_values_ = con_trans_values;
-        constraints_initialized_ = true;
-    }
-
-    static torch::Tensor
-        extendVectorWithConstraints(const torch::Tensor& vector,
-            const torch::Device& device)
-    {
-        TORCH_CHECK(vector.is_complex(), "Input vector must be complex type");
-        TORCH_CHECK(vector.dim() == 1, "Input vector must be 1-dimensional");
-
-        const int original_size = vector.numel();
-        int extended_size = original_size;
-
-        // 找到最大ID以确定扩展大小
-        for (const auto& vecid : con_trans_id_)
-        {
-            if (!vecid.empty())
-            {
-                auto max_it = std::max_element(vecid.begin(), vecid.end());
-                extended_size = std::max(extended_size, *max_it + 1);
-            }
-        }
-
-        if (extended_size == original_size)
-        {
-            return vector.clone();
-        }
-
-        // 创建扩展后的向量
-        torch::TensorOptions options = torch::TensorOptions().dtype(torch::kComplexFloat).device(device);
-
-        torch::Tensor extended_vector = torch::zeros({ extended_size }, options);
-
-        // 方法1：使用 PyTorch 的索引操作（在 GPU 上）
-        // 创建索引，选择原始部分
-        torch::Tensor indices = torch::arange(0, original_size, torch::kLong).to(device);
-        extended_vector.index_copy_(0, indices, vector);
-
-        // 在 GPU 上处理约束
-        for (size_t i = 0; i < con_trans_id_.size(); ++i)
-        {
-            const auto& vecid = con_trans_id_[i];
-            const auto& values = con_trans_values_[i];
-
-            if (vecid.empty() || values.empty() ||
-                vecid.size() != values.size())
-            {
-                continue;
-            }
-
-            // 找到原始ID（最小值）
-            auto min_it = std::min_element(vecid.begin(), vecid.end());
-            int origin_idx = std::distance(vecid.begin(), min_it);
-            int origin_id = vecid[origin_idx];
-
-            // 确保原始ID有效
-            if (origin_id < 0 || origin_id >= original_size)
-            {
-                continue;
-            }
-
-            // 获取原始ID对应的系数
-            std::complex<double> origin_coeff = values[origin_idx];
-            double origin_coeff_real = std::real(origin_coeff);
-            double origin_coeff_imag = std::imag(origin_coeff);
-
-            // 检查分母不为零
-            if (std::abs(origin_coeff_real) < 1e-10 ||
-                std::abs(origin_coeff_imag) < 1e-10)
-            {
-                std::cerr << "Warning: origin coefficient too small, skipping "
-                    "constraint group "
-                    << i << std::endl;
-                continue;
-            }
-
-            // 为每个扩展ID设置值
-            for (size_t j = 0; j < vecid.size(); ++j)
-            {
-                if (j == origin_idx)
-                    continue; // 跳过原始ID
-
-                int extended_id = vecid[j];
-
-                // 确保扩展ID有效且不超过values数组的大小
-                if (extended_id >= 0 && extended_id < extended_size &&
-                    j < values.size())
-                {
-                    std::complex<double> ext_coeff = values[j];
-                    double ext_coeff_real = std::real(ext_coeff);
-                    double ext_coeff_imag = std::imag(ext_coeff);
-
-                    // 计算系数比例（直接在 GPU 上）
-                    float real_ratio =
-                        static_cast<float>(ext_coeff_real / origin_coeff_real);
-                    float imag_ratio =
-                        static_cast<float>(ext_coeff_imag / origin_coeff_imag);
-
-                    // 获取原始向量的值
-                    torch::Tensor origin_value = vector[origin_id];
-
-                    // 计算实部和虚部
-                    torch::Tensor real_part = (origin_value + torch::conj(origin_value)) / 2.0f;
-                    torch::Tensor imag_part = (origin_value - torch::conj(origin_value)) / (2.0f * c10::complex<float>(0, 1));
-
-                    // 计算扩展值
-                    torch::Tensor extended_real = real_ratio * real_part;
-                    torch::Tensor extended_imag = imag_ratio * imag_part;
-
-                    // 合并实部和虚部
-                    torch::Tensor extended_value = extended_real + c10::complex<float>(0, 1) * extended_imag;
-
-                    // 赋值
-                    extended_vector[extended_id] = extended_value;
-                }
-            }
-        }
-
-        return extended_vector;
-    }
-
-private:
-    static torch::Tensor
-        mergeGradientsWithConstraints(const torch::Tensor& extended_grad,
-            int original_size)
-    {
-        torch::Device device = extended_grad.device();
-        torch::Tensor grad_vector =
-            torch::zeros({ original_size }, torch::kComplexFloat).to(device);
-
-        // 复制原始元素的梯度
-        if (original_size > 0)
-        {
-            grad_vector.copy_(extended_grad.slice(0, 0, original_size));
-        }
-
-        // 如果没有约束，直接返回
-        if (con_trans_id_.empty())
-        {
-            return grad_vector;
-        }
-
-        // 对于每个约束组
-        for (size_t group_idx = 0; group_idx < con_trans_id_.size();
-            ++group_idx)
-        {
-            const auto& vecid = con_trans_id_[group_idx];
-            const auto& values = con_trans_values_[group_idx];
-
-            if (vecid.empty() || values.empty() ||
-                vecid.size() != values.size())
-            {
-                continue;
-            }
-
-            // 找到原始ID（最小值）
-            auto min_it = std::min_element(vecid.begin(), vecid.end());
-            int origin_idx = std::distance(vecid.begin(), min_it);
-            int origin_id = vecid[origin_idx];
-
-            if (origin_id < 0 || origin_id >= original_size)
-            {
-                continue;
-            }
-
-            std::complex<double> origin_coeff = values[origin_idx];
-            double origin_coeff_real = std::real(origin_coeff);
-            double origin_coeff_imag = std::imag(origin_coeff);
-
-            if (std::abs(origin_coeff_real) < 1e-10 ||
-                std::abs(origin_coeff_imag) < 1e-10)
-            {
-                continue;
-            }
-
-            // 收集该原始元素对应的所有扩展元素
-            std::vector<int> ext_indices;
-            std::vector<float> real_ratios, imag_ratios;
-
-            for (size_t j = 0; j < vecid.size(); ++j)
-            {
-                if (j == origin_idx)
-                    continue;
-
-                int extended_id = vecid[j];
-                if (extended_id < 0 || extended_id >= extended_grad.numel() ||
-                    j >= values.size())
-                {
-                    continue;
-                }
-
-                std::complex<double> ext_coeff = values[j];
-                real_ratios.push_back(static_cast<float>(std::real(ext_coeff) /
-                    origin_coeff_real));
-                imag_ratios.push_back(static_cast<float>(std::imag(ext_coeff) /
-                    origin_coeff_imag));
-                ext_indices.push_back(extended_id);
-            }
-
-            if (ext_indices.empty())
-                continue;
-
-            // 转换为张量
-            torch::Tensor ext_idx_tensor = torch::tensor(ext_indices, torch::kLong).to(device);
-            torch::Tensor real_ratio_tensor = torch::tensor(real_ratios, torch::kFloat).to(device);
-            torch::Tensor imag_ratio_tensor = torch::tensor(imag_ratios, torch::kFloat).to(device);
-
-            // 获取扩展元素的梯度
-            torch::Tensor ext_grads = extended_grad.index_select(0, ext_idx_tensor);
-
-            // 分离实部和虚部
-            torch::Tensor ext_grad_real = (ext_grads + torch::conj(ext_grads)) / 2.0f;
-            torch::Tensor ext_grad_imag = (ext_grads - torch::conj(ext_grads)) / (2.0f * c10::complex<float>(0, 1));
-
-            // 计算总贡献
-            torch::Tensor total_contrib = (real_ratio_tensor * ext_grad_real +
-                c10::complex<float>(0, 1) * imag_ratio_tensor * ext_grad_imag).sum();
-
-            // 累加到原始元素
-            grad_vector[origin_id] = grad_vector[origin_id] + total_contrib;
-        }
-
-        return grad_vector;
-    }
 };
-
-// 初始化静态成员变量
-std::vector<std::vector<int>> NLLFunction::con_trans_id_;
-std::vector<std::vector<std::complex<double>>> NLLFunction::con_trans_values_;
-bool NLLFunction::constraints_initialized_ = false;
 
 ////////////////////////////////////////
 ////////////////////////////////////////
@@ -1235,12 +997,12 @@ public:
     torch::Tensor getNLL(torch::Tensor& vector, torch::Tensor theta = torch::empty({ 0 }))
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
-        return NLLFunction::apply(vector, theta, d_all_amplitudes_, &amp_calc_,
+        return NLLFunction::apply(vector, theta, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
             phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
-    int getNVector() const { return n_gls_ - con_trans_id_.size(); }
+    int getNVector() const { return params_.nFreeVector(); }
 
     torch::Tensor getSLVectors() const
     {
@@ -1259,7 +1021,7 @@ public:
 
         torch::Device dev(torch::kCUDA, vector.get_device());
 
-        torch::Tensor extended_vector = NLLFunction::extendVectorWithConstraints(vector, dev);
+        torch::Tensor extended_vector = params_.extendVector(vector, dev);
 
         // 将extended_vector分配到多个GPU（如果需要，可以直接在GPU上处理约束）
         std::vector<torch::Tensor> extended_vec_per_gpu;
@@ -2137,7 +1899,7 @@ public:
         const int n = vector.numel();
         const int n2 = 2 * n;
         torch::Device dev = vector.device();
-        torch::Tensor extended_vector = NLLFunction::extendVectorWithConstraints(vector, dev);
+        torch::Tensor extended_vector = params_.extendVector(vector, dev);
         torch::Tensor extended_vector_conj = extended_vector.conj();
         const cuComplex* d_vec = reinterpret_cast<const cuComplex*>(extended_vector.data_ptr());
         const cuComplex* d_vec_conj = reinterpret_cast<const cuComplex*>(extended_vector_conj.data_ptr());
@@ -2235,26 +1997,16 @@ public:
 
         // 按约束Jacobian投影: H_orig (2n×2n) = J^T * H_ext (2·n_ext×2·n_ext) * J
         // J是diagonal blocks: J[2*eid][2*oid]=real_ratio, J[2*eid+1][2*oid+1]=imag_ratio
-        // 与extendVectorWithConstraints的约定一致
         if (n_ext > n) {
             std::vector<int> h_oids, h_eids;
             std::vector<double> h_re, h_im;
-            for (size_t gi = 0; gi < con_trans_id_.size(); ++gi) {
-                const auto& vecid = con_trans_id_[gi];
-                const auto& vals = con_trans_values_[gi];
-                if (vecid.empty()) continue;
-                int oid = *std::min_element(vecid.begin(), vecid.end());
-                auto oit = std::find(vecid.begin(), vecid.end(), oid);
-                int oidx = std::distance(vecid.begin(), oit);
-                std::complex<double> oc = vals[oidx];
-                double oc_re = std::real(oc), oc_im = std::imag(oc);
-                for (size_t j = 0; j < vecid.size(); ++j) {
-                    if ((int)j == oidx) continue;
-                    h_oids.push_back(oid);
-                    h_eids.push_back(vecid[j]);
-                    // 与extendVectorWithConstraints一致：分别计算实部和虚部的比例
-                    h_re.push_back(std::real(vals[j]) / oc_re);
-                    h_im.push_back(std::imag(vals[j]) / oc_im);
+            for (const auto& g : params_.constraintGroups()) {
+                for (size_t j = 0; j < g.ext_indices.size(); ++j) {
+                    if (static_cast<int>(j) == g.origin_idx_in_group) continue;
+                    h_oids.push_back(g.origin_id);
+                    h_eids.push_back(g.ext_indices[j]);
+                    h_re.push_back(static_cast<double>(g.real_ratios[j]));
+                    h_im.push_back(static_cast<double>(g.imag_ratios[j]));
                 }
             }
             int ncons = h_oids.size();
@@ -2302,7 +2054,7 @@ public:
             n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
 
         // 2. 扩展向量
-        torch::Tensor extended_v = NLLFunction::extendVectorWithConstraints(vector, vector.device());
+        torch::Tensor extended_v = params_.extendVector(vector, vector.device());
         int n_ext = extended_v.numel();
         int primary_dev = vector.get_device();
 
@@ -2485,7 +2237,7 @@ public:
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
 
         // ===== 中心值 =====
-        torch::Tensor ev_center = NLLFunction::extendVectorWithConstraints(vector, dev);
+        torch::Tensor ev_center = params_.extendVector(vector, dev);
         std::vector<double> phsp_center(npartials), bf_center(npartials);
         computePhspAndBF(ev_center, phsp_center, bf_center,
             npartials, d_truth_amps, truth_ev_per_gpu, dataIntegral);
@@ -2509,8 +2261,8 @@ public:
                     auto vm = v_real.clone(); vm[j] -= eps;
                     auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
                     auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
-                    auto evp = NLLFunction::extendVectorWithConstraints(cvp, dev);
-                    auto evm = NLLFunction::extendVectorWithConstraints(cvm, dev);
+                    auto evp = params_.extendVector(cvp, dev);
+                    auto evm = params_.extendVector(cvm, dev);
 
                     std::vector<double> phsp_p(npartials), bf_p(npartials);
                     std::vector<double> phsp_m(npartials), bf_m(npartials);
@@ -2635,13 +2387,13 @@ public:
 
     std::vector<std::vector<int>> getConstraintsIndex() const
     {
-        return con_trans_id_;
+        return params_.constraintsIndex();
     }
 
     std::vector<std::vector<std::pair<double, double>>> getConstraintsValues() const
     {
         std::vector<std::vector<std::pair<double, double>>> output;
-        for (const auto& vec : con_trans_values_)
+        for (const auto& vec : params_.constraintsValues())
         {
             std::vector<std::pair<double, double>> temp;
             for (const auto& val : vec)
@@ -2718,9 +2470,8 @@ private:
     std::vector<std::string> resonance_names_;
     std::vector<std::string> legends_;
 
-    // 约束信息
-    std::vector<std::vector<int>> con_trans_id_;
-    std::vector<std::vector<std::complex<double>>> con_trans_values_;
+    // 参数管理器（统一管理 vector / theta / 约束）
+    Parameters params_;
 
     // config 初始化
     ConfigParser config_parser_;
@@ -2825,6 +2576,11 @@ private:
         }
         d_all_amplitudes_ = calculateAmplitudes(Vp4_all_, &amp_calc_);
 
+        // 设置共振态自由参数个数
+        if (!amp_calc_.empty()) {
+            params_.setNFreeTheta(amp_calc_.nFreeResParams());
+        }
+
         // 输出d_all_amplitudes_[0]所有内容:
         // int Ntotal = 0;
         // for (size_t j = 0; j < events_[0].size(); ++j)
@@ -2917,8 +2673,6 @@ private:
         //     }
         // }
         // delete[] h_phsp;
-
-        NLLFunction::setConstraints(con_trans_id_, con_trans_values_);
 
         std::cout << "Number of GPUs available: " << n_gpus_ << std::endl;
         std::cout << "Number of partial waves: " << n_gls_ << std::endl;
@@ -3346,6 +3100,8 @@ private:
 
         // 设置约束条件
         auto constraints = config_parser_.getConstraints();
+        std::vector<std::vector<int>> con_trans_id;
+        std::vector<std::vector<std::complex<double>>> con_trans_values;
 
         for (const auto& constraint : constraints)
         {
@@ -3368,15 +3124,12 @@ private:
             int num_constraints = amp_ids_con.size();
             for (int i = 0; i < amp_ids_con[0].size(); ++i)
             {
-                // // 先输出amp_ids_con内容和amplitude_names_对应关系，便于调试
-
                 std::vector<int> combination;
                 for (int j = 0; j < num_constraints; ++j)
                 {
                     combination.push_back(amp_ids_con[j][i]);
                 }
-                // all_combinations.push_back(combination);
-                con_trans_id_.push_back(combination);
+                con_trans_id.push_back(combination);
 
                 // 第一个是{1+1j}, 后面是constraint.values
                 std::vector<std::complex<double>> values = {
@@ -3385,11 +3138,13 @@ private:
                 {
                     values.push_back(val);
                 }
-                // con_values.push_back(values);
-                con_trans_values_.push_back(values);
+                con_trans_values.push_back(values);
             }
 
         }
+
+        // 初始化参数管理器
+        params_.initialize(n_amplitudes_ - static_cast<int>(con_trans_id.size()), con_trans_id, con_trans_values);
     }
 
     std::vector<cuComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
