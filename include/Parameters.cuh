@@ -50,12 +50,20 @@ public:
     torch::Tensor collapseVectorGrad(const torch::Tensor& extended_grad,
                                     int original_size) const;
 
+    // ---------- 统一参数拆分 ----------
+
+    // 将统一 params [real(v_0..n-1), imag(v_0..n-1), θ_0..P-1] 拆分为复数 vector 和 theta
+    // params: [2*nFreeVector + nFreeTheta] float64, 在 GPU 上
+    // 返回: {vector [nFreeVector] complex, theta [nFreeTheta] float64}
+    std::pair<torch::Tensor, torch::Tensor> splitParams(const torch::Tensor& params) const;
+
     // ---------- 维度查询 ----------
 
     int nFreeVector() const { return n_free_vector_; }
     int nFreeTheta() const { return n_free_theta_; }
     int nExtended() const { return n_extended_; }
     int nTotalFree() const { return n_free_vector_ + n_free_theta_; }
+    int nParams() const { return 2 * n_free_vector_ + n_free_theta_; }
     bool hasConstraints() const { return !groups_.empty(); }
     bool initialized() const { return initialized_; }
 
@@ -249,6 +257,39 @@ inline torch::Tensor Parameters::collapseVectorGrad(
     }
 
     return grad;
+}
+
+// ============================================================
+// splitParams 实现
+// ============================================================
+
+inline std::pair<torch::Tensor, torch::Tensor> Parameters::splitParams(
+    const torch::Tensor& params) const
+{
+    TORCH_CHECK(params.dim() == 1, "params must be 1-dimensional");
+    TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
+    TORCH_CHECK(params.numel() == nParams(),
+        "params size mismatch: got ", params.numel(),
+        ", expected ", nParams());
+
+    int nv = n_free_vector_;
+    int nt = n_free_theta_;
+
+    // 实部和虚部用 torch 操作切片（保持 autograd 图连通）
+    torch::Tensor real_part = params.slice(0, 0, nv);
+    torch::Tensor imag_part = params.slice(0, nv, 2 * nv);
+    torch::Tensor vector = torch::complex(
+        real_part.to(torch::kFloat), imag_part.to(torch::kFloat));
+
+    torch::Tensor theta;
+    if (nt > 0) {
+        theta = params.slice(0, 2 * nv, 2 * nv + nt);
+    } else {
+        theta = torch::empty({0},
+            torch::TensorOptions().dtype(torch::kFloat64).device(params.device()));
+    }
+
+    return {vector, theta};
 }
 
 #endif // PARAMETERS_CUH

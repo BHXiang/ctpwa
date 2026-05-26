@@ -574,12 +574,11 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
 class NLLFunction : public torch::autograd::Function<NLLFunction>
 {
 public:
-    // 多 GPU 前向传播
+    // 多 GPU 前向传播：输入统一 params = [real(v_0..n-1), imag(v_0..n-1), θ_0..P-1] float64
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
-        torch::Tensor vector,
-        torch::Tensor theta,                   // 共振态参数 [nFreeResParams]
-        Parameters* params,                    // 参数管理器（含约束）
+        torch::Tensor params_tensor,           // 统一参数 [2*nFreeVector + nFreeTheta] float64
+        Parameters* params_mgr,                // 参数管理器（含约束 & 维度信息）
         std::vector<cuComplex*>& d_all_amplitudes_list,
         AmpCalc* amp_calc,                     // 共振态管理器
         cuComplex* d_phsp_matrix_,
@@ -592,13 +591,17 @@ public:
         int n_amplitudes_,
         int n_polar_)
     {
+        TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
+
+        // 0. 拆分 params → vector + theta
+        auto [vector, theta] = params_mgr->splitParams(params_tensor);
+
         int num_gpus = d_all_amplitudes_list.size();
         TORCH_CHECK(num_gpus > 0, "No GPUs provided");
-        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(params && params->initialized(), "Parameters not initialized");
+        TORCH_CHECK(vector.is_cuda(), "params must be on CUDA");
 
         // 1. 将 vector 扩展向量
-        torch::Tensor extended_vector = params->extendVector(vector, vector.device());
+        torch::Tensor extended_vector = params_mgr->extendVector(vector, vector.device());
         int extended_n_gls = extended_vector.numel();
         const int primary_dev = vector.get_device();
 
@@ -924,10 +927,10 @@ public:
 
         // global_extended_grad = global_extended_grad * 2; // 转置共轭以匹配PyTorch的梯度定义
 
-        ctx->save_for_backward({ vector, extended_vec_per_gpu[0] });
+        ctx->save_for_backward({ params_tensor });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
         ctx->saved_data["grad_theta"] = grad_theta;
-        ctx->saved_data["params_ptr"] = reinterpret_cast<int64_t>(params);
+        ctx->saved_data["params_ptr"] = reinterpret_cast<int64_t>(params_mgr);
 
         // std::cout << "Total data NLL: " << loss << std::endl;
         return torch::tensor(loss, torch::kDouble).to(vector.device());
@@ -938,17 +941,30 @@ public:
         const torch::autograd::tensor_list& grad_outputs)
     {
         const auto saved = ctx->get_saved_variables();
-        const auto& original_vector = saved[0];
-        const auto& extended_vector_template = saved[1];
+        const auto& params_tensor = saved[0];
         const auto& global_extended_grad = ctx->saved_data["global_extended_grad"].toTensor();
         const auto& grad_theta = ctx->saved_data["grad_theta"].toTensor();
-        auto* params = reinterpret_cast<Parameters*>(ctx->saved_data["params_ptr"].toInt());
+        auto* params_mgr = reinterpret_cast<Parameters*>(ctx->saved_data["params_ptr"].toInt());
 
-        torch::Tensor grad_vector = params->collapseVectorGrad(global_extended_grad, original_vector.numel());
+        int nv = params_mgr->nFreeVector();
+        int nt = params_mgr->nFreeTheta();
 
-        return { grad_vector * grad_outputs[0],
-                grad_theta.numel() > 0 ? grad_theta * grad_outputs[0] : torch::Tensor(),
-                torch::Tensor(),   // params
+        // 收缩 extended→free，并组装为 grad_params = [Re(grad_v), Im(grad_v), grad_θ]
+        // global_extended_grad 存的是 Wirtinger 共轭梯度 ∂L/∂v*；
+        // 对应实参数: ∂L/∂Re(v) = 2·Re(∂L/∂v*), ∂L/∂Im(v) = 2·Im(∂L/∂v*)
+        torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
+        torch::Tensor grad_real = (torch::real(grad_vec) * 2.0).to(torch::kFloat64);
+        torch::Tensor grad_imag = (torch::imag(grad_vec) * 2.0).to(torch::kFloat64);
+
+        torch::Tensor grad_params;
+        if (nt > 0 && grad_theta.numel() > 0) {
+            grad_params = torch::cat({grad_real, grad_imag, grad_theta});
+        } else {
+            grad_params = torch::cat({grad_real, grad_imag});
+        }
+
+        return { grad_params * grad_outputs[0],
+                torch::Tensor(),   // params_mgr
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
@@ -994,15 +1010,19 @@ public:
 
     bool isValid() const { return initialized_; }
 
-    torch::Tensor getNLL(torch::Tensor& vector, torch::Tensor theta = torch::empty({ 0 }))
+    torch::Tensor getNLL(torch::Tensor params)
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
-        return NLLFunction::apply(vector, theta, &params_, d_all_amplitudes_, &amp_calc_,
+        TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
+        return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
             phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
     int getNVector() const { return params_.nFreeVector(); }
+    int getNFreeTheta() const { return params_.nFreeTheta(); }
+    int getNParams() const { return params_.nParams(); }
+    const Parameters& getParams() const { return params_; }
 
     torch::Tensor getSLVectors() const
     {
@@ -1885,12 +1905,11 @@ public:
         // if (h_partial_results != nullptr) delete[] h_partial_results;
     }
 
-    torch::Tensor getHessian(torch::Tensor& vector)
+    // ---- 内部 Hessian 计算 ----
+
+    torch::Tensor computeCouplingHessian(torch::Tensor& vector)
     {
-        // 基于解析公式计算 Hessian，参考 best_hess.py
-        // H = Σ_k [-2*tildeB_k/S_k + 4*Bu_k*Bu_k^T/S_k²]
-        //     - Σ_k w_k*[-2*tildeB_bkg_k/S_bkg_k + 4*Bu_bkg_k*Bu_bkg_k^T/S_bkg_k²]
-        //     + (N_data-W_bkg)*[2*tildeP/T - 4*Pu*Pu^T/T²]
+        // 耦合参数 Hessian [2n × 2n]（被 getBranchFractions 调用）
 
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == torch::kComplexFloat, "vector must be complex128");
@@ -2038,74 +2057,203 @@ public:
         return hessian_reduced;
     }
 
-    // 共振态参数 Hessian（P×P，在最优点调用一次）
-    torch::Tensor getResonanceHessian(torch::Tensor vector, torch::Tensor theta)
-    {
-        TORCH_CHECK(vector.is_cuda() && theta.is_cuda(), "inputs must be on CUDA");
-        TORCH_CHECK(theta.numel() > 0, "theta must not be empty");
-        TORCH_CHECK(initialized_, "analysis not initialized");
+    // ========== 统一 params 接口 ==========
 
-        int P = theta.numel();
-        int n_gpu = static_cast<int>(d_all_amplitudes_.size());
+    // 完整 Hessian: 返回 (2n+P) × (2n+P)，params = [real(v), imag(v), θ] float64
+    torch::Tensor getHessian(torch::Tensor params) {
+        TORCH_CHECK(params.is_cuda() && params.dtype() == torch::kFloat64,
+            "params must be float64 CUDA tensor");
 
-        // 1. 更新振幅
-        amp_calc_.reComputeAmps(d_all_amplitudes_,
-            reinterpret_cast<const double*>(theta.data_ptr()),
-            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+        int nv = params_.nFreeVector();
+        int nt = params_.nFreeTheta();
+        int n2 = 2 * nv;
+        int total = n2 + nt;
 
-        // 2. 扩展向量
-        torch::Tensor extended_v = params_.extendVector(vector, vector.device());
-        int n_ext = extended_v.numel();
-        int primary_dev = vector.get_device();
+        auto [vector, theta] = params_.splitParams(params);
+        auto dev = params.device();
 
-        // 3. 分配 per-GPU w buffer
-        std::vector<cuComplex*> d_w_bufs(n_gpu, nullptr);
-        std::vector<int> n_data_events(n_gpu, 0);
+        torch::Tensor hessian = torch::zeros({total, total}, torch::kFloat64).to(dev);
 
-        for (int gpu = 0; gpu < n_gpu; ++gpu) {
-            cudaSetDevice(gpu);
-            torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
-            const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
+        // ========== 耦合参数 Hessian [0:n2, 0:n2] ==========
+        if (n2 > 0) {
+            torch::Tensor extended_vector = params_.extendVector(vector, dev);
+            const cuComplex* d_vec = reinterpret_cast<const cuComplex*>(extended_vector.data_ptr());
+            const int n_ext = extended_vector.numel();
 
-            int nData = events_[gpu][1];
-            if (nData == 0) continue;
-            n_data_events[gpu] = nData;
+            // phsp 因子
+            cudaSetDevice(dev.index());
+            cuComplex* d_P_vec;
+            cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(cuComplex));
+            float *d_pr, *d_pi;
+            cudaMalloc(&d_pr, sizeof(float));
+            cudaMalloc(&d_pi, sizeof(float));
+            computeQuadraticForm(d_phsp_matrix_, d_vec, d_P_vec, d_pr, d_pi, n_amplitudes_);
+            float phr, phi;
+            cudaMemcpy(&phr, d_pr, sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&phi, d_pi, sizeof(float), cudaMemcpyDeviceToHost);
+            double phsp_factor = (double)phr;
+            cudaFree(d_pr); cudaFree(d_pi);
+            cudaFree(d_P_vec);
 
-            // 预计算 T
-            amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
+            // 扩展 Hessian (2·n_ext × 2·n_ext)
+            torch::Tensor hess_ext = torch::zeros({2 * n_ext, 2 * n_ext}, torch::kDouble).to(dev);
+            double* d_hess_ext = hess_ext.data_ptr<double>();
+            int hess_sz = (2 * n_ext) * (2 * n_ext);
+            int totalDataEvents = 0;
 
-            // 分配 w buffer
-            int nTotal = nData * n_polar_;
-            cudaMalloc(&d_w_bufs[gpu], nTotal * sizeof(cuComplex));
+            // 多GPU: data + bkg Hessian 贡献
+            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+                cudaSetDevice(gpu);
+                torch::Tensor vec_gpu = extended_vector.to(torch::Device(torch::kCUDA, gpu));
+                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(vec_gpu.data_ptr());
 
-            // 跑 computeFactorNLL 获取 w
-            cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-            cuComplex* d_grad_dummy;
-            cudaMalloc(&d_grad_dummy, n_ext * sizeof(cuComplex));
-            computeFactorNLL(d_amp, d_v_gpu, d_grad_dummy,
-                nData, n_polar_, n_amplitudes_, nullptr, d_w_bufs[gpu]);
-            cudaFree(d_grad_dummy);
-            cudaDeviceSynchronize();
+                double* d_hess_gpu;
+                cudaMalloc(&d_hess_gpu, hess_sz * sizeof(double));
+                cudaMemset(d_hess_gpu, 0, hess_sz * sizeof(double));
+
+                int nData = events_[gpu][1];
+                if (nData > 0) {
+                    totalDataEvents += nData;
+                    cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                    computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
+                }
+
+                int nBkg = events_[gpu][2];
+                if (nBkg > 0) {
+                    double* d_w_bkg;
+                    cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
+                    if (bkg_weights_[gpu] != nullptr) {
+                        std::vector<double> h_w_neg(nBkg);
+                        cudaMemcpy(h_w_neg.data(), bkg_weights_[gpu], nBkg * sizeof(double), cudaMemcpyDeviceToHost);
+                        for (int i = 0; i < nBkg; ++i) h_w_neg[i] = -h_w_neg[i];
+                        cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
+                    } else {
+                        std::vector<double> h_w_neg(nBkg, -1.0);
+                        cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
+                    }
+                    cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
+                    computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
+                    cudaFree(d_w_bkg);
+                }
+
+                if (gpu == dev.index()) {
+                    double one = 1.0;
+                    cublasHandle_t h; cublasCreate(&h);
+                    cublasDaxpy(h, hess_sz, &one, d_hess_gpu, 1, d_hess_ext, 1);
+                    cublasDestroy(h);
+                } else {
+                    double* d_hess_buf;
+                    cudaSetDevice(dev.index());
+                    cudaMalloc(&d_hess_buf, hess_sz * sizeof(double));
+                    cudaMemcpyPeer(d_hess_buf, dev.index(), d_hess_gpu, gpu, hess_sz * sizeof(double));
+                    double one = 1.0;
+                    cublasHandle_t h; cublasCreate(&h);
+                    cublasDaxpy(h, hess_sz, &one, d_hess_buf, 1, d_hess_ext, 1);
+                    cublasDestroy(h);
+                    cudaFree(d_hess_buf);
+                }
+                cudaFree(d_hess_gpu);
+            }
+            cudaSetDevice(dev.index());
+
+            // phsp Hessian 贡献
+            double phsp_weight = (double)totalDataEvents - bkg_integral_;
+            computePhspHessian(d_phsp_matrix_, d_vec, phsp_factor, phsp_weight, d_hess_ext, n_ext);
+
+            // 约束投影: H_orig (2n×2n) = J^T · H_ext (2·n_ext×2·n_ext) · J
+            if (n_ext > nv) {
+                std::vector<int> h_oids, h_eids;
+                std::vector<double> h_re, h_im;
+                for (const auto& g : params_.constraintGroups()) {
+                    for (size_t j = 0; j < g.ext_indices.size(); ++j) {
+                        if (static_cast<int>(j) == g.origin_idx_in_group) continue;
+                        h_oids.push_back(g.origin_id);
+                        h_eids.push_back(g.ext_indices[j]);
+                        h_re.push_back(static_cast<double>(g.real_ratios[j]));
+                        h_im.push_back(static_cast<double>(g.imag_ratios[j]));
+                    }
+                }
+                int ncons = h_oids.size();
+                int *d_oids, *d_eids;
+                double *d_re, *d_im;
+                cudaMalloc(&d_oids, ncons * sizeof(int));
+                cudaMalloc(&d_eids, ncons * sizeof(int));
+                cudaMalloc(&d_re, ncons * sizeof(double));
+                cudaMalloc(&d_im, ncons * sizeof(double));
+                cudaMemcpy(d_oids, h_oids.data(), ncons * sizeof(int), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_eids, h_eids.data(), ncons * sizeof(int), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_re, h_re.data(), ncons * sizeof(double), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_im, h_im.data(), ncons * sizeof(double), cudaMemcpyHostToDevice);
+
+                torch::Tensor hess_reduced = torch::zeros({n2, n2}, torch::kDouble).to(dev);
+                double* d_hess_reduced = hess_reduced.data_ptr<double>();
+                reduceHessianWithConstraints(d_hess_ext, d_hess_reduced, d_oids, d_eids, d_re, d_im, ncons, nv, n_ext);
+
+                cudaFree(d_oids); cudaFree(d_eids); cudaFree(d_re); cudaFree(d_im);
+                hessian.slice(0, 0, n2).slice(1, 0, n2).copy_(hess_reduced);
+            } else {
+                hessian.slice(0, 0, n2).slice(1, 0, n2).copy_(hess_ext.slice(0, 0, n2).slice(1, 0, n2));
+            }
         }
 
-        // 4. 计算 Hessian
-        cudaSetDevice(primary_dev);
-        double* d_hess;
-        cudaMalloc(&d_hess, P * P * sizeof(double));
-        amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0);
+        // ========== 共振态参数 Hessian [n2:total, n2:total] ==========
+        if (nt > 0 && theta.numel() > 0) {
+            int P = nt;
+            int n_gpu = static_cast<int>(d_all_amplitudes_.size());
+            int primary_dev = dev.index();
 
-        torch::Tensor result = torch::empty({ P, P },
-            torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
-        cudaMemcpy(result.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
-        cudaFree(d_hess);
+            amp_calc_.reComputeAmps(d_all_amplitudes_,
+                reinterpret_cast<const double*>(theta.data_ptr()),
+                n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
 
-        // 5. 清理
-        for (int gpu = 0; gpu < n_gpu; ++gpu) {
-            if (d_w_bufs[gpu]) { cudaSetDevice(gpu); cudaFree(d_w_bufs[gpu]); }
+            torch::Tensor extended_v = params_.extendVector(vector, dev);
+            int n_ext = extended_v.numel();
+
+            std::vector<cuComplex*> d_w_bufs(n_gpu, nullptr);
+            std::vector<int> n_data_events(n_gpu, 0);
+
+            for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                cudaSetDevice(gpu);
+                torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
+                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
+
+                int nData = events_[gpu][1];
+                if (nData == 0) continue;
+                n_data_events[gpu] = nData;
+
+                amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
+
+                int nTotal = nData * n_polar_;
+                cudaMalloc(&d_w_bufs[gpu], nTotal * sizeof(cuComplex));
+
+                cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                cuComplex* d_grad_dummy;
+                cudaMalloc(&d_grad_dummy, n_ext * sizeof(cuComplex));
+                computeFactorNLL(d_amp, d_v_gpu, d_grad_dummy,
+                    nData, n_polar_, n_amplitudes_, nullptr, d_w_bufs[gpu]);
+                cudaFree(d_grad_dummy);
+                cudaDeviceSynchronize();
+            }
+
+            cudaSetDevice(primary_dev);
+            double* d_hess;
+            cudaMalloc(&d_hess, P * P * sizeof(double));
+            amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0);
+
+            torch::Tensor res_hess = torch::empty({P, P},
+                torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+            cudaMemcpy(res_hess.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
+            cudaFree(d_hess);
+
+            for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                if (d_w_bufs[gpu]) { cudaSetDevice(gpu); cudaFree(d_w_bufs[gpu]); }
+            }
+            cudaSetDevice(primary_dev);
+
+            hessian.slice(0, n2, total).slice(1, n2, total).copy_(res_hess);
         }
-        cudaSetDevice(primary_dev);
 
-        return result;
+        return hessian;
     }
 
     // 内部：用已加载的truth振幅，对给定extended_vector计算phsp积分+BF
@@ -2244,7 +2392,7 @@ public:
 
         // ===== 误差: BF_error = sqrt(diag(J @ H^{-1} @ J^T)) =====
         std::vector<double> bf_errors(npartials, 0.0);
-        torch::Tensor hessian = getHessian(vector);
+        torch::Tensor hessian = computeCouplingHessian(vector);
         if (hessian.numel() > 0 && hessian.size(0) == n2) {
             auto eig = torch::linalg_eigvalsh(hessian);
             if (eig[0].item<double>() > 1e-8) {
@@ -3397,17 +3545,15 @@ PYBIND11_MODULE(ctpwa, m)
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
-        .def("getNLL", [](analysis& self, torch::Tensor vector) {
-        return self.getNLL(vector);
-            }, pybind11::arg("vector"))
-        .def("getNLL", [](analysis& self, torch::Tensor vector, torch::Tensor theta) {
-        return self.getNLL(vector, theta);
-            }, pybind11::arg("vector"), pybind11::arg("theta"))
+        .def("getNLL", &analysis::getNLL, pybind11::arg("params"),
+             "Compute NLL. params: [real(v), imag(v), theta] float64")
         .def("getNVector", &analysis::getNVector)
+        .def("getNFreeTheta", &analysis::getNFreeTheta)
+        .def("getNParams", &analysis::getNParams)
         .def("getSLVectors", &analysis::getSLVectors)
         .def("writeResult", &analysis::writeResult)
-        .def("getHessian", &analysis::getHessian)
-        .def("getResonanceHessian", &analysis::getResonanceHessian)
+        .def("getHessian", &analysis::getHessian, pybind11::arg("params"),
+             "Full Hessian (2n+P)×(2n+P). params: [real(v), imag(v), theta] float64")
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)

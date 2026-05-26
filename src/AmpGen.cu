@@ -1562,7 +1562,7 @@ __global__ void resonanceGradientKernel(
     int nEvents, int nPolar, int decayChain_size, double bf_d, double sign,
     int t_evt_offset,
     const thrust::complex<double>* d_slamps,
-    const cuComplex* d_v, int site)
+    const cuComplex* d_v, int site, int nSLComb)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
@@ -1596,148 +1596,111 @@ __global__ void resonanceGradientKernel(
         }
     }
 
-    // ============================================================
-    // 遍历整个衰变链, 用 AD 计算 R_total = ∏ (factor at each node)
-    // ============================================================
-    CV R_ad(1.0, 0.0); // 起始值 1+0i
+    // 累加各 SL 贡献: c[pol] = Σ_sl ∂R_sl/∂θ · T_sl[evt,pol]
+    // 然后 d log(I)/dθ = 2 Re(Σ_pol conj(w_pol) · c[pol])
+    // 由于 ∂R_sl/∂θ 对 pol 独立, 等价于: 2 Re(Σ_sl ∂R_sl/∂θ · Σ_pol conj(w_pol) T_sl[evt,pol])
+    int n_events_total = d_momenta->n_events;
 
-    for (int ni = 0; ni < decayChain_size; ++ni) {
-        const DecayNode& node = d_decayNodes[ni];
-        const SL& sl = d_slComb[ni]; // 使用 SL combo 0 (Bf 的 L 对所有 SL combo 相同)
-        int L = sl.L;
+    for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
+        // ----------------------------------------------------------------
+        // 用 AD 计算 R_sl = ∏_ni node_factor(L_{sl,ni})
+        // ----------------------------------------------------------------
+        CV R_ad(1.0, 0.0);
 
-        // 四动量
-        LorentzVector pM  = d_momenta->getMomentum(global_evt, node.mother_idx);
-        LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
-        LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
+        for (int ni = 0; ni < decayChain_size; ++ni) {
+            const DecayNode& node = d_decayNodes[ni];
+            const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
+            int L = sl.L;
 
-        double mm = pM.M();
-        double md1 = node.mass[1], md2 = node.mass[2];
-        if (md1 <= 0) md1 = pD1.M();
-        if (md2 <= 0) md2 = pD2.M();
+            LorentzVector pM  = d_momenta->getMomentum(global_evt, node.mother_idx);
+            LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
+            LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
 
-        // ---- q (实际破缺动量) ----
-        double qq = breakup_momentum(mm, md1, md2);
-        AD q_ad(qq);
+            double mm = pM.M();
+            // qq 使用事件四动量的质量（与 computeAmpsKernel 保持一致）
+            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+            AD q_ad(qq);
 
-        // ---- q0 (名义破缺动量, 用 AD 传播质量依赖) ----
-        AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+            // q0 时回退到事件质量（仅在 node.mass < 0 且非目标共振态时使用）
+            double md1 = pD1.M();
+            double md2 = pD2.M();
 
-        // 母粒子质量
-        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-            m0_q0_ad = m0_ad; // 目标共振态的参数
-        } else if (node.mass[0] > 0) {
-            m0_q0_ad = AD(node.mass[0]); // 固定质量（如 Jpsi）
-        } else {
-            // 其他共振态: 暂用 1.0 (单共振态场景不会触发)
-            m0_q0_ad = AD(1.0);
-        }
-
-        // 子粒子质量
-        if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
-            md1_q0_ad = m0_ad;
-        else
-            md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
-
-        if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
-            md2_q0_ad = m0_ad;
-        else
-            md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
-
-        // q0² = (m0²-(m1+m2)²)*(m0²-(m1-m2)²) / (4*m0²)
-        AD s_md = md1_q0_ad + md2_q0_ad;
-        AD d_md = md1_q0_ad - md2_q0_ad;
-        AD m0sq = m0_q0_ad * m0_q0_ad;
-        AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
-        q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-        AD q0_ad = sqrt(q0sq);
-
-        // ---- 节点因子 ----
-        // 检查当前节点是否为共振态节点
-        bool is_res = false;
-        CV node_factor(1.0, 0.0);
-
-        // 遍历所有共振态, 看哪个匹配此节点
-        // 注意: 我们需要 resonance_count 参数, 但这里用 d_res 数组
-        // 简化: 检查母粒子 idx 是否匹配
-        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-            is_res = true;
-            AD m_ad(mm);
-            AD res_m0 = m0_ad;
-
-            if (target_res.type == ResModelType::BWR) {
-                node_factor = BWR<AD>(m_ad, res_m0, gamma_ad, L, q_ad, q0_ad, bf_d);
-            } else if (target_res.type == ResModelType::BW) {
-                node_factor = BW<AD>(m_ad, res_m0, gamma_ad);
+            AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
+                m0_q0_ad = m0_ad;
+            } else if (node.mass[0] > 0) {
+                m0_q0_ad = AD(node.mass[0]);
             } else {
-                // Flatte / ONE: 暂不支持, 返回 1
-                node_factor = CV(1.0, 0.0);
+                m0_q0_ad = AD(1.0);
+            }
+            if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
+                md1_q0_ad = m0_ad;
+            else
+                md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+            if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
+                md2_q0_ad = m0_ad;
+            else
+                md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+
+            AD s_md = md1_q0_ad + md2_q0_ad;
+            AD d_md = md1_q0_ad - md2_q0_ad;
+            AD m0sq = m0_q0_ad * m0_q0_ad;
+            AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
+            q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
+            AD q0_ad = sqrt(q0sq);
+
+            CV node_factor(1.0, 0.0);
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
+                AD m_ad(mm);
+                AD res_m0 = m0_ad;
+                if (target_res.type == ResModelType::BWR) {
+                    node_factor = BWR<AD>(m_ad, res_m0, gamma_ad, L, q_ad, q0_ad, bf_d);
+                } else if (target_res.type == ResModelType::BW) {
+                    node_factor = BW<AD>(m_ad, res_m0, gamma_ad);
+                } else {
+                    node_factor = CV(1.0, 0.0);
+                }
+                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                node_factor.real = node_factor.real * bf_ad;
+                node_factor.imag = node_factor.imag * bf_ad;
+            } else {
+                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                node_factor.real = bf_ad;
+                node_factor.imag = AD(0.0);
             }
 
-            // 共振态节点后乘 Bf
-            AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-            node_factor.real = node_factor.real * bf_ad;
-            node_factor.imag = node_factor.imag * bf_ad;
-        } else {
-            // 非共振态节点: 只乘 Bf
-            AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-            node_factor.real = bf_ad;
-            node_factor.imag = AD(0.0);
+            CV new_R;
+            new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
+            new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+            R_ad = new_R;
         }
 
-        if (evt == 0 && threadIdx.x == 0) {
-            double bf_ni = Bf<double>(L, qq, q0_ad.val, bf_d);
-            printf("PY_NODE%d L=%d mm=%.10f qq=%.10f q0=%.10f Bf=%.10f\n",
-                ni, L, mm, qq, q0_ad.val, bf_ni);
-        }
-        // 乘入总乘积
-        // (a+ib)*(c+id) = (ac-bd) + i(ad+bc)
-        CV new_R;
-        new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
-        new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
-        R_ad = new_R;
-    }
+        // ----------------------------------------------------------------
+        // 累加 sl 的贡献: 对 pol 求和 Σ_p conj(w_p) · v_sl · slamps[sl,e,p]
+        // 然后乘以 ∂R_sl/∂θ 的 (实部, 虚部) 并提取实部
+        // ----------------------------------------------------------------
+        cuComplex v_sl = d_v[site + sl_idx];
 
-    // DEBUG: dump data for Python reproduction
-    if (evt == 0 && threadIdx.x == 0) {
-        // SL amps for this event (all SL, all pol)
-        printf("PY_SLAMPS ");
-        for (int sl = 0; sl < 2; ++sl) {
-            for (int p = 0; p < nPolar; ++p) {
-                int idx = sl * d_momenta->n_events * nPolar + global_evt * nPolar + p;
-                auto slv = d_slamps[idx];
-                printf("(%.10f,%.10f)", slv.real(), slv.imag());
-                if (!(sl == 1 && p == nPolar-1)) printf(",");
-            }
+        double s_re = 0.0, s_im = 0.0;
+        for (int pol = 0; pol < nPolar; ++pol) {
+            cuComplex w_val = d_w[evt * nPolar + pol];
+            int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
+            auto sl_amp = d_slamps[amp_idx];
+            double sl_re = sl_amp.real();
+            double sl_im = sl_amp.imag();
+            // T_sl = v_sl * slamps[sl,e,p]
+            double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
+            double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
+            // conj(w) * T
+            s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
+            s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
         }
-        printf("\n");
-        printf("PY_DATA sign=%.6f global_evt=%d nPolar=%d\n", sign, global_evt, nPolar);
-        printf("PY_R dR_dmass=(%.10f,%.10f) dR_dwidth=(%.10f,%.10f) R=(%.10f,%.10f)\n",
-            R_ad.real.grad[0], R_ad.imag.grad[0],
-            R_ad.real.grad[1], R_ad.imag.grad[1],
-            R_ad.real.val, R_ad.imag.val);
-        // Print w and T for all 9 polarizations
-        printf("PY_W_T ");
-        for (int p = 0; p < nPolar; ++p) {
-            cuComplex tw = d_w[evt * nPolar + p];
-            cuComplex tT = d_T[global_evt * nPolar + p];
-            printf("(%.10f,%.10f,%.10f,%.10f)", tw.x, tw.y, tT.x, tT.y);
-            if (p < nPolar-1) printf(",");
-        }
-        printf("\n");
-    }
-
-    for (int pol = 0; pol < nPolar; ++pol) {
-        cuComplex w_val = d_w[evt * nPolar + pol];
-        cuComplex T_val = d_T[global_evt * nPolar + pol];
-
-        double c_re = (double)w_val.x*(double)T_val.x + (double)w_val.y*(double)T_val.y;
-        double c_im = (double)w_val.x*(double)T_val.y - (double)w_val.y*(double)T_val.x;
 
         for (int j = 0; j < Nfree; ++j) {
             double dRr = R_ad.real.grad[j];
             double dRi = R_ad.imag.grad[j];
-            double contrib = -2.0 * sign * (c_re*dRr - c_im*dRi);
+            // 2 Re((s_re + i s_im) * (dRr + i dRi)) = 2 (s_re*dRr - s_im*dRi)
+            double contrib = -2.0 * sign * (s_re * dRr - s_im * dRi);
             atomicAdd(&d_grad[d_global_idx[j]], contrib);
         }
     }
@@ -1864,7 +1827,8 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site);
+                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        static_cast<int>(cas->getNSLCombs()));
                     break;
                 case 2:
                     resonanceGradientKernel<2><<<grid, kBlockSize>>>(
@@ -1874,7 +1838,8 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site);
+                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        static_cast<int>(cas->getNSLCombs()));
                     break;
                 case 3:
                     resonanceGradientKernel<3><<<grid, kBlockSize>>>(
@@ -1884,7 +1849,8 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site);
+                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        static_cast<int>(cas->getNSLCombs()));
                     break;
                 default: break;
                 }
