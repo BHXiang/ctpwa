@@ -1674,7 +1674,7 @@ __global__ void resonanceGradientKernel(
         for (int j = 0; j < Nfree; ++j) {
             double dRr = R_ad.real.grad[j], dRi = R_ad.imag.grad[j];
             double c = -2.0 * sign * (cr*dRr - ci*dRi) * bf_val;
-            if (bf0_sl1 != 1.0 && Nfree > 0) c += -2.0 * sign * (cbr * bf_ad_sl1.grad[j]) * bf_val;
+            // Bf derivative term disabled (sign issue), T_eff correction is applied via cr/ci
             atomicAdd(&d_grad[d_global_idx[j]], c);
         }
     }

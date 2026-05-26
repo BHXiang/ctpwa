@@ -812,6 +812,8 @@ public:
                     n_data_events[g] = events_list[g][1];
                     phsp_offsets[g] = events_list[g][0];
                 }
+                const cuComplex* d_v_ptr = reinterpret_cast<const cuComplex*>(
+                    extended_vec_per_gpu[primary_dev].data_ptr());
                 amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res,
                     +1.0, phsp_offsets, d_v_ptr);
             }
@@ -847,7 +849,7 @@ public:
                     const cuComplex* d_v_ptr2 = reinterpret_cast<const cuComplex*>(
                         extended_vec_per_gpu[primary_dev].data_ptr());
                     amp_calc->computeResonanceGradient(d_S_bufs, n_phsp_evts, d_grad_res,
-                        phsp_sign, {}, d_v_ptr);
+                        phsp_sign, {}, d_v_ptr2);
 
                     for (int g = 0; g < num_gpus; ++g)
                         if (d_S_bufs[g]) { cudaSetDevice(g); cudaFree(d_S_bufs[g]); }
