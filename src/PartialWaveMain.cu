@@ -761,12 +761,6 @@ public:
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
                     d_grad, nData_gpu, n_polar_, n_amplitudes_, nullptr, d_w_out);
 
-                // DEBUG: verify w immediately after computeFactorNLL
-                if (d_w_out) {
-                    cuComplex hw; cudaMemcpy(&hw, d_w_out, sizeof(cuComplex), cudaMemcpyDeviceToHost);
-                    printf("DEBUG_FWD2 w[0]=(%.6f,%.6f)\n", hw.x, hw.y);
-                }
-
                 total_data_nll += nll;
                 totalDataEvents += nData_gpu;
                 // P2P累加到global (正号)

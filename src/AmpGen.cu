@@ -1693,13 +1693,6 @@ __global__ void resonanceGradientKernel(
         R_ad = new_R;
     }
 
-    if (evt == 0 && threadIdx.x == 0) {
-        printf("DEBUG_R dR_dmass=(%.6f,%.6f) dR_dwidth=(%.6f,%.6f)\\n",
-            R_ad.real.grad[0], R_ad.imag.grad[0],
-            R_ad.real.grad[1], R_ad.imag.grad[1]);
-    }
-
-    double debug_sum_mass = 0, debug_sum_width = 0;
     for (int pol = 0; pol < nPolar; ++pol) {
         cuComplex w_val = d_w[evt * nPolar + pol];
         cuComplex T_val = d_T[global_evt * nPolar + pol];
@@ -1711,20 +1704,8 @@ __global__ void resonanceGradientKernel(
             double dRr = R_ad.real.grad[j];
             double dRi = R_ad.imag.grad[j];
             double contrib = -2.0 * sign * (c_re*dRr - c_im*dRi);
-            if (j == 0) debug_sum_mass += contrib;
-            if (j == 1) debug_sum_width += contrib;
             atomicAdd(&d_grad[d_global_idx[j]], contrib);
         }
-        if (evt == 0 && pol < 3 && threadIdx.x == 0) {
-            printf("  pol%d: w=(%.6f,%.6f) T=(%.6f,%.6f) contrib_m=%.6f\\n",
-                pol, (double)w_val.x, (double)w_val.y,
-                (double)T_val.x, (double)T_val.y,
-                -2.0*sign*(c_re*R_ad.real.grad[0] - c_im*R_ad.imag.grad[0]));
-        }
-    }
-    if (evt == 0 && threadIdx.x == 0) {
-        printf("  total contrib: mass=%.6f width=%.6f sign=%.4f\\n",
-            debug_sum_mass, debug_sum_width, sign);
     }
 }
 // ---------------------------------------------------------------------------
