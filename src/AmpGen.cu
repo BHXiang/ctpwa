@@ -1549,7 +1549,9 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
     return sqrt(q_sq) / (2.0 * m);
 }
 
-// 梯度 kernel 模板实现 (q0 AD + per-SL Bf修正 + event offset)
+// 梯度 kernel 模板实现 (完整衰变链 AutoDiff 版)
+// R_total = Bf_0 * Propagator_1 * Bf_1 * Propagator_2 * Bf_2 * ...
+// ∂R_total/∂θ 通过 AutoDiff 自动传播所有依赖关系（包括 Bf 对 mass 的依赖）
 template <int Nfree>
 __global__ void resonanceGradientKernel(
     const cuComplex* d_w, const cuComplex* d_T,
@@ -1565,121 +1567,150 @@ __global__ void resonanceGradientKernel(
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
     int global_evt = evt + t_evt_offset;
-    int nTotalEvt = d_momenta->n_events;
 
-    const DeviceResonance& res = d_res[res_idx_in_block];
-    const double* rp = d_all_params + res.param_offset;
-
-    // Step 1: 找共振态节点
-    double mm = 0.0, qq = 0.0, node_md1 = 1.0, node_md2 = 1.0;
-    int res_L = 0; bool found = false;
-    for (int ni = 0; ni < decayChain_size; ++ni) {
-        const DecayNode& node = d_decayNodes[ni];
-        if (node.mother_idx != res.particle_idx) continue;
-        LorentzVector pM = d_momenta->getMomentum(global_evt, node.mother_idx);
-        LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
-        LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
-        mm = pM.M();
-        double md1 = node.mass[1], md2 = node.mass[2];
-        if (md1 <= 0) md1 = pD1.M();
-        if (md2 <= 0) md2 = pD2.M();
-        node_md1 = md1; node_md2 = md2;
-        qq = breakup_momentum(mm, md1, md2);
-        res_L = d_slComb[ni].L;
-        found = true; break;
-    }
-    if (!found) return;
-
-    // Step 2: AutoDiff
     using AD = Var<double, Nfree, false>;
-    AD m_ad(mm);
+    using CV = ComplexVar<double, Nfree, false>;
+
+    // 确定目标共振态的参数位置和自由参数映射
+    const DeviceResonance& target_res = d_res[res_idx_in_block];
+    const double* target_rp = d_all_params + target_res.param_offset;
+
     int ftg[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
     for (int j = 0; j < Nfree; ++j) { int pi = d_param_map[j]; if (pi>=0&&pi<8) ftg[pi] = j; }
 
-    AD m0_ad(rp[0]); if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
-    AD gamma0_ad;
-    if (res.type == ResModelType::BWR || res.type == ResModelType::BW) {
-        gamma0_ad = AD(rp[1]); if (ftg[1] >= 0) gamma0_ad.grad[ftg[1]] = 1.0;
+    // 目标共振态参数 AD（只有目标共振态的参数有梯度）
+    AD m0_ad(target_rp[0]);
+    if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
+
+    AD gamma_ad; // width / couplings
+    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
+        gamma_ad = AD(target_rp[1]);
+        if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
     }
-    AD q_ad(qq);
-    // q0 AD (preserves derivative through breakup_momentum)
-    AD md1a(node_md1), md2a(node_md2);
-    AD sm = md1a+md2a, dm = md1a-md2a, msq = m0_ad*m0_ad;
-    AD q0sq = (msq - sm*sm)*(msq - dm*dm)/(AD(4.0)*msq);
-    q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-    AD q0_ad = sqrt(q0sq);
-    double q0_val = q0_ad.val;
 
-    ComplexVar<double, Nfree, false> R_ad;
-    if (res.type == ResModelType::BWR)
-        R_ad = BWR<AD>(m_ad, m0_ad, gamma0_ad, res_L, q_ad, q0_ad, bf_d);
-    else if (res.type == ResModelType::BW)
-        R_ad = BW<AD>(m_ad, m0_ad, gamma0_ad);
-    else return;
-
-    double bf_val = 1.0;
-    if (res.type == ResModelType::BWR || res.type == ResModelType::ONE)
-        bf_val = Bf<double>(res_L, qq, q0_val, bf_d);
-
-    // Step 3: per-SL Bf 修正
-    double bf0_sl0 = 1.0, bf0_sl1 = 1.0;
-    AD bf_ad_sl1;
-    if (d_slamps && d_v) {
-        const DecayNode& nd0 = d_decayNodes[0];
-        LorentzVector pM0 = d_momenta->getMomentum(global_evt, nd0.mother_idx);
-        double mm0 = pM0.M(), md1_0 = nd0.mass[1], md2_0 = nd0.mass[2];
-        LorentzVector pD1 = d_momenta->getMomentum(global_evt, nd0.daug1_idx);
-        LorentzVector pD2 = d_momenta->getMomentum(global_evt, nd0.daug2_idx);
-        if (md1_0 <= 0) md1_0 = pD1.M();
-        if (md2_0 <= 0) md2_0 = pD2.M();
-        double qq0 = breakup_momentum(mm0, md1_0, md2_0);
-        double md2q0 = nd0.mass[2] <= 0 ? rp[0] : md2_0;
-        double q00 = breakup_momentum(nd0.mass[0], md1_0, md2q0);
-        bf0_sl0 = Bf<double>(d_slComb[0].L, qq0, q00, bf_d);
-        int L1 = d_slComb[decayChain_size].L;
-        bf0_sl1 = Bf<double>(L1, qq0, q00, bf_d);
-        if (L1 > 0 && Nfree > 0) {
-            AD qq0a(qq0), m1a(md1_0), m2a = m0_ad, m0a(nd0.mass[0]);
-            AD s2=m1a+m2a, d2=m1a-m2a, msq2=m0a*m0a;
-            AD q0s2 = (msq2-s2*s2)*(msq2-d2*d2)/(AD(4.0)*msq2);
-            q0s2.val = q0s2.val < 0.0 ? 0.0 : q0s2.val;
-            bf_ad_sl1 = Bf<AD>(L1, qq0a, sqrt(q0s2), bf_d);
+    AD other_g[4]; // Flatte couplings
+    if (target_res.type == ResModelType::Flatte) {
+        for (int k = 0; k < target_res.param_count - 1 && k < 4; ++k) {
+            other_g[k] = AD(target_rp[1 + k]);
+            if (ftg[1 + k] >= 0) other_g[k].grad[ftg[1 + k]] = 1.0;
         }
     }
 
+    // ============================================================
+    // 遍历整个衰变链, 用 AD 计算 R_total = ∏ (factor at each node)
+    // ============================================================
+    CV R_ad(1.0, 0.0); // 起始值 1+0i
+
+    for (int ni = 0; ni < decayChain_size; ++ni) {
+        const DecayNode& node = d_decayNodes[ni];
+        const SL& sl = d_slComb[ni]; // 使用 SL combo 0 (Bf 的 L 对所有 SL combo 相同)
+        int L = sl.L;
+
+        // 四动量
+        LorentzVector pM  = d_momenta->getMomentum(global_evt, node.mother_idx);
+        LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
+        LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
+
+        double mm = pM.M();
+        double md1 = node.mass[1], md2 = node.mass[2];
+        if (md1 <= 0) md1 = pD1.M();
+        if (md2 <= 0) md2 = pD2.M();
+
+        // ---- q (实际破缺动量) ----
+        double qq = breakup_momentum(mm, md1, md2);
+        AD q_ad(qq);
+
+        // ---- q0 (名义破缺动量, 用 AD 传播质量依赖) ----
+        AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+
+        // 母粒子质量
+        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
+            m0_q0_ad = m0_ad; // 目标共振态的参数
+        } else if (node.mass[0] > 0) {
+            m0_q0_ad = AD(node.mass[0]); // 固定质量（如 Jpsi）
+        } else {
+            // 其他共振态: 暂用 1.0 (单共振态场景不会触发)
+            m0_q0_ad = AD(1.0);
+        }
+
+        // 子粒子质量
+        if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
+            md1_q0_ad = m0_ad;
+        else
+            md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+
+        if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
+            md2_q0_ad = m0_ad;
+        else
+            md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+
+        // q0² = (m0²-(m1+m2)²)*(m0²-(m1-m2)²) / (4*m0²)
+        AD s_md = md1_q0_ad + md2_q0_ad;
+        AD d_md = md1_q0_ad - md2_q0_ad;
+        AD m0sq = m0_q0_ad * m0_q0_ad;
+        AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
+        q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
+        AD q0_ad = sqrt(q0sq);
+
+        // ---- 节点因子 ----
+        // 检查当前节点是否为共振态节点
+        bool is_res = false;
+        CV node_factor(1.0, 0.0);
+
+        // 遍历所有共振态, 看哪个匹配此节点
+        // 注意: 我们需要 resonance_count 参数, 但这里用 d_res 数组
+        // 简化: 检查母粒子 idx 是否匹配
+        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
+            is_res = true;
+            AD m_ad(mm);
+            AD res_m0 = m0_ad;
+
+            if (target_res.type == ResModelType::BWR) {
+                node_factor = BWR<AD>(m_ad, res_m0, gamma_ad, L, q_ad, q0_ad, bf_d);
+            } else if (target_res.type == ResModelType::BW) {
+                node_factor = BW<AD>(m_ad, res_m0, gamma_ad);
+            } else {
+                // Flatte / ONE: 暂不支持, 返回 1
+                node_factor = CV(1.0, 0.0);
+            }
+
+            // 共振态节点后乘 Bf
+            AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+            node_factor.real = node_factor.real * bf_ad;
+            node_factor.imag = node_factor.imag * bf_ad;
+        } else {
+            // 非共振态节点: 只乘 Bf
+            AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+            node_factor.real = bf_ad;
+            node_factor.imag = AD(0.0);
+        }
+
+        // 乘入总乘积
+        // (a+ib)*(c+id) = (ac-bd) + i(ad+bc)
+        CV new_R;
+        new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
+        new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+        R_ad = new_R;
+    }
+
+    // ============================================================
+    // 累加梯度: -2 * sign * Re( conj(w) * T * ∂R_total/∂θ_j )
+    // ============================================================
     for (int pol = 0; pol < nPolar; ++pol) {
         cuComplex w_val = d_w[evt * nPolar + pol];
-        cuComplex T_eff, T1_BWR;
-        if (d_slamps && d_v) {
-            int i0 = 0*nTotalEvt*nPolar + global_evt*nPolar + pol;
-            int i1 = 1*nTotalEvt*nPolar + global_evt*nPolar + pol;
-            auto s0 = d_slamps[i0], s1 = d_slamps[i1];
-            cuComplex v0 = d_v[site+0], v1 = d_v[site+1];
-            cuComplex T0 = make_cuComplex((float)(v0.x*s0.real()-v0.y*s0.imag()),(float)(v0.x*s0.imag()+v0.y*s0.real()));
-            cuComplex T1 = make_cuComplex((float)(v1.x*s1.real()-v1.y*s1.imag()),(float)(v1.x*s1.imag()+v1.y*s1.real()));
-            T_eff = make_cuComplex((float)(T0.x*bf0_sl0+T1.x*bf0_sl1),(float)(T0.y*bf0_sl0+T1.y*bf0_sl1));
-            double br=R_ad.real.val, bi=R_ad.imag.val;
-            T1_BWR = make_cuComplex((float)(T1.x*br-T1.y*bi),(float)(T1.x*bi+T1.y*br));
-        } else {
-            T_eff = d_T[global_evt * nPolar + pol];
-            T1_BWR = make_cuComplex(0.0f,0.0f);
-        }
-        double cr = (double)w_val.x*(double)T_eff.x + (double)w_val.y*(double)T_eff.y;
-        double ci = (double)w_val.x*(double)T_eff.y - (double)w_val.y*(double)T_eff.x;
-        double cbr=0.0, cbi=0.0;
-        if (bf0_sl1 != 1.0) {
-            cbr = (double)w_val.x*(double)T1_BWR.x + (double)w_val.y*(double)T1_BWR.y;
-            cbi = (double)w_val.x*(double)T1_BWR.y - (double)w_val.y*(double)T1_BWR.x;
-        }
+        cuComplex T_val = d_T[global_evt * nPolar + pol];
+
+        double c_re = (double)w_val.x*(double)T_val.x + (double)w_val.y*(double)T_val.y;
+        double c_im = (double)w_val.x*(double)T_val.y - (double)w_val.y*(double)T_val.x;
+
         for (int j = 0; j < Nfree; ++j) {
-            double dRr = R_ad.real.grad[j], dRi = R_ad.imag.grad[j];
-            double c = -2.0 * sign * (cr*dRr - ci*dRi) * bf_val;
-            // Bf derivative term disabled (sign issue), T_eff correction is applied via cr/ci
-            atomicAdd(&d_grad[d_global_idx[j]], c);
+            double dRr = R_ad.real.grad[j];
+            double dRi = R_ad.imag.grad[j];
+            double contrib = -2.0 * sign * (c_re*dRr - c_im*dRi);
+            atomicAdd(&d_grad[d_global_idx[j]], contrib);
         }
     }
 }
-
 // ---------------------------------------------------------------------------
 // T 计算 kernel: T[e,p] = Σ_sl v[site+sl] * slamps[sl, e, p]
 // ---------------------------------------------------------------------------
