@@ -235,10 +235,21 @@ public:
     // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
     // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
     void computeResonanceGradient(
+        const std::vector<cuComplex*>& d_w,
+        const std::vector<int>& n_events,
+        double* d_grad_res,
+        double sign = 1.0,
+        const std::vector<int>& t_offset = {},
+        const cuComplex* d_v = nullptr);
+
+    // 计算共振态参数 Hessian ∂²NLL/∂θ∂θ（P×P 对称矩阵，仅上三角）
+    // d_hess: 输出 [P×P]，在 GPU 0，按列存储（与 LBFGS 等优化器兼容）
+    void computeResonanceHessian(
         const std::vector<cuComplex*>& d_w,   // 每 GPU 一份
-        const std::vector<int>& n_events,     // 每 GPU 的事件数（对应 d_w 的大小）
-        double* d_grad_res,                   // 输出，在 GPU 0
-        double sign = 1.0);                   // +1=加, -1=减
+        const std::vector<int>& n_events,     // 每 GPU 的事件数
+        double* d_hess,                       // 输出 [P×P]
+        int hess_ld,                          // leading dimension = P
+        double sign = 1.0);
 
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
@@ -301,6 +312,33 @@ __global__ void resonanceGradientKernel(
     int nEvents, int nPolar,
     int decayChain_size,
     double bf_d,
-    double sign = 1.0);                // +1=data, -1=bkg
+    double sign = 1.0,
+    int t_evt_offset = 0,
+    const thrust::complex<double>* d_slamps = nullptr,
+    const cuComplex* d_v = nullptr,
+    int site = 0);
+
+// 共振态 Hessian 块 kernel：计算 (r,s) 块的 Pr×Ps 子矩阵
+// Pr, Ps: 共振态 r 和 s 的自由参数个数
+// SameRes: r==s 时需 ∂²R/∂θ²（WithHess=true），否则只需 ∂R/∂θ
+template <int Pr, int Ps, bool SameRes>
+__global__ void resonanceHessianBlockKernel(
+    const cuComplex* d_w,              // [nEvents × nPolar] w = S/I
+    const cuComplex* d_T_r,            // [nEvents × nPolar] 共振态 r 的 T
+    const cuComplex* d_T_s,            // [nEvents × nPolar] 共振态 s 的 T
+    const DeviceMomenta* d_momenta,
+    const DecayNode* d_decayNodes,
+    const SL* d_slComb,
+    const DeviceResonance* d_res,
+    const double* d_all_params,
+    int res_r_idx, int res_s_idx,      // 在 d_res 中的下标
+    const int* d_param_map_r,          // [Pr]
+    const int* d_param_map_s,          // [Ps]
+    double* d_hess,                    // 输出 [P×P]
+    int hess_ld,                       // leading dim = P
+    int offset_r, int offset_s,        // 在 Hessian 中的起始行列
+    int nEvents, int nPolar,
+    int decayChain_size, double bf_d,
+    double sign = 1.0);                // +1=data/-1=bkg
 
 #endif // AMPGEN_CUH

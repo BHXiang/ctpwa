@@ -631,6 +631,39 @@ public:
                 amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
                 cudaDeviceSynchronize();
             }
+
+            // 更新 d_phsp_matrix_（振幅已变，phsp 矩阵需同步）
+            cudaSetDevice(primary_dev);
+            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+            for (int gpu = 0; gpu < num_gpus; ++gpu) {
+                int nPhsp = events_list[gpu][0];
+                if (nPhsp == 0) continue;
+                cudaSetDevice(gpu);
+                cuComplex* d_phsp_gpu;
+                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                cublasHandle_t h;
+                cublasCreate(&h);
+                cuComplex alpha = make_cuComplex(1.0f / static_cast<float>(nPhsp), 0.0f);
+                cuComplex beta = make_cuComplex(0.0f, 0.0f);
+                cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C,
+                    n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
+                    &alpha,
+                    d_all_amplitudes_list[gpu], n_amplitudes_,
+                    d_all_amplitudes_list[gpu], n_amplitudes_,
+                    &beta, d_phsp_gpu, n_amplitudes_);
+                cublasDestroy(h);
+                if (gpu == primary_dev) {
+                    cudaMemcpy(d_phsp_matrix_, d_phsp_gpu,
+                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                } else {
+                    cudaMemcpyPeer(d_phsp_matrix_, primary_dev, d_phsp_gpu, gpu,
+                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    cudaSetDevice(primary_dev);
+                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                }
+                cudaFree(d_phsp_gpu);
+            }
         }
 
         // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
@@ -771,21 +804,63 @@ public:
             cudaMalloc(&d_grad_res, n_free_res * sizeof(double));
             cudaMemset(d_grad_res, 0, n_free_res * sizeof(double));
 
-            // data 贡献 (sign=+1)
+            // data 贡献 (sign=+1, d_T/d_momenta 需加 phsp 偏移)
             if (totalDataEvents > 0) {
-                // 构建 per-GPU data 事件数
                 std::vector<int> n_data_events(num_gpus);
-                for (int g = 0; g < num_gpus; ++g) n_data_events[g] = events_list[g][1];
-                amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res, +1.0);
+                std::vector<int> phsp_offsets(num_gpus);
+                for (int g = 0; g < num_gpus; ++g) {
+                    n_data_events[g] = events_list[g][1];
+                    phsp_offsets[g] = events_list[g][0];
+                }
+                const cuComplex* d_v_ptr = reinterpret_cast<const cuComplex*>(
+                    extended_vec_per_gpu[primary_dev].data_ptr());
+                amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res,
+                    +1.0, phsp_offsets, d_v_ptr);
             }
-            // bkg 贡献 (sign=-1)
-            // 注：bkg 的 w 需要单独捕获；此处简化为 bkg 与 data 共享 w buffer（后续完善）
-            // 当前仅实现 data 贡献
+
+            // phsp 贡献: ∂(N_data*log(phsp))/∂θ = (2*N_data/(phsp*N_phsp)) * Σ Re(conj(S)*T*∂R/∂θ*bf)
+            {
+                int total_phsp = 0;
+                for (int g = 0; g < num_gpus; ++g) total_phsp += events_list[g][0];
+                if (total_phsp > 0 && phsp_factor > 1e-30) {
+                    double phsp_sign = -totalDataEvents / (phsp_factor * total_phsp);
+
+                    std::vector<cuComplex*> d_S_bufs(num_gpus, nullptr);
+                    std::vector<int> n_phsp_evts(num_gpus);
+                    cublasHandle_t ch;
+                    cublasCreate(&ch);
+                    for (int g = 0; g < num_gpus; ++g) {
+                        cudaSetDevice(g);
+                        int nP = events_list[g][0];
+                        n_phsp_evts[g] = nP;
+                        if (nP == 0) continue;
+                        int nTot = nP * n_polar_;
+                        cudaMalloc(&d_S_bufs[g], nTot * sizeof(cuComplex));
+                        cuComplex* d_amp = d_all_amplitudes_list[g];
+                        const cuComplex* d_vg = reinterpret_cast<const cuComplex*>(
+                            extended_vec_per_gpu[g].data_ptr());
+                        cuComplex a = make_cuComplex(1.0f, 0.0f);
+                        cuComplex b = make_cuComplex(0.0f, 0.0f);
+                        cublasCgemv(ch, CUBLAS_OP_T, n_amplitudes_, nTot,
+                            &a, d_amp, n_amplitudes_, d_vg, 1, &b, d_S_bufs[g], 1);
+                    }
+                    cublasDestroy(ch);
+
+                    const cuComplex* d_v_ptr2 = reinterpret_cast<const cuComplex*>(
+                        extended_vec_per_gpu[primary_dev].data_ptr());
+                    amp_calc->computeResonanceGradient(d_S_bufs, n_phsp_evts, d_grad_res,
+                        phsp_sign, {}, d_v_ptr2);
+
+                    for (int g = 0; g < num_gpus; ++g)
+                        if (d_S_bufs[g]) { cudaSetDevice(g); cudaFree(d_S_bufs[g]); }
+                }
+            }
 
             grad_theta = torch::empty({ n_free_res },
                 torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
             cudaMemcpy(grad_theta.data_ptr(), d_grad_res,
                 n_free_res * sizeof(double), cudaMemcpyDeviceToDevice);
+
             cudaFree(d_grad_res);
         }
         else {
@@ -2208,6 +2283,76 @@ public:
         return hessian_reduced;
     }
 
+    // 共振态参数 Hessian（P×P，在最优点调用一次）
+    torch::Tensor getResonanceHessian(torch::Tensor vector, torch::Tensor theta)
+    {
+        TORCH_CHECK(vector.is_cuda() && theta.is_cuda(), "inputs must be on CUDA");
+        TORCH_CHECK(theta.numel() > 0, "theta must not be empty");
+        TORCH_CHECK(initialized_, "analysis not initialized");
+
+        int P = theta.numel();
+        int n_gpu = static_cast<int>(d_all_amplitudes_.size());
+
+        // 1. 更新振幅
+        amp_calc_.reComputeAmps(d_all_amplitudes_,
+            reinterpret_cast<const double*>(theta.data_ptr()),
+            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+
+        // 2. 扩展向量
+        torch::Tensor extended_v = NLLFunction::extendVectorWithConstraints(vector, vector.device());
+        int n_ext = extended_v.numel();
+        int primary_dev = vector.get_device();
+
+        // 3. 分配 per-GPU w buffer
+        std::vector<cuComplex*> d_w_bufs(n_gpu, nullptr);
+        std::vector<int> n_data_events(n_gpu, 0);
+
+        for (int gpu = 0; gpu < n_gpu; ++gpu) {
+            cudaSetDevice(gpu);
+            torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
+            const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
+
+            int nData = events_[gpu][1];
+            if (nData == 0) continue;
+            n_data_events[gpu] = nData;
+
+            // 预计算 T
+            amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
+
+            // 分配 w buffer
+            int nTotal = nData * n_polar_;
+            cudaMalloc(&d_w_bufs[gpu], nTotal * sizeof(cuComplex));
+
+            // 跑 computeFactorNLL 获取 w
+            cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+            cuComplex* d_grad_dummy;
+            cudaMalloc(&d_grad_dummy, n_ext * sizeof(cuComplex));
+            computeFactorNLL(d_amp, d_v_gpu, d_grad_dummy,
+                nData, n_polar_, n_amplitudes_, nullptr, d_w_bufs[gpu]);
+            cudaFree(d_grad_dummy);
+            cudaDeviceSynchronize();
+        }
+
+        // 4. 计算 Hessian
+        cudaSetDevice(primary_dev);
+        double* d_hess;
+        cudaMalloc(&d_hess, P * P * sizeof(double));
+        amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0);
+
+        torch::Tensor result = torch::empty({ P, P },
+            torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
+        cudaMemcpy(result.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
+        cudaFree(d_hess);
+
+        // 5. 清理
+        for (int gpu = 0; gpu < n_gpu; ++gpu) {
+            if (d_w_bufs[gpu]) { cudaSetDevice(gpu); cudaFree(d_w_bufs[gpu]); }
+        }
+        cudaSetDevice(primary_dev);
+
+        return result;
+    }
+
     // 内部：用已加载的truth振幅，对给定extended_vector计算phsp积分+BF
     void computePhspAndBF(
         const torch::Tensor& extended_vector,
@@ -3504,6 +3649,7 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getSLVectors", &analysis::getSLVectors)
         .def("writeResult", &analysis::writeResult)
         .def("getHessian", &analysis::getHessian)
+        .def("getResonanceHessian", &analysis::getResonanceHessian)
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)
