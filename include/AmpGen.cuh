@@ -251,9 +251,25 @@ public:
         int hess_ld,                          // leading dimension = P
         double sign = 1.0);
 
+    // 计算混合 Hessian ∂²NLL/∂v∂θ (2·n_amplitudes × P)
+    // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
+    // d_amp: 完整的振幅矩阵 [nEvents × nPolar × n_amplitudes]（每 GPU 一份）
+    // d_mixed_hess: 输出 [2·n_amplitudes × P]，在 primary GPU 上
+    void computeMixedHessian(
+        const std::vector<cuComplex*>& d_w,
+        const std::vector<cuComplex*>& d_amp,
+        const std::vector<int>& n_events,
+        int n_amplitudes,
+        double* d_mixed_hess,
+        int ld_mixed,
+        double sign = 1.0);
+
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
+
+    // 测试：用 AutoDiff 计算 BWR Hessian
+    static void testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d, double* out);
 
 private:
     std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放

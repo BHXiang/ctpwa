@@ -2279,6 +2279,17 @@ public:
             cudaMemcpy(res_hess.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
             cudaFree(d_hess);
 
+            // ========== 混合 Hessian [0:n2, n2:total] 和 [n2:total, 0:n2] ==========
+            // TODO: 对于所有channel共享同一共振态的模型，∂²NLL/∂v∂θ = 0
+            // (因为 g_v[a] = -2 Re(conj(T)·SL_a/Σ|T|²) 不依赖 θ)
+            // 对于多衰变链模型，mixed block非零，需要调用 computeMixedHessian
+            // 当前暂时填零
+            {
+                hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
+                hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
+            }
+
+            // 清理 d_w_bufs (resonance block)
             for (int gpu = 0; gpu < n_gpu; ++gpu) {
                 if (d_w_bufs[gpu]) { cudaSetDevice(gpu); cudaFree(d_w_bufs[gpu]); }
             }
@@ -2361,6 +2372,14 @@ public:
 
         computeBFfromIntegrals(out_phsp.data(), h_truth_partial.data(),
             h_scattering.data(), out_bf.data(), npartials, dataIntegral);
+    }
+
+    // 测试：用 AutoDiff 计算 BWR Hessian，返回 [12] float64 tensor
+    torch::Tensor testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d)
+    {
+        torch::Tensor out = torch::empty({12}, torch::kFloat64);
+        AmpCalc::testBWRHessian(m, m0, g0, L, q, q0, d, out.data_ptr<double>());
+        return out;
     }
 
     torch::Tensor getBranchFractions(torch::Tensor& vector)
@@ -3591,6 +3610,10 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)
+        .def("testBWRHessian", &analysis::testBWRHessian,
+             pybind11::arg("m"), pybind11::arg("m0"), pybind11::arg("g0"),
+             pybind11::arg("L"), pybind11::arg("q"), pybind11::arg("q0"), pybind11::arg("d") = 3.0,
+             "Test AutoDiff BWR Hessian. Returns [R_re,R_im, dRe_dm0,dRe_dg0,dIm_dm0,dIm_dg0, d2Re_dm02,d2Re_dm0dg0,d2Re_dg02, d2Im_dm02,d2Im_dm0dg0,d2Im_dg02]")
         .def("getBranchFractions", &analysis::getBranchFractions)
         .def("getBkgTensor", &analysis::getBkgTensor)
         .def("getBkgWeightsTensor", &analysis::getBkgWeightsTensor)
