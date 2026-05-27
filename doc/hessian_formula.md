@@ -1,105 +1,108 @@
-# Resonance Parameter Hessian Formula
+# 共振态参数 Hessian 公式
 
-## 1. NLL Definition
+## 1. NLL 定义
 
-For a single decay chain with coupling parameters `v` and resonance parameters `θ`:
+单衰变链，耦合参数 `v`，共振态参数 `θ`：
 
-```
-NLL = -∑_data log(I_e) + n_data · log(phsp_factor)
+$$
+\text{NLL} = -\sum_{\text{data}} \log I_e + n_{\text{data}} \cdot \log(\text{phsp\_factor})
+$$
 
-where:
-  I_e = ∑_p |S_{e,p}|²                          (intensity summed over polarizations)
-  S_{e,p} = ∑_a A_{e,p}^a · v_a                (amplitude sum)
-  A_{e,p}^a = SL_{e,p}^a · R_e(θ) · bf         (full amplitude)
-  T_r(e,p) = ∑_{a∈block} SL_{e,p}^a · v_a      (effective coupling, no R, no bf)
-  phsp_factor = (1/N_phsp) · ∑_phsp |S|²
-```
+其中：
+- $I_e = \sum_p |S_{e,p}|^2$ （所有极化求和）
+- $S_{e,p} = \sum_a A_{e,p}^a \cdot v_a$
+- $A_{e,p}^a = SL_{e,p}^a \cdot R_e(\theta) \cdot bf$ （完整振幅）
+- $T_r(e,p) = \sum_{a \in \text{block}} SL_{e,p}^a \cdot v_a$ （有效耦合，不含 R 和 bf）
+- $\text{phsp\_factor} = \frac{1}{N_{\text{phsp}}} \sum_{\text{phsp}} |S|^2$
 
-Key relation: `S_{e,p} = R_e(θ) · bf · T_r(e,p)` for single-chain (all channels share same R).
+关键关系（单链，所有channel共享同一R）：$S_{e,p} = R_e(\theta) \cdot bf \cdot T_r(e,p)$
 
-## 2. Per-event Gradient ∂NLL/∂θ
+## 2. 梯度 $\partial\text{NLL}/\partial\theta$ （每个事件）
 
-```
-g_θ[j] = -(1/I) · ∂I/∂θ_j
+$$
+g_\theta[j] = -\frac{1}{I} \frac{\partial I}{\partial\theta_j}
+$$
 
-∂I/∂θ_j = 2 · bf · ∑_p Re(conj(S_p) · T_p · D^j)
+$$
+\frac{\partial I}{\partial\theta_j} = 2 \cdot bf \cdot \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^j\big)
+$$
 
-where D^j = ∂R/∂θ_j  (complex, from AutoDiff Var<double,N,true>)
+其中 $D^j = \partial R/\partial\theta_j$ （复数，由 AutoDiff `Var<double,N,true>` 计算）。
 
-Therefore:
-  g_θ[j] = -(2·bf/I) · ∑_p Re(conj(S_p) · T_p · D^j)
-         = -(2·bf/I) · Re( D^j · ∑_p conj(S_p)·T_p )
-         = -2·bf · Re( D^j · ∑_p conj(w_p)·T_p )      [since conj(S)=I·conj(w)]
-```
+因此：
+$$
+g_\theta[j] = -\frac{2 \cdot bf}{I} \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^j\big)
+            = -\frac{2 \cdot bf}{I} \cdot \text{Re}\Big(D^j \cdot \sum_p \text{conj}(S_p) \cdot T_p\Big)
+            = -2 \cdot bf \cdot \text{Re}\Big(D^j \cdot \sum_p \text{conj}(w_p) \cdot T_p\Big)
+$$
 
-The last form uses `w = S/I`, which is what ctpwa's `computeFactorNLL` outputs.
+最后一步用了 $\text{conj}(S) = I \cdot \text{conj}(w)$，$w = S/I$ 正是 ctpwa 的 `computeFactorNLL` 输出。
 
-## 3. Per-event Hessian ∂²NLL/∂θ∂θ
+## 3. Hessian $\partial^2\text{NLL}/\partial\theta\partial\theta$ （每个事件）
 
-```
-H = g·g^T - (1/I) · ∂²I/∂θ∂θ
+$$
+H = g \cdot g^T - \frac{1}{I} \cdot \frac{\partial^2 I}{\partial\theta\partial\theta}
+$$
 
-where ∂²I/∂θ_j∂θ_k = 
-    2·bf² · ∑_p |T_p|² · Re(conj(D^k) · D^j)           [|T|² term]
-  + 2·bf   · ∑_p Re(conj(S_p) · T_p · D²_jk)           [D² term]
-```
+其中：
+$$
+\frac{\partial^2 I}{\partial\theta_j \partial\theta_k} =
+    \underbrace{2 \cdot bf^2 \cdot \sum_p |T_p|^2 \cdot \text{Re}\big(\text{conj}(D^k) \cdot D^j\big)}_{|T|^2\text{ 项}}
+  + \underbrace{2 \cdot bf \cdot \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^2_{jk}\big)}_{D^2\text{ 项}}
+$$
 
-**Note**: `D²_jk = ∂²R/∂θ_j∂θ_k` from AutoDiff `Var<double,N,true>::hess[j][k]`.
+其中 $D^2_{jk} = \partial^2 R/\partial\theta_j\partial\theta_k$ 由 AutoDiff `Var<double,N,true>::hess[j][k]` 提供。
 
-## 4. CUDA-compatible per-event formula
+**已验证**：AutoDiff 的 $D^j$ 和 $D^2_{jk}$ 与 PyTorch autograd 完全一致（差异 < 1e-15）。
 
-All quantities aggregated in ONE pass over polarizations:
+## 4. CUDA 实现：per-event 聚合公式
 
-```cpp
-// Per-event aggregates:
-double I_inv = 0.0;           // 1/I = Σ|w_p|²
-double sum_T2 = 0.0;          // Σ|T_p|²
-double sum_cwT_re = 0.0;      // Σ Re(conj(w_p)·T_p)
-double sum_cwT_im = 0.0;      // Σ Im(conj(w_p)·T_p)
-
-for (int p = 0; p < nPolar; ++p) {
-    w = d_w[evt * nPolar + p];
-    T = d_T[evt * nPolar + p];
-    I_inv += |w|²;
-    sum_T2 += |T|²;
-    sum_cwT += conj(w) * T;   // complex accumulation
-}
-
-// Gradient:
-g[j] = -2 · bf · (D_re[j] · sum_cwT_re - D_im[j] · sum_cwT_im)
-
-// Hessian:
-H[j][k] = g[j] · g[k]                                    // outer product
-        - 2·I_inv · bf² · sum_T2 · Re(conj(D_k)·D_j)     // |T|² correction
-        - 2 · bf · Re(sum_cwT · D²_jk)                    // D² correction
-```
-
-Where `Re(conj(D_k)·D_j) = D_re[k]·D_re[j] + D_im[k]·D_im[j]`.
-
-## 5. Key Simplification
-
-The `I` cancels in the D² correction:
-```
--(2/I)·bf·∑ Re(conj(S)·T·D²) = -2·bf·∑ Re(conj(w)·T·D²)
-```
-So the D² correction uses `sum_cwT = Σ conj(w)·T` directly, WITHOUT `I_inv` factor.
-
-## 6. Verified Against PyTorch
-
-Python verification (matching exact ctpwa formulas, q0 fixed):
+一次循环遍历所有极化，聚合所有量，然后算一次外积+修正：
 
 ```
-PyTorch autograd θ-θ:
+// 第一步：遍历极化，聚合 per-event 量
+I_inv = Σ|w_p|²          // = 1/I
+sum_T2 = Σ|T_p|²
+sum_cwT = Σ conj(w_p)·T_p   // 复数
+
+// 第二步：梯度
+g[j] = -2·bf · Re(D^j · sum_cwT)
+
+// 第三步：Hessian
+H[j][k] = g[j]·g[k]                                          // 外积
+        - 2·I_inv·bf²·sum_T2·Re(conj(D_k)·D_j)               // |T|² 修正
+        - 2·bf·Re(sum_cwT · D²_jk)                            // D² 修正
+```
+
+其中 $\text{Re}(\text{conj}(D_k) \cdot D_j) = D_{re}[k] \cdot D_{re}[j] + D_{im}[k] \cdot D_{im}[j]$.
+
+## 5. 关键简化
+
+D² 修正项中的 $I$ 会约掉：
+
+$$
+-\frac{2}{I} \cdot bf \cdot \sum \text{Re}(\text{conj}(S) \cdot T \cdot D^2)
+= -2 \cdot bf \cdot \sum \text{Re}(\text{conj}(w) \cdot T \cdot D^2)
+$$
+
+所以 D² 修正直接用 `sum_cwT = Σ conj(w)·T`，**不需要乘 `I_inv`**。
+
+## 6. 与 PyTorch 的对比验证
+
+Python 验证（使用与 ctpwa 完全相同的 BWR 公式，q0 固定近似）：
+
+```
+PyTorch autograd θ-θ 块:
   [[-21.052335, -5.967517],
    [-5.967517,  2.008298]]
 
-Manual formula θ-θ:
+手写公式 θ-θ 块:
   [[-21.052335, -5.967517],
    [-5.967517,  2.008298]]
-  → MATCH (diff < 1e-10)
+  → 完全一致 (diff < 1e-10)
 ```
 
-AutoDiff D² values also verified:
+AutoDiff 计算的 $D^2$ 值也验证通过：
 ```
 PyTorch BWR Hessian:
   d²Re/dm0²=18.4789  d²Re/dm0dg0=13.0991  d²Re/dg0²=-0.5906
@@ -108,40 +111,45 @@ PyTorch BWR Hessian:
 ctpwa testBWRHessian (Var<double,2,true>):
   d²Re/dm0²=18.4789  d²Re/dm0dg0=13.0991  d²Re/dg0²=-0.5906
   d²Im/dm0²=41.1079  d²Im/dm0dg0=-2.8514  d²Im/dg0²=-5.2698
-  → MATCH (diff < 1e-15)
+  → 完全一致 (diff < 1e-15)
 ```
 
-## 7. Found Bugs
+## 7. 已发现的 Bug
 
-### Bug 1: Missing event offset in resonanceHessianBlockKernel
-- **Symptom**: D values ~4x too small, wrong kinematics (m=1.80 vs expected m=1.11)
-- **Root cause**: Kernel accesses `d_momenta->getMomentum(evt, ...)` where `evt` is data-relative index (0), but momenta array contains ALL events. Data event is at absolute index 3.
-- **Fix**: Add `evt_offset` parameter. Use `evt_abs = evt + evt_offset` for momenta access.
+### Bug 1：Hessian kernel 缺少事件偏移量
+- **现象**：D 值偏小约4倍，运动学不对（m=1.80 vs 正确值 m=1.11）
+- **根因**：`resonanceHessianBlockKernel` 访问 `d_momenta->getMomentum(evt, ...)` 时，`evt` 是 data 子集内的相对索引（0），但 momenta 数组包含所有事件。数据事件的绝对索引是 3（= 3个phsp事件）。
+- **修复**：增加 `evt_offset` 参数，用 `evt_abs = evt + evt_offset` 访问 momenta。在 `getHessian` 中传入 `events_[gpu][0]`（phsp数量）作为偏移。
 
-### Bug 2: Per-polarization |w|² weighting (in original code)
-- **Symptom**: Hessian values ~10x too small
-- **Root cause**: Correction term uses `|w_p|² = |S_p|²/I²` per-polarization instead of per-event `1/I = Σ|w|²`. Also, outer product does `Σ_p X_p·Y_p` instead of `(Σ_p X_p)·(Σ_q Y_q)`.
-- **Fix**: Restructure Step 5 to per-event aggregates (see Section 4).
+### Bug 2：逐个极化的 |w|² 加权（原始代码）
+- **现象**：Hessian 值偏小约10倍
+- **根因**：修正项用 `|w_p|² = |S_p|²/I²` 逐极化加权，应改用 per-event `1/I = Σ|w|²`。外积项做的是 `Σ_p X_p·Y_p` 而非 `(Σ_p X_p)·(Σ_q Y_q)`。
+- **修复**：Step 5 重构为 per-event 聚合（见第4节公式）。
 
-## 8. Missing Feature: PHSP Contribution
+## 8. 缺失功能：PHSP 对 θ-θ 的贡献
 
-The phsp contributes to θ-θ Hessian through:
-```
-n_data · ∂²log(phsp_factor)/∂θ²
+phsp_factor 也依赖 θ（通过 R），其 Hessian 贡献为：
 
-where phsp_factor = Σ_phsp |S|² / n_phsp
+$$
+n_{\text{data}} \cdot \frac{\partial^2 \log(\text{phsp\_factor})}{\partial\theta^2}
+$$
 
-∂²log(phsp_factor)/∂θ² = (Σ∂²I/∂θ²)/(ΣI) - (Σ∂I/∂θ)(Σ∂I/∂θ)^T/(ΣI)²
-```
+$$
+\frac{\partial^2 \log(\Sigma I / n)}{\partial\theta^2}
+= \frac{\Sigma \partial^2 I/\partial\theta^2}{\Sigma I}
+- \frac{(\Sigma \partial I/\partial\theta)(\Sigma \partial I/\partial\theta)^T}{(\Sigma I)^2}
+$$
 
-Currently `computeResonanceHessian` only handles data+bkg events.
+当前 `computeResonanceHessian` 只算了 data+bkg 的贡献，缺少 phsp 部分。
 
-## 9. Mixed Block ∂²NLL/∂v∂θ
+## 9. 混合块 $\partial^2\text{NLL}/\partial v\partial\theta$
 
-For single-chain models where all channels share the same resonance:
-```
-g_v[a] = -2 · Re(conj(T)·SL_a / Σ|T|²)
-```
-This is **independent of θ** (R and bf cancel). Therefore `∂²NLL/∂v∂θ = 0` identically.
+对于所有 channel 共享同一共振态的单链模型：
 
-For multi-chain models, the mixed block is non-zero and needs `computeMixedHessian`.
+$$
+g_v[a] = -2 \cdot \text{Re}\left(\frac{\text{conj}(T) \cdot SL_a}{\Sigma|T|^2}\right)
+$$
+
+**与 θ 无关**（R 和 bf 在分子分母中约掉）。因此 $\partial^2\text{NLL}/\partial v\partial\theta = 0$。
+
+多链模型（不同channel对应不同共振态）混合块非零，需要 `computeMixedHessian`。
