@@ -1934,10 +1934,12 @@ __global__ void resonanceHessianBlockKernel(
     int res_r_idx, int res_s_idx,
     const int* d_param_map_r, const int* d_param_map_s,
     double* d_hess, int hess_ld, int offset_r, int offset_s,
-    int nEvents, int nPolar, int decayChain_size, double bf_d, double sign)
+    int nEvents, int nPolar, int decayChain_size, double bf_d, double sign,
+    int evt_offset = 0)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
+    int evt_abs = evt + evt_offset;  // absolute event index in momenta array
 
     const DeviceResonance& res_r = d_res[res_r_idx];
     const double* p_r = d_all_params + res_r.param_offset;
@@ -1949,9 +1951,9 @@ __global__ void resonanceHessianBlockKernel(
     for (int ni = 0; ni < decayChain_size; ++ni) {
         const DecayNode& node = d_decayNodes[ni];
         if (node.mother_idx != res_r.particle_idx) continue;
-        LorentzVector pM = d_momenta->getMomentum(evt, node.mother_idx);
-        LorentzVector pD1 = d_momenta->getMomentum(evt, node.daug1_idx);
-        LorentzVector pD2 = d_momenta->getMomentum(evt, node.daug2_idx);
+        LorentzVector pM = d_momenta->getMomentum(evt_abs, node.mother_idx);
+        LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
+        LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
         mm = pM.M();
         double md1 = node.mass[1], md2 = node.mass[2];
         if (md1 <= 0) md1 = pD1.M();
@@ -1979,6 +1981,11 @@ __global__ void resonanceHessianBlockKernel(
         R_r_ad = BWR<AD1>(m_ad, m0_r_ad, g_r_ad, res_L_r, q_ad, q0_ad, bf_d);
     else if (res_r.type == ResModelType::BW)
         R_r_ad = BW<AD1>(m_ad, m0_r_ad, g_r_ad);
+    if (evt == 0) printf("BWR_DBG m=%.4f m0=%.4f g0=%.4f q=%.4f q0=%.4f L=%d R=(%.4f,%.4f) dR0=(%.4f,%.4f) dR1=(%.4f,%.4f)\n",
+        m_ad.val, m0_r_ad.val, g_r_ad.val, q_ad.val, q0_ad.val, res_L_r,
+        R_r_ad.real.val, R_r_ad.imag.val,
+        R_r_ad.real.grad[0], R_r_ad.imag.grad[0],
+        R_r_ad.real.grad[1], R_r_ad.imag.grad[1]);
     else return;
     double bf_val = Bf<double>(res_L_r, qq, q0_r, bf_d);
 
@@ -1995,10 +2002,10 @@ __global__ void resonanceHessianBlockKernel(
         bool found_s = false;
         for (int ni = 0; ni < decayChain_size; ++ni) {
             if (d_decayNodes[ni].mother_idx == res_s_ptr->particle_idx) {
-                LorentzVector pM = d_momenta->getMomentum(evt, d_decayNodes[ni].mother_idx);
+                LorentzVector pM = d_momenta->getMomentum(evt_abs, d_decayNodes[ni].mother_idx);
                 mm = pM.M();
-                LorentzVector pD1 = d_momenta->getMomentum(evt, d_decayNodes[ni].daug1_idx);
-                LorentzVector pD2 = d_momenta->getMomentum(evt, d_decayNodes[ni].daug2_idx);
+                LorentzVector pD1 = d_momenta->getMomentum(evt_abs, d_decayNodes[ni].daug1_idx);
+                LorentzVector pD2 = d_momenta->getMomentum(evt_abs, d_decayNodes[ni].daug2_idx);
                 double md1 = d_decayNodes[ni].mass[1], md2 = d_decayNodes[ni].mass[2];
                 if (md1 <= 0) md1 = pD1.M();
                 if (md2 <= 0) md2 = pD2.M();
@@ -2048,6 +2055,9 @@ __global__ void resonanceHessianBlockKernel(
     }
 
     // Step 5: 对每个极化累加
+    // DEBUG: per-event aggregates
+    double _dbg_I_inv = 0.0, _dbg_sumT2 = 0.0, _dbg_sumCwT_re = 0.0, _dbg_sumCwT_im = 0.0;
+    double _dbg_gth_r = 0.0, _dbg_gth_s = 0.0;
     for (int p = 0; p < nPolar; ++p) {
         cuComplex w_val = d_w[evt * nPolar + p];
         cuComplex Tr_val = d_T_r[evt * nPolar + p];
@@ -2058,6 +2068,9 @@ __global__ void resonanceHessianBlockKernel(
         double inv_w2 = 1.0 / w2;
         double I_inv = w2;  // I = 1/|w|² → 1/I = |w|²
 
+        // DEBUG: accumulate per-event
+        _dbg_I_inv += w2;
+
         // conj(w)
         double cw_re = (double)w_val.x;
         double cw_im = -(double)w_val.y;
@@ -2065,6 +2078,10 @@ __global__ void resonanceHessianBlockKernel(
         // c_T_r = conj(w) * T_r
         double cTr_re = cw_re * Tr_val.x - cw_im * Tr_val.y;
         double cTr_im = cw_re * Tr_val.y + cw_im * Tr_val.x;
+
+        // DEBUG: accumulate
+        _dbg_sumCwT_re += cTr_re; _dbg_sumCwT_im += cTr_im;
+        _dbg_sumT2 += (double)Tr_val.x*Tr_val.x + (double)Tr_val.y*Tr_val.y;
 
         // c_T_s = conj(w) * T_s
         double cTs_re, cTs_im;
@@ -2142,6 +2159,22 @@ __global__ void resonanceHessianBlockKernel(
             }
         }
     }
+
+    // DEBUG: compare per-event aggregates with Python
+    if (_dbg_I_inv > 1e-30 && evt == 0) {
+        double d_re = R_r_ad.real.grad[0], d_im = R_r_ad.imag.grad[0];
+        double d2_re = R_r_ad.real.grad[1], d2_im = R_r_ad.imag.grad[1];
+        _dbg_gth_r = -2.0 * bf_val * (d_re * _dbg_sumCwT_re - d_im * _dbg_sumCwT_im);
+        _dbg_gth_s = -2.0 * bf_val * (d2_re * _dbg_sumCwT_re - d2_im * _dbg_sumCwT_im);
+        printf("DBG evt=%d I_inv=%.6f sumT2=%.4f cwT=(%.6f,%.6f) D[0]=(%.6f,%.6f) D[1]=(%.6f,%.6f) gth=(%.4f,%.4f) bf=%.4f\n",
+            evt, _dbg_I_inv, _dbg_sumT2, _dbg_sumCwT_re, _dbg_sumCwT_im,
+            d_re, d_im, d2_re, d2_im, _dbg_gth_r, _dbg_gth_s, bf_val);
+        if (SameRes) printf("  D2_re=[[%.6f,%.6f],[%.6f,%.6f]] D2_im=[[%.6f,%.6f],[%.6f,%.6f]]\n",
+            R_r_hess.real.hess[0][0], R_r_hess.real.hess[0][1],
+            R_r_hess.real.hess[1][0], R_r_hess.real.hess[1][1],
+            R_r_hess.imag.hess[0][0], R_r_hess.imag.hess[0][1],
+            R_r_hess.imag.hess[1][0], R_r_hess.imag.hess[1][1]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,11 +2183,13 @@ __global__ void resonanceHessianBlockKernel(
 void AmpCalc::computeResonanceHessian(
     const std::vector<cuComplex*>& d_w,
     const std::vector<int>& n_events,
-    double* d_hess, int hess_ld, double sign)
+    double* d_hess, int hess_ld, double sign,
+    const std::vector<int>& t_offset)
 {
     int n_gpu = static_cast<int>(d_w.size());
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
+    bool has_offset = (t_offset.size() == d_w.size());
 
     // 计算每个 block 的全局参数偏移
     std::vector<int> block_offset(blocks_.size(), 0);
@@ -2235,7 +2270,7 @@ void AmpCalc::computeResonanceHessian(
                                     ri, ri, d_map_i, d_map_i,
                                     d_hess_per_gpu[gpu], n_free,
                                     global_i[0], global_i[0],
-                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign);
+                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign, has_offset ? t_offset[gpu] : 0);
                             } else if (Pr == 2) {
                                 resonanceHessianBlockKernel<2,2,true><<<grid,kBlockSize>>>(
                                     d_w[gpu], blk_i.d_T[gpu], blk_i.d_T[gpu],
@@ -2245,7 +2280,7 @@ void AmpCalc::computeResonanceHessian(
                                     ri, ri, d_map_i, d_map_i,
                                     d_hess_per_gpu[gpu], n_free,
                                     global_i[0], global_i[0],
-                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign);
+                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign, has_offset ? t_offset[gpu] : 0);
                             } else if (Pr == 3) {
                                 resonanceHessianBlockKernel<3,3,true><<<grid,kBlockSize>>>(
                                     d_w[gpu], blk_i.d_T[gpu], blk_i.d_T[gpu],
@@ -2255,7 +2290,7 @@ void AmpCalc::computeResonanceHessian(
                                     ri, ri, d_map_i, d_map_i,
                                     d_hess_per_gpu[gpu], n_free,
                                     global_i[0], global_i[0],
-                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign);
+                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign, has_offset ? t_offset[gpu] : 0);
                             }
                         } else {
                             if (Pr == 1 && Ps == 1) {
@@ -2269,7 +2304,7 @@ void AmpCalc::computeResonanceHessian(
                                     ri, rj, d_map_i, d_map_j,
                                     d_hess_per_gpu[gpu], n_free,
                                     global_i[0], global_j[0],
-                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign);
+                                    nEv, nPol, cas_i->getDecayChainSize(), 3.0, sign, has_offset ? t_offset[gpu] : 0);
                             }
                             // 更多 Pr×Ps 组合...
                         }
@@ -2311,4 +2346,20 @@ void AmpCalc::computeResonanceHessian(
         cudaFree(d_hess_per_gpu[gpu]);
     }
     cudaSetDevice(0);
+}
+
+void AmpCalc::testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d, double* out)
+{
+    using AD = Var<double, 2, true>;
+    AD m_ad(m);
+    AD m0_ad(m0);  m0_ad.grad[0] = 1.0;
+    AD g0_ad(g0);  g0_ad.grad[1] = 1.0;
+    AD q_ad(q);
+    AD q0_ad(q0);
+    auto R = BWR<AD>(m_ad, m0_ad, g0_ad, L, q_ad, q0_ad, d);
+    out[0] = R.real.val;  out[1] = R.imag.val;
+    out[2] = R.real.grad[0]; out[3] = R.real.grad[1];
+    out[4] = R.imag.grad[0]; out[5] = R.imag.grad[1];
+    out[6] = R.real.hess[0][0]; out[7] = R.real.hess[0][1]; out[8] = R.real.hess[1][1];
+    out[9] = R.imag.hess[0][0]; out[10]= R.imag.hess[0][1]; out[11]= R.imag.hess[1][1];
 }

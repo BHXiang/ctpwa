@@ -2272,7 +2272,9 @@ public:
             cudaSetDevice(primary_dev);
             double* d_hess;
             cudaMalloc(&d_hess, P * P * sizeof(double));
-            amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0);
+            std::vector<int> data_offsets(n_gpu);
+            for (int gpu = 0; gpu < n_gpu; ++gpu) data_offsets[gpu] = events_[gpu][0]; // phsp count = data offset
+            amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0, data_offsets);
 
             torch::Tensor res_hess = torch::empty({P, P},
                 torch::TensorOptions().dtype(torch::kFloat64).device(dev));

@@ -249,7 +249,8 @@ public:
         const std::vector<int>& n_events,     // 每 GPU 的事件数
         double* d_hess,                       // 输出 [P×P]
         int hess_ld,                          // leading dimension = P
-        double sign = 1.0);
+        double sign = 1.0,
+        const std::vector<int>& t_offset = {});
 
     // 计算混合 Hessian ∂²NLL/∂v∂θ (2·n_amplitudes × P)
     // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
