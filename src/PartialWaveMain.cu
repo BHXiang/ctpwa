@@ -700,13 +700,17 @@ public:
         double total_data_nll = 0.0;
         double total_bkg_nll = 0.0;
         int totalDataEvents = 0;
+        int totalBkgEvents = 0;
+        double bkg_integral = bkg_integral_;
 
         // 预分配持久化buffer（首次分配，之后复用）
         static cuComplex* s_d_grad_global = nullptr;
         static cuComplex* s_d_grad_buf = nullptr;
         static std::vector<cuComplex*> s_d_grad_per_gpu;
-        static std::vector<cuComplex*> s_d_w_bufs;       // [新增] per-GPU w buffer
-        static std::vector<int> s_w_buf_sizes;            // [新增]
+        static std::vector<cuComplex*> s_d_w_bufs;       // per-GPU data w buffer
+        static std::vector<cuComplex*> s_d_w_bkg_bufs;   // per-GPU bkg  w buffer
+        static std::vector<int> s_w_buf_sizes;            // data
+        static std::vector<int> s_w_bkg_buf_sizes;        // bkg
         static int s_alloc_n = 0;
 
         if (s_alloc_n < extended_n_gls || s_d_grad_per_gpu.size() < (size_t)num_gpus) {
@@ -714,17 +718,19 @@ public:
             if (s_d_grad_buf) cudaFree(s_d_grad_buf);
             for (auto& p : s_d_grad_per_gpu) if (p) cudaFree(p);
             for (auto& p : s_d_w_bufs) if (p) cudaFree(p);
+            for (auto& p : s_d_w_bkg_bufs) if (p) cudaFree(p);
 
             cudaSetDevice(primary_dev);
             cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(cuComplex));
             cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(cuComplex));
             s_d_grad_per_gpu.resize(num_gpus, nullptr);
             s_d_w_bufs.resize(num_gpus, nullptr);
+            s_d_w_bkg_bufs.resize(num_gpus, nullptr);
             s_w_buf_sizes.resize(num_gpus, 0);
+            s_w_bkg_buf_sizes.resize(num_gpus, 0);
             for (int g = 0; g < num_gpus; ++g) {
                 cudaSetDevice(g);
                 cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(cuComplex));
-                // w buffer 按需分配（下面各循环中）
             }
             s_alloc_n = extended_n_gls;
         }
@@ -780,10 +786,23 @@ public:
                 cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
                 const double* d_w = d_bkg_weights_list[gpu];
 
+                // 分配/检查 bkg  w buffer
+                cuComplex* d_w_bkg_out = nullptr;
+                if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
+                    int nTotal = nBkg_gpu * n_polar_;
+                    if (s_w_bkg_buf_sizes[gpu] < nTotal) {
+                        if (s_d_w_bkg_bufs[gpu]) cudaFree(s_d_w_bkg_bufs[gpu]);
+                        cudaMalloc(&s_d_w_bkg_bufs[gpu], nTotal * sizeof(cuComplex));
+                        s_w_bkg_buf_sizes[gpu] = nTotal;
+                    }
+                    d_w_bkg_out = s_d_w_bkg_bufs[gpu];
+                }
+
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
-                    d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w);
+                    d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w, d_w_bkg_out);
 
                 total_bkg_nll += nll;
+                totalBkgEvents += nBkg_gpu;
                 if (gpu == primary_dev) {
                     axpyComplex(d_grad_global, d_grad, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
                 }
@@ -817,12 +836,27 @@ public:
                     +1.0, phsp_offsets, d_v_ptr);
             }
 
-            // phsp 贡献: ∂(N_data*log(phsp))/∂θ = (2*N_data/(phsp*N_phsp)) * Σ Re(conj(S)*T*∂R/∂θ*bf)
+            // bkg 贡献 (sign=-1, loss = data_nll - bkg_nll)
+            if (totalBkgEvents > 0) {
+                std::vector<int> n_bkg_events(num_gpus);
+                std::vector<int> bkg_offsets(num_gpus);
+                for (int g = 0; g < num_gpus; ++g) {
+                    n_bkg_events[g] = events_list[g][2];
+                    bkg_offsets[g] = events_list[g][0] + events_list[g][1]; // phsp + data 偏移
+                }
+                const cuComplex* d_v_ptr = reinterpret_cast<const cuComplex*>(
+                    extended_vec_per_gpu[primary_dev].data_ptr());
+                amp_calc->computeResonanceGradient(s_d_w_bkg_bufs, n_bkg_events, d_grad_res,
+                    -1.0, bkg_offsets, d_v_ptr);
+            }
+
+            // phsp 贡献: ∂((N_data-W_bkg)*log(phsp))/∂θ
             {
                 int total_phsp = 0;
                 for (int g = 0; g < num_gpus; ++g) total_phsp += events_list[g][0];
+                double effective_data = totalDataEvents - bkg_integral_;
                 if (total_phsp > 0 && phsp_factor > 1e-30) {
-                    double phsp_sign = -totalDataEvents / (phsp_factor * total_phsp);
+                    double phsp_sign = -effective_data / (phsp_factor * total_phsp);
 
                     std::vector<cuComplex*> d_S_bufs(num_gpus, nullptr);
                     std::vector<int> n_phsp_evts(num_gpus);
@@ -892,8 +926,8 @@ public:
             // std::cerr << "WARNING: phsp_factor invalid (" << phsp_factor << "), clamping to 1e-30" << std::endl;
             phsp_factor = 1e-30;
         }
-        printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
-            total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
+        // printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
+        //     total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
 
         double loss = total_data_nll - total_bkg_nll
             + (totalDataEvents - bkg_integral_) * log(phsp_factor);
