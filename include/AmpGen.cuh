@@ -257,18 +257,30 @@ public:
         double default_weight,
         const cuComplex* d_v);
 
-    // 计算混合 Hessian ∂²NLL/∂v∂θ (2·n_amplitudes × P)
-    // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
-    // d_amp: 完整的振幅矩阵 [nEvents × nPolar × n_amplitudes]（每 GPU 一份）
-    // d_mixed_hess: 输出 [2·n_amplitudes × P]，在 primary GPU 上
+    // 计算混合 Hessian ∂²(Σ_e w_e · log I_e) / ∂v_a∂θ_j
+    // 输出 d_mixed [2·n_ext × P_total]（行主序），累加贡献
+    // d_event_weights[gpu]: per-event 权重数组（null → default_weight）
     void computeMixedHessian(
-        const std::vector<cuComplex*>& d_w,
-        const std::vector<cuComplex*>& d_amp,
         const std::vector<int>& n_events,
-        int n_amplitudes,
-        double* d_mixed_hess,
-        int ld_mixed,
-        double sign = 1.0);
+        int n_ext,
+        double* d_mixed, int P_total,
+        const std::vector<int>& t_offset,
+        const std::vector<double*>& d_event_weights,
+        double default_weight,
+        const cuComplex* d_v,
+        const std::vector<cuComplex*>& d_amp_batches);
+
+    // 计算 phsp 贡献 c·log(F) 的 θθ/vθ 二阶导（F = (1/N) Σ I_e）
+    // 同时累加到 d_hess_th [P×P] 和 d_mixed [2·n_ext × P_total]
+    void computePhspContribution(
+        const std::vector<int>& n_phsp_events,
+        double c,
+        int n_ext,
+        double* d_hess_th, int P_total,
+        double* d_mixed,
+        const std::vector<int>& t_offset,
+        const cuComplex* d_v,
+        const std::vector<cuComplex*>& d_amp_phsp);
 
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }

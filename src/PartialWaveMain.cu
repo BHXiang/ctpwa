@@ -2279,22 +2279,93 @@ public:
                     bkg_weights_, 1.0, d_v_primary);
             }
 
-            // --- phsp 贡献: TODO (d²log(phsp_factor) 需特殊处理)
-
-            torch::Tensor res_hess = torch::empty({P, P},
-                torch::TensorOptions().dtype(torch::kFloat64).device(dev));
-            cudaMemcpy(res_hess.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
-            cudaFree(d_hess);
+            // ========== 混合 Hessian 缓冲提前分配，与 d_hess 一起接收 phsp 贡献 ==========
+            int mixed_ext_rows = 2 * n_ext;
+            double* d_mixed_ext;
+            cudaSetDevice(primary_dev);
+            cudaMalloc(&d_mixed_ext, mixed_ext_rows * P * sizeof(double));
+            cudaMemset(d_mixed_ext, 0, mixed_ext_rows * P * sizeof(double));
 
             // ========== 混合 Hessian [0:n2, n2:total] 和 [n2:total, 0:n2] ==========
-            // TODO: 对于所有channel共享同一共振态的模型，∂²NLL/∂v∂θ = 0
-            // 对于多衰变链模型需要调用 computeMixedHessian
+            // ∂²(Σ w·log I)/∂v_a∂θ_j; 对 data/bkg/phsp 分别累加
             {
-                hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
-                hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
+
+                // data 贡献 (w=-1)
+                {
+                    std::vector<int> n_data_events(n_gpu, 0);
+                    std::vector<int> data_offsets(n_gpu, 0);
+                    std::vector<cuComplex*> d_amp_data(n_gpu, nullptr);
+                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                        n_data_events[gpu] = events_[gpu][1];
+                        data_offsets[gpu] = events_[gpu][0];
+                        d_amp_data[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                    }
+                    std::vector<double*> empty_weights;
+                    amp_calc_.computeMixedHessian(
+                        n_data_events, n_ext, d_mixed_ext, P,
+                        data_offsets, empty_weights, -1.0,
+                        d_v_primary, d_amp_data);
+                }
+
+                // bkg 贡献 (w=+bkg_weight)
+                {
+                    std::vector<int> n_bkg_events(n_gpu, 0);
+                    std::vector<int> bkg_offsets(n_gpu, 0);
+                    std::vector<cuComplex*> d_amp_bkg(n_gpu, nullptr);
+                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                        n_bkg_events[gpu] = events_[gpu][2];
+                        bkg_offsets[gpu] = events_[gpu][0] + events_[gpu][1];
+                        d_amp_bkg[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
+                    }
+                    amp_calc_.computeMixedHessian(
+                        n_bkg_events, n_ext, d_mixed_ext, P,
+                        bkg_offsets, bkg_weights_, 1.0,
+                        d_v_primary, d_amp_bkg);
+                }
+
+                // phsp 贡献: c·log(phsp_factor)，c = N_data - bkg_integral
+                {
+                    int totalDataEvents = 0;
+                    for (int gpu = 0; gpu < n_gpu; ++gpu) totalDataEvents += events_[gpu][1];
+                    double c_phsp = static_cast<double>(totalDataEvents) - bkg_integral_;
+
+                    std::vector<int> n_phsp_events(n_gpu, 0);
+                    std::vector<int> phsp_offsets(n_gpu, 0);
+                    std::vector<cuComplex*> d_amp_phsp(n_gpu, nullptr);
+                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                        n_phsp_events[gpu] = events_[gpu][0];
+                        phsp_offsets[gpu] = 0;
+                        d_amp_phsp[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][0];
+                    }
+                    amp_calc_.computePhspContribution(
+                        n_phsp_events, c_phsp, n_ext,
+                        d_hess, P, d_mixed_ext, phsp_offsets,
+                        d_v_primary, d_amp_phsp);
+                }
+
+                // 仅处理无约束情形: n_ext == nv
+                if (n_ext == nv) {
+                    torch::Tensor mixed = torch::empty({mixed_ext_rows, P},
+                        torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+                    cudaMemcpy(mixed.data_ptr(), d_mixed_ext,
+                        mixed_ext_rows * P * sizeof(double), cudaMemcpyDeviceToDevice);
+
+                    hessian.slice(0, 0, n2).slice(1, n2, total).copy_(mixed);
+                    hessian.slice(0, n2, total).slice(1, 0, n2).copy_(mixed.transpose(0, 1));
+                } else {
+                    // 有约束: 需要 J^T 投影，TODO
+                    hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
+                    hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
+                }
+                cudaFree(d_mixed_ext);
             }
 
+            // 抽取 res_hess (θθ) 到 hessian, 包含 data+bkg+phsp 贡献
+            torch::Tensor res_hess = torch::empty({P, P},
+                torch::TensorOptions().dtype(torch::kFloat64).device(dev));
             cudaSetDevice(primary_dev);
+            cudaMemcpy(res_hess.data_ptr(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToDevice);
+            cudaFree(d_hess);
             hessian.slice(0, n2, total).slice(1, n2, total).copy_(res_hess);
         }
 
