@@ -2502,6 +2502,16 @@ __global__ void accumDSperEventKernel(
             }
         }
     }
+    // DEBUG: print per-event aggregates for first event
+    if (evt == 0) {
+        printf("AD dbg evt=%d site=%d Nlocal=%d Nglobal=%d:\n", evt, site, Nlocal, Nglobal);
+        for (int j = 0; j < Nlocal; ++j) {
+            int jg = d_global_idx[j];
+            printf("  jg=%d: total_dS_re=%.6f total_dS_im=%.6f\n", jg,
+                d_dS_re[(evt * nPolar + 0) * Nglobal + jg],
+                d_dS_im[(evt * nPolar + 0) * Nglobal + jg]);
+        }
+    }
 }
 
 // Assemble per-event θθ Hessian contribution.
@@ -2527,6 +2537,24 @@ __global__ void assembleResHessKernel(
     if (I_val < 1e-30) return;
     double inv_I = 1.0 / I_val;
     double inv_I2 = inv_I * inv_I;
+
+    // DEBUG: compute G and dS for first event
+    if (evt == 0) {
+        double Gdbg[8]={0};
+        for (int p=0;p<nPolar;++p){
+            double sr=d_S_re[evt*nPolar+p],si=d_S_im[evt*nPolar+p];
+            for(int j=0;j<Nglobal;++j) Gdbg[j]+=sr*d_dS_re[(evt*nPolar+p)*Nglobal+j]+si*d_dS_im[(evt*nPolar+p)*Nglobal+j];
+        }
+        double d2_00=d_d2S_re[((0*nPolar+0)*Nglobal+0)*Nglobal+0];
+        double d2_01=d_d2S_re[((0*nPolar+0)*Nglobal+0)*Nglobal+1];
+        double d2_11=d_d2S_re[((0*nPolar+0)*Nglobal+1)*Nglobal+1];
+        printf("ASM evt=%d w=%.4f I=%.4f Ng=%d G=%f %f %f %f dS=%f %f %f %f d2S=%f %f %f\n",
+            evt,w_evt,I_val,Nglobal,
+            Gdbg[0]*2.0,Gdbg[1]*2.0,Gdbg[2]*2.0,Gdbg[3]*2.0,
+            d_dS_re[(0*nPolar+0)*Nglobal+0],d_dS_re[(0*nPolar+0)*Nglobal+1],
+            d_dS_re[(0*nPolar+0)*Nglobal+2],d_dS_re[(0*nPolar+0)*Nglobal+3],
+            d2_00,d2_01,d2_11);
+    }
 
     // G_j = 2·Σ_p (S_re·dS_re + S_im·dS_im)
     // We can't store G in registers (Nglobal could be up to ~8 here). Recompute per j.
@@ -2554,6 +2582,7 @@ __global__ void assembleResHessKernel(
             }
             Gk *= 2.0;
             double term = w_evt * (2.0 * R2 * inv_I - Gj * Gk * inv_I2);
+            if (evt==0 && j==0 && k==0) printf("ASMterm j=0 k=0 term=%.6f (w=%.4f R2=%.6f I=%.4f Gj=%.4f Gk=%.4f)\n",term,w_evt,R2,I_val,Gj,Gk);
             atomicAdd(&d_hess[k * hess_ld + j], term);
         }
     }
