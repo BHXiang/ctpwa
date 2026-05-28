@@ -2256,27 +2256,31 @@ public:
             {
                 std::vector<int> n_data_events(n_gpu, 0);
                 std::vector<int> data_offsets(n_gpu, 0);
+                std::vector<cuComplex*> d_amp_data(n_gpu, nullptr);
                 for (int gpu = 0; gpu < n_gpu; ++gpu) {
                     n_data_events[gpu] = events_[gpu][1];
                     data_offsets[gpu] = events_[gpu][0]; // phsp 偏移
+                    d_amp_data[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
                 }
                 std::vector<double*> empty_weights;
                 amp_calc_.computeResonanceHessian(
                     n_data_events, d_hess, P, data_offsets,
-                    empty_weights, -1.0, d_v_primary);
+                    empty_weights, -1.0, d_v_primary, n_ext, d_amp_data);
             }
 
             // --- bkg 贡献: w_e = +bkg_weight, +w·log(I_bkg)
             {
                 std::vector<int> n_bkg_events(n_gpu, 0);
                 std::vector<int> bkg_offsets(n_gpu, 0);
+                std::vector<cuComplex*> d_amp_bkg(n_gpu, nullptr);
                 for (int gpu = 0; gpu < n_gpu; ++gpu) {
                     n_bkg_events[gpu] = events_[gpu][2];
                     bkg_offsets[gpu] = events_[gpu][0] + events_[gpu][1]; // phsp + data 偏移
+                    d_amp_bkg[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
                 }
                 amp_calc_.computeResonanceHessian(
                     n_bkg_events, d_hess, P, bkg_offsets,
-                    bkg_weights_, 1.0, d_v_primary);
+                    bkg_weights_, 1.0, d_v_primary, n_ext, d_amp_bkg);
             }
 
             // ========== 混合 Hessian 缓冲提前分配，与 d_hess 一起接收 phsp 贡献 ==========

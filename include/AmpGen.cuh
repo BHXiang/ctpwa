@@ -255,7 +255,9 @@ public:
         const std::vector<int>& t_offset,
         const std::vector<double*>& d_event_weights,
         double default_weight,
-        const cuComplex* d_v);
+        const cuComplex* d_v,
+        int n_ext,
+        const std::vector<cuComplex*>& d_amp_batches);
 
     // 计算混合 Hessian ∂²(Σ_e w_e · log I_e) / ∂v_a∂θ_j
     // 输出 d_mixed [2·n_ext × P_total]（行主序），累加贡献

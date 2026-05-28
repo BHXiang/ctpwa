@@ -1233,6 +1233,7 @@ __global__ void updateResonanceParamsKernel(
     const double* d_free_params,        // 全局自由参数数组
     const int* d_res_idx,               // 每个自由参数 → 共振态索引
     const int* d_param_idx,             // 每个自由参数 → params[] 下标
+    const int* d_global_offset,         // 每个本block自由参数 → 全局slot下标
     int n_local_free)                   // 本 block 涉及的自由参数数
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1241,7 +1242,7 @@ __global__ void updateResonanceParamsKernel(
     int p = d_param_idx[i];
     if (r < resonance_count) {
         int offset = d_resonances[r].param_offset;
-        d_all_params[offset + p] = d_free_params[i];
+        d_all_params[offset + p] = d_free_params[d_global_offset[i]];
     }
 }
 
@@ -1460,21 +1461,24 @@ void AmpCalc::reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
             int n_local = static_cast<int>(local_res_idx.size());
             if (n_local == 0) continue;
 
-            int* d_res_idx, * d_param_idx;
+            int* d_res_idx, * d_param_idx, * d_global_offset;
             cudaMalloc(&d_res_idx, n_local * sizeof(int));
             cudaMalloc(&d_param_idx, n_local * sizeof(int));
+            cudaMalloc(&d_global_offset, n_local * sizeof(int));
             cudaMemcpy(d_res_idx, local_res_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
             cudaMemcpy(d_param_idx, local_param_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_global_offset, local_global_offset.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
 
             int grid = (n_local + blockSize - 1) / blockSize;
             updateResonanceParamsKernel<<<grid, blockSize>>>(
                 block.d_all_params[gpu], block.d_resonances[gpu],
                 block.resonance_count,
-                d_params_per_gpu[gpu], d_res_idx, d_param_idx, n_local);
+                d_params_per_gpu[gpu], d_res_idx, d_param_idx, d_global_offset, n_local);
 
             cudaDeviceSynchronize();
             cudaFree(d_res_idx);
             cudaFree(d_param_idx);
+            cudaFree(d_global_offset);
         }
 
         // 重跑 computeAmpsKernel
@@ -1941,7 +1945,8 @@ __global__ void resonanceHessianFullKernel(
     int t_evt_offset,
     const thrust::complex<double>* d_slamps,
     const cuComplex* d_v, int site, int hess_ld,
-    const double* d_event_weights, double default_weight)
+    const double* d_event_weights, double default_weight,
+    const cuComplex* d_amp, int n_ext)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
@@ -1982,6 +1987,16 @@ __global__ void resonanceHessianFullKernel(
             for (int k = 0; k < Nfree; ++k) {
                 d2S_re[p][j][k] = 0.0; d2S_im[p][j][k] = 0.0;
             }
+        }
+    }
+
+    // Full S over all partial waves (from precomputed d_amp)
+    for (int p = 0; p < nPolar; ++p) {
+        for (int a = 0; a < n_ext; ++a) {
+            cuComplex amp_ap = d_amp[evt * nPolar * n_ext + p * n_ext + a];
+            cuComplex v_a = d_v[a];
+            S_re[p] += (double)v_a.x * amp_ap.x - (double)v_a.y * amp_ap.y;
+            S_im[p] += (double)v_a.x * amp_ap.y + (double)v_a.y * amp_ap.x;
         }
     }
 
@@ -2057,8 +2072,6 @@ __global__ void resonanceHessianFullKernel(
             double c_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
             double c_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
 
-            S_re[p] += c_re * R_ad.real.val - c_im * R_ad.imag.val;
-            S_im[p] += c_re * R_ad.imag.val + c_im * R_ad.real.val;
             for (int j = 0; j < Nfree; ++j) {
                 dS_re[p][j] += c_re * R_ad.real.grad[j] - c_im * R_ad.imag.grad[j];
                 dS_im[p][j] += c_re * R_ad.imag.grad[j] + c_im * R_ad.real.grad[j];
@@ -2317,6 +2330,331 @@ __global__ void resonanceHessianBlockKernel(
 
 }
 
+// ============================================================
+// Unified Hessian over global free-parameter dimension
+// 3-pass scheme:
+//   Pass A: compute S_re/S_im per (evt,p) from d_amp and d_v.
+//   Pass B: per (block,res) launch: AD with local Nlocal slots → accumulate
+//           dS_re/dS_im/d2S_re/d2S_im into per-event arrays indexed by GLOBAL slot.
+//           Also stash dF_re/dF_im per block-event-sl for the mixed step.
+//   Pass C: per-event, evaluate H_jk = w·(2·R2/I − G_j·G_k/I²) → atomicAdd.
+//   Pass D (mixed): per (block,res) launch: use stashed dF and full S/dS
+//           to write mixed Hessian d_mixed[2·n_ext × P_total].
+// ============================================================
+
+__global__ void computeSperEventKernel(
+    double* d_S_re, double* d_S_im,                 // [nEvents * nPolar]
+    const cuComplex* d_amp,                         // [nEvents * nPolar * n_ext]
+    const cuComplex* d_v,                           // [n_ext]
+    int nEvents, int nPolar, int n_ext)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    for (int p = 0; p < nPolar; ++p) {
+        double sre = 0.0, sim = 0.0;
+        for (int a = 0; a < n_ext; ++a) {
+            cuComplex amp_ap = d_amp[evt * nPolar * n_ext + p * n_ext + a];
+            cuComplex v_a = d_v[a];
+            sre += (double)v_a.x * amp_ap.x - (double)v_a.y * amp_ap.y;
+            sim += (double)v_a.x * amp_ap.y + (double)v_a.y * amp_ap.x;
+        }
+        d_S_re[evt * nPolar + p] = sre;
+        d_S_im[evt * nPolar + p] = sim;
+    }
+}
+
+// Accumulate dS/d2S in GLOBAL-Nfree indexing for this (block,res).
+// Also write dF per (sl,j_global) for this block-event window into d_dF arrays.
+template <int Nlocal>
+__global__ void accumDSperEventKernel(
+    const DeviceMomenta* d_momenta, const DecayNode* d_decayNodes,
+    const SL* d_slComb, const DeviceResonance* d_res,
+    int res_idx_in_block, const double* d_all_params,
+    const int* d_param_map, const int* d_global_idx,
+    int nEvents, int nPolar, int decayChain_size, int nSLComb, double bf_d,
+    int t_evt_offset,
+    const thrust::complex<double>* d_slamps,
+    const cuComplex* d_v, int site,
+    double* d_dS_re, double* d_dS_im,            // [nEvents * nPolar * Nglobal]
+    double* d_d2S_re, double* d_d2S_im,          // [nEvents * nPolar * Nglobal * Nglobal]
+    double* d_dF_re, double* d_dF_im,            // [nEvents * nSLComb * Nglobal] for this block (per-block buffer)
+    int Nglobal)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    int global_evt = evt + t_evt_offset;
+    int n_events_total = d_momenta->n_events;
+
+    using AD = Var<double, Nlocal, true>;
+    using CV = ComplexVar<double, Nlocal, true>;
+
+    const DeviceResonance& target_res = d_res[res_idx_in_block];
+    const double* target_rp = d_all_params + target_res.param_offset;
+
+    int ftg[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
+    for (int j = 0; j < Nlocal; ++j) {
+        int pi = d_param_map[j];
+        if (pi >= 0 && pi < 8) ftg[pi] = j;
+    }
+
+    AD m0_ad(target_rp[0]);
+    if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
+    AD gamma_ad;
+    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
+        gamma_ad = AD(target_rp[1]);
+        if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
+    }
+
+    for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
+        CV R_ad(1.0, 0.0);
+        for (int ni = 0; ni < decayChain_size; ++ni) {
+            const DecayNode& node = d_decayNodes[ni];
+            const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
+            int L = sl.L;
+
+            LorentzVector pM  = d_momenta->getMomentum(global_evt, node.mother_idx);
+            LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
+            LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
+
+            double mm = pM.M();
+            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+            AD q_ad(qq);
+            double md1 = pD1.M(), md2 = pD2.M();
+
+            AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0)
+                m0_q0_ad = m0_ad;
+            else if (node.mass[0] > 0)
+                m0_q0_ad = AD(node.mass[0]);
+            else
+                m0_q0_ad = AD(1.0);
+            if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
+                md1_q0_ad = m0_ad;
+            else
+                md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+            if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
+                md2_q0_ad = m0_ad;
+            else
+                md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+
+            AD s_md = md1_q0_ad + md2_q0_ad;
+            AD d_md = md1_q0_ad - md2_q0_ad;
+            AD m0sq = m0_q0_ad * m0_q0_ad;
+            AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
+            q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
+            AD q0_ad = sqrt(q0sq);
+
+            CV node_factor(1.0, 0.0);
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
+                AD m_ad(mm);
+                if (target_res.type == ResModelType::BWR)
+                    node_factor = BWR<AD>(m_ad, m0_ad, gamma_ad, L, q_ad, q0_ad, bf_d);
+                else if (target_res.type == ResModelType::BW)
+                    node_factor = BW<AD>(m_ad, m0_ad, gamma_ad);
+                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                node_factor.real = node_factor.real * bf_ad;
+                node_factor.imag = node_factor.imag * bf_ad;
+            } else {
+                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                node_factor.real = bf_ad;
+                node_factor.imag = AD(0.0);
+            }
+
+            CV new_R;
+            new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
+            new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+            R_ad = new_R;
+        }
+
+        // stash dF for this block (for the mixed-hess step)
+        for (int j = 0; j < Nlocal; ++j) {
+            int jg = d_global_idx[j];
+            int dF_idx = ((evt * nSLComb) + sl_idx) * Nglobal + jg;
+            d_dF_re[dF_idx] = R_ad.real.grad[j];
+            d_dF_im[dF_idx] = R_ad.imag.grad[j];
+        }
+
+        cuComplex v_sl = d_v[site + sl_idx];
+        double vr = (double)v_sl.x, vi = (double)v_sl.y;
+
+        for (int p = 0; p < nPolar; ++p) {
+            int slamp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + p;
+            auto sl_amp = d_slamps[slamp_idx];
+            double sl_re = sl_amp.real();
+            double sl_im = sl_amp.imag();
+            double c_re = vr * sl_re - vi * sl_im;
+            double c_im = vr * sl_im + vi * sl_re;
+
+            int base_p = (evt * nPolar + p);
+            for (int j = 0; j < Nlocal; ++j) {
+                int jg = d_global_idx[j];
+                double dSre = c_re * R_ad.real.grad[j] - c_im * R_ad.imag.grad[j];
+                double dSim = c_re * R_ad.imag.grad[j] + c_im * R_ad.real.grad[j];
+                d_dS_re[base_p * Nglobal + jg] += dSre;
+                d_dS_im[base_p * Nglobal + jg] += dSim;
+                for (int k = 0; k < Nlocal; ++k) {
+                    int kg = d_global_idx[k];
+                    double d2re = c_re * R_ad.real.hess[j][k] - c_im * R_ad.imag.hess[j][k];
+                    double d2im = c_re * R_ad.imag.hess[j][k] + c_im * R_ad.real.hess[j][k];
+                    d_d2S_re[(base_p * Nglobal + jg) * Nglobal + kg] += d2re;
+                    d_d2S_im[(base_p * Nglobal + jg) * Nglobal + kg] += d2im;
+                }
+            }
+        }
+    }
+}
+
+// Assemble per-event θθ Hessian contribution.
+__global__ void assembleResHessKernel(
+    const double* d_S_re, const double* d_S_im,
+    const double* d_dS_re, const double* d_dS_im,
+    const double* d_d2S_re, const double* d_d2S_im,
+    double* d_hess, int hess_ld,
+    const double* d_event_weights, double default_weight,
+    int nEvents, int nPolar, int Nglobal)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    double w_evt = d_event_weights ? d_event_weights[evt] : default_weight;
+    if (w_evt == 0.0) return;
+
+    double I_val = 0.0;
+    for (int p = 0; p < nPolar; ++p) {
+        double sr = d_S_re[evt * nPolar + p];
+        double si = d_S_im[evt * nPolar + p];
+        I_val += sr*sr + si*si;
+    }
+    if (I_val < 1e-30) return;
+    double inv_I = 1.0 / I_val;
+    double inv_I2 = inv_I * inv_I;
+
+    // G_j = 2·Σ_p (S_re·dS_re + S_im·dS_im)
+    // We can't store G in registers (Nglobal could be up to ~8 here). Recompute per j.
+    for (int j = 0; j < Nglobal; ++j) {
+        double Gj = 0.0;
+        for (int p = 0; p < nPolar; ++p) {
+            double sr = d_S_re[evt * nPolar + p];
+            double si = d_S_im[evt * nPolar + p];
+            int idx = (evt * nPolar + p) * Nglobal + j;
+            Gj += sr * d_dS_re[idx] + si * d_dS_im[idx];
+        }
+        Gj *= 2.0;
+        for (int k = 0; k < Nglobal; ++k) {
+            double Gk = 0.0;
+            double R2 = 0.0;
+            for (int p = 0; p < nPolar; ++p) {
+                double sr = d_S_re[evt * nPolar + p];
+                double si = d_S_im[evt * nPolar + p];
+                int idxj = (evt * nPolar + p) * Nglobal + j;
+                int idxk = (evt * nPolar + p) * Nglobal + k;
+                Gk += sr * d_dS_re[idxk] + si * d_dS_im[idxk];
+                int idx2 = ((evt * nPolar + p) * Nglobal + j) * Nglobal + k;
+                R2 += d_dS_re[idxk] * d_dS_re[idxj] + d_dS_im[idxk] * d_dS_im[idxj]
+                    + sr * d_d2S_re[idx2] + si * d_d2S_im[idx2];
+            }
+            Gk *= 2.0;
+            double term = w_evt * (2.0 * R2 * inv_I - Gj * Gk * inv_I2);
+            atomicAdd(&d_hess[k * hess_ld + j], term);
+        }
+    }
+}
+
+// Mixed Hessian assembly using full S, full dS, and per-block dF.
+// For each block: a ∈ [site, site+nSLComb); compute K, M; only that block's
+// sl rows contribute the N correction.
+__global__ void assembleMixedHessKernel(
+    const double* d_S_re, const double* d_S_im,
+    const double* d_dS_re, const double* d_dS_im,
+    const double* d_dF_re, const double* d_dF_im,   // [nEvents * nSLComb * Nglobal] (this block)
+    const cuComplex* d_v,
+    const cuComplex* d_amp,                         // [nEvents * nPolar * n_ext]
+    const thrust::complex<double>* d_slamps,
+    int t_evt_offset,
+    double* d_mixed, int P_total,
+    const double* d_event_weights, double default_weight,
+    int nEvents, int nPolar, int n_ext, int nSLComb, int site, int Nglobal,
+    int n_events_total)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    int global_evt = evt + t_evt_offset;
+    double w_evt = d_event_weights ? d_event_weights[evt] : default_weight;
+    if (w_evt == 0.0) return;
+
+    double I_val = 0.0;
+    for (int p = 0; p < nPolar; ++p) {
+        double sr = d_S_re[evt * nPolar + p];
+        double si = d_S_im[evt * nPolar + p];
+        I_val += sr*sr + si*si;
+    }
+    if (I_val < 1e-30) return;
+    double inv_I = 1.0 / I_val;
+    double inv_I2 = inv_I * inv_I;
+
+    // For each a in [site, site+nSLComb): write H[(Re or Im)v_a, θ_j]
+    for (int sl_in_block = 0; sl_in_block < nSLComb; ++sl_in_block) {
+        int a = site + sl_in_block;
+
+        // K_a = Σ_p S_p · conj(amp_ap)  → real K_re, imag K_im
+        double K_re = 0.0, K_im = 0.0;
+        for (int p = 0; p < nPolar; ++p) {
+            cuComplex amp_ap = d_amp[evt * nPolar * n_ext + p * n_ext + a];
+            double ar = amp_ap.x, ai = amp_ap.y;
+            double sr = d_S_re[evt * nPolar + p];
+            double si = d_S_im[evt * nPolar + p];
+            K_re += sr * ar + si * ai;
+            K_im += sr * ai - si * ar;
+        }
+        double dI_xa = 2.0 * K_re;
+        double dI_ya = -2.0 * K_im;
+
+        for (int j = 0; j < Nglobal; ++j) {
+            // G_j = dI/dθ_j
+            double Gj = 0.0;
+            // M_j = Σ_p dS_pj · conj(amp_ap)
+            double M_re = 0.0, M_im = 0.0;
+            for (int p = 0; p < nPolar; ++p) {
+                cuComplex amp_ap = d_amp[evt * nPolar * n_ext + p * n_ext + a];
+                double ar = amp_ap.x, ai = amp_ap.y;
+                double sr = d_S_re[evt * nPolar + p];
+                double si = d_S_im[evt * nPolar + p];
+                int idx = (evt * nPolar + p) * Nglobal + j;
+                double dSr = d_dS_re[idx], dSi = d_dS_im[idx];
+                Gj += sr * dSr + si * dSi;
+                M_re += dSr * ar + dSi * ai;
+                M_im += dSi * ar - dSr * ai;
+            }
+            Gj *= 2.0;
+
+            // N correction: only nonzero if (a corresponds to this block's sl)
+            // dF for this (block,sl_in_block, j_global)
+            int dF_idx = ((evt * nSLComb) + sl_in_block) * Nglobal + j;
+            double dFr = d_dF_re[dF_idx];
+            double dFi = d_dF_im[dF_idx];
+            double N_re = 0.0, N_im = 0.0;
+            if (dFr != 0.0 || dFi != 0.0) {
+                for (int p = 0; p < nPolar; ++p) {
+                    int slamp_idx = sl_in_block * n_events_total * nPolar + global_evt * nPolar + p;
+                    auto sl_amp = d_slamps[slamp_idx];
+                    double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
+                    double sr = d_S_re[evt * nPolar + p];
+                    double si = d_S_im[evt * nPolar + p];
+                    double cSs_re = sr * sl_re + si * sl_im;
+                    double cSs_im = sr * sl_im - si * sl_re;
+                    N_re += dFr * cSs_re - dFi * cSs_im;
+                    N_im += dFr * cSs_im + dFi * cSs_re;
+                }
+            }
+            double d2I_xa_th = 2.0 * M_re + 2.0 * N_re;
+            double d2I_ya_th = 2.0 * M_im - 2.0 * N_im;
+            double H_xa = w_evt * (d2I_xa_th * inv_I - dI_xa * Gj * inv_I2);
+            double H_ya = w_evt * (d2I_ya_th * inv_I - dI_ya * Gj * inv_I2);
+            atomicAdd(&d_mixed[a * P_total + j], H_xa);
+            atomicAdd(&d_mixed[(n_ext + a) * P_total + j], H_ya);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AmpCalc::computeResonanceHessian
 // 累加 ∂² (Σ_e w_e log I_e) / ∂θ_j ∂θ_k 到 d_hess (P×P) — 调用方负责累加 data/bkg/phsp
@@ -2327,7 +2665,9 @@ void AmpCalc::computeResonanceHessian(
     const std::vector<int>& t_offset,
     const std::vector<double*>& d_event_weights,
     double default_weight,
-    const cuComplex* d_v)
+    const cuComplex* d_v,
+    int n_ext,
+    const std::vector<cuComplex*>& d_amp_batches)
 {
     int n_gpu = static_cast<int>(n_events.size());
     int n_free = nFreeResParams();
@@ -2335,34 +2675,59 @@ void AmpCalc::computeResonanceHessian(
     bool has_offset = (t_offset.size() == (size_t)n_gpu);
 
     constexpr int kBlockSize = 256;
+    const int Nglobal = n_free;
 
-    std::vector<double*> d_hess_per_gpu(n_gpu, nullptr);
-    int hess_total = n_free * n_free;
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         cudaSetDevice(gpu);
-        cudaMalloc(&d_hess_per_gpu[gpu], hess_total * sizeof(double));
-        cudaMemset(d_hess_per_gpu[gpu], 0, hess_total * sizeof(double));
-    }
+        int nEv = n_events[gpu];
+        if (nEv <= 0) continue;
+        int evt_off = has_offset ? t_offset[gpu] : 0;
+        double* dw = (d_event_weights.size() == (size_t)n_gpu) ? d_event_weights[gpu] : nullptr;
+        cuComplex* d_amp_gpu = (d_amp_batches.size() == (size_t)n_gpu) ? d_amp_batches[gpu] : nullptr;
+        if (d_amp_gpu == nullptr) continue;
 
-    for (size_t bi = 0; bi < blocks_.size(); ++bi) {
-        auto& blk = blocks_[bi];
-        auto& cas = cas_list_[blk.cas_idx];
+        int nPol = static_cast<int>(cas_list_[0]->getNPolarizations());
+        int grid = (nEv + kBlockSize - 1) / kBlockSize;
 
-        for (int r = 0; r < blk.resonance_count; ++r) {
-            std::vector<int> local_map, global_idx;
-            for (int s = 0; s < n_free; ++s) {
-                if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
-                    local_map.push_back(slots_[s].param_idx);
-                    global_idx.push_back(s);
+        // Allocate per-event buffers (global Nfree dim)
+        size_t n_S = (size_t)nEv * nPol;
+        size_t n_dS = n_S * Nglobal;
+        size_t n_d2S = n_dS * Nglobal;
+        double *d_S_re, *d_S_im, *d_dS_re, *d_dS_im, *d_d2S_re, *d_d2S_im;
+        cudaMalloc(&d_S_re, n_S * sizeof(double));
+        cudaMalloc(&d_S_im, n_S * sizeof(double));
+        cudaMalloc(&d_dS_re, n_dS * sizeof(double));
+        cudaMalloc(&d_dS_im, n_dS * sizeof(double));
+        cudaMalloc(&d_d2S_re, n_d2S * sizeof(double));
+        cudaMalloc(&d_d2S_im, n_d2S * sizeof(double));
+        cudaMemset(d_dS_re, 0, n_dS * sizeof(double));
+        cudaMemset(d_dS_im, 0, n_dS * sizeof(double));
+        cudaMemset(d_d2S_re, 0, n_d2S * sizeof(double));
+        cudaMemset(d_d2S_im, 0, n_d2S * sizeof(double));
+
+        // Pass A: compute S per (evt,p)
+        computeSperEventKernel<<<grid, kBlockSize>>>(
+            d_S_re, d_S_im, d_amp_gpu, d_v, nEv, nPol, n_ext);
+
+        // Pass B: per (block,res), accumulate dS/d2S into global buffers.
+        // (dF buffer is per-block-launch but we don't keep it here.)
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            auto& blk = blocks_[bi];
+            auto& cas = cas_list_[blk.cas_idx];
+            int nSLComb = static_cast<int>(cas->getNSLCombs());
+            int nPol_b = static_cast<int>(cas->getNPolarizations());
+            (void)nPol_b;
+
+            for (int r = 0; r < blk.resonance_count; ++r) {
+                std::vector<int> local_map, global_idx;
+                for (int s = 0; s < n_free; ++s) {
+                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
+                        local_map.push_back(slots_[s].param_idx);
+                        global_idx.push_back(s);
+                    }
                 }
-            }
-            int Nlocal = static_cast<int>(local_map.size());
-            if (Nlocal == 0) continue;
-
-            for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                cudaSetDevice(gpu);
-                int nEv = n_events[gpu];
-                if (nEv <= 0) continue;
+                int Nlocal = static_cast<int>(local_map.size());
+                if (Nlocal == 0) continue;
 
                 int *d_map, *d_gidx;
                 cudaMalloc(&d_map, Nlocal * sizeof(int));
@@ -2370,80 +2735,64 @@ void AmpCalc::computeResonanceHessian(
                 cudaMemcpy(d_map, local_map.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
                 cudaMemcpy(d_gidx, global_idx.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
 
-                int nPol = static_cast<int>(cas->getNPolarizations());
-                int grid = (nEv + kBlockSize - 1) / kBlockSize;
-                int evt_off = has_offset ? t_offset[gpu] : 0;
-                double* dw = (d_event_weights.size() == (size_t)n_gpu) ? d_event_weights[gpu] : nullptr;
+                // throw-away dF buffer for this (block,res)
+                size_t n_dF = (size_t)nEv * nSLComb * Nglobal;
+                double *d_dF_re, *d_dF_im;
+                cudaMalloc(&d_dF_re, n_dF * sizeof(double));
+                cudaMalloc(&d_dF_im, n_dF * sizeof(double));
+                cudaMemset(d_dF_re, 0, n_dF * sizeof(double));
+                cudaMemset(d_dF_im, 0, n_dF * sizeof(double));
 
                 switch (Nlocal) {
                 case 1:
-                    resonanceHessianFullKernel<1><<<grid,kBlockSize>>>(
+                    accumDSperEventKernel<1><<<grid, kBlockSize>>>(
                         cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
                         cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu],
-                        d_map, d_hess_per_gpu[gpu], d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(),
-                        static_cast<int>(cas->getNSLCombs()), 3.0, evt_off,
-                        cas->getSLAmps()[gpu], d_v, blk.site, n_free,
-                        dw, default_weight);
+                        r, blk.d_all_params[gpu], d_map, d_gidx,
+                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
+                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
+                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
+                        d_dF_re, d_dF_im, Nglobal);
                     break;
                 case 2:
-                    resonanceHessianFullKernel<2><<<grid,kBlockSize>>>(
+                    accumDSperEventKernel<2><<<grid, kBlockSize>>>(
                         cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
                         cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu],
-                        d_map, d_hess_per_gpu[gpu], d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(),
-                        static_cast<int>(cas->getNSLCombs()), 3.0, evt_off,
-                        cas->getSLAmps()[gpu], d_v, blk.site, n_free,
-                        dw, default_weight);
+                        r, blk.d_all_params[gpu], d_map, d_gidx,
+                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
+                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
+                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
+                        d_dF_re, d_dF_im, Nglobal);
                     break;
                 case 3:
-                    resonanceHessianFullKernel<3><<<grid,kBlockSize>>>(
+                    accumDSperEventKernel<3><<<grid, kBlockSize>>>(
                         cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
                         cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu],
-                        d_map, d_hess_per_gpu[gpu], d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(),
-                        static_cast<int>(cas->getNSLCombs()), 3.0, evt_off,
-                        cas->getSLAmps()[gpu], d_v, blk.site, n_free,
-                        dw, default_weight);
+                        r, blk.d_all_params[gpu], d_map, d_gidx,
+                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
+                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
+                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
+                        d_dF_re, d_dF_im, Nglobal);
                     break;
                 default: break;
                 }
                 cudaDeviceSynchronize();
                 cudaFree(d_map);
                 cudaFree(d_gidx);
+                cudaFree(d_dF_re);
+                cudaFree(d_dF_im);
             }
         }
-    }
 
-    // 累加所有 GPU 到 d_hess
-    cudaSetDevice(0);
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        if (gpu == 0) {
-            int grid = (hess_total + 255) / 256;
-            daxpy_kernel<<<grid, 256>>>(d_hess, d_hess_per_gpu[0], 1.0, hess_total);
-            cudaDeviceSynchronize();
-        } else {
-            std::vector<double> h_temp(hess_total);
-            cudaSetDevice(gpu);
-            cudaMemcpy(h_temp.data(), d_hess_per_gpu[gpu],
-                       hess_total * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaSetDevice(0);
-            double* d_temp;
-            cudaMalloc(&d_temp, hess_total * sizeof(double));
-            cudaMemcpy(d_temp, h_temp.data(), hess_total * sizeof(double), cudaMemcpyHostToDevice);
-            int grid = (hess_total + 255) / 256;
-            daxpy_kernel<<<grid, 256>>>(d_hess, d_temp, 1.0, hess_total);
-            cudaDeviceSynchronize();
-            cudaFree(d_temp);
-        }
-    }
+        // Pass C: assemble Hessian using full S, full dS, full d²S
+        assembleResHessKernel<<<grid, kBlockSize>>>(
+            d_S_re, d_S_im, d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
+            d_hess, hess_ld, dw, default_weight, nEv, nPol, Nglobal);
+        cudaDeviceSynchronize();
 
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
-        cudaFree(d_hess_per_gpu[gpu]);
+        cudaFree(d_S_re); cudaFree(d_S_im);
+        cudaFree(d_dS_re); cudaFree(d_dS_im);
+        cudaFree(d_d2S_re); cudaFree(d_d2S_im);
     }
     cudaSetDevice(0);
 }
