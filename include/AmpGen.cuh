@@ -242,15 +242,20 @@ public:
         const std::vector<int>& t_offset = {},
         const cuComplex* d_v = nullptr);
 
-    // 计算共振态参数 Hessian ∂²NLL/∂θ∂θ（P×P 对称矩阵，仅上三角）
-    // d_hess: 输出 [P×P]，在 GPU 0，按列存储（与 LBFGS 等优化器兼容）
+    // 计算共振态参数 Hessian 增量贡献 ∂²L/∂θ∂θ
+    // L = Σ_e w_e · log I_e (per-event 加权 log-likelihood)
+    // d_hess: 累加到 [P×P]，在 GPU 0，列存储
+    // d_event_weights[gpu]: per-event 权重数组（null=使用 default_weight）
+    // default_weight: 当 d_event_weights[gpu] 为 null 时使用（如 data=-1, bkg=+0.5）
+    // d_v: 耦合向量 (每 GPU 第一个为 primary device 上的指针，需通过 cas 转 GPU)
     void computeResonanceHessian(
-        const std::vector<cuComplex*>& d_w,   // 每 GPU 一份
         const std::vector<int>& n_events,     // 每 GPU 的事件数
         double* d_hess,                       // 输出 [P×P]
         int hess_ld,                          // leading dimension = P
-        double sign = 1.0,
-        const std::vector<int>& t_offset = {});
+        const std::vector<int>& t_offset,
+        const std::vector<double*>& d_event_weights,
+        double default_weight,
+        const cuComplex* d_v);
 
     // 计算混合 Hessian ∂²NLL/∂v∂θ (2·n_amplitudes × P)
     // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）

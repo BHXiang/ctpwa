@@ -2243,38 +2243,43 @@ public:
             torch::Tensor extended_v = params_.extendVector(vector, dev);
             int n_ext = extended_v.numel();
 
-            std::vector<cuComplex*> d_w_bufs(n_gpu, nullptr);
-            std::vector<int> n_data_events(n_gpu, 0);
-
-            for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                cudaSetDevice(gpu);
-                torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
-                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
-
-                int nData = events_[gpu][1];
-                if (nData == 0) continue;
-                n_data_events[gpu] = nData;
-
-                amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
-
-                int nTotal = nData * n_polar_;
-                cudaMalloc(&d_w_bufs[gpu], nTotal * sizeof(cuComplex));
-
-                cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                cuComplex* d_grad_dummy;
-                cudaMalloc(&d_grad_dummy, n_ext * sizeof(cuComplex));
-                computeFactorNLL(d_amp, d_v_gpu, d_grad_dummy,
-                    nData, n_polar_, n_amplitudes_, nullptr, d_w_bufs[gpu]);
-                cudaFree(d_grad_dummy);
-                cudaDeviceSynchronize();
-            }
+            // 取 primary GPU 上的 v 指针
+            torch::Tensor v_primary = extended_v.to(torch::Device(torch::kCUDA, primary_dev));
+            const cuComplex* d_v_primary = reinterpret_cast<const cuComplex*>(v_primary.data_ptr());
 
             cudaSetDevice(primary_dev);
             double* d_hess;
             cudaMalloc(&d_hess, P * P * sizeof(double));
-            std::vector<int> data_offsets(n_gpu);
-            for (int gpu = 0; gpu < n_gpu; ++gpu) data_offsets[gpu] = events_[gpu][0]; // phsp count = data offset
-            amp_calc_.computeResonanceHessian(d_w_bufs, n_data_events, d_hess, P, +1.0, data_offsets);
+            cudaMemset(d_hess, 0, P * P * sizeof(double));
+
+            // --- data 贡献: w_e = -1, log(I_data) 的二阶导
+            {
+                std::vector<int> n_data_events(n_gpu, 0);
+                std::vector<int> data_offsets(n_gpu, 0);
+                for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                    n_data_events[gpu] = events_[gpu][1];
+                    data_offsets[gpu] = events_[gpu][0]; // phsp 偏移
+                }
+                std::vector<double*> empty_weights;
+                amp_calc_.computeResonanceHessian(
+                    n_data_events, d_hess, P, data_offsets,
+                    empty_weights, -1.0, d_v_primary);
+            }
+
+            // --- bkg 贡献: w_e = +bkg_weight, +w·log(I_bkg)
+            {
+                std::vector<int> n_bkg_events(n_gpu, 0);
+                std::vector<int> bkg_offsets(n_gpu, 0);
+                for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                    n_bkg_events[gpu] = events_[gpu][2];
+                    bkg_offsets[gpu] = events_[gpu][0] + events_[gpu][1]; // phsp + data 偏移
+                }
+                amp_calc_.computeResonanceHessian(
+                    n_bkg_events, d_hess, P, bkg_offsets,
+                    bkg_weights_, 1.0, d_v_primary);
+            }
+
+            // --- phsp 贡献: TODO (d²log(phsp_factor) 需特殊处理)
 
             torch::Tensor res_hess = torch::empty({P, P},
                 torch::TensorOptions().dtype(torch::kFloat64).device(dev));
@@ -2283,20 +2288,13 @@ public:
 
             // ========== 混合 Hessian [0:n2, n2:total] 和 [n2:total, 0:n2] ==========
             // TODO: 对于所有channel共享同一共振态的模型，∂²NLL/∂v∂θ = 0
-            // (因为 g_v[a] = -2 Re(conj(T)·SL_a/Σ|T|²) 不依赖 θ)
-            // 对于多衰变链模型，mixed block非零，需要调用 computeMixedHessian
-            // 当前暂时填零
+            // 对于多衰变链模型需要调用 computeMixedHessian
             {
                 hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
                 hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
             }
 
-            // 清理 d_w_bufs (resonance block)
-            for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                if (d_w_bufs[gpu]) { cudaSetDevice(gpu); cudaFree(d_w_bufs[gpu]); }
-            }
             cudaSetDevice(primary_dev);
-
             hessian.slice(0, n2, total).slice(1, n2, total).copy_(res_hess);
         }
 
