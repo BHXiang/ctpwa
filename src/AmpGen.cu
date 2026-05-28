@@ -1683,7 +1683,7 @@ __global__ void resonanceGradientKernel(
         // 累加 sl 的贡献: 对 pol 求和 Σ_p conj(w_p) · v_sl · slamps[sl,e,p]
         // 然后乘以 ∂R_sl/∂θ 的 (实部, 虚部) 并提取实部
         // ----------------------------------------------------------------
-        cuComplex v_sl = d_v[site + sl_idx];
+        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
 
         double s_re = 0.0, s_im = 0.0;
         for (int pol = 0; pol < nPolar; ++pol) {
@@ -2063,7 +2063,7 @@ __global__ void resonanceHessianFullKernel(
             R_ad = new_R;
         }
 
-        cuComplex v_sl = d_v[site + sl_idx];
+        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
         for (int p = 0; p < nPolar; ++p) {
             int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + p;
             auto sl_amp = d_slamps[amp_idx];
@@ -2474,7 +2474,7 @@ __global__ void accumDSperEventKernel(
             d_dF_im[dF_idx] = R_ad.imag.grad[j];
         }
 
-        cuComplex v_sl = d_v[site + sl_idx];
+        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
         double vr = (double)v_sl.x, vi = (double)v_sl.y;
 
         for (int p = 0; p < nPolar; ++p) {
@@ -2915,7 +2915,7 @@ __global__ void resonanceMixedHessianKernel(
             dF_re[sl_idx][j] = R_ad.real.grad[j];
             dF_im[sl_idx][j] = R_ad.imag.grad[j];
         }
-        cuComplex v_sl = d_v[site + sl_idx];
+        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
         double vr = (double)v_sl.x, vi = (double)v_sl.y;
         for (int p = 0; p < nPolar; ++p) {
             int slamp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + p;
@@ -3239,7 +3239,7 @@ __global__ void phspContributionSumsKernel(
             dF_re_arr[sl_idx][j] = R_ad.real.grad[j];
             dF_im_arr[sl_idx][j] = R_ad.imag.grad[j];
         }
-        cuComplex v_sl = d_v[site + sl_idx];
+        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
         double vr = (double)v_sl.x, vi = (double)v_sl.y;
         for (int p = 0; p < nPolar; ++p) {
             int slamp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + p;
