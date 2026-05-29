@@ -142,8 +142,9 @@ __global__ void hessianStage1Kernel(
                 LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
                 LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
                 double mm = pM.M();
-                double md1 = pD1.M(); //node.mass[1] > 0 ? node.mass[1] : pD1.M();
-                double md2 = pD2.M(); //node.mass[2] > 0 ? node.mass[2] : pD2.M();
+                // double mm = pM.M();
+                double md1 = pD1.M();
+                double md2 = pD2.M();
                 double qq = breakup_momentum(mm, md1, md2);
 
                 AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
@@ -153,10 +154,10 @@ __global__ void hessianStage1Kernel(
                 else m0_q0_ad = AD(1.0);
                 if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
                     md1_q0_ad = *m0p;
-                else md1_q0_ad = AD(md1);
+                else md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
                 if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
                     md2_q0_ad = *m0p;
-                else md2_q0_ad = AD(md2);
+                else md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
 
                 AD s_md = md1_q0_ad + md2_q0_ad;
                 AD d_md = md1_q0_ad - md2_q0_ad;
@@ -220,12 +221,6 @@ __global__ void hessianStage1Kernel(
     }
     for (int j = 0; j < NT; ++j) g[j] *= -2.0;
 
-    // DEBUG: print all events
-    printf("  [evt_abs=%d] S[0..2]=(%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f) I=%.4f\n",
-        evt_abs, Sr[0], Si[0], Sr[1], Si[1], Sr[2], Si[2], I_val);
-    printf("  [evt_abs=%d] dS[0][0]=(%.4f,%.4f) dS[1][0]=(%.4f,%.4f)\n",
-        evt_abs, dS_re[0][0], dS_im[0][0], dS_re[1][0], dS_im[1][0]);
-
     // ===== Output g, dS to temp buffers =====
     for (int j = 0; j < NT; ++j)
         d_g_out[evt * NT + j] = g[j];
@@ -264,13 +259,6 @@ __global__ void hessianStage1Kernel(
             H_loc[j][k] = hjk;
             if (j != k) H_loc[k][j] = hjk;
 
-            // DEBUG: print Hessian terms
-            if (j == 0 && k == 0)
-                printf("  [evt_abs=%d] H[0][0]: TermA=%.4f TermB=%.4f TermC=%.4f hjk=%.4f\n",
-                    evt_abs, g[0]*g[0], -2.0*inv_I*(dS_re[0][0]*dS_re[0][0]+dS_im[0][0]*dS_im[0][0]),
-                    hjk - g[0]*g[0] + 2.0*inv_I*(dS_re[0][0]*dS_re[0][0]+dS_im[0][0]*dS_im[0][0]),
-                    hjk);
-
             int gj = ftg[rj][j % Npr];
             int gk = ftg[rk][k % Npr];
             if (gj >= 0 && gk >= 0) {
@@ -286,15 +274,6 @@ __global__ void hessianStage1Kernel(
         }
     }
 
-    // DEBUG: print per-event phsp g and H (all events)
-    if (default_weight == 0.0) {
-        printf("  phsp evt_abs=%d g=[%.6f %.6f %.6f %.6f] I=%.6f\n",
-            evt_abs, g[0], g[1], g[2], g[3], I_val);
-        printf("  H=[[%.4f %.4f %.4f %.4f]\n", H_loc[0][0], H_loc[0][1], H_loc[0][2], H_loc[0][3]);
-        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[1][0], H_loc[1][1], H_loc[1][2], H_loc[1][3]);
-        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[2][0], H_loc[2][1], H_loc[2][2], H_loc[2][3]);
-        printf("     [%.4f %.4f %.4f %.4f]]\n", H_loc[3][0], H_loc[3][1], H_loc[3][2], H_loc[3][3]);
-    }
     // Phsp: accumulate I and I*g
     if (default_weight == 0.0 && d_phsp_I != nullptr)
         atomicAdd(d_phsp_I, I_val);

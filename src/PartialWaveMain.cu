@@ -2266,7 +2266,7 @@ public:
             cudaMalloc(&d_hess, P * P * sizeof(double));
             cudaMemset(d_hess, 0, P * P * sizeof(double));
 
-            // Data: weight=+1.0 (no per-event weights needed)
+            // Data: weight=+1.0
             {
                 std::vector<int> n_data_ev(n_gpu, 0), data_off(n_gpu, 0);
                 for (int g = 0; g < n_gpu; ++g) {
@@ -2274,19 +2274,6 @@ public:
                 }
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {});
-                // DEBUG: dump data Hessian
-                {
-                    double* h_tmp = new double[P*P];
-                    cudaMemcpy(h_tmp, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
-                    printf("=== Data only Hessian (P=%d) ===\n", P);
-                    for (int j = 0; j < P; ++j) {
-                        printf("  [");
-                        for (int k = 0; k < P; ++k)
-                            printf("%12.6f%s", h_tmp[j*P+k], k<P-1?", ":"");
-                        printf("]\n");
-                    }
-                    delete[] h_tmp;
-                }
             }
 
             // Bkg: weight = -w_e
@@ -2301,22 +2288,9 @@ public:
                 }
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -wb,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_);
-                // DEBUG: dump data+bkg Hessian
-                {
-                    double* h_tmp = new double[P*P];
-                    cudaMemcpy(h_tmp, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
-                    printf("=== Data+Bkg Hessian (wb=%.4f) ===\n", wb);
-                    for (int j = 0; j < P; ++j) {
-                        printf("  [");
-                        for (int k = 0; k < P; ++k)
-                            printf("%12.6f%s", h_tmp[j*P+k], k<P-1?", ":"");
-                        printf("]\n");
-                    }
-                    delete[] h_tmp;
-                }
             }
 
-            // Phsp: sign=0, accumulate I, I*g, I*(g·g^T-H)
+            // Phsp: sign=0, accumulate to phsp buffers, then post-process
             {
                 double* d_phsp_I, * d_phsp_grad, * d_phsp_hessA;
                 cudaMalloc(&d_phsp_I, sizeof(double));
@@ -2331,14 +2305,11 @@ public:
                     n_phsp_ev[g] = events_[g][0]; phsp_off[g] = 0;
                 }
 
-                // Save pre-phsp d_hess for comparison
-                double* h_hess_pre = new double[P*P];
-                cudaMemcpy(h_hess_pre, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
-
                 amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {}, d_phsp_I, d_phsp_grad, d_phsp_hessA);
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                    d_phsp_I, d_phsp_grad, d_phsp_hessA);
 
-                // Phsp Hessian: H_phsp = A/(pf*np)*ΣI*(g·g^T-H) - A/(pf*np)²*(ΣIg)(ΣIg)^T
+                // Phsp post-processing: H_phsp = A/(pf*np)*ΣIA - A/(pf*np)²*ΣIg·ΣIg^T
                 double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
                 cudaMemcpy(&h_pI, d_phsp_I, sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_pg, d_phsp_grad, P * sizeof(double), cudaMemcpyDeviceToHost);
@@ -2350,27 +2321,6 @@ public:
                 double A = static_cast<double>(totData) - bkg_integral_;
                 int np_tot = 0; for (int g = 0; g < n_gpu; ++g) np_tot += events_[g][0];
                 double pf = h_pI / np_tot;
-
-                printf("=== Phsp intermediates: I=%.10f pf=%.10f A=%.4f np=%d c1=%.10f c2=%.10f ===\n",
-                    h_pI, pf, A, np_tot, A/(pf*np_tot), -A/(pf*pf*np_tot*np_tot));
-                printf("Phsp grad (Σ I*g): [");
-                for (int j = 0; j < P; ++j) printf("%.6f%s", h_pg[j], j<P-1?", ":"");
-                printf("]\n");
-                printf("Phsp hessA (Σ I*(g*g^T-H)):\n");
-                for (int j = 0; j < P; ++j) {
-                    printf("  [");
-                    for (int k = 0; k < P; ++k)
-                        printf("%12.6f%s", h_ph[j*P+k], k<P-1?", ":"");
-                    printf("]\n");
-                }
-                printf("d_hess after phsp kernel (before post-processing):\n");
-                for (int j = 0; j < P; ++j) {
-                    printf("  [");
-                    for (int k = 0; k < P; ++k)
-                        printf("%12.6f%s", h_dh[j*P+k], k<P-1?", ":"");
-                    printf("]\n");
-                }
-
                 double c1 = A / (pf * np_tot);
                 double c2 = -A / (pf * pf * np_tot * np_tot);
 
@@ -2378,19 +2328,9 @@ public:
                     for (int k = 0; k < P; ++k)
                         h_dh[j * P + k] += c1 * h_ph[j * P + k] + c2 * h_pg[j] * h_pg[k];
 
-                printf("d_hess after phsp post-processing:\n");
-                for (int j = 0; j < P; ++j) {
-                    printf("  [");
-                    for (int k = 0; k < P; ++k)
-                        printf("%12.6f%s", h_dh[j*P+k], k<P-1?", ":"");
-                    printf("]\n");
-                }
-
                 cudaMemcpy(d_hess, h_dh, P * P * sizeof(double), cudaMemcpyHostToDevice);
                 delete[] h_pg; delete[] h_ph; delete[] h_dh;
-                delete[] h_hess_pre;
             }
-
 
             // Mixed Hessian: zero for now (unified kernel doesn't compute mixed blocks yet)
             hessian.slice(0, 0, n2).slice(1, n2, total).zero_();

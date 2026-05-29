@@ -1701,17 +1701,6 @@ __global__ void resonanceGradientKernel(
             s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
         }
 
-        // DEBUG: print first event, first SL
-        // if (evt == 0 && sl_idx == 0) {
-        printf("GRAD evt=%d sl=%d site=%d v=(%.4f,%.4f) s=(%.4f,%.4f)\n",
-            evt, sl_idx, site, (double)v_sl.x, (double)v_sl.y, s_re, s_im);
-        for (int j = 0; j < Nfree; ++j)
-            printf("  j=%d gidx=%d dR=(%.4f,%.4f) contrib=%.4f\n",
-                j, d_global_idx[j], R_ad.real.grad[j], R_ad.imag.grad[j],
-                -2.0 * sign * (s_re * R_ad.real.grad[j] - s_im * R_ad.imag.grad[j]));
-        // print first pol w and T
-        cuComplex w0 = d_w[evt * nPolar + 0];
-        printf("  w[0]=(%.4f,%.4f)\n", (double)w0.x, (double)w0.y);
         // }
 
         for (int j = 0; j < Nfree; ++j) {
@@ -2408,10 +2397,6 @@ __global__ void unifiedHessianKernel(
     constexpr int NT = Npr * Nres;  // total free params in this block
     int sl_per_res = nSL / Nres;
 
-    if (evt == 0)
-        printf("  unifiedHessianKernel<%d,%d> nEv=%d nSL=%d sl_per_res=%d NT=%d\n",
-            Npr, Nres, nEvents, nSL, sl_per_res, NT);
-
     // ===== AutoDiff variables per resonance =====
     using AD = Var<double, Npr, true>;
     AD m0_ad[Nres], g_ad[Nres];
@@ -2423,12 +2408,7 @@ __global__ void unifiedHessianKernel(
         g_ad[r] = AD(d_all_params[po + 1]);
         g_ad[r].grad[1] = 1.0;
         for (int j = 0; j < Npr; ++j)
-            ftg[r][j] = d_global_idx[r * Npr + j];  // local → global index
-        if (evt_abs < 5)  // print once per event
-            printf("  AD setup r=%d po=%d particle_idx=%d m0=%.6f w0=%.6f ftg=[%d,%d]\n",
-                r, po, d_resonances[r].particle_idx,
-                d_all_params[po], d_all_params[po+1],
-                ftg[r][0], ftg[r][1]);
+            ftg[r][j] = d_global_idx[r * Npr + j];
     }
 
     // ===== Compute S[p] = Σ_sl v[sl] * slamps[sl,p] * R_sl (double) =====
@@ -2655,16 +2635,6 @@ __global__ void unifiedHessianKernel(
             }
         }
     }
-    // DEBUG: print per-event g and H for first event (matching lab_hessian format)
-    if (evt == 0) {
-        printf("  evt=%d sign=%.1f g=[%.6f %.6f %.6f %.6f] I=%.6f\n",
-            evt_abs, default_weight, g[0], g[1], g[2], g[3], I_val);
-        printf("  H=[[%.4f %.4f %.4f %.4f]\n", H_loc[0][0], H_loc[0][1], H_loc[0][2], H_loc[0][3]);
-        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[1][0], H_loc[1][1], H_loc[1][2], H_loc[1][3]);
-        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[2][0], H_loc[2][1], H_loc[2][2], H_loc[2][3]);
-        printf("     [%.4f %.4f %.4f %.4f]]\n", H_loc[3][0], H_loc[3][1], H_loc[3][2], H_loc[3][3]);
-    }
-
     // Phsp accumulation for I and I*g
     if (default_weight == 0.0 && d_phsp_I != nullptr) {
         atomicAdd(d_phsp_I, I_val);
@@ -2849,16 +2819,6 @@ __global__ void accumDSperEventKernel(
             }
         }
     }
-    // DEBUG: print per-event aggregates for first event
-    if (evt == 0) {
-        printf("AD dbg evt=%d site=%d Nlocal=%d Nglobal=%d:\n", evt, site, Nlocal, Nglobal);
-        for (int j = 0; j < Nlocal; ++j) {
-            int jg = d_global_idx[j];
-            printf("  jg=%d: total_dS_re=%.6f total_dS_im=%.6f\n", jg,
-                d_dS_re[(evt * nPolar + 0) * Nglobal + jg],
-                d_dS_im[(evt * nPolar + 0) * Nglobal + jg]);
-        }
-    }
 }
 
 // Assemble per-event θθ Hessian contribution.
@@ -2884,24 +2844,6 @@ __global__ void assembleResHessKernel(
     if (I_val < 1e-30) return;
     double inv_I = 1.0 / I_val;
     double inv_I2 = inv_I * inv_I;
-
-    // DEBUG: compute G and dS for first event
-    if (evt == 0) {
-        double Gdbg[8]={0};
-        for (int p=0;p<nPolar;++p){
-            double sr=d_S_re[evt*nPolar+p],si=d_S_im[evt*nPolar+p];
-            for(int j=0;j<Nglobal;++j) Gdbg[j]+=sr*d_dS_re[(evt*nPolar+p)*Nglobal+j]+si*d_dS_im[(evt*nPolar+p)*Nglobal+j];
-        }
-        double d2_00=d_d2S_re[((0*nPolar+0)*Nglobal+0)*Nglobal+0];
-        double d2_01=d_d2S_re[((0*nPolar+0)*Nglobal+0)*Nglobal+1];
-        double d2_11=d_d2S_re[((0*nPolar+0)*Nglobal+1)*Nglobal+1];
-        printf("ASM evt=%d w=%.4f I=%.4f Ng=%d G=%f %f %f %f dS=%f %f %f %f d2S=%f %f %f\n",
-            evt,w_evt,I_val,Nglobal,
-            Gdbg[0]*2.0,Gdbg[1]*2.0,Gdbg[2]*2.0,Gdbg[3]*2.0,
-            d_dS_re[(0*nPolar+0)*Nglobal+0],d_dS_re[(0*nPolar+0)*Nglobal+1],
-            d_dS_re[(0*nPolar+0)*Nglobal+2],d_dS_re[(0*nPolar+0)*Nglobal+3],
-            d2_00,d2_01,d2_11);
-    }
 
     // G_j = 2·Σ_p (S_re·dS_re + S_im·dS_im)
     // We can't store G in registers (Nglobal could be up to ~8 here). Recompute per j.
@@ -2929,7 +2871,6 @@ __global__ void assembleResHessKernel(
             }
             Gk *= 2.0;
             double term = w_evt * (2.0 * R2 * inv_I - Gj * Gk * inv_I2);
-            if (evt==0 && j==0 && k==0) printf("ASMterm j=0 k=0 term=%.6f (w=%.4f R2=%.6f I=%.4f Gj=%.4f Gk=%.4f)\n",term,w_evt,R2,I_val,Gj,Gk);
             atomicAdd(&d_hess[k * hess_ld + j], term);
         }
     }
