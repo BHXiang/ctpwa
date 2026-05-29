@@ -75,6 +75,8 @@ __global__ void hessianStage1Kernel(
     double* d_g_out,       // [nEv * NT]
     double* d_dS_re_out,   // [nEv * NT * nPolar]
     double* d_dS_im_out,   // [nEv * NT * nPolar]
+    double* d_dF_re_out = nullptr,  // [nEv * nSL * Npr] ∂F/∂θ for mixed Hessian
+    double* d_dF_im_out = nullptr,
     // Phsp accumulators
     double* d_phsp_I = nullptr,
     double* d_phsp_grad = nullptr,
@@ -187,6 +189,15 @@ __global__ void hessianStage1Kernel(
                 new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
                 new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
                 R_ad = new_R;
+            }
+        }
+
+        // Output ∂F/∂θ for mixed Hessian
+        if (d_dF_re_out) {
+            for (int j = 0; j < Npr; ++j) {
+                int fidx = evt * nSL * Npr + sl_idx * Npr + j;
+                d_dF_re_out[fidx] = R_ad.real.grad[j];
+                d_dF_im_out[fidx] = R_ad.imag.grad[j];
             }
         }
 
@@ -371,6 +382,154 @@ __global__ void hessianCrossBlockKernel(
                 atomicAdd(&d_phsp_hessA[gkb * phsp_ld + gja], phsp_val);
                 atomicAdd(&d_phsp_hessA[gja * phsp_ld + gkb], phsp_val);
             }
+        }
+    }
+}
+
+// ============================================================
+// Stage 3: Per-block mixed Hessian ∂²L/∂v_a∂θ_j (vθ same-block)
+// H[Re(v_a),θ_j] = -2w/I·[Re(conj(dS_j)·amp_a) + Re(conj(S)·slamp_a·dF_j) + g_j·Re(conj(S)·amp_a)]
+// H[Im(v_a),θ_j] = +2w/I·[Im(conj(dS_j)·amp_a) + Im(conj(S)·slamp_a·dF_j) + g_j·Im(conj(S)·amp_a)]
+// ============================================================
+__global__ void hessianMixedBlockKernel(
+    const double* d_S_re, const double* d_S_im,   // [nEv*nPolar]
+    const double* d_I,                             // [nEv]
+    const cuComplex* d_amp,                        // [nEv_total*nPolar*n_amp_total]
+    const thrust::complex<double>* d_slamps,        // [nSLtotal * nTotal]
+    const double* d_g,                             // [nEv*Npr]
+    const double* d_dS_re, const double* d_dS_im,  // [nEv*Npr*nPolar]
+    const double* d_dF_re, const double* d_dF_im,  // [nEv*nSL*Npr]
+    const int* d_global_idx,                       // [Npr]
+    double* d_mixed, int mixed_ld,                 // [2*n_amp_total × P]
+    int nEvents, int nSL, int Npr, int nPolar, int n_amp_total, int site,
+    int nTotal_slamp,
+    double default_weight, const double* d_event_weights,
+    int evt_offset = 0)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    int evt_abs = evt + evt_offset;
+    double w = d_event_weights ? d_event_weights[evt] : default_weight;
+    double I_val = d_I[evt];
+    if (I_val < 1e-30) return;
+    double inv_I = 1.0 / I_val;
+
+    const double* g_ptr = d_g + evt * Npr;
+    const double* dS_re_ptr = d_dS_re + evt * Npr * nPolar;
+    const double* dS_im_ptr = d_dS_im + evt * Npr * nPolar;
+    const double* Sr_ptr = d_S_re + evt * nPolar;
+    const double* Si_ptr = d_S_im + evt * nPolar;
+
+    for (int a = 0; a < nSL; ++a) {
+        int global_a = site + a;
+        const double* dF_re_ptr = d_dF_re + evt * nSL * Npr + a * Npr;
+        const double* dF_im_ptr = d_dF_im + evt * nSL * Npr + a * Npr;
+
+        for (int j = 0; j < Npr; ++j) {
+            int gj = d_global_idx[j];
+            if (gj < 0) continue;
+
+            double term1_re = 0.0, term1_im = 0.0;
+            double term2_re = 0.0, term2_im = 0.0;
+            double term3_re = 0.0, term3_im = 0.0;
+
+            double dF_re = dF_re_ptr[j], dF_im = dF_im_ptr[j];
+
+            for (int p = 0; p < nPolar; ++p) {
+                cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + global_a];
+                double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+
+                double sr = Sr_ptr[p], si = Si_ptr[p];
+
+                int ds_idx = j * nPolar + p;
+                double ds_re = dS_re_ptr[ds_idx], ds_im = dS_im_ptr[ds_idx];
+
+                auto sl_amp = d_slamps[a * nTotal_slamp + evt_abs * nPolar + p];
+                double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
+
+                // Term 1: Re/Im(conj(dS_j) · amp_a)
+                term1_re += ds_re * ar + ds_im * ai;
+                term1_im += ds_re * ai - ds_im * ar;
+
+                // Term 2: Re/Im(conj(S) · slamp_a · dF_j)
+                double sl_dF_re = sl_re * dF_re - sl_im * dF_im;
+                double sl_dF_im = sl_re * dF_im + sl_im * dF_re;
+                term2_re += sr * sl_dF_re + si * sl_dF_im;
+                term2_im += sr * sl_dF_im - si * sl_dF_re;
+
+                // Term 3 coef: Re/Im(conj(S) · amp_a)
+                term3_re += sr * ar + si * ai;
+                term3_im += sr * ai - si * ar;
+            }
+
+            double gj_val = g_ptr[j];
+            double coeff = w * 2.0 * inv_I;
+
+            d_mixed[global_a * mixed_ld + gj] += -coeff * (term1_re + term2_re + gj_val * term3_re);
+            d_mixed[(n_amp_total + global_a) * mixed_ld + gj] += coeff * (term1_im + term2_im + gj_val * term3_im);
+        }
+    }
+}
+
+// ============================================================
+// Stage 4: Cross-block mixed Hessian (vθ cross terms)
+// Term 2 = 0 (∂θ_amp_a = 0 for a in A, θ in B). Terms 1+3 survive.
+// ============================================================
+__global__ void hessianCrossMixedKernel(
+    const double* d_S_re, const double* d_S_im,
+    const double* d_I,
+    const cuComplex* d_amp,
+    const double* d_g_B, const double* d_dS_re_B, const double* d_dS_im_B,
+    const int* d_gidx_B, int NTb,
+    int nSL_A, int site_A,
+    int nEvents, int nPolar, int n_amp_total,
+    double* d_mixed, int mixed_ld,
+    double default_weight, const double* d_event_weights,
+    int evt_offset = 0)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    double w = d_event_weights ? d_event_weights[evt] : default_weight;
+    double I_val = d_I[evt];
+    if (I_val < 1e-30) return;
+    double inv_I = 1.0 / I_val;
+
+    const double* Sr_ptr = d_S_re + evt * nPolar;
+    const double* Si_ptr = d_S_im + evt * nPolar;
+    const double* gB_ptr = d_g_B + evt * NTb;
+    const double* dS_reB_ptr = d_dS_re_B + evt * NTb * nPolar;
+    const double* dS_imB_ptr = d_dS_im_B + evt * NTb * nPolar;
+
+    for (int a = 0; a < nSL_A; ++a) {
+        int ga = site_A + a;
+
+        double term3_re = 0.0, term3_im = 0.0;
+        for (int p = 0; p < nPolar; ++p) {
+            cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
+            double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+            double sr = Sr_ptr[p], si = Si_ptr[p];
+            term3_re += sr * ar + si * ai;
+            term3_im += sr * ai - si * ar;
+        }
+
+        for (int jb = 0; jb < NTb; ++jb) {
+            int gjb = d_gidx_B[jb];
+            if (gjb < 0) continue;
+            double gj_val = gB_ptr[jb];
+
+            double term1_re = 0.0, term1_im = 0.0;
+            for (int p = 0; p < nPolar; ++p) {
+                cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
+                double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+                int ds_idx = jb * nPolar + p;
+                double ds_re = dS_reB_ptr[ds_idx], ds_im = dS_imB_ptr[ds_idx];
+                term1_re += ds_re * ar + ds_im * ai;
+                term1_im += ds_re * ai - ds_im * ar;
+            }
+
+            double coeff = w * 2.0 * inv_I;
+            d_mixed[ga * mixed_ld + gjb] += -coeff * (term1_re + gj_val * term3_re);
+            d_mixed[(n_amp_total + ga) * mixed_ld + gjb] += coeff * (term1_im + gj_val * term3_im);
         }
     }
 }

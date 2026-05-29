@@ -2265,6 +2265,9 @@ public:
             double* d_hess;
             cudaMalloc(&d_hess, P * P * sizeof(double));
             cudaMemset(d_hess, 0, P * P * sizeof(double));
+            double* d_mixed = nullptr;
+            cudaMalloc(&d_mixed, 2 * n_amplitudes_ * P * sizeof(double));
+            cudaMemset(d_mixed, 0, 2 * n_amplitudes_ * P * sizeof(double));
 
             // Data: weight=+1.0
             {
@@ -2273,7 +2276,8 @@ public:
                     n_data_ev[g] = events_[g][1]; data_off[g] = events_[g][0];
                 }
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {});
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                    nullptr, nullptr, nullptr, d_mixed);
             }
 
             // Bkg: weight = -w_e
@@ -2287,7 +2291,8 @@ public:
                     cudaMemcpy(&wb, bkg_weights_[0], sizeof(double), cudaMemcpyDeviceToHost);
                 }
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -wb,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_);
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                    nullptr, nullptr, nullptr, d_mixed);
             }
 
             // Phsp: sign=0, accumulate to phsp buffers, then post-process
@@ -2307,7 +2312,7 @@ public:
 
                 amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
-                    d_phsp_I, d_phsp_grad, d_phsp_hessA);
+                    d_phsp_I, d_phsp_grad, d_phsp_hessA, d_mixed);
 
                 // Phsp post-processing: H_phsp = A/(pf*np)*ΣIA - A/(pf*np)²*ΣIg·ΣIg^T
                 double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
@@ -2332,9 +2337,40 @@ public:
                 delete[] h_pg; delete[] h_ph; delete[] h_dh;
             }
 
-            // Mixed Hessian: zero for now (unified kernel doesn't compute mixed blocks yet)
-            hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
-            hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
+            // Mixed Hessian: extract d_mixed[2*n_ext × P] → hessian[2*nv × P]
+            {
+                std::vector<double> h_mixed(2 * n_amplitudes_ * P);
+                cudaMemcpy(h_mixed.data(), d_mixed, 2 * n_amplitudes_ * P * sizeof(double), cudaMemcpyDeviceToHost);
+                cudaFree(d_mixed);
+
+                std::vector<double> h_proj(2 * nv * P, 0.0);
+                // Project constraints
+                for (const auto& g : params_.constraintGroups()) {
+                    int oid = g.origin_id;
+                    for (size_t c = 0; c < g.ext_indices.size(); ++c) {
+                        if ((int)c == g.origin_idx_in_group) continue;
+                        int eid = g.ext_indices[c];
+                        double rr = static_cast<double>(g.real_ratios[c]);
+                        double ir = static_cast<double>(g.imag_ratios[c]);
+                        for (int j = 0; j < P; ++j) {
+                            h_mixed[oid * P + j] += rr * h_mixed[eid * P + j]
+                                                  + ir * h_mixed[(n_amplitudes_ + eid) * P + j];
+                            h_mixed[(n_amplitudes_ + oid) * P + j] += -ir * h_mixed[eid * P + j]
+                                                                     + rr * h_mixed[(n_amplitudes_ + eid) * P + j];
+                        }
+                    }
+                }
+                for (int i = 0; i < nv; ++i) {
+                    for (int j = 0; j < P; ++j) {
+                        h_proj[i * P + j] = h_mixed[i * P + j];
+                        h_proj[(nv + i) * P + j] = h_mixed[(n_amplitudes_ + i) * P + j];
+                    }
+                }
+                torch::Tensor mixed_t = torch::from_blob(h_proj.data(), {2 * nv, P},
+                    torch::TensorOptions().dtype(torch::kFloat64)).clone().to(dev);
+                hessian.slice(0, 0, n2).slice(1, n2, total).copy_(mixed_t);
+                hessian.slice(0, n2, total).slice(1, 0, n2).copy_(mixed_t.transpose(0, 1));
+            }
 
             // Copy theta-theta result to hessian
             torch::Tensor res_hess = torch::empty({P, P},

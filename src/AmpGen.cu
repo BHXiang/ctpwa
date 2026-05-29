@@ -3107,7 +3107,8 @@ void AmpCalc::computeUnifiedHessian(
     const std::vector<double*>& d_event_weights,
     double* d_phsp_I,
     double* d_phsp_grad,
-    double* d_phsp_hessA)
+    double* d_phsp_hessA,
+    double* d_mixed_out)
 {
     int n_gpu = static_cast<int>(n_events.size());
     int n_free = nFreeResParams();
@@ -3120,6 +3121,8 @@ void AmpCalc::computeUnifiedHessian(
         double* d_g = nullptr;
         double* d_dS_re = nullptr;
         double* d_dS_im = nullptr;
+        double* d_dF_re = nullptr;
+        double* d_dF_im = nullptr;
         int* d_gidx = nullptr;
         int NT;
         int nEv;
@@ -3189,6 +3192,8 @@ void AmpCalc::computeUnifiedHessian(
             cudaMalloc(&bt.d_g, nEv * NT * sizeof(double));
             cudaMalloc(&bt.d_dS_re, nEv * NT * nPol * sizeof(double));
             cudaMalloc(&bt.d_dS_im, nEv * NT * nPol * sizeof(double));
+            cudaMalloc(&bt.d_dF_re, nEv * nSL * Npr * sizeof(double));
+            cudaMalloc(&bt.d_dF_im, nEv * nSL * Npr * sizeof(double));
             cudaMalloc(&bt.d_gidx, NT * sizeof(int));
             cudaMemcpy(bt.d_gidx, global_idx.data(), NT * sizeof(int), cudaMemcpyHostToDevice);
 
@@ -3202,7 +3207,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
-                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
             } else if (Npr == 2 && Nres == 1) {
                 hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
@@ -3211,7 +3216,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
-                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
             } else {
                 printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
@@ -3241,11 +3246,62 @@ void AmpCalc::computeUnifiedHessian(
             }
         }
 
+        // ===== Stage 3: Per-block mixed Hessian (vθ same-block) =====
+        // ===== Stage 4: Cross-block mixed Hessian (vθ cross terms) =====
+        if (d_mixed_out) {
+            for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+                auto& bt = temps_per_gpu[gpu][bi];
+                if (!bt.d_g || !bt.d_dF_re) continue;
+                auto& blk = blocks_[bi];
+                int nSL = static_cast<int>(cas0->getNSLCombs());
+                int Npr = 0;
+                for (int s = 0; s < n_free; ++s)
+                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
+                if (Npr < 1) continue;
+                int nTotal_slamp = static_cast<int>(cas0->getNEventsVec()[gpu]) * nPol;
+                int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                hessianMixedBlockKernel<<<grid, kBlockSize>>>(
+                    d_S_re, d_S_im, d_I_full,
+                    d_amp + evt_off * nPol * n_amp_total,
+                    cas0->getSLAmps()[gpu],
+                    bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
+                    d_mixed_out, nFreeResParams(),
+                    nEv, nSL, Npr, nPol, n_amp_total, blk.site,
+                    nTotal_slamp, default_weight, d_w, evt_off);
+                cudaDeviceSynchronize();
+            }
+
+            // Cross-block mixed
+            for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+                auto& blkA = blocks_[bi];
+                int nSL_A = static_cast<int>(cas0->getNSLCombs());
+                for (size_t bj = 0; bj < blocks_.size(); ++bj) {
+                    if (bi == bj) continue;
+                    auto& btB = temps_per_gpu[gpu][bj];
+                    if (!btB.d_g) continue;
+                    if (blocks_[bi].cas_idx != blocks_[bj].cas_idx) continue;
+                    int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                    hessianCrossMixedKernel<<<grid, kBlockSize>>>(
+                        d_S_re, d_S_im, d_I_full,
+                        d_amp + evt_off * nPol * n_amp_total,
+                        btB.d_g, btB.d_dS_re, btB.d_dS_im, btB.d_gidx, btB.NT,
+                        nSL_A, blkA.site,
+                        nEv, nPol, n_amp_total,
+                        d_mixed_out, nFreeResParams(),
+                        default_weight, d_w, evt_off);
+                    cudaDeviceSynchronize();
+                }
+            }
+        }
+
         // Free temp buffers
         for (auto& bt : temps_per_gpu[gpu]) {
             if (bt.d_g) cudaFree(bt.d_g);
             if (bt.d_dS_re) cudaFree(bt.d_dS_re);
             if (bt.d_dS_im) cudaFree(bt.d_dS_im);
+            if (bt.d_dF_re) cudaFree(bt.d_dF_re);
+            if (bt.d_dF_im) cudaFree(bt.d_dF_im);
             if (bt.d_gidx) cudaFree(bt.d_gidx);
         }
         cudaFree(d_S_re); cudaFree(d_S_im); cudaFree(d_I_full);

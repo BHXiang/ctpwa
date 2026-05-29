@@ -262,7 +262,8 @@ public:
         const std::vector<double*>& d_event_weights = {},
         double* d_phsp_I = nullptr,
         double* d_phsp_grad = nullptr,
-        double* d_phsp_hessA = nullptr);
+        double* d_phsp_hessA = nullptr,
+        double* d_mixed_out = nullptr);
 
     void computeResonanceHessian(
         const std::vector<int>& n_events,     // 每 GPU 的事件数
