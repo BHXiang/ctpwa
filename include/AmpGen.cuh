@@ -45,6 +45,9 @@ struct DecayNode {
     double mass[3] = { -1, -1, -1 };
 };
 
+// 工具函数声明 (定义在 AmpGen.cu)
+__device__ double breakup_momentum(double m, double m1, double m2);
+
 // 设备端四动量结构体
 struct DeviceMomenta {
     LorentzVector* momenta;    // 所有粒子的四动量
@@ -248,6 +251,19 @@ public:
     // d_event_weights[gpu]: per-event 权重数组（null=使用 default_weight）
     // default_weight: 当 d_event_weights[gpu] 为 null 时使用（如 data=-1, bkg=+0.5）
     // d_v: 耦合向量 (每 GPU 第一个为 primary device 上的指针，需通过 cas 转 GPU)
+    void computeUnifiedHessian(
+        const std::vector<int>& n_events,
+        double* d_hess, int hess_ld,
+        const std::vector<int>& t_offset,
+        double default_weight,
+        const cuComplex* d_v_interleaved,
+        const cuComplex* d_amp,
+        int n_amp_total,
+        const std::vector<double*>& d_event_weights = {},
+        double* d_phsp_I = nullptr,
+        double* d_phsp_grad = nullptr,
+        double* d_phsp_hessA = nullptr);
+
     void computeResonanceHessian(
         const std::vector<int>& n_events,     // 每 GPU 的事件数
         double* d_hess,                       // 输出 [P×P]
@@ -287,6 +303,7 @@ public:
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
+    const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
 
     // 测试：用 AutoDiff 计算 BWR Hessian
     static void testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d, double* out);

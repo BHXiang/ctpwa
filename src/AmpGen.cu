@@ -1,4 +1,5 @@
 #include <AmpGen.cuh>
+#include <ComputeNLL.cuh>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <cuda_runtime.h>
@@ -1683,7 +1684,7 @@ __global__ void resonanceGradientKernel(
         // 累加 sl 的贡献: 对 pol 求和 Σ_p conj(w_p) · v_sl · slamps[sl,e,p]
         // 然后乘以 ∂R_sl/∂θ 的 (实部, 虚部) 并提取实部
         // ----------------------------------------------------------------
-        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
+        cuComplex v_sl = d_v[site + sl_idx];
 
         double s_re = 0.0, s_im = 0.0;
         for (int pol = 0; pol < nPolar; ++pol) {
@@ -1699,6 +1700,19 @@ __global__ void resonanceGradientKernel(
             s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
             s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
         }
+
+        // DEBUG: print first event, first SL
+        // if (evt == 0 && sl_idx == 0) {
+        printf("GRAD evt=%d sl=%d site=%d v=(%.4f,%.4f) s=(%.4f,%.4f)\n",
+            evt, sl_idx, site, (double)v_sl.x, (double)v_sl.y, s_re, s_im);
+        for (int j = 0; j < Nfree; ++j)
+            printf("  j=%d gidx=%d dR=(%.4f,%.4f) contrib=%.4f\n",
+                j, d_global_idx[j], R_ad.real.grad[j], R_ad.imag.grad[j],
+                -2.0 * sign * (s_re * R_ad.real.grad[j] - s_im * R_ad.imag.grad[j]));
+        // print first pol w and T
+        cuComplex w0 = d_w[evt * nPolar + 0];
+        printf("  w[0]=(%.4f,%.4f)\n", (double)w0.x, (double)w0.y);
+        // }
 
         for (int j = 0; j < Nfree; ++j) {
             double dRr = R_ad.real.grad[j];
@@ -1716,16 +1730,16 @@ __global__ void computeEffectiveCouplingKernel(
     cuComplex* d_T,
     const thrust::complex<double>* d_slamps,
     const cuComplex* d_v,
-    int nSL, int nTotal)
+    int nSL, int nTotal,
+    int sl_start, int sl_end)  // SL range: only sum over these SL channels
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nTotal) return;
 
     double re = 0.0, im = 0.0;
-    for (int sl = 0; sl < nSL; ++sl) {
+    for (int sl = sl_start; sl < sl_end; ++sl) {
         auto sv = d_slamps[sl * nTotal + idx];
         auto vv = d_v[sl];
-        // (vv.x + i*vv.y) * (sv.real + i*sv.imag)
         re += (double)vv.x * sv.real() - (double)vv.y * sv.imag();
         im += (double)vv.x * sv.imag() + (double)vv.y * sv.real();
     }
@@ -1757,7 +1771,7 @@ void AmpCalc::computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes)
         int grid = (nTotal + kBlockSize - 1) / kBlockSize;
         computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
             block.d_T[gpu], cas->getSLAmps()[gpu],
-            d_v + block.site, nSL, nTotal);
+            d_v + block.site, nSL, nTotal, 0, nSL);
         cudaDeviceSynchronize();
     }
 }
@@ -2129,28 +2143,28 @@ __global__ void resonanceHessianBlockKernel(
     const double* p_r = d_all_params + res_r.param_offset;
 
     // Step 1: 找共振态 r 节点，算不变质量
-    double mm = 0.0, qq = 0.0, q0_r = 0.0;
+    double mm = 0.0, qq = 0.0;
     int res_L_r = 0;
+    double md1_r_fixed = 0.0, md2_r_fixed = 0.0; // saved for AD q0 computation
     bool found = false;
     for (int ni = 0; ni < decayChain_size; ++ni) {
-        const DecayNode& node = d_decayNodes[ni];
-        if (node.mother_idx != res_r.particle_idx) continue;
-        LorentzVector pM = d_momenta->getMomentum(evt_abs, node.mother_idx);
-        LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
-        LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
+        const DecayNode& dnode = d_decayNodes[ni];
+        if (dnode.mother_idx != res_r.particle_idx) continue;
+        LorentzVector pM = d_momenta->getMomentum(evt_abs, dnode.mother_idx);
+        LorentzVector pD1 = d_momenta->getMomentum(evt_abs, dnode.daug1_idx);
+        LorentzVector pD2 = d_momenta->getMomentum(evt_abs, dnode.daug2_idx);
         mm = pM.M();
-        double md1 = node.mass[1], md2 = node.mass[2];
-        if (md1 <= 0) md1 = pD1.M();
-        if (md2 <= 0) md2 = pD2.M();
-        qq = breakup_momentum(mm, md1, md2);
-        q0_r = breakup_momentum(p_r[0], md1, md2);
+        md1_r_fixed = dnode.mass[1] > 0 ? dnode.mass[1] : pD1.M();
+        md2_r_fixed = dnode.mass[2] > 0 ? dnode.mass[2] : pD2.M();
+        qq = breakup_momentum(mm, md1_r_fixed, md2_r_fixed);
         res_L_r = d_slComb[ni].L;
         found = true;
         break;
     }
     if (!found) return;
 
-    // Step 2: D_r = ∂R_r/∂θ（Pr 个值），用 WithHess=false
+    // Step 2: F_r = BWR·Bf, full resonance factor with AD (includes ∂Bf/∂θ through q0)
+    // q0 computed with AD to capture ∂Bf/∂m0 through q0(m0)
     using AD1 = Var<double, Pr, false>;
     AD1 m_ad(mm);
     AD1 m0_r_ad(p_r[0]), g_r_ad(p_r[1]);
@@ -2159,24 +2173,37 @@ __global__ void resonanceHessianBlockKernel(
         if (pi == 0) m0_r_ad.grad[j] = 1.0;
         if (pi == 1) g_r_ad.grad[j]  = 1.0;
     }
-    AD1 q_ad(qq), q0_ad(q0_r);
-    ComplexVar<double, Pr, false> R_r_ad;
-    if (res_r.type == ResModelType::BWR)
-        R_r_ad = BWR<AD1>(m_ad, m0_r_ad, g_r_ad, res_L_r, q_ad, q0_ad, bf_d);
-    else if (res_r.type == ResModelType::BW)
-        R_r_ad = BW<AD1>(m_ad, m0_r_ad, g_r_ad);
-    double bf_val = Bf<double>(res_L_r, qq, q0_r, bf_d);
+    // q0 with AD: m0_q0 depends on resonance mass, daughter masses fixed
+    AD1 m0_q0_r_ad = m0_r_ad;
+    AD1 md1_r_ad(md1_r_fixed), md2_r_ad(md2_r_fixed);
+    AD1 s_md_r = md1_r_ad + md2_r_ad;
+    AD1 d_md_r = md1_r_ad - md2_r_ad;
+    AD1 m0sq_r = m0_q0_r_ad * m0_q0_r_ad;
+    AD1 q0sq_r = (m0sq_r - s_md_r*s_md_r) * (m0sq_r - d_md_r*d_md_r) / (AD1(4.0) * m0sq_r);
+    q0sq_r.val = q0sq_r.val < 0.0 ? 0.0 : q0sq_r.val;
+    AD1 q0_r_ad = sqrt(q0sq_r);
+    AD1 q_ad(qq);
 
-    // Step 3: D_s 和（如果 SameRes）D²_r
+    ComplexVar<double, Pr, false> R_r_ad;
+    if (res_r.type == ResModelType::BWR) {
+        auto bw_r = BWR<AD1>(m_ad, m0_r_ad, g_r_ad, res_L_r, q_ad, q0_r_ad, bf_d);
+        auto bf_r_ad = Bf<AD1>(res_L_r, q_ad, q0_r_ad, bf_d);
+        R_r_ad.real = bw_r.real * bf_r_ad;
+        R_r_ad.imag = bw_r.imag * bf_r_ad;
+    } else if (res_r.type == ResModelType::BW) {
+        R_r_ad = BW<AD1>(m_ad, m0_r_ad, g_r_ad);
+    }
+    // bf_val = 1.0 since Bf is now part of the AD chain
+
+    // Step 3: F_s = BWR·Bf for resonance s (with AD q0, !SameRes only)
     const DeviceResonance* res_s_ptr = &res_r;
     const double* p_s = p_r;
     int res_L_s = res_L_r;
-    double q0_s = q0_r;
+    double md1_s_fixed = md1_r_fixed, md2_s_fixed = md2_r_fixed;
 
     if constexpr (!SameRes) {
         res_s_ptr = &d_res[res_s_idx];
         p_s = d_all_params + res_s_ptr->param_offset;
-        // 找共振态 s 节点
         bool found_s = false;
         for (int ni = 0; ni < decayChain_size; ++ni) {
             if (d_decayNodes[ni].mother_idx == res_s_ptr->particle_idx) {
@@ -2184,11 +2211,9 @@ __global__ void resonanceHessianBlockKernel(
                 mm = pM.M();
                 LorentzVector pD1 = d_momenta->getMomentum(evt_abs, d_decayNodes[ni].daug1_idx);
                 LorentzVector pD2 = d_momenta->getMomentum(evt_abs, d_decayNodes[ni].daug2_idx);
-                double md1 = d_decayNodes[ni].mass[1], md2 = d_decayNodes[ni].mass[2];
-                if (md1 <= 0) md1 = pD1.M();
-                if (md2 <= 0) md2 = pD2.M();
-                qq = breakup_momentum(mm, md1, md2);
-                q0_s = breakup_momentum(p_s[0], md1, md2);
+                md1_s_fixed = d_decayNodes[ni].mass[1] > 0 ? d_decayNodes[ni].mass[1] : pD1.M();
+                md2_s_fixed = d_decayNodes[ni].mass[2] > 0 ? d_decayNodes[ni].mass[2] : pD2.M();
+                qq = breakup_momentum(mm, md1_s_fixed, md2_s_fixed);
                 res_L_s = d_slComb[ni].L;
                 found_s = true;
                 break;
@@ -2205,16 +2230,29 @@ __global__ void resonanceHessianBlockKernel(
         if (pi == 0) m0_s_ad.grad[k] = 1.0;
         if (pi == 1) g_s_ad.grad[k]  = 1.0;
     }
-    AD2 q_ad_s(qq), q0_ad_s(q0_s);
-    ComplexVar<double, Ps, false> R_s_ad;
-    if (res_s_ptr->type == ResModelType::BWR)
-        R_s_ad = BWR<AD2>(m_ad_s, m0_s_ad, g_s_ad, res_L_s, q_ad_s, q0_ad_s, bf_d);
-    else if (res_s_ptr->type == ResModelType::BW)
-        R_s_ad = BW<AD2>(m_ad_s, m0_s_ad, g_s_ad);
-    else return;
-    double bf_val_s = Bf<double>(res_L_s, qq, q0_s, bf_d);
+    // q0 with AD for resonance s
+    AD2 m0_q0_s_ad = m0_s_ad;
+    AD2 md1_s_ad(md1_s_fixed), md2_s_ad(md2_s_fixed);
+    AD2 s_md_s = md1_s_ad + md2_s_ad;
+    AD2 d_md_s = md1_s_ad - md2_s_ad;
+    AD2 m0sq_s = m0_q0_s_ad * m0_q0_s_ad;
+    AD2 q0sq_s = (m0sq_s - s_md_s*s_md_s) * (m0sq_s - d_md_s*d_md_s) / (AD2(4.0) * m0sq_s);
+    q0sq_s.val = q0sq_s.val < 0.0 ? 0.0 : q0sq_s.val;
+    AD2 q0_s_ad = sqrt(q0sq_s);
+    AD2 q_ad_s(qq);
 
-    // Step 4: 如果需要 Hessian（SameRes），用 WithHess=true 再算一次
+    ComplexVar<double, Ps, false> R_s_ad;
+    if (res_s_ptr->type == ResModelType::BWR) {
+        auto bw_s = BWR<AD2>(m_ad_s, m0_s_ad, g_s_ad, res_L_s, q_ad_s, q0_s_ad, bf_d);
+        auto bf_s_ad = Bf<AD2>(res_L_s, q_ad_s, q0_s_ad, bf_d);
+        R_s_ad.real = bw_s.real * bf_s_ad;
+        R_s_ad.imag = bw_s.imag * bf_s_ad;
+    } else if (res_s_ptr->type == ResModelType::BW) {
+        R_s_ad = BW<AD2>(m_ad_s, m0_s_ad, g_s_ad);
+    } else return;
+    // bf_val_s = 1.0 since Bf is in AD chain
+
+    // Step 4: 需要 Hessian（SameRes），用 WithHess=true，同样 q0 AD + Bf AD
     ComplexVar<double, Pr, true> R_r_hess;
     if constexpr (SameRes) {
         using ADH = Var<double, Pr, true>;
@@ -2225,14 +2263,33 @@ __global__ void resonanceHessianBlockKernel(
             if (pi == 0) m0_h.grad[j] = 1.0;
             if (pi == 1) g_h.grad[j]  = 1.0;
         }
-        ADH q_ad_h(qq), q0_ad_h(q0_r);
-        if (res_r.type == ResModelType::BWR)
-            R_r_hess = BWR<ADH>(m_ad_h, m0_h, g_h, res_L_r, q_ad_h, q0_ad_h, bf_d);
-        else
+        // q0 with ADH
+        ADH m0_q0_h = m0_h;
+        ADH md1_h(md1_r_fixed), md2_h(md2_r_fixed);
+        ADH s_md_h = md1_h + md2_h;
+        ADH d_md_h = md1_h - md2_h;
+        ADH m0sq_h = m0_q0_h * m0_q0_h;
+        ADH q0sq_h = (m0sq_h - s_md_h*s_md_h) * (m0sq_h - d_md_h*d_md_h) / (ADH(4.0) * m0sq_h);
+        q0sq_h.val = q0sq_h.val < 0.0 ? 0.0 : q0sq_h.val;
+        ADH q0_h_ad = sqrt(q0sq_h);
+        ADH q_h_ad(qq);
+
+        if (res_r.type == ResModelType::BWR) {
+            auto bw_h = BWR<ADH>(m_ad_h, m0_h, g_h, res_L_r, q_h_ad, q0_h_ad, bf_d);
+            auto bf_h_ad = Bf<ADH>(res_L_r, q_h_ad, q0_h_ad, bf_d);
+            R_r_hess.real = bw_h.real * bf_h_ad;
+            R_r_hess.imag = bw_h.imag * bf_h_ad;
+        } else {
             R_r_hess = BW<ADH>(m_ad_h, m0_h, g_h);
+        }
     }
 
-    // Step 5: 对每个极化累加
+    // Step 5: per-event aggregates -> gradient -> outer product + correction.
+    // Verified: H = g·g^T - (1/I)·∂²I. g = -2·bf·Re(D·Σconj(w)·T)
+    double I_inv = 0.0, sum_T2_r = 0.0;
+    double sum_cwT_r_re = 0.0, sum_cwT_r_im = 0.0;
+    double sum_cwT_s_re = 0.0, sum_cwT_s_im = 0.0;
+    double sum_TsTr_re = 0.0, sum_TsTr_im = 0.0;
     for (int p = 0; p < nPolar; ++p) {
         cuComplex w_val = d_w[evt * nPolar + p];
         cuComplex Tr_val = d_T_r[evt * nPolar + p];
@@ -2240,94 +2297,384 @@ __global__ void resonanceHessianBlockKernel(
 
         double w2 = (double)w_val.x * w_val.x + (double)w_val.y * w_val.y;
         if (w2 < 1e-30) continue;
-        double inv_w2 = 1.0 / w2;
-        double I_inv = w2;  // I = 1/|w|² → 1/I = |w|²
 
-        // conj(w)
+        I_inv += w2;  // Σ|w|² = 1/I
+
         double cw_re = (double)w_val.x;
-        double cw_im = -(double)w_val.y;
+        double cw_im = -(double)w_val.y;  // conj(w)
 
-        // c_T_r = conj(w) * T_r
         double cTr_re = cw_re * Tr_val.x - cw_im * Tr_val.y;
         double cTr_im = cw_re * Tr_val.y + cw_im * Tr_val.x;
+        sum_cwT_r_re += cTr_re; sum_cwT_r_im += cTr_im;
 
-        // c_T_s = conj(w) * T_s
-        double cTs_re, cTs_im;
+        double T2_r = (double)Tr_val.x * Tr_val.x + (double)Tr_val.y * Tr_val.y;
+        sum_T2_r += T2_r;
+
         if constexpr (SameRes) {
-            cTs_re = cTr_re; cTs_im = cTr_im;
+            sum_cwT_s_re += cTr_re; sum_cwT_s_im += cTr_im;
         } else {
-            cTs_re = cw_re * Ts_val.x - cw_im * Ts_val.y;
-            cTs_im = cw_re * Ts_val.y + cw_im * Ts_val.x;
+            double cTs_re = cw_re * Ts_val.x - cw_im * Ts_val.y;
+            double cTs_im = cw_re * Ts_val.y + cw_im * Ts_val.x;
+            sum_cwT_s_re += cTs_re; sum_cwT_s_im += cTs_im;
+            sum_TsTr_re += Ts_val.x * Tr_val.x + Ts_val.y * Tr_val.y;
+            sum_TsTr_im += Ts_val.x * Tr_val.y - Ts_val.y * Tr_val.x;
         }
+    }
 
-        // G_r[j] = 2 * inv_w2 * Re(c_T_r * D_r[j])
-        double G_r[8], G_s[8];
-        for (int j = 0; j < Pr; ++j) {
-            double dRr_re = R_r_ad.real.grad[j];
-            double dRr_im = R_r_ad.imag.grad[j];
-            G_r[j] = 2.0 * inv_w2 * (cTr_re * dRr_re - cTr_im * dRr_im) * bf_val;
-        }
+    if (I_inv < 1e-30) return;
+
+    // g[j] = -2·Re(D^j · Σ conj(w)·T)  (bf already in AD, no separate bf factor)
+    double g_r[8] = { 0 }, g_s[8] = { 0 };
+    for (int j = 0; j < Pr; ++j) {
+        double d_re = R_r_ad.real.grad[j], d_im = R_r_ad.imag.grad[j];
+        g_r[j] = -2.0 * (d_re * sum_cwT_r_re - d_im * sum_cwT_r_im);
+    }
+    for (int k = 0; k < Ps; ++k) {
+        double d_re = R_s_ad.real.grad[k], d_im = R_s_ad.imag.grad[k];
+        g_s[k] = -2.0 * (d_re * sum_cwT_s_re - d_im * sum_cwT_s_im);
+    }
+
+    // Outer product: g·g^T
+    for (int j = 0; j < Pr; ++j) {
         for (int k = 0; k < Ps; ++k) {
-            double dRs_re = R_s_ad.real.grad[k];
-            double dRs_im = R_s_ad.imag.grad[k];
-            G_s[k] = 2.0 * inv_w2 * (cTs_re * dRs_re - cTs_im * dRs_im) * bf_val_s;
+            double prod = sign * g_r[j] * g_s[k];
+            atomicAdd(&d_hess[(offset_s + k) * hess_ld + (offset_r + j)], prod);
         }
+    }
 
-        // 一阶乘积项: H += |w|⁴ * G[j] * G[k] (即 I^{-2} * G*G)
-        double I2_inv = w2 * w2;  // |w|⁴ = 1/I²
+    // Correction: -(1/I)·∂²I
+    if constexpr (SameRes) {
+        for (int j = 0; j < Pr; ++j) {
+            for (int k = 0; k < Pr; ++k) {
+                double d_re_j = R_r_ad.real.grad[j], d_im_j = R_r_ad.imag.grad[j];
+                double d_re_k = R_r_ad.real.grad[k], d_im_k = R_r_ad.imag.grad[k];
+                double partA = sum_T2_r * (d_re_k * d_re_j + d_im_k * d_im_j);
+                double D2_re = R_r_hess.real.hess[j][k], D2_im = R_r_hess.imag.hess[j][k];
+                double partB = sum_cwT_r_re * D2_re - sum_cwT_r_im * D2_im;
+                double term = sign * 2.0 * (I_inv * partA + partB);
+                atomicAdd(&d_hess[(offset_r + k) * hess_ld + (offset_r + j)], -term);
+            }
+        }
+    }
+    else {
         for (int j = 0; j < Pr; ++j) {
             for (int k = 0; k < Ps; ++k) {
-                double prod = sign * I2_inv * G_r[j] * G_s[k];
-                atomicAdd(&d_hess[(offset_s + k) * hess_ld + (offset_r + j)], prod);
+                double d_re_j = R_r_ad.real.grad[j], d_im_j = R_r_ad.imag.grad[j];
+                double d_re_k = R_s_ad.real.grad[k], d_im_k = R_s_ad.imag.grad[k];
+                double cd_re = d_re_k * d_re_j + d_im_k * d_im_j;
+                double d2_re = sum_TsTr_re * cd_re - sum_TsTr_im * (d_re_k * d_im_j - d_im_k * d_re_j);
+                double term = sign * 2.0 * I_inv * d2_re;
+                atomicAdd(&d_hess[(offset_s + k) * hess_ld + (offset_r + j)], -term);
+            }
+        }
+    }
+
+}
+
+// ============================================================
+// NEW: Unified Hessian kernel (verified formula from standalone test)
+// H_jk = g_j·g_k - 2/I·Re(conj(dS_k)·dS_j) - 2/I·Re(conj(S)·d²S_jk)
+//
+// Processes all SL channels in one block, computes full Hessian.
+// Template: Npr = params per resonance (2 for BWR), Nres = number of resonances
+// ============================================================
+template<int Npr, int Nres>
+__global__ void unifiedHessianKernel(
+    const thrust::complex<double>* d_slamps, // pure spin amplitudes [sl*nTotal + evt*nPol + pol]
+    const cuComplex* d_v,                  // couplings [Nsl] (interleaved real/imag)
+    const DeviceMomenta* d_momenta,
+    const DecayNode* d_decayNodes, int decayChain_size,
+    const SL* d_slComb,
+    const DeviceResonance* d_resonances,     // [Nres]
+    const double* d_all_params,              // flat params [Npr*Nres]
+    const int* d_global_idx,                 // local→global mapping [Npr*Nres]
+    double* d_hess, int hess_ld,             // output Hessian (global indexing)
+    int nEvents, int nSL, int nPolar, double bf_d, double default_weight,
+    const double* d_event_weights = nullptr, // per-event weights (null=use default_weight)
+    double* d_phsp_I = nullptr,        // [1] Σ I_e for phsp normalization
+    double* d_phsp_grad = nullptr,     // [NT] Σ I_e * g_e_j for phsp gradient
+    double* d_phsp_hessA = nullptr,    // [NT*NT] Σ I_e * (g·g^T - H) for phsp Hessian
+    int evt_offset = 0)
+{
+    static_assert(Npr >= 1 && Npr <= 3, "Npr must be 1-3");
+    static_assert(Nres >= 1 && Nres <= 4, "Nres must be 1-4");
+
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    int evt_abs = evt + evt_offset;
+    int nTotal = d_momenta->n_events * nPolar;  // total (events*polar) for slamp indexing
+    double weight = d_event_weights ? d_event_weights[evt] : default_weight;
+
+    constexpr int NT = Npr * Nres;  // total free params in this block
+    int sl_per_res = nSL / Nres;
+
+    if (evt == 0)
+        printf("  unifiedHessianKernel<%d,%d> nEv=%d nSL=%d sl_per_res=%d NT=%d\n",
+            Npr, Nres, nEvents, nSL, sl_per_res, NT);
+
+    // ===== AutoDiff variables per resonance =====
+    using AD = Var<double, Npr, true>;
+    AD m0_ad[Nres], g_ad[Nres];
+    int ftg[Nres][Npr];  // local→global mapping
+    for (int r = 0; r < Nres; ++r) {
+        int po = d_resonances[r].param_offset;  // offset in d_all_params
+        m0_ad[r] = AD(d_all_params[po]);
+        m0_ad[r].grad[0] = 1.0;
+        g_ad[r] = AD(d_all_params[po + 1]);
+        g_ad[r].grad[1] = 1.0;
+        for (int j = 0; j < Npr; ++j)
+            ftg[r][j] = d_global_idx[r * Npr + j];  // local → global index
+        if (evt_abs < 5)  // print once per event
+            printf("  AD setup r=%d po=%d particle_idx=%d m0=%.6f w0=%.6f ftg=[%d,%d]\n",
+                r, po, d_resonances[r].particle_idx,
+                d_all_params[po], d_all_params[po+1],
+                ftg[r][0], ftg[r][1]);
+    }
+
+    // ===== Compute S[p] = Σ_sl v[sl] * slamps[sl,p] * R_sl (double) =====
+    // First pass: compute R_sl values (double, no AD) for S and I
+    double R_val_re[16], R_val_im[16];  // per-SL R values (max 16 SL)
+    double Sr[32] = {0}, Si[32] = {0};
+    for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
+        int res = sl_idx / sl_per_res;
+        cuComplex vv = d_v[sl_idx];
+        const DeviceResonance& target = d_resonances[res];
+        int po = target.param_offset;
+
+        // Compute R_sl (double) for S
+        double Rr = 1.0, Ri = 0.0;
+        for (int ni = 0; ni < decayChain_size; ++ni) {
+            const DecayNode& node = d_decayNodes[ni];
+            const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
+            int L = sl.L;
+            LorentzVector pM  = d_momenta->getMomentum(evt_abs, node.mother_idx);
+            LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
+            LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
+            double mm = pM.M();
+            double md1 = node.mass[1] > 0 ? node.mass[1] : pD1.M();
+            double md2 = node.mass[2] > 0 ? node.mass[2] : pD2.M();
+            double qq = breakup_momentum(mm, md1, md2);
+            // q0 daughter masses: if a daughter IS the resonance, use resonance mass param
+            double m0_q0 = 1.0;
+            if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
+                m0_q0 = d_all_params[po];
+            else if (node.mass[0] > 0) m0_q0 = node.mass[0];
+            double md1_q0 = md1, md2_q0 = md2;
+            if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
+                md1_q0 = d_all_params[po];
+            if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
+                md2_q0 = d_all_params[po];
+            double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
+            double nf_re, nf_im;
+            if (node.mother_idx == target.particle_idx && node.mass[0] <= 0) {
+                double m0v = d_all_params[po], g0v = d_all_params[po+1], qqv = qq, q0v = q0;
+                auto bw = BWR<double>(mm, m0v, g0v, L, qqv, q0v, bf_d);
+                double bf = Bf<double>(L, qq, q0, bf_d);
+                nf_re = bw.real() * bf; nf_im = bw.imag() * bf;
+            } else { double bf = Bf<double>(L, qq, q0, bf_d); nf_re = bf; nf_im = 0.0; }
+            double nr_re = Rr * nf_re - Ri * nf_im;
+            double nr_im = Rr * nf_im + Ri * nf_re;
+            Rr = nr_re; Ri = nr_im;
+        }
+        R_val_re[sl_idx] = Rr; R_val_im[sl_idx] = Ri;
+
+        // Accumulate S[p] = Σ v[sl] * slamp * R_sl
+        for (int p = 0; p < nPolar; ++p) {
+            auto sl_amp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p];
+            double sv_re = sl_amp.real(), sv_im = sl_amp.imag();
+            // v * slamp
+            double vs_re = (double)vv.x * sv_re - (double)vv.y * sv_im;
+            double vs_im = (double)vv.x * sv_im + (double)vv.y * sv_re;
+            // v * slamp * R
+            Sr[p] += vs_re * Rr - vs_im * Ri;
+            Si[p] += vs_im * Rr + vs_re * Ri;
+        }
+    }
+    double I_val = 0.0;
+    for (int p = 0; p < nPolar; ++p) I_val += Sr[p] * Sr[p] + Si[p] * Si[p];
+    if (I_val < 1e-30) return;
+    double inv_I = 1.0 / I_val;
+
+    // ===== Accumulate dS_total[j][p] and d²S[j][k][p] =====
+    double dS_re[NT][32] = {{0}}, dS_im[NT][32] = {{0}};
+    double d2S_re[NT][NT][32] = {{{0}}}, d2S_im[NT][NT][32] = {{{0}}};
+
+    for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
+        int res = sl_idx / sl_per_res;  // which resonance owns this SL
+        if (res >= Nres) continue;
+        cuComplex vv = d_v[sl_idx];
+
+        // AD F for this SL
+        using CV = ComplexVar<double, Npr, true>;
+        CV R_ad(1.0, 0.0);
+        {
+            const DeviceResonance& target = d_resonances[res];
+            AD* m0p = &m0_ad[res];
+            AD* gp = &g_ad[res];
+
+            for (int ni = 0; ni < decayChain_size; ++ni) {
+                const DecayNode& node = d_decayNodes[ni];
+                const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
+                int L = sl.L;
+
+                LorentzVector pM  = d_momenta->getMomentum(evt_abs, node.mother_idx);
+                LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
+                LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
+
+                double mm = pM.M();
+                double md1 = node.mass[1] > 0 ? node.mass[1] : pD1.M();
+                double md2 = node.mass[2] > 0 ? node.mass[2] : pD2.M();
+                double qq = breakup_momentum(mm, md1, md2);
+
+                // q0 with AD: if a daughter IS the resonance, its mass depends on m0
+                AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
+                    m0_q0_ad = *m0p;
+                else if (node.mass[0] > 0)
+                    m0_q0_ad = AD(node.mass[0]);
+                else
+                    m0_q0_ad = AD(1.0);
+                if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
+                    md1_q0_ad = *m0p;
+                else
+                    md1_q0_ad = AD(md1);
+                if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
+                    md2_q0_ad = *m0p;
+                else
+                    md2_q0_ad = AD(md2);
+
+                AD s_md = md1_q0_ad + md2_q0_ad;
+                AD d_md = md1_q0_ad - md2_q0_ad;
+                AD m0sq = m0_q0_ad * m0_q0_ad;
+                AD q0sq = (m0sq - s_md*s_md) * (m0sq - d_md*d_md) / (AD(4.0) * m0sq);
+                q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
+                AD q0_ad = sqrt(q0sq);
+                AD q_ad(qq);
+
+                CV node_factor(1.0, 0.0);
+                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0) {
+                    AD m_ad(mm);
+                    if (target.type == ResModelType::BWR) {
+                        auto bw = BWR<AD>(m_ad, *m0p, *gp, L, q_ad, q0_ad, bf_d);
+                        auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                        node_factor.real = bw.real * bf;
+                        node_factor.imag = bw.imag * bf;
+                    } else {
+                        node_factor = BW<AD>(m_ad, *m0p, *gp);
+                    }
+                } else {
+                    auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                    node_factor.real = bf;
+                    node_factor.imag = AD(0.0);
+                }
+                CV new_R;
+                new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
+                new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+                R_ad = new_R;
             }
         }
 
-        // 二阶导数项: H -= 2*|w|² * Re(... )  (= -2/I * Re(...))
-        double factor = sign * 2.0 * I_inv;
-        if constexpr (SameRes) {
-            // SameRes: -2|w|² * Re(|T_r|² * conj(D_k)*D_j + conj(w)/|w|² * T_r * D²_jk)
-            double T2 = (double)Tr_val.x * Tr_val.x + (double)Tr_val.y * Tr_val.y;
-            double ST_re = cw_re * inv_w2 * Tr_val.x - cw_im * inv_w2 * Tr_val.y;
-            double ST_im = cw_re * inv_w2 * Tr_val.y + cw_im * inv_w2 * Tr_val.x;
-            for (int j = 0; j < Pr; ++j) {
-                for (int k = 0; k < Pr; ++k) {
-                    double dR_re_j = R_r_ad.real.grad[j];
-                    double dR_im_j = R_r_ad.imag.grad[j];
-                    double dR_re_k = R_r_ad.real.grad[k];
-                    double dR_im_k = R_r_ad.imag.grad[k];
-                    // |T|² * conj(D_k) * D_j
-                    double d2_re = T2 * (dR_re_k * dR_re_j + dR_im_k * dR_im_j);
-                    double d2_im = T2 * (dR_re_k * dR_im_j - dR_im_k * dR_re_j);
-                    // conj(w)/|w|² * T * D²_jk
-                    double D2_re = R_r_hess.real.hess[j][k];
-                    double D2_im = R_r_hess.imag.hess[j][k];
-                    d2_re += ST_re * D2_re - ST_im * D2_im;
-                    double term = factor * d2_re * bf_val * bf_val;
-                    atomicAdd(&d_hess[(offset_s + k) * hess_ld + (offset_r + j)], -term);
-                }
+        // Accumulate: dS[j][p] = v[sl] * ∂F/∂θ_j * slamp[sl,p]
+        // Here slamp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p]
+        // Note: d_slamps has NOT been divided by R_full because they're pure spin
+        int j0 = res * Npr;
+        for (int p = 0; p < nPolar; ++p) {
+            auto sl_amp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p];
+            double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
+            // T_sl[p] = v[sl] * slamp[sl,p]
+            double t_re = (double)vv.x * sl_re - (double)vv.y * sl_im;
+            double t_im = (double)vv.x * sl_im + (double)vv.y * sl_re;
+
+            for (int j = 0; j < Npr; ++j) {
+                double dFr = R_ad.real.grad[j], dFi = R_ad.imag.grad[j];
+                // dS[j0+j][p] += (dFr + i*dFi) * (t_re + i*t_im)
+                dS_re[j0 + j][p] += dFr * t_re - dFi * t_im;
+                dS_im[j0 + j][p] += dFr * t_im + dFi * t_re;
             }
-        } else {
-            // !SameRes: -2|w|² * Re(conj(T_s)*T_r * conj(D_sk)*D_rj)
-            double TsTr_re = Ts_val.x * Tr_val.x + Ts_val.y * Tr_val.y;
-            double TsTr_im = Ts_val.x * Tr_val.y - Ts_val.y * Tr_val.x;
-            for (int j = 0; j < Pr; ++j) {
-                for (int k = 0; k < Ps; ++k) {
-                    double dRr_re = R_r_ad.real.grad[j];
-                    double dRr_im = R_r_ad.imag.grad[j];
-                    double dRs_re = R_s_ad.real.grad[k];
-                    double dRs_im = R_s_ad.imag.grad[k];
-                    // conj(D_sk) * D_rj
-                    double cd_re = dRs_re * dRr_re + dRs_im * dRr_im;
-                    double cd_im = dRs_re * dRr_im - dRs_im * dRr_re;
-                    // conj(T_s)*T_r * conj(D_sk)*D_rj
-                    double d2_re = TsTr_re * cd_re - TsTr_im * cd_im;
-                    double term = factor * d2_re * bf_val * bf_val_s;
-                    atomicAdd(&d_hess[(offset_s + k) * hess_ld + (offset_r + j)], -term);
+            for (int j = 0; j < Npr; ++j) {
+                for (int k = j; k < Npr; ++k) {
+                    double d2Fr = R_ad.real.hess[j][k], d2Fi = R_ad.imag.hess[j][k];
+                    d2S_re[j0 + j][j0 + k][p] += d2Fr * t_re - d2Fi * t_im;
+                    d2S_im[j0 + j][j0 + k][p] += d2Fr * t_im + d2Fi * t_re;
                 }
             }
         }
     }
 
+    // ===== Compute gradient g[j] from dS_total =====
+    double g[NT] = {0};
+    for (int p = 0; p < nPolar; ++p) {
+        double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;  // conj(S/I) = conj(w)
+        for (int j = 0; j < NT; ++j) {
+            g[j] += cwr * dS_re[j][p] - cwi * dS_im[j][p];
+        }
+    }
+    for (int j = 0; j < NT; ++j) g[j] *= -2.0;
+
+    // ===== Compute Hessian: H = g·g^T - 2/I·Re(conj(dS_k)·dS_j) - 2/I·Re(conj(S)·d²S) =====
+    double H_loc[NT][NT] = {{0}};
+    for (int j = 0; j < NT; ++j) {
+        for (int k = j; k < NT; ++k) {
+            double hjk = g[j] * g[k];  // Term A
+
+            // Term B: -2/I * Σ_p (dS_re_k*dS_re_j + dS_im_k*dS_im_j)
+            double termB = 0.0;
+            for (int p = 0; p < nPolar; ++p)
+                termB += dS_re[k][p] * dS_re[j][p] + dS_im[k][p] * dS_im[j][p];
+            termB *= -2.0 * inv_I;
+            hjk += termB;
+
+            // Term C: -2/I * Re(conj(S)·d²S) = -2 * Re(conj(w)·d²S)
+            // (same-resonance only: j,k from same resonance)
+            int rj = j / Npr, rk = k / Npr;
+            if (rj == rk) {
+                double termC = 0.0;
+                for (int p = 0; p < nPolar; ++p) {
+                    double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;
+                    termC += cwr * d2S_re[j][k][p] - cwi * d2S_im[j][k][p];
+                }
+                termC *= -2.0;
+                hjk += termC;
+            }
+
+            H_loc[j][k] = hjk;
+            if (j != k) H_loc[k][j] = hjk;
+
+            // Accumulate to global Hessian
+            int gj = ftg[rj][j % Npr];
+            int gk = ftg[rk][k % Npr];
+            if (gj >= 0 && gk >= 0) {
+                double contrib = weight * hjk;
+                atomicAdd(&d_hess[gk * hess_ld + gj], contrib);
+                if (j != k) atomicAdd(&d_hess[gj * hess_ld + gk], contrib);
+            }
+            // Phsp: accumulate I * (g·g^T - H) = I * (g[j]*g[k] - hjk)
+            if (default_weight == 0.0 && d_phsp_hessA != nullptr && gj >= 0 && gk >= 0) {
+                atomicAdd(&d_phsp_hessA[gk * NT + gj], I_val * (g[j] * g[k] - hjk));
+                if (j != k) atomicAdd(&d_phsp_hessA[gj * NT + gk], I_val * (g[j] * g[k] - hjk));
+            }
+        }
+    }
+    // DEBUG: print per-event g and H for first event (matching lab_hessian format)
+    if (evt == 0) {
+        printf("  evt=%d sign=%.1f g=[%.6f %.6f %.6f %.6f] I=%.6f\n",
+            evt_abs, default_weight, g[0], g[1], g[2], g[3], I_val);
+        printf("  H=[[%.4f %.4f %.4f %.4f]\n", H_loc[0][0], H_loc[0][1], H_loc[0][2], H_loc[0][3]);
+        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[1][0], H_loc[1][1], H_loc[1][2], H_loc[1][3]);
+        printf("     [%.4f %.4f %.4f %.4f]\n", H_loc[2][0], H_loc[2][1], H_loc[2][2], H_loc[2][3]);
+        printf("     [%.4f %.4f %.4f %.4f]]\n", H_loc[3][0], H_loc[3][1], H_loc[3][2], H_loc[3][3]);
+    }
+
+    // Phsp accumulation for I and I*g
+    if (default_weight == 0.0 && d_phsp_I != nullptr) {
+        atomicAdd(d_phsp_I, I_val);
+    }
+    if (default_weight == 0.0 && d_phsp_grad != nullptr) {
+        for (int j = 0; j < NT; ++j) {
+            int gj = ftg[j / Npr][j % Npr];
+            if (gj >= 0) atomicAdd(&d_phsp_grad[gj], I_val * g[j]);
+        }
+    }
 }
 
 // ============================================================
@@ -2702,126 +3049,265 @@ void AmpCalc::computeResonanceHessian(
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
     bool has_offset = (t_offset.size() == (size_t)n_gpu);
-
     constexpr int kBlockSize = 256;
-    const int Nglobal = n_free;
-
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         cudaSetDevice(gpu);
         int nEv = n_events[gpu];
         if (nEv <= 0) continue;
         int evt_off = has_offset ? t_offset[gpu] : 0;
-        double* dw = (d_event_weights.size() == (size_t)n_gpu) ? d_event_weights[gpu] : nullptr;
         cuComplex* d_amp_gpu = (d_amp_batches.size() == (size_t)n_gpu) ? d_amp_batches[gpu] : nullptr;
         if (d_amp_gpu == nullptr) continue;
-
         int nPol = static_cast<int>(cas_list_[0]->getNPolarizations());
         int grid = (nEv + kBlockSize - 1) / kBlockSize;
-
-        // Allocate per-event buffers (global Nfree dim)
-        size_t n_S = (size_t)nEv * nPol;
-        size_t n_dS = n_S * Nglobal;
-        size_t n_d2S = n_dS * Nglobal;
-        double *d_S_re, *d_S_im, *d_dS_re, *d_dS_im, *d_d2S_re, *d_d2S_im;
-        cudaMalloc(&d_S_re, n_S * sizeof(double));
-        cudaMalloc(&d_S_im, n_S * sizeof(double));
-        cudaMalloc(&d_dS_re, n_dS * sizeof(double));
-        cudaMalloc(&d_dS_im, n_dS * sizeof(double));
-        cudaMalloc(&d_d2S_re, n_d2S * sizeof(double));
-        cudaMalloc(&d_d2S_im, n_d2S * sizeof(double));
-        cudaMemset(d_dS_re, 0, n_dS * sizeof(double));
-        cudaMemset(d_dS_im, 0, n_dS * sizeof(double));
-        cudaMemset(d_d2S_re, 0, n_d2S * sizeof(double));
-        cudaMemset(d_d2S_im, 0, n_d2S * sizeof(double));
-
-        // Pass A: compute S per (evt,p)
-        computeSperEventKernel<<<grid, kBlockSize>>>(
-            d_S_re, d_S_im, d_amp_gpu, d_v, nEv, nPol, n_ext);
-
-        // Pass B: per (block,res), accumulate dS/d2S into global buffers.
-        // (dF buffer is per-block-launch but we don't keep it here.)
+        int nTotal = nEv * nPol;
+        cuComplex* d_w_buf;
+        cudaMalloc(&d_w_buf, nTotal * sizeof(cuComplex));
+        cuComplex* d_grad_dummy;
+        cudaMalloc(&d_grad_dummy, n_ext * sizeof(cuComplex));
+        computeFactorNLL(d_amp_gpu, d_v, d_grad_dummy, nEv, nPol, n_ext, nullptr, d_w_buf);
+        cudaFree(d_grad_dummy);
+        cudaDeviceSynchronize();
         for (size_t bi = 0; bi < blocks_.size(); ++bi) {
             auto& blk = blocks_[bi];
             auto& cas = cas_list_[blk.cas_idx];
-            int nSLComb = static_cast<int>(cas->getNSLCombs());
-            int nPol_b = static_cast<int>(cas->getNPolarizations());
-            (void)nPol_b;
+            int dsz = cas->getDecayChainSize();
+            int nSL = static_cast<int>(cas->getNSLCombs());
+            int sl_per_res = nSL / blk.resonance_count;  // SL channels per resonance
 
-            for (int r = 0; r < blk.resonance_count; ++r) {
-                std::vector<int> local_map, global_idx;
+            // Compute per-resonance T arrays (T_r = Σ_{sl∈r} v[sl]*slamps[sl])
+            std::vector<cuComplex*> d_T_per_res(blk.resonance_count, nullptr);
+            for (int ri = 0; ri < blk.resonance_count; ++ri) {
+                cudaMalloc(&d_T_per_res[ri], nTotal * sizeof(cuComplex));
+                int sl_start = ri * sl_per_res;
+                int sl_end = sl_start + sl_per_res;
+                int gridT = (nTotal + kBlockSize - 1) / kBlockSize;
+                computeEffectiveCouplingKernel<<<gridT, kBlockSize>>>(
+                    d_T_per_res[ri], cas->getSLAmps()[gpu],
+                    d_v + blk.site, nSL, nTotal, sl_start, sl_end);
+            }
+            cudaDeviceSynchronize();
+
+            for (int ri = 0; ri < blk.resonance_count; ++ri) {
+                std::vector<int> map_i, gidx_i;
                 for (int s = 0; s < n_free; ++s) {
-                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
-                        local_map.push_back(slots_[s].param_idx);
-                        global_idx.push_back(s);
+                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == ri) {
+                        map_i.push_back(slots_[s].param_idx);
+                        gidx_i.push_back(s);
                     }
                 }
-                int Nlocal = static_cast<int>(local_map.size());
-                if (Nlocal == 0) continue;
-
-                int *d_map, *d_gidx;
-                cudaMalloc(&d_map, Nlocal * sizeof(int));
-                cudaMalloc(&d_gidx, Nlocal * sizeof(int));
-                cudaMemcpy(d_map, local_map.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
-                cudaMemcpy(d_gidx, global_idx.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
-
-                // throw-away dF buffer for this (block,res)
-                size_t n_dF = (size_t)nEv * nSLComb * Nglobal;
-                double *d_dF_re, *d_dF_im;
-                cudaMalloc(&d_dF_re, n_dF * sizeof(double));
-                cudaMalloc(&d_dF_im, n_dF * sizeof(double));
-                cudaMemset(d_dF_re, 0, n_dF * sizeof(double));
-                cudaMemset(d_dF_im, 0, n_dF * sizeof(double));
-
-                switch (Nlocal) {
-                case 1:
-                    accumDSperEventKernel<1><<<grid, kBlockSize>>>(
-                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
-                        cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu], d_map, d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
-                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
-                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
-                        d_dF_re, d_dF_im, Nglobal);
-                    break;
-                case 2:
-                    accumDSperEventKernel<2><<<grid, kBlockSize>>>(
-                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
-                        cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu], d_map, d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
-                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
-                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
-                        d_dF_re, d_dF_im, Nglobal);
-                    break;
-                case 3:
-                    accumDSperEventKernel<3><<<grid, kBlockSize>>>(
-                        cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
-                        cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                        r, blk.d_all_params[gpu], d_map, d_gidx,
-                        nEv, nPol, cas->getDecayChainSize(), nSLComb, 3.0,
-                        evt_off, cas->getSLAmps()[gpu], d_v, blk.site,
-                        d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
-                        d_dF_re, d_dF_im, Nglobal);
-                    break;
-                default: break;
+                int Pr = (int)map_i.size();
+                if (Pr == 0 || Pr > 3) continue;
+                for (int rj = ri; rj < blk.resonance_count; ++rj) {
+                    std::vector<int> map_j, gidx_j;
+                    for (int s = 0; s < n_free; ++s) {
+                        if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == rj) {
+                            map_j.push_back(slots_[s].param_idx);
+                            gidx_j.push_back(s);
+                        }
+                    }
+                    int Ps = (int)map_j.size();
+                    if (Ps == 0 || Ps > 3) continue;
+                    bool sr = (ri == rj);
+                    int* dm_i, * dm_j, * dg_i, * dg_j;
+                    cudaMalloc(&dm_i, Pr * sizeof(int));cudaMalloc(&dm_j, Ps * sizeof(int));
+                    cudaMalloc(&dg_i, Pr * sizeof(int));cudaMalloc(&dg_j, Ps * sizeof(int));
+                    cudaMemcpy(dm_i, map_i.data(), Pr * sizeof(int), cudaMemcpyHostToDevice);
+                    cudaMemcpy(dm_j, map_j.data(), Ps * sizeof(int), cudaMemcpyHostToDevice);
+                    cudaMemcpy(dg_i, gidx_i.data(), Pr * sizeof(int), cudaMemcpyHostToDevice);
+                    cudaMemcpy(dg_j, gidx_j.data(), Ps * sizeof(int), cudaMemcpyHostToDevice);
+                    if (sr) {
+                        if (Pr == 1) resonanceHessianBlockKernel<1, 1, true> << <grid, kBlockSize >> > (
+                            d_w_buf, d_T_per_res[ri], d_T_per_res[rj], cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                            cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu], blk.d_all_params[gpu],
+                            ri, ri, dm_i, dm_i, d_hess, hess_ld, gidx_i[0], gidx_i[0], nEv, nPol, dsz, 3.0, default_weight, evt_off);
+                        else if (Pr == 2) resonanceHessianBlockKernel<2, 2, true> << <grid, kBlockSize >> > (
+                            d_w_buf, d_T_per_res[ri], d_T_per_res[rj], cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                            cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu], blk.d_all_params[gpu],
+                            ri, ri, dm_i, dm_i, d_hess, hess_ld, gidx_i[0], gidx_i[0], nEv, nPol, dsz, 3.0, default_weight, evt_off);
+                        else resonanceHessianBlockKernel<3, 3, true> << <grid, kBlockSize >> > (
+                            d_w_buf, d_T_per_res[ri], d_T_per_res[rj], cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                            cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu], blk.d_all_params[gpu],
+                            ri, ri, dm_i, dm_i, d_hess, hess_ld, gidx_i[0], gidx_i[0], nEv, nPol, dsz, 3.0, default_weight, evt_off);
+                    }
+                    else {
+                        if (Pr == 1 && Ps == 1) resonanceHessianBlockKernel<1, 1, false> << <grid, kBlockSize >> > (
+                            d_w_buf, d_T_per_res[ri], d_T_per_res[rj], cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                            cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu], blk.d_all_params[gpu],
+                            ri, rj, dm_i, dm_j, d_hess, hess_ld, gidx_i[0], gidx_j[0], nEv, nPol, dsz, 3.0, default_weight, evt_off);
+                        else if (Pr == 2 && Ps == 2) resonanceHessianBlockKernel<2, 2, false> << <grid, kBlockSize >> > (
+                            d_w_buf, d_T_per_res[ri], d_T_per_res[rj], cas->getMomenta()[gpu], cas->getDecayNodes()[gpu],
+                            cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu], blk.d_all_params[gpu],
+                            ri, rj, dm_i, dm_j, d_hess, hess_ld, gidx_i[0], gidx_j[0], nEv, nPol, dsz, 3.0, default_weight, evt_off);
+                    }
+                    cudaDeviceSynchronize();
+                    cudaFree(dm_i);cudaFree(dm_j);cudaFree(dg_i);cudaFree(dg_j);
                 }
+            }
+            // Free per-resonance T arrays
+            for (auto& t : d_T_per_res) { if (t) cudaFree(t); }
+        }
+        cudaFree(d_w_buf);
+    }
+    cudaSetDevice(0);
+}
+
+// ============================================================
+// AmpCalc::computeUnifiedHessian (NEW — verified formula)
+// Computes θθ Hessian block using unifiedHessianKernel.
+// ============================================================
+void AmpCalc::computeUnifiedHessian(
+    const std::vector<int>& n_events,
+    double* d_hess, int hess_ld,
+    const std::vector<int>& t_offset,
+    double default_weight,
+    const cuComplex* d_v_interleaved,
+    const cuComplex* d_amp,
+    int n_amp_total,
+    const std::vector<double*>& d_event_weights,
+    double* d_phsp_I,
+    double* d_phsp_grad,
+    double* d_phsp_hessA)
+{
+    int n_gpu = static_cast<int>(n_events.size());
+    int n_free = nFreeResParams();
+    if (n_free == 0 || blocks_.empty()) return;
+    bool has_offset = (t_offset.size() == (size_t)n_gpu);
+    constexpr int kBlockSize = 256;
+
+    // Temp buffer info per block (stored for stage 2 cross-block)
+    struct BlockTemp {
+        double* d_g = nullptr;
+        double* d_dS_re = nullptr;
+        double* d_dS_im = nullptr;
+        int* d_gidx = nullptr;
+        int NT;
+        int nEv;
+    };
+    std::vector<std::vector<BlockTemp>> temps_per_gpu(n_gpu);
+
+    // ===== Stage 1: per-block same-resonance Hessian =====
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        cudaSetDevice(gpu);
+        int nEv = n_events[gpu];
+        if (nEv <= 0) continue;
+        int evt_off = has_offset ? t_offset[gpu] : 0;
+        const double* d_w = (gpu < (int)d_event_weights.size()) ? d_event_weights[gpu] : nullptr;
+
+        // Pre-pass: compute full S[p] = Σ_a v[a]·amp[a,e,p] and I[e] from raw amplitudes
+        // Uses d_all_amplitudes_ which already include R factors
+        auto& cas0 = cas_list_[blocks_[0].cas_idx];
+        int nPol = static_cast<int>(cas0->getNPolarizations());
+        double *d_S_re, *d_S_im, *d_I_full;
+        cudaMalloc(&d_S_re, nEv*nPol*sizeof(double));
+        cudaMalloc(&d_S_im, nEv*nPol*sizeof(double));
+        cudaMalloc(&d_I_full, nEv*sizeof(double));
+        {
+            int grid = (nEv + kBlockSize - 1) / kBlockSize;
+            computeSfromAmpsKernel<<<grid, kBlockSize>>>(
+                d_S_re, d_S_im, d_I_full,
+                d_amp + evt_off * nPol * n_amp_total,
+                d_v_interleaved, nEv, nPol, n_amp_total);
+            cudaDeviceSynchronize();
+        }
+
+        temps_per_gpu[gpu].resize(blocks_.size());
+
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            auto& blk = blocks_[bi];
+            auto& cas = cas_list_[blk.cas_idx];
+            int Nres = blk.resonance_count;
+            if (Nres < 1 || Nres > 4) continue;
+
+            int nSL = static_cast<int>(cas->getNSLCombs());
+            int nPol = static_cast<int>(cas->getNPolarizations());
+            int dsz = cas->getDecayChainSize();
+
+            int Npr = 0;
+            for (int s = 0; s < n_free; ++s) {
+                if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
+            }
+            if (Npr < 1 || Npr > 3) continue;
+
+            int NT = Npr * Nres;
+
+            // Build global index mapping
+            std::vector<int> global_idx(NT, -1);
+            for (int r = 0; r < Nres; ++r) {
+                int count = 0;
+                for (int s = 0; s < n_free; ++s) {
+                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
+                        if (count < Npr) { global_idx[r * Npr + count] = s; ++count; }
+                    }
+                }
+            }
+
+            // Allocate temp buffers for this block
+            auto& bt = temps_per_gpu[gpu][bi];
+            bt.NT = NT;
+            bt.nEv = nEv;
+            cudaMalloc(&bt.d_g, nEv * NT * sizeof(double));
+            cudaMalloc(&bt.d_dS_re, nEv * NT * nPol * sizeof(double));
+            cudaMalloc(&bt.d_dS_im, nEv * NT * nPol * sizeof(double));
+            cudaMalloc(&bt.d_gidx, NT * sizeof(int));
+            cudaMemcpy(bt.d_gidx, global_idx.data(), NT * sizeof(int), cudaMemcpyHostToDevice);
+
+            int grid = (nEv + kBlockSize - 1) / kBlockSize;
+
+            const cuComplex* d_v_blk = d_v_interleaved + blk.site;
+            if (Npr == 2 && Nres == 2) {
+                hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
+                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
+                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+            } else if (Npr == 2 && Nres == 1) {
+                hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
+                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
+                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+            } else {
+                printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
+            }
+            cudaDeviceSynchronize();
+        }
+
+        // ===== Stage 2: cross-block Hessian =====
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            auto& btA = temps_per_gpu[gpu][bi];
+            if (!btA.d_g) continue;
+            for (size_t bj = bi + 1; bj < blocks_.size(); ++bj) {
+                auto& btB = temps_per_gpu[gpu][bj];
+                if (!btB.d_g) continue;
+                if (blocks_[bi].cas_idx != blocks_[bj].cas_idx) continue;
+
+                int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                hessianCrossBlockKernel<<<grid, kBlockSize>>>(
+                    btA.d_g, btA.d_dS_re, btA.d_dS_im,
+                    btB.d_g, btB.d_dS_re, btB.d_dS_im,
+                    d_I_full, btA.d_gidx, btB.d_gidx,
+                    btA.NT, btB.NT, nEv, nPol,
+                    d_hess, hess_ld, default_weight, d_w,
+                    (default_weight == 0.0) ? d_phsp_hessA : nullptr,
+                    (d_phsp_hessA ? nFreeResParams() : 1));
                 cudaDeviceSynchronize();
-                cudaFree(d_map);
-                cudaFree(d_gidx);
-                cudaFree(d_dF_re);
-                cudaFree(d_dF_im);
             }
         }
 
-        // Pass C: assemble Hessian using full S, full dS, full d²S
-        assembleResHessKernel<<<grid, kBlockSize>>>(
-            d_S_re, d_S_im, d_dS_re, d_dS_im, d_d2S_re, d_d2S_im,
-            d_hess, hess_ld, dw, default_weight, nEv, nPol, Nglobal);
-        cudaDeviceSynchronize();
-
-        cudaFree(d_S_re); cudaFree(d_S_im);
-        cudaFree(d_dS_re); cudaFree(d_dS_im);
-        cudaFree(d_d2S_re); cudaFree(d_d2S_im);
+        // Free temp buffers
+        for (auto& bt : temps_per_gpu[gpu]) {
+            if (bt.d_g) cudaFree(bt.d_g);
+            if (bt.d_dS_re) cudaFree(bt.d_dS_re);
+            if (bt.d_dS_im) cudaFree(bt.d_dS_im);
+            if (bt.d_gidx) cudaFree(bt.d_gidx);
+        }
+        cudaFree(d_S_re); cudaFree(d_S_im); cudaFree(d_I_full);
     }
     cudaSetDevice(0);
 }

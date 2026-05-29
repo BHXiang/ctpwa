@@ -2230,6 +2230,7 @@ public:
             }
         }
 
+
         // ========== 共振态参数 Hessian [n2:total, n2:total] ==========
         if (nt > 0 && theta.numel() > 0) {
             int P = nt;
@@ -2243,128 +2244,159 @@ public:
             torch::Tensor extended_v = params_.extendVector(vector, dev);
             int n_ext = extended_v.numel();
 
-            // 取 primary GPU 上的 v 指针
-            torch::Tensor v_primary = extended_v.to(torch::Device(torch::kCUDA, primary_dev));
-            const cuComplex* d_v_primary = reinterpret_cast<const cuComplex*>(v_primary.data_ptr());
+            // Build interleaved v array: [Re(v0),Im(v0), Re(v1),Im(v1), ...]
+            torch::Tensor v_re = torch::real(extended_v).to(torch::kFloat32);
+            torch::Tensor v_im = torch::imag(extended_v).to(torch::kFloat32);
+            torch::Tensor v_il_tensor = torch::empty({ n_ext * 2 },
+                torch::TensorOptions().dtype(torch::kFloat32).device(dev));
+            v_il_tensor.slice(0, 0, 2 * n_ext, 2).copy_(v_re);
+            v_il_tensor.slice(0, 1, 2 * n_ext, 2).copy_(v_im);
+            const cuComplex* d_v_interleaved = reinterpret_cast<const cuComplex*>(v_il_tensor.data_ptr());
+
+            // Compute effective coupling T_r per GPU (needed by unifiedHessianKernel)
+            for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                cudaSetDevice(gpu);
+                torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
+                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
+                amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
+            }
 
             cudaSetDevice(primary_dev);
             double* d_hess;
             cudaMalloc(&d_hess, P * P * sizeof(double));
             cudaMemset(d_hess, 0, P * P * sizeof(double));
 
-            // --- data 贡献: w_e = -1, log(I_data) 的二阶导
+            // Data: weight=+1.0 (no per-event weights needed)
             {
-                std::vector<int> n_data_events(n_gpu, 0);
-                std::vector<int> data_offsets(n_gpu, 0);
-                std::vector<cuComplex*> d_amp_data(n_gpu, nullptr);
-                for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                    n_data_events[gpu] = events_[gpu][1];
-                    data_offsets[gpu] = events_[gpu][0]; // phsp 偏移
-                    d_amp_data[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                std::vector<int> n_data_ev(n_gpu, 0), data_off(n_gpu, 0);
+                for (int g = 0; g < n_gpu; ++g) {
+                    n_data_ev[g] = events_[g][1]; data_off[g] = events_[g][0];
                 }
-                std::vector<double*> empty_weights;
-                amp_calc_.computeResonanceHessian(
-                    n_data_events, d_hess, P, data_offsets,
-                    empty_weights, -1.0, d_v_primary, n_ext, d_amp_data);
+                amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {});
+                // DEBUG: dump data Hessian
+                {
+                    double* h_tmp = new double[P*P];
+                    cudaMemcpy(h_tmp, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
+                    printf("=== Data only Hessian (P=%d) ===\n", P);
+                    for (int j = 0; j < P; ++j) {
+                        printf("  [");
+                        for (int k = 0; k < P; ++k)
+                            printf("%12.6f%s", h_tmp[j*P+k], k<P-1?", ":"");
+                        printf("]\n");
+                    }
+                    delete[] h_tmp;
+                }
             }
 
-            // --- bkg 贡献: w_e = +bkg_weight, +w·log(I_bkg)
+            // Bkg: weight = -w_e
             {
-                std::vector<int> n_bkg_events(n_gpu, 0);
-                std::vector<int> bkg_offsets(n_gpu, 0);
-                std::vector<cuComplex*> d_amp_bkg(n_gpu, nullptr);
-                for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                    n_bkg_events[gpu] = events_[gpu][2];
-                    bkg_offsets[gpu] = events_[gpu][0] + events_[gpu][1]; // phsp + data 偏移
-                    d_amp_bkg[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
+                std::vector<int> n_bkg_ev(n_gpu, 0), bkg_off(n_gpu, 0);
+                for (int g = 0; g < n_gpu; ++g) {
+                    n_bkg_ev[g] = events_[g][2]; bkg_off[g] = events_[g][0] + events_[g][1];
                 }
-                amp_calc_.computeResonanceHessian(
-                    n_bkg_events, d_hess, P, bkg_offsets,
-                    bkg_weights_, 1.0, d_v_primary, n_ext, d_amp_bkg);
+                double wb = 0.0;
+                if (!bkg_weights_.empty() && bkg_weights_[0] != nullptr) {
+                    cudaMemcpy(&wb, bkg_weights_[0], sizeof(double), cudaMemcpyDeviceToHost);
+                }
+                amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -wb,
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_);
+                // DEBUG: dump data+bkg Hessian
+                {
+                    double* h_tmp = new double[P*P];
+                    cudaMemcpy(h_tmp, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
+                    printf("=== Data+Bkg Hessian (wb=%.4f) ===\n", wb);
+                    for (int j = 0; j < P; ++j) {
+                        printf("  [");
+                        for (int k = 0; k < P; ++k)
+                            printf("%12.6f%s", h_tmp[j*P+k], k<P-1?", ":"");
+                        printf("]\n");
+                    }
+                    delete[] h_tmp;
+                }
             }
 
-            // ========== 混合 Hessian 缓冲提前分配，与 d_hess 一起接收 phsp 贡献 ==========
-            int mixed_ext_rows = 2 * n_ext;
-            double* d_mixed_ext;
-            cudaSetDevice(primary_dev);
-            cudaMalloc(&d_mixed_ext, mixed_ext_rows * P * sizeof(double));
-            cudaMemset(d_mixed_ext, 0, mixed_ext_rows * P * sizeof(double));
-
-            // ========== 混合 Hessian [0:n2, n2:total] 和 [n2:total, 0:n2] ==========
-            // ∂²(Σ w·log I)/∂v_a∂θ_j; 对 data/bkg/phsp 分别累加
+            // Phsp: sign=0, accumulate I, I*g, I*(g·g^T-H)
             {
+                double* d_phsp_I, * d_phsp_grad, * d_phsp_hessA;
+                cudaMalloc(&d_phsp_I, sizeof(double));
+                cudaMalloc(&d_phsp_grad, P * sizeof(double));
+                cudaMalloc(&d_phsp_hessA, P* P * sizeof(double));
+                cudaMemset(d_phsp_I, 0, sizeof(double));
+                cudaMemset(d_phsp_grad, 0, P * sizeof(double));
+                cudaMemset(d_phsp_hessA, 0, P* P * sizeof(double));
 
-                // data 贡献 (w=-1)
-                {
-                    std::vector<int> n_data_events(n_gpu, 0);
-                    std::vector<int> data_offsets(n_gpu, 0);
-                    std::vector<cuComplex*> d_amp_data(n_gpu, nullptr);
-                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                        n_data_events[gpu] = events_[gpu][1];
-                        data_offsets[gpu] = events_[gpu][0];
-                        d_amp_data[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                    }
-                    std::vector<double*> empty_weights;
-                    amp_calc_.computeMixedHessian(
-                        n_data_events, n_ext, d_mixed_ext, P,
-                        data_offsets, empty_weights, -1.0,
-                        d_v_primary, d_amp_data);
+                std::vector<int> n_phsp_ev(n_gpu, 0), phsp_off(n_gpu, 0);
+                for (int g = 0; g < n_gpu; ++g) {
+                    n_phsp_ev[g] = events_[g][0]; phsp_off[g] = 0;
                 }
 
-                // bkg 贡献 (w=+bkg_weight)
-                {
-                    std::vector<int> n_bkg_events(n_gpu, 0);
-                    std::vector<int> bkg_offsets(n_gpu, 0);
-                    std::vector<cuComplex*> d_amp_bkg(n_gpu, nullptr);
-                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                        n_bkg_events[gpu] = events_[gpu][2];
-                        bkg_offsets[gpu] = events_[gpu][0] + events_[gpu][1];
-                        d_amp_bkg[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                    }
-                    amp_calc_.computeMixedHessian(
-                        n_bkg_events, n_ext, d_mixed_ext, P,
-                        bkg_offsets, bkg_weights_, 1.0,
-                        d_v_primary, d_amp_bkg);
+                // Save pre-phsp d_hess for comparison
+                double* h_hess_pre = new double[P*P];
+                cudaMemcpy(h_hess_pre, d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
+
+                amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {}, d_phsp_I, d_phsp_grad, d_phsp_hessA);
+
+                // Phsp Hessian: H_phsp = A/(pf*np)*ΣI*(g·g^T-H) - A/(pf*np)²*(ΣIg)(ΣIg)^T
+                double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
+                cudaMemcpy(&h_pI, d_phsp_I, sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_pg, d_phsp_grad, P * sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_ph, d_phsp_hessA, P* P * sizeof(double), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_dh, d_hess, P* P * sizeof(double), cudaMemcpyDeviceToHost);
+                cudaFree(d_phsp_I); cudaFree(d_phsp_grad); cudaFree(d_phsp_hessA);
+
+                int totData = 0; for (int g = 0; g < n_gpu; ++g) totData += events_[g][1];
+                double A = static_cast<double>(totData) - bkg_integral_;
+                int np_tot = 0; for (int g = 0; g < n_gpu; ++g) np_tot += events_[g][0];
+                double pf = h_pI / np_tot;
+
+                printf("=== Phsp intermediates: I=%.10f pf=%.10f A=%.4f np=%d c1=%.10f c2=%.10f ===\n",
+                    h_pI, pf, A, np_tot, A/(pf*np_tot), -A/(pf*pf*np_tot*np_tot));
+                printf("Phsp grad (Σ I*g): [");
+                for (int j = 0; j < P; ++j) printf("%.6f%s", h_pg[j], j<P-1?", ":"");
+                printf("]\n");
+                printf("Phsp hessA (Σ I*(g*g^T-H)):\n");
+                for (int j = 0; j < P; ++j) {
+                    printf("  [");
+                    for (int k = 0; k < P; ++k)
+                        printf("%12.6f%s", h_ph[j*P+k], k<P-1?", ":"");
+                    printf("]\n");
+                }
+                printf("d_hess after phsp kernel (before post-processing):\n");
+                for (int j = 0; j < P; ++j) {
+                    printf("  [");
+                    for (int k = 0; k < P; ++k)
+                        printf("%12.6f%s", h_dh[j*P+k], k<P-1?", ":"");
+                    printf("]\n");
                 }
 
-                // phsp 贡献: c·log(phsp_factor)，c = N_data - bkg_integral
-                {
-                    int totalDataEvents = 0;
-                    for (int gpu = 0; gpu < n_gpu; ++gpu) totalDataEvents += events_[gpu][1];
-                    double c_phsp = static_cast<double>(totalDataEvents) - bkg_integral_;
+                double c1 = A / (pf * np_tot);
+                double c2 = -A / (pf * pf * np_tot * np_tot);
 
-                    std::vector<int> n_phsp_events(n_gpu, 0);
-                    std::vector<int> phsp_offsets(n_gpu, 0);
-                    std::vector<cuComplex*> d_amp_phsp(n_gpu, nullptr);
-                    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                        n_phsp_events[gpu] = events_[gpu][0];
-                        phsp_offsets[gpu] = 0;
-                        d_amp_phsp[gpu] = d_all_amplitudes_[gpu] + amp_offsets_[gpu][0];
-                    }
-                    amp_calc_.computePhspContribution(
-                        n_phsp_events, c_phsp, n_ext,
-                        d_hess, P, d_mixed_ext, phsp_offsets,
-                        d_v_primary, d_amp_phsp);
+                for (int j = 0; j < P; ++j)
+                    for (int k = 0; k < P; ++k)
+                        h_dh[j * P + k] += c1 * h_ph[j * P + k] + c2 * h_pg[j] * h_pg[k];
+
+                printf("d_hess after phsp post-processing:\n");
+                for (int j = 0; j < P; ++j) {
+                    printf("  [");
+                    for (int k = 0; k < P; ++k)
+                        printf("%12.6f%s", h_dh[j*P+k], k<P-1?", ":"");
+                    printf("]\n");
                 }
 
-                // 仅处理无约束情形: n_ext == nv
-                if (n_ext == nv) {
-                    torch::Tensor mixed = torch::empty({mixed_ext_rows, P},
-                        torch::TensorOptions().dtype(torch::kFloat64).device(dev));
-                    cudaMemcpy(mixed.data_ptr(), d_mixed_ext,
-                        mixed_ext_rows * P * sizeof(double), cudaMemcpyDeviceToDevice);
-
-                    hessian.slice(0, 0, n2).slice(1, n2, total).copy_(mixed);
-                    hessian.slice(0, n2, total).slice(1, 0, n2).copy_(mixed.transpose(0, 1));
-                } else {
-                    // 有约束: 需要 J^T 投影，TODO
-                    hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
-                    hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
-                }
-                cudaFree(d_mixed_ext);
+                cudaMemcpy(d_hess, h_dh, P * P * sizeof(double), cudaMemcpyHostToDevice);
+                delete[] h_pg; delete[] h_ph; delete[] h_dh;
+                delete[] h_hess_pre;
             }
 
-            // 抽取 res_hess (θθ) 到 hessian, 包含 data+bkg+phsp 贡献
+
+            // Mixed Hessian: zero for now (unified kernel doesn't compute mixed blocks yet)
+            hessian.slice(0, 0, n2).slice(1, n2, total).zero_();
+            hessian.slice(0, n2, total).slice(1, 0, n2).zero_();
+
+            // Copy theta-theta result to hessian
             torch::Tensor res_hess = torch::empty({P, P},
                 torch::TensorOptions().dtype(torch::kFloat64).device(dev));
             cudaSetDevice(primary_dev);
@@ -2372,6 +2404,7 @@ public:
             cudaFree(d_hess);
             hessian.slice(0, n2, total).slice(1, n2, total).copy_(res_hess);
         }
+
 
         return hessian;
     }
@@ -2658,6 +2691,23 @@ public:
         {
             return torch::empty({ 0 }, torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA));
         }
+    }
+    void saveSLAmps(const std::string& filename) const
+    {
+        auto& cas_list = amp_calc_.casList();
+        if (cas_list.empty()) { printf("saveSLAmps: no cas available\n"); return; }
+        auto& cas = cas_list[0];
+        int nEv = static_cast<int>(cas->getNEventsVec()[0]);
+        int nPol = static_cast<int>(cas->getNPolarizations());
+        int nSL = static_cast<int>(cas->getNSLCombs());
+        int total = nEv * nPol * nSL;
+        thrust::complex<double>* h_buf = new thrust::complex<double>[total];
+        cudaMemcpy(h_buf, cas->getSLAmps()[0], total * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
+        FILE* f = fopen(filename.c_str(), "wb");
+        fwrite(h_buf, sizeof(thrust::complex<double>), total, f);
+        fclose(f);
+        delete[] h_buf;
+        printf("saveSLAmps: saved %d complex numbers to %s (nEv=%d nPol=%d nSL=%d)\n", total, filename.c_str(), nEv, nPol, nSL);
     }
     /////////////////////////////
 
@@ -3692,6 +3742,7 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getBranchFractions", &analysis::getBranchFractions)
         .def("getBkgTensor", &analysis::getBkgTensor)
         .def("getBkgWeightsTensor", &analysis::getBkgWeightsTensor)
+        .def("saveSLAmps", &analysis::saveSLAmps)
         .def("getConstraintsIndex", &analysis::getConstraintsIndex)
         .def("getConstraintsValues", &analysis::getConstraintsValues)
         .def("getAmplitudeNames", &analysis::getAmplitudeNames)
