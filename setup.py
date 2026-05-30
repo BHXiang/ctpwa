@@ -15,7 +15,8 @@ project_dir = os.path.dirname(os.path.abspath(__file__))
 def get_cuda_gencode_flags():
     """检测当前 nvcc 支持的 SM 架构，只对存在的架构生成 -gencode 选项"""
     # 期望支持的目标架构（主版本号对应 compute capability）
-    desired_sm = [70, 75, 80, 86, 89, 90, 100, 120]
+    # desired_sm = [70, 75, 80, 86, 89, 90, 100, 120]
+    desired_sm = [120]
 
     try:
         output = subprocess.check_output(
