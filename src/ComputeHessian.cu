@@ -384,7 +384,9 @@ __global__ void computeSfromAmpsKernel(
     double* d_S_re, double* d_S_im, double* d_I,
     const cuComplex* d_amp,   // [nEv * nPol * n_amp]
     const cuComplex* d_v,     // [n_amp]
-    int nEvents, int nPolar, int n_amp)
+    int nEvents, int nPolar, int n_amp,
+    double* d_phsp_t3_re = nullptr,   // [n_amp]
+    double* d_phsp_t3_im = nullptr)   // [n_amp]
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
@@ -406,6 +408,21 @@ __global__ void computeSfromAmpsKernel(
     double I_val = 0.0;
     for (int p = 0; p < nPolar; ++p) I_val += Sr[p] * Sr[p] + Si[p] * Si[p];
     d_I[evt] = I_val;
+
+    // Accumulate term3 = conj(S) * amp_a for phsp mixed Hessian
+    if (d_phsp_t3_re) {
+        for (int a = 0; a < n_amp; ++a) {
+            double t3_re = 0.0, t3_im = 0.0;
+            for (int p = 0; p < nPolar; ++p) {
+                cuComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
+                double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+                t3_re += Sr[p] * ar + Si[p] * ai;
+                t3_im += Sr[p] * ai - Si[p] * ar;
+            }
+            atomicAdd(&d_phsp_t3_re[a], t3_re);
+            atomicAdd(&d_phsp_t3_im[a], t3_im);
+        }
+    }
 }
 
 // ============================================================
@@ -762,7 +779,6 @@ __global__ void hessianMixedBlockKernel(
     int nTotal_slamp,
     double default_weight, const double* d_event_weights,
     double* d_phsp_sum = nullptr,
-    double* d_phsp_t3 = nullptr,
     int evt_offset = 0)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
@@ -832,18 +848,8 @@ __global__ void hessianMixedBlockKernel(
                 d_mixed[(n_amp_total + global_a) * mixed_ld + gj] += coeff * (term1_im + term2_im + gj_val * term3_im);
             }
         }
-        if (is_phsp && d_phsp_t3) {
-            double t3_re = 0.0, t3_im = 0.0;
-            for (int p = 0; p < nPolar; ++p) {
-                cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + global_a];
-                double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
-                double sr = Sr_ptr[p], si = Si_ptr[p];
-                t3_re += sr * ar + si * ai;
-                t3_im += sr * ai - si * ar;
-            }
-            atomicAdd(&d_phsp_t3[global_a], t3_re);
-            atomicAdd(&d_phsp_t3[n_amp_total + global_a], t3_im);
-        }
+        // d_phsp_t3 is now computed in the pre-pass (computeSfromAmpsKernel),
+        // which covers all SL channels regardless of free-param status.
     }
 }
 
@@ -862,7 +868,6 @@ __global__ void hessianCrossMixedKernel(
     double* d_mixed, int mixed_ld,
     double default_weight, const double* d_event_weights,
     double* d_phsp_sum = nullptr,
-    double* d_phsp_t3 = nullptr,
     int evt_offset = 0)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
@@ -915,9 +920,8 @@ __global__ void hessianCrossMixedKernel(
                 d_mixed[(n_amp_total + ga) * mixed_ld + gjb] += coeff * (term1_im + gj_val * term3_im);
             }
         }
-        if (is_phsp && d_phsp_t3) {
-            atomicAdd(&d_phsp_t3[ga], term3_re);
-            atomicAdd(&d_phsp_t3[n_amp_total + ga], term3_im);
-        }
+        // d_phsp_t3 is NOT written here: term3 is a per-amplitude sum,
+        // already accumulated by hessianMixedBlockKernel (stage 3).
+        // Writing again from cross-block would double-count.
     }
 }

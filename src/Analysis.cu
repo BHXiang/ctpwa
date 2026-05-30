@@ -2361,7 +2361,7 @@ public:
                     cudaMemcpy(h_t3.data(), d_phsp_mixed_t3, 2 * n_amplitudes_ * sizeof(double), cudaMemcpyDeviceToHost);
                     cudaFree(d_phsp_mixed_sum); cudaFree(d_phsp_mixed_t3);
                     double c1m = 2.0 * phsp_A / (phsp_pf * phsp_np);
-                    double c2m = 1.0 * phsp_A / (phsp_pf * phsp_pf * phsp_np * phsp_np);
+                    double c2m = 2.0 * phsp_A / (phsp_pf * phsp_pf * phsp_np * phsp_np);
                     // Re part: H = +c1m * sum + c2m * t3 * pg
                     // Im part: H = -c1m * sum - 2*c2m * t3 * pg  (sign from ∂L/∂Im = -2A/(pf*np)*ΣIm)
                     for (int a = 0; a < n_amplitudes_; ++a) {
@@ -3705,10 +3705,9 @@ private:
                                 all_free_ranges.push_back({});
                             }
                         }
-                        if (has_any)
-                        {
-                            amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges);
-                        }
+                        // Always add block — even without free params, its SL channels
+                        // contribute to cross-block mixed Hessian (vθ).
+                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges);
                     }
 
                     gls_index += cas->getNSLCombs();

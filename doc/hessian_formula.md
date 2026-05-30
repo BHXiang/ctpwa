@@ -1,155 +1,215 @@
-# 共振态参数 Hessian 公式
+# Hessian 公式备忘录
+
+> 已验证精度：vv, vθ, θv, θθ 四个 block 与 PyTorch autograd 差异 < 1.2×10⁻⁶
 
 ## 1. NLL 定义
 
-单衰变链，耦合参数 `v`，共振态参数 `θ`：
-
 $$
-\text{NLL} = -\sum_{\text{data}} \log I_e + n_{\text{data}} \cdot \log(\text{phsp\_factor})
+\text{NLL} = -\sum_{\text{data}} \log I_e + w_{\text{bkg}} \sum_{\text{bkg}} \log I_e + A \cdot \log(\text{pf})
 $$
 
 其中：
+
+- $A = N_{\text{data}} - \int_{\text{bkg}}$ （phsp 项的系数）
+- $\text{pf} = \frac{1}{N_{\text{phsp}}} \sum_{e \in \text{phsp}} I_e$
 - $I_e = \sum_p |S_{e,p}|^2$ （所有极化求和）
-- $S_{e,p} = \sum_a A_{e,p}^a \cdot v_a$
-- $A_{e,p}^a = SL_{e,p}^a \cdot R_e(\theta) \cdot bf$ （完整振幅）
-- $T_r(e,p) = \sum_{a \in \text{block}} SL_{e,p}^a \cdot v_a$ （有效耦合，不含 R 和 bf）
-- $\text{phsp\_factor} = \frac{1}{N_{\text{phsp}}} \sum_{\text{phsp}} |S|^2$
+- $S_{e,p} = \sum_a v_a \cdot \text{amp}_{a,e,p}$ （所有 channel 求和）
+- $\text{amp}_{a,e,p} = SL_{a,e,p} \cdot R_{\text{res}(a),e}(\theta) \cdot bf$ （完整振幅）
 
-关键关系（单链，所有channel共享同一R）：$S_{e,p} = R_e(\theta) \cdot bf \cdot T_r(e,p)$
+## 2. Per-event 量定义
 
-## 2. 梯度 $\partial\text{NLL}/\partial\theta$ （每个事件）
+### 2.1 基本量
+
+| 符号 | 定义 | 含义 |
+|------|------|------|
+| $S[p]$ | $\sum_a v_a \cdot \text{amp}_a[p]$ | 每个极化的复振幅 |
+| $I$ | $\sum_p (S_{\text{re}}[p]^2 + S_{\text{im}}[p]^2)$ | 每个事件的强度 |
+| $1/I$ | | 逆强度 |
+
+### 2.2 一阶导数
+
+| 符号 | 公式 | 含义 |
+|------|------|------|
+| $\partial S/\partial v_a^{\text{re}}$ | $\text{amp}_a$ | S 对耦合实部的导数 |
+| $\partial S/\partial v_a^{\text{im}}$ | $i \cdot \text{amp}_a$ | S 对耦合虚部的导数 |
+| $dS_j[p]$ | $\partial S[p]/\partial\theta_j$ | S 对共振态参数的导数 |
+| $\partial I/\partial v_a^{\text{re}}$ | $2 \cdot \text{Re}(\text{conj}(S) \cdot \text{amp}_a)$ | I 对耦合实部的导数 |
+| $\partial I/\partial v_a^{\text{im}}$ | $-2 \cdot \text{Im}(\text{conj}(S) \cdot \text{amp}_a)$ | I 对耦合虚部的导数 |
+| $\partial I/\partial\theta_j$ | $2 \cdot \text{Re}(\text{conj}(S) \cdot dS_j)$ | I 对共振态参数的导数 |
+
+### 2.3 二阶导数
+
+| 符号 | 公式 | 含义 |
+|------|------|------|
+| $\partial^2 I/\partial v_a^{\text{re}}\partial\theta_j$ | $2 \cdot \text{Re}(\text{conj}(dS_j) \cdot \text{amp}_a + \text{conj}(S) \cdot \partial\text{amp}_a/\partial\theta_j)$ | 混合二阶导数（实部） |
+| $\partial^2 I/\partial v_a^{\text{im}}\partial\theta_j$ | $-2 \cdot \text{Im}(\text{conj}(dS_j) \cdot \text{amp}_a + \text{conj}(S) \cdot \partial\text{amp}_a/\partial\theta_j)$ | 混合二阶导数（虚部） |
+| $\partial\text{amp}_a/\partial\theta_j$ | $SL_a \cdot \partial R_{\text{res}(a)}/\partial\theta_j$ | 振幅对 θ 的导数（同块非零，跨块为零） |
+
+### 2.4 Per-event 梯度
+
+| 符号 | 公式 | 含义 |
+|------|------|------|
+| $g_j$ | $-\frac{2}{I} \cdot \text{Re}(\text{conj}(S) \cdot dS_j)$ | $\partial(-\log I)/\partial\theta_j$（per-event，无权重） |
+| $g_a^{(v,\text{re})}$ | $-\frac{2}{I} \cdot \text{Re}(\text{conj}(S) \cdot \text{amp}_a)$ | $\partial(-\log I)/\partial v_a^{\text{re}}$ |
+| $g_a^{(v,\text{im})}$ | $+\frac{2}{I} \cdot \text{Im}(\text{conj}(S) \cdot \text{amp}_a)$ | $\partial(-\log I)/\partial v_a^{\text{im}}$ |
+
+## 3. Hessian 公式（data + bkg）
+
+每事件带权重 $w_e$（data=+1, bkg=-w_b）：
+
+### 3.1 vv Block（由 PyTorch autograd 计算）
+
+$H_{vv} = \partial^2\text{NLL}/\partial v\partial v$，由 `NLLFunction` 的 autograd 自动计算。
+
+### 3.2 θθ Block
+
+对每个事件 $e$，per-event Hessian：
 
 $$
-g_\theta[j] = -\frac{1}{I} \frac{\partial I}{\partial\theta_j}
+h_{jk} = g_j \cdot g_k - \frac{2}{I} \cdot \text{Re}(\text{conj}(dS_k) \cdot dS_j) - \frac{2}{I} \cdot \text{Re}(\text{conj}(S) \cdot d^2S_{jk})
+$$
+
+三项分别称为 **Term A**（外积）、**Term B**（$|dS|^2$ 修正）、**Term C**（$d^2S$ 修正，仅同块非零）。
+
+总 θθ Hessian：
+
+$$
+H_{\theta\theta}[j,k] = \sum_e w_e \cdot h_{jk}^{(e)}
+$$
+
+### 3.3 vθ / θv Block（混合 Hessian）
+
+对每个振幅 $a$ 和共振态参数 $j$（同块，即 $a$ 和 $\theta_j$ 属于同一 resonance）：
+
+$$
+\begin{aligned}
+H_{v_a^{\text{re}}, \theta_j} &= -\frac{2w_e}{I} \cdot \Big[\text{Re}(\text{conj}(dS_j) \cdot \text{amp}_a) + \text{Re}(\text{conj}(S) \cdot \partial\text{amp}_a/\partial\theta_j) + g_j \cdot \text{Re}(\text{conj}(S) \cdot \text{amp}_a)\Big] \\
+&= -\frac{2w_e}{I} \cdot \big[\text{Term1}_{\text{re}} + \text{Term2}_{\text{re}} + g_j \cdot \text{Term3}_{\text{re}}\big]
+\end{aligned}
 $$
 
 $$
-\frac{\partial I}{\partial\theta_j} = 2 \cdot bf \cdot \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^j\big)
+H_{v_a^{\text{im}}, \theta_j} = +\frac{2w_e}{I} \cdot \big[\text{Term1}_{\text{im}} + \text{Term2}_{\text{im}} + g_j \cdot \text{Term3}_{\text{im}}\big]
 $$
 
-其中 $D^j = \partial R/\partial\theta_j$ （复数，由 AutoDiff `Var<double,N,true>` 计算）。
+对跨块（$a$ 和 $\theta_j$ 属于不同 resonance）：Term2 = 0（因为 $\partial\text{amp}_a/\partial\theta_j = 0$），只用 Term1 + Term3。
 
-因此：
+---
+
+**Term1, Term2, Term3 定义：**
+
+| 项 | 实部公式 | 虚部公式 |
+|----|---------|---------|
+| Term1 | $\text{Re}(\text{conj}(dS_j) \cdot \text{amp}_a)$ | $\text{Im}(\text{conj}(dS_j) \cdot \text{amp}_a)$ |
+| Term2 | $\text{Re}(\text{conj}(S) \cdot SL_a \cdot \partial R/\partial\theta_j)$ | $\text{Im}(\text{conj}(S) \cdot SL_a \cdot \partial R/\partial\theta_j)$ |
+| Term3 | $\text{Re}(\text{conj}(S) \cdot \text{amp}_a)$ | $\text{Im}(\text{conj}(S) \cdot \text{amp}_a)$ |
+
+---
+
+## 4. Phsp 贡献
+
+### 4.1 θθ Block
+
+Phsp 项 $L_{\text{phsp}} = A \cdot \log(\text{pf})$，其中 $\text{pf} = \frac{1}{N_{\text{phsp}}} \sum_{e \in \text{phsp}} I_e$。
+
 $$
-g_\theta[j] = -\frac{2 \cdot bf}{I} \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^j\big)
-            = -\frac{2 \cdot bf}{I} \cdot \text{Re}\Big(D^j \cdot \sum_p \text{conj}(S_p) \cdot T_p\Big)
-            = -2 \cdot bf \cdot \text{Re}\Big(D^j \cdot \sum_p \text{conj}(w_p) \cdot T_p\Big)
-$$
-
-最后一步用了 $\text{conj}(S) = I \cdot \text{conj}(w)$，$w = S/I$ 正是 ctpwa 的 `computeFactorNLL` 输出。
-
-## 3. Hessian $\partial^2\text{NLL}/\partial\theta\partial\theta$ （每个事件）
-
-$$
-H = g \cdot g^T - \frac{1}{I} \cdot \frac{\partial^2 I}{\partial\theta\partial\theta}
+\frac{\partial^2 L_{\text{phsp}}}{\partial\theta_j\partial\theta_k} = c_1 \cdot \Sigma_{\text{phsp}}[I \cdot (g_j g_k - h_{jk})] + c_2 \cdot (\Sigma I g_j) \cdot (\Sigma I g_k)
 $$
 
 其中：
+- $c_1 = \dfrac{A}{\text{pf} \cdot N_{\text{phsp}}}$
+- $c_2 = -\dfrac{A}{\text{pf}^2 \cdot N_{\text{phsp}}^2}$
+
+### 4.2 vθ Block
+
+Phsp 对混合 Hessian 的贡献：
+
 $$
-\frac{\partial^2 I}{\partial\theta_j \partial\theta_k} =
-    \underbrace{2 \cdot bf^2 \cdot \sum_p |T_p|^2 \cdot \text{Re}\big(\text{conj}(D^k) \cdot D^j\big)}_{|T|^2\text{ 项}}
-  + \underbrace{2 \cdot bf \cdot \sum_p \text{Re}\big(\text{conj}(S_p) \cdot T_p \cdot D^2_{jk}\big)}_{D^2\text{ 项}}
+\frac{\partial^2 L_{\text{phsp}}}{\partial v_a^{\text{re}}\partial\theta_j} = c_{1m} \cdot \Sigma_{\text{phsp}}(\text{Term1}_{\text{re}} + \text{Term2}_{\text{re}}) + c_{2m} \cdot \big(\Sigma_{\text{phsp}} \text{Term3}_{\text{re}}^{(a)}\big) \cdot \big(\Sigma_{\text{phsp}} I \cdot g_j\big)
 $$
 
-其中 $D^2_{jk} = \partial^2 R/\partial\theta_j\partial\theta_k$ 由 AutoDiff `Var<double,N,true>::hess[j][k]` 提供。
+$$
+\frac{\partial^2 L_{\text{phsp}}}{\partial v_a^{\text{im}}\partial\theta_j} = -\Big[c_{1m} \cdot \Sigma_{\text{phsp}}(\text{Term1}_{\text{im}} + \text{Term2}_{\text{im}}) + c_{2m} \cdot \big(\Sigma_{\text{phsp}} \text{Term3}_{\text{im}}^{(a)}\big) \cdot \big(\Sigma_{\text{phsp}} I \cdot g_j\big)\Big]
+$$
 
-**已验证**：AutoDiff 的 $D^j$ 和 $D^2_{jk}$ 与 PyTorch autograd 完全一致（差异 < 1e-15）。
+其中：
+- $c_{1m} = \dfrac{2A}{\text{pf} \cdot N_{\text{phsp}}}$
+- $c_{2m} = \dfrac{2A}{\text{pf}^2 \cdot N_{\text{phsp}}^2}$
 
-## 4. CUDA 实现：per-event 聚合公式
+> **注意**：$c_{1m}$ 和 $c_{2m}$ 都有因子 2（与 θθ 的 $c_1, c_2$ 不同），这是因为 $\partial I/\partial v = 2 \cdot \text{Term3}$，而 $\partial I/\partial\theta = -I \cdot g$。
 
-一次循环遍历所有极化，聚合所有量，然后算一次外积+修正：
+---
+
+## 5. CUDA 实现结构
+
+### 5.1 Kernel 流水线
 
 ```
-// 第一步：遍历极化，聚合 per-event 量
-I_inv = Σ|w_p|²          // = 1/I
-sum_T2 = Σ|T_p|²
-sum_cwT = Σ conj(w_p)·T_p   // 复数
+Pre-pass: computeSfromAmpsKernel
+  → 计算 S[p], I, 以及 Term3（用于 phsp vθ）
 
-// 第二步：梯度
-g[j] = -2·bf · Re(D^j · sum_cwT)
+Stage 1: hessianStage1Kernel<Npr, Nres>  (per-block, per-event)
+  → 输出 per-event g_j, dS_j, ∂F/∂θ_j
+  → 累加同块 θθ Hessian
+  → 累加 phsp: I·g, I·(g⊗g - h)
 
-// 第三步：Hessian
-H[j][k] = g[j]·g[k]                                          // 外积
-        - 2·I_inv·bf²·sum_T2·Re(conj(D_k)·D_j)               // |T|² 修正
-        - 2·bf·Re(sum_cwT · D²_jk)                            // D² 修正
+Stage 2: hessianCrossBlockKernel
+  → 跨块 θθ Hessian（仅 Term A + Term B）
+
+Stage 3: hessianMixedBlockKernel  (per-block)
+  → 同块 vθ Hessian（Term 1 + 2 + 3）
+  → phsp path: 写 Term1+Term2 到 h_sum，Term3 由 pre-pass 计算
+
+Stage 4: hessianCrossMixedKernel
+  → 跨块 vθ Hessian（仅 Term 1 + 3，Term2=0）
+  → phsp path: 写 Term1 到 h_sum（Term3 已由 pre-pass 计算，不重复）
 ```
 
-其中 $\text{Re}(\text{conj}(D_k) \cdot D_j) = D_{re}[k] \cdot D_{re}[j] + D_{im}[k] \cdot D_{im}[j]$.
+### 5.2 关键注意点
 
-## 5. 关键简化
+- **Pre-pass 计算完整 S**：Stage 1 不自己算 S，而是从 pre-pass 读入。确保 S 包含所有 channel 的贡献（不仅是本块的）。
+- **Term3（t3）在 pre-pass 统一计算**：Term3 是 per-amplitude 的量，与具体哪个 θ block 无关。在 pre-pass 中一次性计算所有 SL channel 的 Term3，避免 stage 3 和 stage 4 重复累加。
+- **跨块 Term2 = 0**：对于 $a \in \text{block A}, \theta_j \in \text{block B}$，$\partial\text{amp}_a/\partial\theta_j = 0$，因此 Term2 不参与跨块贡献。
+- **Phsp 的 is_phsp 判断**：`default_weight == 0.0 && d_phsp_sum != nullptr` 时走 phsp 路径，写入独立 buffer（非 d_mixed）。
+- **所有 resonance 必须注册到 blocks_**：即使没有 free params，其 SL channels 也需要参与跨块 vθ 计算（stage 4）。
 
-D² 修正项中的 $I$ 会约掉：
+### 5.3 符号约定
 
-$$
--\frac{2}{I} \cdot bf \cdot \sum \text{Re}(\text{conj}(S) \cdot T \cdot D^2)
-= -2 \cdot bf \cdot \sum \text{Re}(\text{conj}(w) \cdot T \cdot D^2)
-$$
+| ctpwa | 数学含义 |
+|-------|---------|
+| `g[j]` | $-\partial(\log I)/\partial\theta_j$（无权重） |
+| `d_dS_re[j][p]` | $\text{Re}(\partial S[p]/\partial\theta_j)$ |
+| `d_dS_im[j][p]` | $\text{Im}(\partial S[p]/\partial\theta_j)$ |
+| `d_dF_re[a][j]` | $\text{Re}(\partial R_{\text{res}(a)}/\partial\theta_j)$ |
+| `d_dF_im[a][j]` | $\text{Im}(\partial R_{\text{res}(a)}/\partial\theta_j)$ |
+| `d_phsp_I` | $\Sigma_{\text{phsp}} I_e$ |
+| `d_phsp_grad[j]` | $\Sigma_{\text{phsp}} I_e \cdot g_j^{(e)}$ |
+| `d_phsp_hessA[j][k]` | $\Sigma_{\text{phsp}} I_e \cdot (g_j g_k - h_{jk})$ |
+| `d_phsp_mixed_sum[a][j]` | $\Sigma_{\text{phsp}}(\text{Term1} + \text{Term2})_{a,j}$ |
+| `d_phsp_mixed_t3[a]` | $\Sigma_{\text{phsp}} \text{Term3}_a$（由 pre-pass 计算） |
 
-所以 D² 修正直接用 `sum_cwT = Σ conj(w)·T`，**不需要乘 `I_inv`**。
+### 5.4 约束投影
 
-## 6. 与 PyTorch 的对比验证
+在 vv 和 vθ block 计算完成后，需要将 extended parameter space 的结果投影到 free parameter space：
 
-Python 验证（使用与 ctpwa 完全相同的 BWR 公式，q0 固定近似）：
-
-```
-PyTorch autograd θ-θ 块:
-  [[-21.052335, -5.967517],
-   [-5.967517,  2.008298]]
-
-手写公式 θ-θ 块:
-  [[-21.052335, -5.967517],
-   [-5.967517,  2.008298]]
-  → 完全一致 (diff < 1e-10)
-```
-
-AutoDiff 计算的 $D^2$ 值也验证通过：
-```
-PyTorch BWR Hessian:
-  d²Re/dm0²=18.4789  d²Re/dm0dg0=13.0991  d²Re/dg0²=-0.5906
-  d²Im/dm0²=41.1079  d²Im/dm0dg0=-2.8514  d²Im/dg0²=-5.2698
-
-ctpwa testBWRHessian (Var<double,2,true>):
-  d²Re/dm0²=18.4789  d²Re/dm0dg0=13.0991  d²Re/dg0²=-0.5906
-  d²Im/dm0²=41.1079  d²Im/dm0dg0=-2.8514  d²Im/dg0²=-5.2698
-  → 完全一致 (diff < 1e-15)
-```
-
-## 7. 已发现的 Bug
-
-### Bug 1：Hessian kernel 缺少事件偏移量
-- **现象**：D 值偏小约4倍，运动学不对（m=1.80 vs 正确值 m=1.11）
-- **根因**：`resonanceHessianBlockKernel` 访问 `d_momenta->getMomentum(evt, ...)` 时，`evt` 是 data 子集内的相对索引（0），但 momenta 数组包含所有事件。数据事件的绝对索引是 3（= 3个phsp事件）。
-- **修复**：增加 `evt_offset` 参数，用 `evt_abs = evt + evt_offset` 访问 momenta。在 `getHessian` 中传入 `events_[gpu][0]`（phsp数量）作为偏移。
-
-### Bug 2：逐个极化的 |w|² 加权（原始代码）
-- **现象**：Hessian 值偏小约10倍
-- **根因**：修正项用 `|w_p|² = |S_p|²/I²` 逐极化加权，应改用 per-event `1/I = Σ|w|²`。外积项做的是 `Σ_p X_p·Y_p` 而非 `(Σ_p X_p)·(Σ_q Y_q)`。
-- **修复**：Step 5 重构为 per-event 聚合（见第4节公式）。
-
-## 8. 缺失功能：PHSP 对 θ-θ 的贡献
-
-phsp_factor 也依赖 θ（通过 R），其 Hessian 贡献为：
+对于实部约束：$v_{\text{ext}}[e] = rr \cdot v_{\text{free}}[\text{oid}] + \cdots$
 
 $$
-n_{\text{data}} \cdot \frac{\partial^2 \log(\text{phsp\_factor})}{\partial\theta^2}
+H_{\text{free}}[\text{oid}, :] \mathrel{+}= rr \cdot H_{\text{ext}}[e, :] + ir \cdot H_{\text{ext}}[n_{\text{ext}} + e, :]
+$$
+$$
+H_{\text{free}}[n_{\text{free}} + \text{oid}, :] \mathrel{+}= -ir \cdot H_{\text{ext}}[e, :] + rr \cdot H_{\text{ext}}[n_{\text{ext}} + e, :]
 $$
 
-$$
-\frac{\partial^2 \log(\Sigma I / n)}{\partial\theta^2}
-= \frac{\Sigma \partial^2 I/\partial\theta^2}{\Sigma I}
-- \frac{(\Sigma \partial I/\partial\theta)(\Sigma \partial I/\partial\theta)^T}{(\Sigma I)^2}
-$$
+---
 
-当前 `computeResonanceHessian` 只算了 data+bkg 的贡献，缺少 phsp 部分。
+## 6. 验证结果
 
-## 9. 混合块 $\partial^2\text{NLL}/\partial v\partial\theta$
+| Block | 1-res（1 个自由共振态） | 2-res（2 个自由共振态） |
+|-------|------------------------|------------------------|
+| vv | 7.73×10⁻⁷ | 7.73×10⁻⁷ |
+| vθ | 2.89×10⁻⁷ | 3.18×10⁻⁷ |
+| θv | 2.89×10⁻⁷ | 3.18×10⁻⁷ |
+| θθ | 8.95×10⁻⁷ | 1.18×10⁻⁶ |
 
-对于所有 channel 共享同一共振态的单链模型：
-
-$$
-g_v[a] = -2 \cdot \text{Re}\left(\frac{\text{conj}(T) \cdot SL_a}{\Sigma|T|^2}\right)
-$$
-
-**与 θ 无关**（R 和 bf 在分子分母中约掉）。因此 $\partial^2\text{NLL}/\partial v\partial\theta = 0$。
-
-多链模型（不同channel对应不同共振态）混合块非零，需要 `computeMixedHessian`。
+测试条件：1 data event, 3 phsp events, 1 bkg event, 9 polarizations, BWR×2 resonances。

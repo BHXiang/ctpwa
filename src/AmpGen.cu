@@ -3149,10 +3149,16 @@ void AmpCalc::computeUnifiedHessian(
         cudaMalloc(&d_I_full, nEv*sizeof(double));
         {
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
+            double *t3_re = nullptr, *t3_im = nullptr;
+            if (d_phsp_mixed_t3) {
+                t3_re = d_phsp_mixed_t3;
+                t3_im = d_phsp_mixed_t3 + n_amp_total;
+            }
             computeSfromAmpsKernel<<<grid, kBlockSize>>>(
                 d_S_re, d_S_im, d_I_full,
                 d_amp + evt_off * nPol * n_amp_total,
-                d_v_interleaved, nEv, nPol, n_amp_total);
+                d_v_interleaved, nEv, nPol, n_amp_total,
+                t3_re, t3_im);
             cudaDeviceSynchronize();
         }
 
@@ -3270,7 +3276,7 @@ void AmpCalc::computeUnifiedHessian(
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mixed_out, nFreeResParams(),
                     nEv, nSL, Npr, nPol, n_amp_total, blk.site,
-                    nTotal_slamp, default_weight, d_w, d_phsp_mixed_sum, d_phsp_mixed_t3, evt_off);
+                    nTotal_slamp, default_weight, d_w, d_phsp_mixed_sum, evt_off);
                 cudaDeviceSynchronize();
             }
 
@@ -3291,7 +3297,7 @@ void AmpCalc::computeUnifiedHessian(
                         nSL_A, blkA.site,
                         nEv, nPol, n_amp_total,
                         d_mixed_out, nFreeResParams(),
-                        default_weight, d_w, d_phsp_mixed_sum, d_phsp_mixed_t3, evt_off);
+                        default_weight, d_w, d_phsp_mixed_sum, evt_off);
                     cudaDeviceSynchronize();
                 }
             }
