@@ -2,7 +2,6 @@
 #include "Amplitude.cu"
 
 #include "ComputeHessian.cu"
-#include "HessianKernel.cu"
 
 #include "AmpGen.cu"
 // #include "ComputeGrad.cu"
