@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include <AutoDiff.cuh>
+#include <Resonance.cuh>
 
 // ============================================================================
 // ResResult<T>: 传播子返回类型萃取
@@ -64,5 +65,25 @@ template <typename T>
 __host__ __device__ auto Flatte(T m, T m0,
     int n_channels, const T* g, const double* channel_masses)
     -> typename ResResult<T>::type;
+
+// ============================================================================
+// 统一共振态因子计算（__device__，模板化 scalar type）
+// ============================================================================
+
+// 计算带 AD 的 breakup momentum q0
+template <typename T>
+__device__ T computeQ0AD(T m0, T md1, T md2);
+
+// 计算单个 DecayNode 的振幅因子（BWR·Bf / BW / ONE / Flatte·Bf / Bf only）
+// params[0]=mass, params[1]=width (BWR/BW) 或 couplings[0] (Flatte)
+// channels: Flatte 道质量数组指针（非 Flatte 时为 nullptr）
+template <typename T>
+__device__ auto computeNodeFactor(
+    int L, T mm, T q_ad, T q0_ad,
+    const T* params, int param_count,
+    ResModelType model_type,
+    const double* channels, int n_channels,
+    double bf_d
+) -> typename ResResult<T>::type;
 
 #endif // RES_MODEL_CUH

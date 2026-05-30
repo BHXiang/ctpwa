@@ -1,5 +1,73 @@
 #include <ResModel.cuh>
 
+// ============================================================================
+// 统一共振态因子计算
+// ============================================================================
+
+template <typename T>
+__device__ T computeQ0AD(T m0, T md1, T md2)
+{
+    T s_md = md1 + md2;
+    T d_md = md1 - md2;
+    T m0sq = m0 * m0;
+    T q0sq = (m0sq - s_md * s_md) * (m0sq - d_md * d_md) / (T(4.0) * m0sq);
+    if constexpr (std::is_arithmetic_v<T>) {
+        if (q0sq < 0.0) q0sq = 0.0;
+        return T(std::sqrt(q0sq));
+    } else {
+        q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
+        return sqrt(q0sq);
+    }
+}
+
+template <typename T>
+__device__ auto computeNodeFactor(
+    int L, T mm, T q_ad, T q0_ad,
+    const T* params, int param_count,
+    ResModelType model_type,
+    const double* channels, int n_channels,
+    double bf_d
+) -> typename ResResult<T>::type
+{
+    switch (model_type) {
+        case ResModelType::BWR: {
+            // params = [mass, width]
+            T m0 = params[0], g0 = params[1];
+            auto bw = BWR<T>(mm, m0, g0, L, q_ad, q0_ad, bf_d);
+            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+            if constexpr (std::is_arithmetic_v<T>) {
+                return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
+            } else {
+                return ResResult<T>::make(bw.real * bf, bw.imag * bf);
+            }
+        }
+        case ResModelType::BW: {
+            T m0 = params[0], g0 = params[1];
+            return BW<T>(mm, m0, g0);
+        }
+        case ResModelType::ONE: {
+            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+            return ResResult<T>::make(bf, T(0.0));
+        }
+        case ResModelType::Flatte: {
+            // params = [mass, coupling0, coupling1, ...]
+            T mass = params[0];
+            T couplings[4];
+            for (int i = 0; i < n_channels && i < 4; ++i)
+                couplings[i] = params[1 + i];
+            auto fl = Flatte<T>(mm, mass, n_channels, couplings, channels);
+            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+            if constexpr (std::is_arithmetic_v<T>) {
+                return ResResult<T>::make(fl.real() * bf, fl.imag() * bf);
+            } else {
+                return ResResult<T>::make(fl.real * bf, fl.imag * bf);
+            }
+        }
+        default:
+            return ResResult<T>::make(T(1.0), T(0.0));
+    }
+}
+
 // 模板化BlattWeisskopf函数，支持double和AutoDiff类型
 template <typename T> __host__ __device__ T Bf(int L, const T &q, const T &q0, double d)
 {
@@ -77,7 +145,7 @@ __host__ __device__ void csqrt_real_t(T x, T& out_re, T& out_im) {
         out_im = 0.0;
     } else {
         out_re = 0.0;
-        out_im = sqrt(-x);
+        out_im = sqrt(T(0.0) - x);
     }
 }
 
@@ -125,9 +193,9 @@ __host__ __device__ auto Flatte(T m, T m0,
     //             = (real_part, 0) - (-i_term_imag, i_term_real)
     //             = (real_part + i_term_imag, -i_term_real)
     T den_re = real_part + i_term_imag;
-    T den_im = -i_term_real;
+    T den_im = T(0.0) - i_term_real;
     T den_sq = den_re * den_re + den_im * den_im;
 
     // 1/denominator = conj(denom) / |denom|² = (den_re - i*den_im) / den_sq
-    return ResResult<T>::make(den_re / den_sq, -den_im / den_sq);
+    return ResResult<T>::make(den_re / den_sq, (T(0.0) - den_im) / den_sq);
 }
