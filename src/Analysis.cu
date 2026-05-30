@@ -3504,6 +3504,21 @@ private:
         // std::cout << "Calculating amplitudes for " << num_gpus << " GPUs..." << std::endl;
 
         auto chains = config_parser_.getDecayChains();
+
+        // Build chain link map from trans constraints:
+        //   chain_linked["chain2"] = {"chain3"}, chain_linked["chain3"] = {"chain2"}
+        std::map<std::string, std::set<std::string>> chain_linked;
+        for (const auto& c : config_parser_.getConstraints()) {
+            if (c.type == "trans" && c.names.size() >= 2) {
+                for (size_t i = 0; i < c.names.size(); ++i)
+                    for (size_t j = 0; j < c.names.size(); ++j)
+                        if (i != j) chain_linked[c.names[i]].insert(c.names[j]);
+            }
+        }
+
+        // Track resonance names already registered in each chain
+        std::map<std::string, std::set<std::string>> chain_resonances; // chain → {resonance names}
+
         int gls_index = 0;
         for (auto chain : chains)
         {
@@ -3688,6 +3703,7 @@ private:
                         const auto& config_res = config_parser_.getResonances();
                         std::vector<std::vector<int>> all_free;
                         std::vector<std::vector<std::vector<double>>> all_free_ranges;
+                        std::set<std::string> skip_slots_for;
                         for (const auto& res : resonance)
                         {
                             auto it = config_res.find(res.getName());
@@ -3701,10 +3717,21 @@ private:
                                 all_free.push_back({});
                                 all_free_ranges.push_back({});
                             }
+                            // Check if this resonance already registered in a trans-linked chain
+                            const auto& linked = chain_linked[chain.name];
+                            for (const auto& linked_chain : linked) {
+                                if (chain_resonances[linked_chain].count(res.getName())) {
+                                    skip_slots_for.insert(res.getName());
+                                    break;
+                                }
+                            }
                         }
+                        // Track resonance names for this chain
+                        for (const auto& res : resonance)
+                            chain_resonances[chain.name].insert(res.getName());
                         // Always add block — even without free params, its SL channels
                         // contribute to cross-block mixed Hessian (vθ).
-                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges);
+                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges, skip_slots_for);
                     }
 
                     gls_index += cas->getNSLCombs();
