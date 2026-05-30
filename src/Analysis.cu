@@ -1950,7 +1950,6 @@ public:
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
 
         const int n = vector.numel();
-        const int n2 = 2 * n;
         torch::Device dev = vector.device();
         torch::Tensor extended_vector = params_.extendVector(vector, dev);
         torch::Tensor extended_vector_conj = extended_vector.conj();
@@ -3689,7 +3688,6 @@ private:
                         const auto& config_res = config_parser_.getResonances();
                         std::vector<std::vector<int>> all_free;
                         std::vector<std::vector<std::vector<double>>> all_free_ranges;
-                        bool has_any = false;
                         for (const auto& res : resonance)
                         {
                             auto it = config_res.find(res.getName());
@@ -3697,7 +3695,6 @@ private:
                             {
                                 all_free.push_back(it->second.free);
                                 all_free_ranges.push_back(it->second.free_range);
-                                has_any = true;
                             }
                             else
                             {

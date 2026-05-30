@@ -518,50 +518,38 @@ __global__ void hessianStage1Kernel(
                 LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
                 LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
                 double mm = pM.M();
-                // double mm = pM.M();
                 double md1 = pD1.M();
                 double md2 = pD2.M();
                 double qq = breakup_momentum(mm, md1, md2);
 
-                AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
+                AD m0_q0, md1_q0, md2_q0;
                 if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
-                    m0_q0_ad = *m0p;
-                else if (node.mass[0] > 0) m0_q0_ad = AD(node.mass[0]);
-                else m0_q0_ad = AD(1.0);
+                    m0_q0 = *m0p;
+                else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
+                else m0_q0 = AD(1.0);
                 if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
-                    md1_q0_ad = *m0p;
-                else md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+                    md1_q0 = *m0p;
+                else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
                 if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
-                    md2_q0_ad = *m0p;
-                else md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+                    md2_q0 = *m0p;
+                else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
 
-                AD s_md = md1_q0_ad + md2_q0_ad;
-                AD d_md = md1_q0_ad - md2_q0_ad;
-                AD m0sq = m0_q0_ad * m0_q0_ad;
-                AD q0sq = (m0sq - s_md * s_md) * (m0sq - d_md * d_md) / (AD(4.0) * m0sq);
-                q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-                AD q0_ad = sqrt(q0sq);
+                AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
                 AD q_ad(qq);
+                bool is_res = (node.mother_idx == target.particle_idx && node.mass[0] <= 0);
 
-                CV node_factor(1.0, 0.0);
-                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0) {
-                    AD m_ad(mm);
-                    if (target.type == ResModelType::BWR) {
-                        auto bw = BWR<AD>(m_ad, *m0p, *gp, L, q_ad, q0_ad, bf_d);
-                        auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                        node_factor.real = bw.real * bf;
-                        node_factor.imag = bw.imag * bf;
-                    }
-                    else { node_factor = BW<AD>(m_ad, *m0p, *gp); }
-                }
-                else {
+                CV nf;
+                if (is_res) {
+                    AD params_arr[2] = {*m0p, *gp};
+                    nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
+                                              params_arr, 2, target.type, nullptr, 0, bf_d);
+                } else {
                     auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                    node_factor.real = bf;
-                    node_factor.imag = AD(0.0);
+                    nf.real = bf; nf.imag = AD(0.0);
                 }
                 CV new_R;
-                new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
-                new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+                new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
+                new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
                 R_ad = new_R;
             }
         }

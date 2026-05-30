@@ -1147,30 +1147,11 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         if (is_resonance_node)
         {
             const double* p = d_all_params + current_res.param_offset;
-            double res_mass = p[0];
-
-            if (current_res.type == ResModelType::BWR)
-            {
-                double res_width = p[1];
-                resAmp *= BWR<double>(mm, res_mass, res_width, sl.L, qq, q0, bf_d);
-                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
-            }
-            else if (current_res.type == ResModelType::BW)
-            {
-                double res_width = p[1];
-                resAmp *= BW<double>(mm, res_mass, res_width);
-            }
-            else if (current_res.type == ResModelType::ONE)
-            {
-                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
-            }
-            else if (current_res.type == ResModelType::Flatte)
-            {
-                // p[0] = mass, p[1..] = couplings; channels in d_all_channels
-                const double* ch = d_all_channels + current_res.channel_offset;
-                resAmp *= Flatte(mm, res_mass, current_res.n_channels, &p[1], ch);
-                resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
-            }
+            const double* ch = (current_res.type == ResModelType::Flatte)
+                ? d_all_channels + current_res.channel_offset : nullptr;
+            resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
+                p, current_res.param_count, current_res.type,
+                ch, current_res.n_channels, bf_d);
         }
     }
 
@@ -1630,53 +1611,33 @@ __global__ void resonanceGradientKernel(
             double md1 = pD1.M();
             double md2 = pD2.M();
 
-            AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
-            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-                m0_q0_ad = m0_ad;
-            } else if (node.mass[0] > 0) {
-                m0_q0_ad = AD(node.mass[0]);
-            } else {
-                m0_q0_ad = AD(1.0);
-            }
+            AD m0_q0, md1_q0, md2_q0;
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0)
+                m0_q0 = m0_ad;
+            else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
+            else m0_q0 = AD(1.0);
             if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
-                md1_q0_ad = m0_ad;
-            else
-                md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+                md1_q0 = m0_ad;
+            else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
             if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
-                md2_q0_ad = m0_ad;
-            else
-                md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+                md2_q0 = m0_ad;
+            else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
 
-            AD s_md = md1_q0_ad + md2_q0_ad;
-            AD d_md = md1_q0_ad - md2_q0_ad;
-            AD m0sq = m0_q0_ad * m0_q0_ad;
-            AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
-            q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-            AD q0_ad = sqrt(q0sq);
+            AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
+            bool is_res = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
 
-            CV node_factor(1.0, 0.0);
-            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-                AD m_ad(mm);
-                AD res_m0 = m0_ad;
-                if (target_res.type == ResModelType::BWR) {
-                    node_factor = BWR<AD>(m_ad, res_m0, gamma_ad, L, q_ad, q0_ad, bf_d);
-                } else if (target_res.type == ResModelType::BW) {
-                    node_factor = BW<AD>(m_ad, res_m0, gamma_ad);
-                } else {
-                    node_factor = CV(1.0, 0.0);
-                }
-                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                node_factor.real = node_factor.real * bf_ad;
-                node_factor.imag = node_factor.imag * bf_ad;
+            CV nf;
+            if (is_res) {
+                AD params_arr[2] = {m0_ad, gamma_ad};
+                nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
+                                          params_arr, 2, target_res.type, nullptr, 0, bf_d);
             } else {
-                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                node_factor.real = bf_ad;
-                node_factor.imag = AD(0.0);
+                AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                nf.real = bf_val; nf.imag = AD(0.0);
             }
-
             CV new_R;
-            new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
-            new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
+            new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
+            new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
             R_ad = new_R;
         }
 
@@ -1933,186 +1894,6 @@ __device__ void make_var_params_hess(
     }
 }
 
-// 完整链路 AutoDiff Hessian kernel (单共振态版)
-// 计算 ∂²(w·log I)/∂θ_j∂θ_k 每事件贡献并累加到 d_hess
-//   I = Σ_p |S_p|², S_p = Σ_sl v_sl · slamp_{sl,e,p} · F_sl(θ)
-//   d²(log I)/dθ² = 2 Re(Σ_p [dS_k·conj(dS_j) + conj(S_p)·d²S_jk]) / I  -  (dI/dθ_j)(dI/dθ_k) / I²
-// w_evt: 每事件权重 (data: -1, bkg: +w_bkg) — 通过 d_event_weights 或 default_weight 提供
-template <int Nfree>
-__global__ void resonanceHessianFullKernel(
-    const DeviceMomenta* d_momenta, const DecayNode* d_decayNodes,
-    const SL* d_slComb, const DeviceResonance* d_res,
-    int res_idx_in_block, const double* d_all_params,
-    const int* d_param_map, double* d_hess, const int* d_global_idx,
-    int nEvents, int nPolar, int decayChain_size, int nSLComb, double bf_d,
-    int t_evt_offset,
-    const thrust::complex<double>* d_slamps,
-    const cuComplex* d_v, int site, int hess_ld,
-    const double* d_event_weights, double default_weight,
-    const cuComplex* d_amp, int n_ext)
-{
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
-    if (evt >= nEvents) return;
-    int global_evt = evt + t_evt_offset;
-    double w_evt = d_event_weights ? d_event_weights[evt] : default_weight;
-    if (w_evt == 0.0) return;
-
-    using AD = Var<double, Nfree, true>;
-    using CV = ComplexVar<double, Nfree, true>;
-
-    const DeviceResonance& target_res = d_res[res_idx_in_block];
-    const double* target_rp = d_all_params + target_res.param_offset;
-
-    int ftg[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
-    for (int j = 0; j < Nfree; ++j) {
-        int pi = d_param_map[j];
-        if (pi >= 0 && pi < 8) ftg[pi] = j;
-    }
-
-    AD m0_ad(target_rp[0]);
-    if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
-    AD gamma_ad;
-    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
-        gamma_ad = AD(target_rp[1]);
-        if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
-    }
-
-    int n_events_total = d_momenta->n_events;
-    constexpr int MAX_POL = 32;
-
-    double S_re[MAX_POL], S_im[MAX_POL];
-    double dS_re[MAX_POL][Nfree], dS_im[MAX_POL][Nfree];
-    double d2S_re[MAX_POL][Nfree][Nfree], d2S_im[MAX_POL][Nfree][Nfree];
-    for (int p = 0; p < nPolar; ++p) {
-        S_re[p] = 0.0; S_im[p] = 0.0;
-        for (int j = 0; j < Nfree; ++j) {
-            dS_re[p][j] = 0.0; dS_im[p][j] = 0.0;
-            for (int k = 0; k < Nfree; ++k) {
-                d2S_re[p][j][k] = 0.0; d2S_im[p][j][k] = 0.0;
-            }
-        }
-    }
-
-    // Full S over all partial waves (from precomputed d_amp)
-    for (int p = 0; p < nPolar; ++p) {
-        for (int a = 0; a < n_ext; ++a) {
-            cuComplex amp_ap = d_amp[evt * nPolar * n_ext + p * n_ext + a];
-            cuComplex v_a = d_v[a];
-            S_re[p] += (double)v_a.x * amp_ap.x - (double)v_a.y * amp_ap.y;
-            S_im[p] += (double)v_a.x * amp_ap.y + (double)v_a.y * amp_ap.x;
-        }
-    }
-
-    for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
-        CV R_ad(1.0, 0.0);
-        for (int ni = 0; ni < decayChain_size; ++ni) {
-            const DecayNode& node = d_decayNodes[ni];
-            const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
-            int L = sl.L;
-
-            LorentzVector pM  = d_momenta->getMomentum(global_evt, node.mother_idx);
-            LorentzVector pD1 = d_momenta->getMomentum(global_evt, node.daug1_idx);
-            LorentzVector pD2 = d_momenta->getMomentum(global_evt, node.daug2_idx);
-
-            double mm = pM.M();
-            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
-            AD q_ad(qq);
-            double md1 = pD1.M(), md2 = pD2.M();
-
-            AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
-            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-                m0_q0_ad = m0_ad;
-            } else if (node.mass[0] > 0) {
-                m0_q0_ad = AD(node.mass[0]);
-            } else {
-                m0_q0_ad = AD(1.0);
-            }
-            if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
-                md1_q0_ad = m0_ad;
-            else
-                md1_q0_ad = AD(node.mass[1] > 0 ? node.mass[1] : md1);
-            if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
-                md2_q0_ad = m0_ad;
-            else
-                md2_q0_ad = AD(node.mass[2] > 0 ? node.mass[2] : md2);
-
-            AD s_md = md1_q0_ad + md2_q0_ad;
-            AD d_md = md1_q0_ad - md2_q0_ad;
-            AD m0sq = m0_q0_ad * m0_q0_ad;
-            AD q0sq = (m0sq - s_md*s_md)*(m0sq - d_md*d_md)/(AD(4.0)*m0sq);
-            q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-            AD q0_ad = sqrt(q0sq);
-
-            CV node_factor(1.0, 0.0);
-            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0) {
-                AD m_ad(mm);
-                if (target_res.type == ResModelType::BWR) {
-                    node_factor = BWR<AD>(m_ad, m0_ad, gamma_ad, L, q_ad, q0_ad, bf_d);
-                } else if (target_res.type == ResModelType::BW) {
-                    node_factor = BW<AD>(m_ad, m0_ad, gamma_ad);
-                }
-                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                node_factor.real = node_factor.real * bf_ad;
-                node_factor.imag = node_factor.imag * bf_ad;
-            } else {
-                AD bf_ad = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                node_factor.real = bf_ad;
-                node_factor.imag = AD(0.0);
-            }
-
-            CV new_R;
-            new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
-            new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
-            R_ad = new_R;
-        }
-
-        cuComplex v_sl = d_v[sl_idx]; // d_v is already offset by site in caller;
-        for (int p = 0; p < nPolar; ++p) {
-            int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + p;
-            auto sl_amp = d_slamps[amp_idx];
-            double sl_re = sl_amp.real();
-            double sl_im = sl_amp.imag();
-            double c_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
-            double c_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
-
-            for (int j = 0; j < Nfree; ++j) {
-                dS_re[p][j] += c_re * R_ad.real.grad[j] - c_im * R_ad.imag.grad[j];
-                dS_im[p][j] += c_re * R_ad.imag.grad[j] + c_im * R_ad.real.grad[j];
-                for (int k = 0; k < Nfree; ++k) {
-                    d2S_re[p][j][k] += c_re * R_ad.real.hess[j][k] - c_im * R_ad.imag.hess[j][k];
-                    d2S_im[p][j][k] += c_re * R_ad.imag.hess[j][k] + c_im * R_ad.real.hess[j][k];
-                }
-            }
-        }
-    }
-
-    double I_val = 0.0;
-    for (int p = 0; p < nPolar; ++p) I_val += S_re[p]*S_re[p] + S_im[p]*S_im[p];
-    if (I_val < 1e-30) return;
-    double inv_I = 1.0 / I_val;
-    double inv_I2 = inv_I * inv_I;
-
-    double G[8] = {0};
-    for (int j = 0; j < Nfree; ++j) {
-        double gv = 0.0;
-        for (int p = 0; p < nPolar; ++p) gv += S_re[p]*dS_re[p][j] + S_im[p]*dS_im[p][j];
-        G[j] = 2.0 * gv;  // = dI/dθ_j
-    }
-
-    for (int j = 0; j < Nfree; ++j) {
-        for (int k = 0; k < Nfree; ++k) {
-            double R2 = 0.0;
-            for (int p = 0; p < nPolar; ++p) {
-                R2 += dS_re[p][k]*dS_re[p][j] + dS_im[p][k]*dS_im[p][j]
-                    + S_re[p]*d2S_re[p][j][k] + S_im[p]*d2S_im[p][j][k];
-            }
-            // d²(log I)/dθ_j∂θ_k = 2·R2/I − G_j·G_k/I²
-            double term = w_evt * (2.0 * R2 * inv_I - G[j] * G[k] * inv_I2);
-            atomicAdd(&d_hess[d_global_idx[k]*hess_ld + d_global_idx[j]], term);
-        }
-    }
-}
-
 template <int Pr, int Ps, bool SameRes>
 __global__ void resonanceHessianBlockKernel(
     const cuComplex* d_w, const cuComplex* d_T_r, const cuComplex* d_T_s,
@@ -2162,27 +1943,15 @@ __global__ void resonanceHessianBlockKernel(
         if (pi == 0) m0_r_ad.grad[j] = 1.0;
         if (pi == 1) g_r_ad.grad[j]  = 1.0;
     }
-    // q0 with AD: m0_q0 depends on resonance mass, daughter masses fixed
-    AD1 m0_q0_r_ad = m0_r_ad;
-    AD1 md1_r_ad(md1_r_fixed), md2_r_ad(md2_r_fixed);
-    AD1 s_md_r = md1_r_ad + md2_r_ad;
-    AD1 d_md_r = md1_r_ad - md2_r_ad;
-    AD1 m0sq_r = m0_q0_r_ad * m0_q0_r_ad;
-    AD1 q0sq_r = (m0sq_r - s_md_r*s_md_r) * (m0sq_r - d_md_r*d_md_r) / (AD1(4.0) * m0sq_r);
-    q0sq_r.val = q0sq_r.val < 0.0 ? 0.0 : q0sq_r.val;
-    AD1 q0_r_ad = sqrt(q0sq_r);
+    AD1 q0_r_ad = computeQ0AD(m0_r_ad, AD1(md1_r_fixed), AD1(md2_r_fixed));
     AD1 q_ad(qq);
 
     ComplexVar<double, Pr, false> R_r_ad;
-    if (res_r.type == ResModelType::BWR) {
-        auto bw_r = BWR<AD1>(m_ad, m0_r_ad, g_r_ad, res_L_r, q_ad, q0_r_ad, bf_d);
-        auto bf_r_ad = Bf<AD1>(res_L_r, q_ad, q0_r_ad, bf_d);
-        R_r_ad.real = bw_r.real * bf_r_ad;
-        R_r_ad.imag = bw_r.imag * bf_r_ad;
-    } else if (res_r.type == ResModelType::BW) {
-        R_r_ad = BW<AD1>(m_ad, m0_r_ad, g_r_ad);
+    if (res_r.type == ResModelType::BWR || res_r.type == ResModelType::BW) {
+        AD1 params_r[2] = {m0_r_ad, g_r_ad};
+        R_r_ad = computeNodeFactor<AD1>(res_L_r, m_ad, q_ad, q0_r_ad,
+                                        params_r, 2, res_r.type, nullptr, 0, bf_d);
     }
-    // bf_val = 1.0 since Bf is now part of the AD chain
 
     // Step 3: F_s = BWR·Bf for resonance s (with AD q0, !SameRes only)
     const DeviceResonance* res_s_ptr = &res_r;
@@ -2219,27 +1988,15 @@ __global__ void resonanceHessianBlockKernel(
         if (pi == 0) m0_s_ad.grad[k] = 1.0;
         if (pi == 1) g_s_ad.grad[k]  = 1.0;
     }
-    // q0 with AD for resonance s
-    AD2 m0_q0_s_ad = m0_s_ad;
-    AD2 md1_s_ad(md1_s_fixed), md2_s_ad(md2_s_fixed);
-    AD2 s_md_s = md1_s_ad + md2_s_ad;
-    AD2 d_md_s = md1_s_ad - md2_s_ad;
-    AD2 m0sq_s = m0_q0_s_ad * m0_q0_s_ad;
-    AD2 q0sq_s = (m0sq_s - s_md_s*s_md_s) * (m0sq_s - d_md_s*d_md_s) / (AD2(4.0) * m0sq_s);
-    q0sq_s.val = q0sq_s.val < 0.0 ? 0.0 : q0sq_s.val;
-    AD2 q0_s_ad = sqrt(q0sq_s);
+    AD2 q0_s_ad = computeQ0AD(m0_s_ad, AD2(md1_s_fixed), AD2(md2_s_fixed));
     AD2 q_ad_s(qq);
 
     ComplexVar<double, Ps, false> R_s_ad;
-    if (res_s_ptr->type == ResModelType::BWR) {
-        auto bw_s = BWR<AD2>(m_ad_s, m0_s_ad, g_s_ad, res_L_s, q_ad_s, q0_s_ad, bf_d);
-        auto bf_s_ad = Bf<AD2>(res_L_s, q_ad_s, q0_s_ad, bf_d);
-        R_s_ad.real = bw_s.real * bf_s_ad;
-        R_s_ad.imag = bw_s.imag * bf_s_ad;
-    } else if (res_s_ptr->type == ResModelType::BW) {
-        R_s_ad = BW<AD2>(m_ad_s, m0_s_ad, g_s_ad);
+    if (res_s_ptr->type == ResModelType::BWR || res_s_ptr->type == ResModelType::BW) {
+        AD2 params_s[2] = {m0_s_ad, g_s_ad};
+        R_s_ad = computeNodeFactor<AD2>(res_L_s, m_ad_s, q_ad_s, q0_s_ad,
+                                        params_s, 2, res_s_ptr->type, nullptr, 0, bf_d);
     } else return;
-    // bf_val_s = 1.0 since Bf is in AD chain
 
     // Step 4: 需要 Hessian（SameRes），用 WithHess=true，同样 q0 AD + Bf AD
     ComplexVar<double, Pr, true> R_r_hess;
@@ -2252,22 +2009,13 @@ __global__ void resonanceHessianBlockKernel(
             if (pi == 0) m0_h.grad[j] = 1.0;
             if (pi == 1) g_h.grad[j]  = 1.0;
         }
-        // q0 with ADH
-        ADH m0_q0_h = m0_h;
-        ADH md1_h(md1_r_fixed), md2_h(md2_r_fixed);
-        ADH s_md_h = md1_h + md2_h;
-        ADH d_md_h = md1_h - md2_h;
-        ADH m0sq_h = m0_q0_h * m0_q0_h;
-        ADH q0sq_h = (m0sq_h - s_md_h*s_md_h) * (m0sq_h - d_md_h*d_md_h) / (ADH(4.0) * m0sq_h);
-        q0sq_h.val = q0sq_h.val < 0.0 ? 0.0 : q0sq_h.val;
-        ADH q0_h_ad = sqrt(q0sq_h);
+        ADH q0_h_ad = computeQ0AD(m0_h, ADH(md1_r_fixed), ADH(md2_r_fixed));
         ADH q_h_ad(qq);
 
-        if (res_r.type == ResModelType::BWR) {
-            auto bw_h = BWR<ADH>(m_ad_h, m0_h, g_h, res_L_r, q_h_ad, q0_h_ad, bf_d);
-            auto bf_h_ad = Bf<ADH>(res_L_r, q_h_ad, q0_h_ad, bf_d);
-            R_r_hess.real = bw_h.real * bf_h_ad;
-            R_r_hess.imag = bw_h.imag * bf_h_ad;
+        if (res_r.type == ResModelType::BWR || res_r.type == ResModelType::BW) {
+            ADH params_h[2] = {m0_h, g_h};
+            R_r_hess = computeNodeFactor<ADH>(res_L_r, m_ad_h, q_h_ad, q0_h_ad,
+                                              params_h, 2, res_r.type, nullptr, 0, bf_d);
         } else {
             R_r_hess = BW<ADH>(m_ad_h, m0_h, g_h);
         }
@@ -2360,292 +2108,6 @@ __global__ void resonanceHessianBlockKernel(
 
 }
 
-// ============================================================
-// NEW: Unified Hessian kernel (verified formula from standalone test)
-// H_jk = g_j·g_k - 2/I·Re(conj(dS_k)·dS_j) - 2/I·Re(conj(S)·d²S_jk)
-//
-// Processes all SL channels in one block, computes full Hessian.
-// Template: Npr = params per resonance (2 for BWR), Nres = number of resonances
-// ============================================================
-template<int Npr, int Nres>
-__global__ void unifiedHessianKernel(
-    const thrust::complex<double>* d_slamps, // pure spin amplitudes [sl*nTotal + evt*nPol + pol]
-    const cuComplex* d_v,                  // couplings [Nsl] (interleaved real/imag)
-    const DeviceMomenta* d_momenta,
-    const DecayNode* d_decayNodes, int decayChain_size,
-    const SL* d_slComb,
-    const DeviceResonance* d_resonances,     // [Nres]
-    const double* d_all_params,              // flat params [Npr*Nres]
-    const int* d_global_idx,                 // local→global mapping [Npr*Nres]
-    double* d_hess, int hess_ld,             // output Hessian (global indexing)
-    int nEvents, int nSL, int nPolar, double bf_d, double default_weight,
-    const double* d_event_weights = nullptr, // per-event weights (null=use default_weight)
-    double* d_phsp_I = nullptr,        // [1] Σ I_e for phsp normalization
-    double* d_phsp_grad = nullptr,     // [NT] Σ I_e * g_e_j for phsp gradient
-    double* d_phsp_hessA = nullptr,    // [NT*NT] Σ I_e * (g·g^T - H) for phsp Hessian
-    int evt_offset = 0)
-{
-    static_assert(Npr >= 1 && Npr <= 3, "Npr must be 1-3");
-    static_assert(Nres >= 1 && Nres <= 4, "Nres must be 1-4");
-
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
-    if (evt >= nEvents) return;
-    int evt_abs = evt + evt_offset;
-    int nTotal = d_momenta->n_events * nPolar;  // total (events*polar) for slamp indexing
-    double weight = d_event_weights ? d_event_weights[evt] : default_weight;
-
-    constexpr int NT = Npr * Nres;  // total free params in this block
-    int sl_per_res = nSL / Nres;
-
-    // ===== AutoDiff variables per resonance =====
-    using AD = Var<double, Npr, true>;
-    AD m0_ad[Nres], g_ad[Nres];
-    int ftg[Nres][Npr];  // local→global mapping
-    for (int r = 0; r < Nres; ++r) {
-        int po = d_resonances[r].param_offset;  // offset in d_all_params
-        m0_ad[r] = AD(d_all_params[po]);
-        m0_ad[r].grad[0] = 1.0;
-        g_ad[r] = AD(d_all_params[po + 1]);
-        g_ad[r].grad[1] = 1.0;
-        for (int j = 0; j < Npr; ++j)
-            ftg[r][j] = d_global_idx[r * Npr + j];
-    }
-
-    // ===== Compute S[p] = Σ_sl v[sl] * slamps[sl,p] * R_sl (double) =====
-    // First pass: compute R_sl values (double, no AD) for S and I
-    double R_val_re[16], R_val_im[16];  // per-SL R values (max 16 SL)
-    double Sr[32] = {0}, Si[32] = {0};
-    for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
-        int res = sl_idx / sl_per_res;
-        cuComplex vv = d_v[sl_idx];
-        const DeviceResonance& target = d_resonances[res];
-        int po = target.param_offset;
-
-        // Compute R_sl (double) for S
-        double Rr = 1.0, Ri = 0.0;
-        for (int ni = 0; ni < decayChain_size; ++ni) {
-            const DecayNode& node = d_decayNodes[ni];
-            const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
-            int L = sl.L;
-            LorentzVector pM  = d_momenta->getMomentum(evt_abs, node.mother_idx);
-            LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
-            LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
-            double mm = pM.M();
-            double md1 = node.mass[1] > 0 ? node.mass[1] : pD1.M();
-            double md2 = node.mass[2] > 0 ? node.mass[2] : pD2.M();
-            double qq = breakup_momentum(mm, md1, md2);
-            // q0 daughter masses: if a daughter IS the resonance, use resonance mass param
-            double m0_q0 = 1.0;
-            if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
-                m0_q0 = d_all_params[po];
-            else if (node.mass[0] > 0) m0_q0 = node.mass[0];
-            double md1_q0 = md1, md2_q0 = md2;
-            if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
-                md1_q0 = d_all_params[po];
-            if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
-                md2_q0 = d_all_params[po];
-            double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
-            double nf_re, nf_im;
-            if (node.mother_idx == target.particle_idx && node.mass[0] <= 0) {
-                double m0v = d_all_params[po], g0v = d_all_params[po+1], qqv = qq, q0v = q0;
-                auto bw = BWR<double>(mm, m0v, g0v, L, qqv, q0v, bf_d);
-                double bf = Bf<double>(L, qq, q0, bf_d);
-                nf_re = bw.real() * bf; nf_im = bw.imag() * bf;
-            } else { double bf = Bf<double>(L, qq, q0, bf_d); nf_re = bf; nf_im = 0.0; }
-            double nr_re = Rr * nf_re - Ri * nf_im;
-            double nr_im = Rr * nf_im + Ri * nf_re;
-            Rr = nr_re; Ri = nr_im;
-        }
-        R_val_re[sl_idx] = Rr; R_val_im[sl_idx] = Ri;
-
-        // Accumulate S[p] = Σ v[sl] * slamp * R_sl
-        for (int p = 0; p < nPolar; ++p) {
-            auto sl_amp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p];
-            double sv_re = sl_amp.real(), sv_im = sl_amp.imag();
-            // v * slamp
-            double vs_re = (double)vv.x * sv_re - (double)vv.y * sv_im;
-            double vs_im = (double)vv.x * sv_im + (double)vv.y * sv_re;
-            // v * slamp * R
-            Sr[p] += vs_re * Rr - vs_im * Ri;
-            Si[p] += vs_im * Rr + vs_re * Ri;
-        }
-    }
-    double I_val = 0.0;
-    for (int p = 0; p < nPolar; ++p) I_val += Sr[p] * Sr[p] + Si[p] * Si[p];
-    if (I_val < 1e-30) return;
-    double inv_I = 1.0 / I_val;
-
-    // ===== Accumulate dS_total[j][p] and d²S[j][k][p] =====
-    double dS_re[NT][32] = {{0}}, dS_im[NT][32] = {{0}};
-    double d2S_re[NT][NT][32] = {{{0}}}, d2S_im[NT][NT][32] = {{{0}}};
-
-    for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
-        int res = sl_idx / sl_per_res;  // which resonance owns this SL
-        if (res >= Nres) continue;
-        cuComplex vv = d_v[sl_idx];
-
-        // AD F for this SL
-        using CV = ComplexVar<double, Npr, true>;
-        CV R_ad(1.0, 0.0);
-        {
-            const DeviceResonance& target = d_resonances[res];
-            AD* m0p = &m0_ad[res];
-            AD* gp = &g_ad[res];
-
-            for (int ni = 0; ni < decayChain_size; ++ni) {
-                const DecayNode& node = d_decayNodes[ni];
-                const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
-                int L = sl.L;
-
-                LorentzVector pM  = d_momenta->getMomentum(evt_abs, node.mother_idx);
-                LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
-                LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
-
-                double mm = pM.M();
-                double md1 = node.mass[1] > 0 ? node.mass[1] : pD1.M();
-                double md2 = node.mass[2] > 0 ? node.mass[2] : pD2.M();
-                double qq = breakup_momentum(mm, md1, md2);
-
-                // q0 with AD: if a daughter IS the resonance, its mass depends on m0
-                AD m0_q0_ad, md1_q0_ad, md2_q0_ad;
-                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
-                    m0_q0_ad = *m0p;
-                else if (node.mass[0] > 0)
-                    m0_q0_ad = AD(node.mass[0]);
-                else
-                    m0_q0_ad = AD(1.0);
-                if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
-                    md1_q0_ad = *m0p;
-                else
-                    md1_q0_ad = AD(md1);
-                if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
-                    md2_q0_ad = *m0p;
-                else
-                    md2_q0_ad = AD(md2);
-
-                AD s_md = md1_q0_ad + md2_q0_ad;
-                AD d_md = md1_q0_ad - md2_q0_ad;
-                AD m0sq = m0_q0_ad * m0_q0_ad;
-                AD q0sq = (m0sq - s_md*s_md) * (m0sq - d_md*d_md) / (AD(4.0) * m0sq);
-                q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-                AD q0_ad = sqrt(q0sq);
-                AD q_ad(qq);
-
-                CV node_factor(1.0, 0.0);
-                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0) {
-                    AD m_ad(mm);
-                    if (target.type == ResModelType::BWR) {
-                        auto bw = BWR<AD>(m_ad, *m0p, *gp, L, q_ad, q0_ad, bf_d);
-                        auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                        node_factor.real = bw.real * bf;
-                        node_factor.imag = bw.imag * bf;
-                    } else {
-                        node_factor = BW<AD>(m_ad, *m0p, *gp);
-                    }
-                } else {
-                    auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                    node_factor.real = bf;
-                    node_factor.imag = AD(0.0);
-                }
-                CV new_R;
-                new_R.real = R_ad.real * node_factor.real - R_ad.imag * node_factor.imag;
-                new_R.imag = R_ad.real * node_factor.imag + R_ad.imag * node_factor.real;
-                R_ad = new_R;
-            }
-        }
-
-        // Accumulate: dS[j][p] = v[sl] * ∂F/∂θ_j * slamp[sl,p]
-        // Here slamp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p]
-        // Note: d_slamps has NOT been divided by R_full because they're pure spin
-        int j0 = res * Npr;
-        for (int p = 0; p < nPolar; ++p) {
-            auto sl_amp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p];
-            double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
-            // T_sl[p] = v[sl] * slamp[sl,p]
-            double t_re = (double)vv.x * sl_re - (double)vv.y * sl_im;
-            double t_im = (double)vv.x * sl_im + (double)vv.y * sl_re;
-
-            for (int j = 0; j < Npr; ++j) {
-                double dFr = R_ad.real.grad[j], dFi = R_ad.imag.grad[j];
-                // dS[j0+j][p] += (dFr + i*dFi) * (t_re + i*t_im)
-                dS_re[j0 + j][p] += dFr * t_re - dFi * t_im;
-                dS_im[j0 + j][p] += dFr * t_im + dFi * t_re;
-            }
-            for (int j = 0; j < Npr; ++j) {
-                for (int k = j; k < Npr; ++k) {
-                    double d2Fr = R_ad.real.hess[j][k], d2Fi = R_ad.imag.hess[j][k];
-                    d2S_re[j0 + j][j0 + k][p] += d2Fr * t_re - d2Fi * t_im;
-                    d2S_im[j0 + j][j0 + k][p] += d2Fr * t_im + d2Fi * t_re;
-                }
-            }
-        }
-    }
-
-    // ===== Compute gradient g[j] from dS_total =====
-    double g[NT] = {0};
-    for (int p = 0; p < nPolar; ++p) {
-        double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;  // conj(S/I) = conj(w)
-        for (int j = 0; j < NT; ++j) {
-            g[j] += cwr * dS_re[j][p] - cwi * dS_im[j][p];
-        }
-    }
-    for (int j = 0; j < NT; ++j) g[j] *= -2.0;
-
-    // ===== Compute Hessian: H = g·g^T - 2/I·Re(conj(dS_k)·dS_j) - 2/I·Re(conj(S)·d²S) =====
-    double H_loc[NT][NT] = {{0}};
-    for (int j = 0; j < NT; ++j) {
-        for (int k = j; k < NT; ++k) {
-            double hjk = g[j] * g[k];  // Term A
-
-            // Term B: -2/I * Σ_p (dS_re_k*dS_re_j + dS_im_k*dS_im_j)
-            double termB = 0.0;
-            for (int p = 0; p < nPolar; ++p)
-                termB += dS_re[k][p] * dS_re[j][p] + dS_im[k][p] * dS_im[j][p];
-            termB *= -2.0 * inv_I;
-            hjk += termB;
-
-            // Term C: -2/I * Re(conj(S)·d²S) = -2 * Re(conj(w)·d²S)
-            // (same-resonance only: j,k from same resonance)
-            int rj = j / Npr, rk = k / Npr;
-            if (rj == rk) {
-                double termC = 0.0;
-                for (int p = 0; p < nPolar; ++p) {
-                    double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;
-                    termC += cwr * d2S_re[j][k][p] - cwi * d2S_im[j][k][p];
-                }
-                termC *= -2.0;
-                hjk += termC;
-            }
-
-            H_loc[j][k] = hjk;
-            if (j != k) H_loc[k][j] = hjk;
-
-            // Accumulate to global Hessian
-            int gj = ftg[rj][j % Npr];
-            int gk = ftg[rk][k % Npr];
-            if (gj >= 0 && gk >= 0) {
-                double contrib = weight * hjk;
-                atomicAdd(&d_hess[gk * hess_ld + gj], contrib);
-                if (j != k) atomicAdd(&d_hess[gj * hess_ld + gk], contrib);
-            }
-            // Phsp: accumulate I * (g·g^T - H) = I * (g[j]*g[k] - hjk)
-            if (default_weight == 0.0 && d_phsp_hessA != nullptr && gj >= 0 && gk >= 0) {
-                atomicAdd(&d_phsp_hessA[gk * NT + gj], I_val * (g[j] * g[k] - hjk));
-                if (j != k) atomicAdd(&d_phsp_hessA[gj * NT + gk], I_val * (g[j] * g[k] - hjk));
-            }
-        }
-    }
-    // Phsp accumulation for I and I*g
-    if (default_weight == 0.0 && d_phsp_I != nullptr) {
-        atomicAdd(d_phsp_I, I_val);
-    }
-    if (default_weight == 0.0 && d_phsp_grad != nullptr) {
-        for (int j = 0; j < NT; ++j) {
-            int gj = ftg[j / Npr][j % Npr];
-            if (gj >= 0) atomicAdd(&d_phsp_grad[gj], I_val * g[j]);
-        }
-    }
-}
 
 // ============================================================
 // Unified Hessian over global free-parameter dimension
@@ -3093,8 +2555,8 @@ void AmpCalc::computeResonanceHessian(
 }
 
 // ============================================================
-// AmpCalc::computeUnifiedHessian (NEW — verified formula)
-// Computes θθ Hessian block using unifiedHessianKernel.
+// AmpCalc::computeUnifiedHessian
+// Computes θθ Hessian block using hessianStage1Kernel + cross-block kernels.
 // ============================================================
 void AmpCalc::computeUnifiedHessian(
     const std::vector<int>& n_events,
