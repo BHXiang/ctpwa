@@ -108,29 +108,15 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     const int nTotal = nEvents * n_polar;
     constexpr int kBlockSize = 256;
 
-    // ----- 持久化资源（首次分配，之后复用） -----
-    static cuComplex* s_d_S = nullptr;
-    static double* s_d_nll = nullptr;
-    static double* s_pinned_nll = nullptr;  // pinned memory for async copy
-    static int s_maxTotal = 0;
-    static cublasHandle_t s_handle = nullptr;
+    // ----- 创建 cuBLAS 句柄 -----
+    cublasHandle_t handle;
+    cublasCreate(&handle);
 
-    if (s_handle == nullptr) {
-        cublasCreate(&s_handle);
-        cudaMallocHost(&s_pinned_nll, sizeof(double));
-    }
-    if (nTotal > s_maxTotal) {
-        if (s_d_S) cudaFree(s_d_S);
-        cudaMalloc(&s_d_S, nTotal * sizeof(cuComplex));
-        s_maxTotal = nTotal;
-    }
-    if (s_d_nll == nullptr) {
-        cudaMalloc(&s_d_nll, sizeof(double));
-    }
-
-    cuComplex* d_S = s_d_S;
-    double* d_nll = s_d_nll;
-    cublasHandle_t handle = s_handle;
+    // ----- 分配临时缓冲区 -----
+    cuComplex* d_S;
+    cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
+    double* d_nll;
+    cudaMalloc(&d_nll, sizeof(double));
 
     // ----- 第一大步：S = A * v -----
     {
@@ -149,8 +135,14 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
         d_S, d_nll, d_weights, nEvents, n_polar);
 
-    // 异步拷回 NLL (不阻塞GPU)
-    cudaMemcpyAsync(s_pinned_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+    // 拷回 NLL
+    double raw_nll;
+    cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+
+    // 若调用者需要 w = S/I（用于共振态梯度），在 conjugate 之前复制
+    if (d_w_out != nullptr) {
+        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+    }
 
     // ----- 第三大步：梯度 grad = -A^H * w -----
     {
@@ -169,15 +161,13 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
         conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
     }
 
-    // 现在同步并读取NLL值（之前是异步拷贝）
-    cudaDeviceSynchronize();
+    // d_w_out already copied before conjugateKernel (above)
 
-    // 若调用者需要 w = S/I（用于共振态梯度），复制到输出 buffer
-    if (d_w_out != nullptr) {
-        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-    }
+    // ----- 清理资源 -----
+    cudaFree(d_S);
+    cudaFree(d_nll);
+    cublasDestroy(handle);
 
-    double raw_nll = *s_pinned_nll;
     return raw_nll;
 }
 
