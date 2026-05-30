@@ -3108,7 +3108,9 @@ void AmpCalc::computeUnifiedHessian(
     double* d_phsp_I,
     double* d_phsp_grad,
     double* d_phsp_hessA,
-    double* d_mixed_out)
+    double* d_mixed_out,
+    double* d_phsp_mixed_sum,
+    double* d_phsp_mixed_t3)
 {
     int n_gpu = static_cast<int>(n_events.size());
     int n_free = nFreeResParams();
@@ -3268,7 +3270,7 @@ void AmpCalc::computeUnifiedHessian(
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mixed_out, nFreeResParams(),
                     nEv, nSL, Npr, nPol, n_amp_total, blk.site,
-                    nTotal_slamp, default_weight, d_w, evt_off);
+                    nTotal_slamp, default_weight, d_w, d_phsp_mixed_sum, d_phsp_mixed_t3, evt_off);
                 cudaDeviceSynchronize();
             }
 
@@ -3289,7 +3291,7 @@ void AmpCalc::computeUnifiedHessian(
                         nSL_A, blkA.site,
                         nEv, nPol, n_amp_total,
                         d_mixed_out, nFreeResParams(),
-                        default_weight, d_w, evt_off);
+                        default_weight, d_w, d_phsp_mixed_sum, d_phsp_mixed_t3, evt_off);
                     cudaDeviceSynchronize();
                 }
             }

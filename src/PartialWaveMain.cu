@@ -2268,6 +2268,12 @@ public:
             double* d_mixed = nullptr;
             cudaMalloc(&d_mixed, 2 * n_amplitudes_ * P * sizeof(double));
             cudaMemset(d_mixed, 0, 2 * n_amplitudes_ * P * sizeof(double));
+            double* d_phsp_mixed_sum = nullptr;
+            double* d_phsp_mixed_t3 = nullptr;
+            cudaMalloc(&d_phsp_mixed_sum, 2 * n_amplitudes_ * P * sizeof(double));
+            cudaMalloc(&d_phsp_mixed_t3, 2 * n_amplitudes_ * sizeof(double));
+            cudaMemset(d_phsp_mixed_sum, 0, 2 * n_amplitudes_ * P * sizeof(double));
+            cudaMemset(d_phsp_mixed_t3, 0, 2 * n_amplitudes_ * sizeof(double));
 
             // Data: weight=+1.0
             {
@@ -2277,7 +2283,7 @@ public:
                 }
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
-                    nullptr, nullptr, nullptr, d_mixed);
+                    nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
             }
 
             // Bkg: weight = -w_e
@@ -2292,9 +2298,12 @@ public:
                 }
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -wb,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
-                    nullptr, nullptr, nullptr, d_mixed);
+                    nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
             }
 
+            double phsp_pf = 1.0, phsp_A = 0.0;
+            int phsp_np = 1;
+            double* phsp_h_pg = nullptr;
             // Phsp: sign=0, accumulate to phsp buffers, then post-process
             {
                 double* d_phsp_I, * d_phsp_grad, * d_phsp_hessA;
@@ -2312,7 +2321,8 @@ public:
 
                 amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
-                    d_phsp_I, d_phsp_grad, d_phsp_hessA, d_mixed);
+                    d_phsp_I, d_phsp_grad, d_phsp_hessA, d_mixed,
+                    d_phsp_mixed_sum, d_phsp_mixed_t3);
 
                 // Phsp post-processing: H_phsp = A/(pf*np)*ΣIA - A/(pf*np)²*ΣIg·ΣIg^T
                 double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
@@ -2334,7 +2344,8 @@ public:
                         h_dh[j * P + k] += c1 * h_ph[j * P + k] + c2 * h_pg[j] * h_pg[k];
 
                 cudaMemcpy(d_hess, h_dh, P * P * sizeof(double), cudaMemcpyHostToDevice);
-                delete[] h_pg; delete[] h_ph; delete[] h_dh;
+                phsp_pf = pf; phsp_A = A; phsp_np = np_tot; phsp_h_pg = h_pg;
+                delete[] h_ph; delete[] h_dh;
             }
 
             // Mixed Hessian: extract d_mixed[2*n_ext × P] → hessian[2*nv × P]
@@ -2342,7 +2353,25 @@ public:
                 std::vector<double> h_mixed(2 * n_amplitudes_ * P);
                 cudaMemcpy(h_mixed.data(), d_mixed, 2 * n_amplitudes_ * P * sizeof(double), cudaMemcpyDeviceToHost);
                 cudaFree(d_mixed);
-
+                // Phsp mixed post-processing: H_phsp = c1_mix * Σ(T1+T2) + c2_mix * ΣK * h_pg^T
+                if (phsp_h_pg) {
+                    std::vector<double> h_sum(2 * n_amplitudes_ * P);
+                    std::vector<double> h_t3(2 * n_amplitudes_);
+                    cudaMemcpy(h_sum.data(), d_phsp_mixed_sum, 2 * n_amplitudes_ * P * sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_t3.data(), d_phsp_mixed_t3, 2 * n_amplitudes_ * sizeof(double), cudaMemcpyDeviceToHost);
+                    cudaFree(d_phsp_mixed_sum); cudaFree(d_phsp_mixed_t3);
+                    double c1m = 2.0 * phsp_A / (phsp_pf * phsp_np);
+                    double c2m = 1.0 * phsp_A / (phsp_pf * phsp_pf * phsp_np * phsp_np);
+                    // Re part: H = +c1m * sum + c2m * t3 * pg
+                    // Im part: H = -c1m * sum - 2*c2m * t3 * pg  (sign from ∂L/∂Im = -2A/(pf*np)*ΣIm)
+                    for (int a = 0; a < n_amplitudes_; ++a) {
+                        for (int j = 0; j < P; ++j) {
+                            h_mixed[a * P + j] += c1m * h_sum[a * P + j] + c2m * h_t3[a] * phsp_h_pg[j];
+                            h_mixed[(n_amplitudes_ + a) * P + j] += -c1m * h_sum[(n_amplitudes_ + a) * P + j] - c2m * h_t3[n_amplitudes_ + a] * phsp_h_pg[j];
+                        }
+                    }
+                    delete[] phsp_h_pg;
+                }
                 std::vector<double> h_proj(2 * nv * P, 0.0);
                 // Project constraints
                 for (const auto& g : params_.constraintGroups()) {
