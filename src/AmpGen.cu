@@ -1269,7 +1269,8 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        const std::vector<Resonance>& resonances,
                        int site,
                        const std::vector<std::vector<int>>& free_indices,
-                       const std::vector<std::vector<std::vector<double>>>& free_ranges)
+                       const std::vector<std::vector<std::vector<double>>>& free_ranges,
+                       const std::set<std::string>& skip_slots_for)
 {
     // 1. 查找或添加 cas 到 cas_list_
     int cas_idx = -1;
@@ -1356,6 +1357,17 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
 
     // 3. 记录参数槽映射
     for (size_t i = 0; i < resonances.size(); ++i) {
+        // Skip slot creation for conjugate resonances (params shared via trans-linked chain)
+        if (skip_slots_for.count(resonances[i].getName())) {
+            auto owner_it = resonance_owners_.find(resonances[i].getName());
+            if (owner_it != resonance_owners_.end()) {
+                conjugate_broadcast_[{block_idx, (int)i}] = owner_it->second;
+            }
+            continue;
+        }
+        // Register as owner for this resonance name
+        resonance_owners_[resonances[i].getName()] = {block_idx, (int)i};
+
         auto ordered_params = resonances[i].getOrderedParams();
         auto expanded = expandFreeIndices(ordered_params, free_indices[i]);
 
@@ -1462,6 +1474,26 @@ void AmpCalc::reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
             cudaFree(d_param_idx);
             cudaFree(d_global_offset);
         }
+
+        // Broadcast theta params to conjugate blocks (cross-chain shared resonances)
+        for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+            int cj_bi = cj_key.first, cj_ri = cj_key.second;
+            int ow_bi = owner_key.first, ow_ri = owner_key.second;
+            auto& cj_block = blocks_[cj_bi];
+            auto& ow_block = blocks_[ow_bi];
+            // Read owner param_offset and param_count from template
+            const auto& h_template = h_templates_[ow_bi];
+            int ow_offset = h_template[ow_ri].param_offset;
+            int ow_count = h_template[ow_ri].param_count;
+            const auto& cj_template = h_templates_[cj_bi];
+            int cj_offset = cj_template[cj_ri].param_offset;
+            // Copy param values from owner to conjugate
+            double* d_ow_params = ow_block.d_all_params[gpu] + ow_offset;
+            double* d_cj_params = cj_block.d_all_params[gpu] + cj_offset;
+            cudaMemcpy(d_cj_params, d_ow_params,
+                       ow_count * sizeof(double), cudaMemcpyDeviceToDevice);
+        }
+        cudaDeviceSynchronize();
 
         // 重跑 computeAmpsKernel
         for (auto& block : blocks_) {

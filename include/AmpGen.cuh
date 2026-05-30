@@ -219,7 +219,8 @@ public:
                   const std::vector<Resonance>& resonances,
                   int site,
                   const std::vector<std::vector<int>>& free_indices,
-                  const std::vector<std::vector<std::vector<double>>>& free_ranges);
+                  const std::vector<std::vector<std::vector<double>>>& free_ranges,
+                  const std::set<std::string>& skip_slots_for = {});
 
     // 用新参数重算所有振幅
     void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
@@ -319,6 +320,11 @@ private:
     std::vector<std::vector<DeviceResonance>> h_templates_;
     std::vector<std::vector<double>> h_param_templates_;
     std::vector<std::vector<double>> h_channel_templates_;
+    // conjugate_broadcast_: 跨链同名共振态参数共享
+    // {conjugate_block_idx, conjugate_res_idx} → {owner_block_idx, owner_res_idx}
+    std::map<std::pair<int,int>, std::pair<int,int>> conjugate_broadcast_;
+    // Track which (block_idx, res_idx) first registered each resonance name
+    std::map<std::string, std::pair<int,int>> resonance_owners_;
 };
 
 // 核函数声明
