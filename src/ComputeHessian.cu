@@ -832,8 +832,10 @@ __global__ void hessianMixedBlockKernel(
             } else {
                 double gj_val = g_ptr[j];
                 double coeff = w * 2.0 * inv_I;
-                d_mixed[global_a * mixed_ld + gj] += -coeff * (term1_re + term2_re + gj_val * term3_re);
-                d_mixed[(n_amp_total + global_a) * mixed_ld + gj] += coeff * (term1_im + term2_im + gj_val * term3_im);
+                double val_re = -coeff * (term1_re + term2_re + gj_val * term3_re);
+                double val_im =  coeff * (term1_im + term2_im + gj_val * term3_im);
+                atomicAdd(&d_mixed[global_a * mixed_ld + gj], val_re);
+                atomicAdd(&d_mixed[(n_amp_total + global_a) * mixed_ld + gj], val_im);
             }
         }
         // d_phsp_t3 is now computed in the pre-pass (computeSfromAmpsKernel),
@@ -904,8 +906,10 @@ __global__ void hessianCrossMixedKernel(
                 atomicAdd(&d_phsp_sum[(n_amp_total + ga) * mixed_ld + gjb], term1_im);
             } else {
                 double coeff = w * 2.0 * inv_I;
-                d_mixed[ga * mixed_ld + gjb] += -coeff * (term1_re + gj_val * term3_re);
-                d_mixed[(n_amp_total + ga) * mixed_ld + gjb] += coeff * (term1_im + gj_val * term3_im);
+                double val_re = -coeff * (term1_re + gj_val * term3_re);
+                double val_im =  coeff * (term1_im + gj_val * term3_im);
+                atomicAdd(&d_mixed[ga * mixed_ld + gjb], val_re);
+                atomicAdd(&d_mixed[(n_amp_total + ga) * mixed_ld + gjb], val_im);
             }
         }
         // d_phsp_t3 is NOT written here: term3 is a per-amplitude sum,
