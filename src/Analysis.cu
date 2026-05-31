@@ -2107,6 +2107,13 @@ public:
 
         torch::Tensor hessian = torch::zeros({total, total}, torch::kFloat64).to(dev);
 
+        // Ensure amplitudes reflect current theta before any Hessian computation
+        if (nt > 0 && theta.numel() > 0) {
+            amp_calc_.reComputeAmps(d_all_amplitudes_,
+                reinterpret_cast<const double*>(theta.data_ptr()),
+                n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+        }
+
         // ========== 耦合参数 Hessian [0:n2, 0:n2] ==========
         if (n2 > 0) {
             torch::Tensor extended_vector = params_.extendVector(vector, dev);
@@ -2235,10 +2242,6 @@ public:
             int P = nt;
             int n_gpu = static_cast<int>(d_all_amplitudes_.size());
             int primary_dev = dev.index();
-
-            amp_calc_.reComputeAmps(d_all_amplitudes_,
-                reinterpret_cast<const double*>(theta.data_ptr()),
-                n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
 
             torch::Tensor extended_v = params_.extendVector(vector, dev);
             int n_ext = extended_v.numel();
