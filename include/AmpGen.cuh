@@ -268,42 +268,6 @@ public:
         double* d_phsp_mixed_sum = nullptr,
         double* d_phsp_mixed_t3 = nullptr);
 
-    void computeResonanceHessian(
-        const std::vector<int>& n_events,     // 每 GPU 的事件数
-        double* d_hess,                       // 输出 [P×P]
-        int hess_ld,                          // leading dimension = P
-        const std::vector<int>& t_offset,
-        const std::vector<double*>& d_event_weights,
-        double default_weight,
-        const cuComplex* d_v,
-        int n_ext,
-        const std::vector<cuComplex*>& d_amp_batches);
-
-    // 计算混合 Hessian ∂²(Σ_e w_e · log I_e) / ∂v_a∂θ_j
-    // 输出 d_mixed [2·n_ext × P_total]（行主序），累加贡献
-    // d_event_weights[gpu]: per-event 权重数组（null → default_weight）
-    void computeMixedHessian(
-        const std::vector<int>& n_events,
-        int n_ext,
-        double* d_mixed, int P_total,
-        const std::vector<int>& t_offset,
-        const std::vector<double*>& d_event_weights,
-        double default_weight,
-        const cuComplex* d_v,
-        const std::vector<cuComplex*>& d_amp_batches);
-
-    // 计算 phsp 贡献 c·log(F) 的 θθ/vθ 二阶导（F = (1/N) Σ I_e）
-    // 同时累加到 d_hess_th [P×P] 和 d_mixed [2·n_ext × P_total]
-    void computePhspContribution(
-        const std::vector<int>& n_phsp_events,
-        double c,
-        int n_ext,
-        double* d_hess_th, int P_total,
-        double* d_mixed,
-        const std::vector<int>& t_offset,
-        const cuComplex* d_v,
-        const std::vector<cuComplex*>& d_amp_phsp);
-
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
@@ -379,28 +343,5 @@ __global__ void resonanceGradientKernel(
     const thrust::complex<double>* d_slamps = nullptr,
     const cuComplex* d_v = nullptr,
     int site = 0);
-
-// 共振态 Hessian 块 kernel：计算 (r,s) 块的 Pr×Ps 子矩阵
-// Pr, Ps: 共振态 r 和 s 的自由参数个数
-// SameRes: r==s 时需 ∂²R/∂θ²（WithHess=true），否则只需 ∂R/∂θ
-template <int Pr, int Ps, bool SameRes>
-__global__ void resonanceHessianBlockKernel(
-    const cuComplex* d_w,              // [nEvents × nPolar] w = S/I
-    const cuComplex* d_T_r,            // [nEvents × nPolar] 共振态 r 的 T
-    const cuComplex* d_T_s,            // [nEvents × nPolar] 共振态 s 的 T
-    const DeviceMomenta* d_momenta,
-    const DecayNode* d_decayNodes,
-    const SL* d_slComb,
-    const DeviceResonance* d_res,
-    const double* d_all_params,
-    int res_r_idx, int res_s_idx,      // 在 d_res 中的下标
-    const int* d_param_map_r,          // [Pr]
-    const int* d_param_map_s,          // [Ps]
-    double* d_hess,                    // 输出 [P×P]
-    int hess_ld,                       // leading dim = P
-    int offset_r, int offset_s,        // 在 Hessian 中的起始行列
-    int nEvents, int nPolar,
-    int decayChain_size, double bf_d,
-    double sign = 1.0);                // +1=data/-1=bkg
 
 #endif // AMPGEN_CUH
