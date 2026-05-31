@@ -2284,16 +2284,6 @@ public:
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
 
-                // 打印d_hess全部
-                std::vector<double> h_hess(P* P);
-                cudaMemcpy(h_hess.data(), d_hess, P* P * sizeof(double), cudaMemcpyDeviceToHost);
-                std::cout << "Data Hessian contribution (P=" << P << "):" << std::endl;
-                for (int j = 0; j < P; ++j) {
-                    for (int k = 0; k < P; ++k) {
-                        std::cout << h_hess[j * P + k] << " ";
-                    }
-                    std::cout << std::endl;
-                }
             }
 
             // Bkg: weight = -w_e
@@ -2310,16 +2300,6 @@ public:
                     d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
 
-                // 打印d_hess全部
-                std::vector<double> h_hess(P* P);
-                cudaMemcpy(h_hess.data(), d_hess, P* P * sizeof(double), cudaMemcpyDeviceToHost);
-                std::cout << "bkg Hessian contribution (P=" << P << "):" << std::endl;
-                for (int j = 0; j < P; ++j) {
-                    for (int k = 0; k < P; ++k) {
-                        std::cout << h_hess[j * P + k] << " ";
-                    }
-                    std::cout << std::endl;
-                }
             }
 
             double phsp_pf = 1.0, phsp_A = 0.0;
@@ -2345,19 +2325,6 @@ public:
                     d_phsp_I, d_phsp_grad, d_phsp_hessA, d_mixed,
                     d_phsp_mixed_sum, d_phsp_mixed_t3);
 
-                // 打印d_hess全部
-                std::vector<double> h_hess(P * P);
-                cudaMemcpy(h_hess.data(), d_hess, P * P * sizeof(double), cudaMemcpyDeviceToHost);
-                std::cout << "phsp Hessian contribution before post-processing (P=" << P << "):" << std::endl;
-                for (int j = 0; j < P; ++j) {
-                    for (int k = 0; k < P; ++k) {
-                        std::cout << h_hess[j * P + k] << " ";
-                    }
-                    std::cout << std::endl;
-                }
-
-                // Phsp post-processing: H_phsp = A/(pf*np)*ΣIA - A/(pf*np)²*ΣIg·ΣIg^T
-                double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
                 cudaMemcpy(&h_pI, d_phsp_I, sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_pg, d_phsp_grad, P * sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_ph, d_phsp_hessA, P* P * sizeof(double), cudaMemcpyDeviceToHost);
