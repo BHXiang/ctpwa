@@ -2325,6 +2325,7 @@ public:
                     d_phsp_I, d_phsp_grad, d_phsp_hessA, d_mixed,
                     d_phsp_mixed_sum, d_phsp_mixed_t3);
 
+                double h_pI, * h_pg = new double[P], * h_ph = new double[P * P], * h_dh = new double[P * P];
                 cudaMemcpy(&h_pI, d_phsp_I, sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_pg, d_phsp_grad, P * sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_ph, d_phsp_hessA, P* P * sizeof(double), cudaMemcpyDeviceToHost);
