@@ -2658,6 +2658,8 @@ void AmpCalc::computeUnifiedHessian(
 
         temps_per_gpu[gpu].resize(blocks_.size());
 
+        bool first_free_block = true;  // track first block with free params for phsp_I
+
         for (size_t bi = 0; bi < blocks_.size(); ++bi) {
             auto& blk = blocks_[bi];
             auto& cas = cas_list_[blk.cas_idx];
@@ -2710,7 +2712,7 @@ void AmpCalc::computeUnifiedHessian(
                     blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
             } else if (Npr == 2 && Nres == 1) {
                 hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
@@ -2719,10 +2721,11 @@ void AmpCalc::computeUnifiedHessian(
                     blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (bi == 0 ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
             } else {
                 printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
             }
+            first_free_block = false;
             cudaDeviceSynchronize();
         }
 
