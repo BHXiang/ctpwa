@@ -917,3 +917,9 @@ __global__ void hessianCrossMixedKernel(
         // Writing again from cross-block would double-count.
     }
 }
+
+// Trivial kernel: negate per-event weights in-place (out[i] = -in[i])
+__global__ void negateWeightsKernel(double* out, const double* in, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = -in[i];
+}
