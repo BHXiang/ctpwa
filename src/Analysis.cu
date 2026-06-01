@@ -2289,20 +2289,36 @@ public:
 
             }
 
-            // Bkg: weight = -w_e
+            // Bkg: weight = -w_e (per-event weights, negated)
             {
                 std::vector<int> n_bkg_ev(n_gpu, 0), bkg_off(n_gpu, 0);
                 for (int g = 0; g < n_gpu; ++g) {
                     n_bkg_ev[g] = events_[g][2]; bkg_off[g] = events_[g][0] + events_[g][1];
                 }
-                double wb = 1.0;  // default: each bkg event weight=1
-                if (!bkg_weights_.empty() && bkg_weights_[0] != nullptr) {
-                    cudaMemcpy(&wb, bkg_weights_[0], sizeof(double), cudaMemcpyDeviceToHost);
+                // Negate per-event bkg weights for Hessian (NLL = -Σ w·log I, so Hessian uses -w)
+                std::vector<double*> neg_bkg_weights;
+                for (int g = 0; g < n_gpu; ++g) {
+                    double* d_neg = nullptr;
+                    if (g < (int)bkg_weights_.size() && bkg_weights_[g] != nullptr && n_bkg_ev[g] > 0) {
+                        cudaSetDevice(g);
+                        cudaMalloc(&d_neg, n_bkg_ev[g] * sizeof(double));
+                        // Copy and negate: d_neg[i] = -bkg_weights_[g][i]
+                        constexpr int kBlock = 256;
+                        int grid = (n_bkg_ev[g] + kBlock - 1) / kBlock;
+                        negateWeightsKernel<<<grid, kBlock>>>(d_neg, bkg_weights_[g], n_bkg_ev[g]);
+                    }
+                    neg_bkg_weights.push_back(d_neg);
                 }
-                amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -wb,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                cudaSetDevice(primary_dev);
+                amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -1.0,
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_,
+                    neg_bkg_weights,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
-
+                // Free negated copies
+                for (int g = 0; g < n_gpu; ++g) {
+                    if (neg_bkg_weights[g]) { cudaSetDevice(g); cudaFree(neg_bkg_weights[g]); }
+                }
+                cudaSetDevice(primary_dev);
             }
 
             double phsp_pf = 1.0, phsp_A = 0.0;
