@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -36,11 +38,26 @@ ConfigParser::ConfigParser(const std::string &config_file)
         if (config["Data"])
             parseData(config["Data"]);
 
-        if (config["DecayChains"])
-            parseDecayChains(config["DecayChains"]);
+        // Parse identical groups from Constraints BEFORE DecayChains
+        // so that symmetrize auto-detection can see them
+        if (config["Constraints"] && config["Constraints"]["identical"]) {
+            int group_idx = 1;
+            for (const auto& group : config["Constraints"]["identical"]) {
+                auto names = group.as<std::vector<std::string>>();
+                std::string group_name = "identical" + std::to_string(group_idx++);
+                for (auto& p : particles_) {
+                    for (const auto& name : names) {
+                        if (p.name == name) p.identical_group = group_name;
+                    }
+                }
+            }
+        }
 
         if (config["Resonances"])
             parseResonances(config["Resonances"]);
+
+        if (config["DecayChains"])
+            parseDecayChains(config["DecayChains"]);
 
         if (config["Constraints"])
             parseConstraints(config["Constraints"]);
@@ -346,86 +363,388 @@ void ConfigParser::parseData(const YAML::Node &node)
 
 void ConfigParser::parseDecayChains(const YAML::Node &node)
 {
+    // Build set of known particle names for compact format detection
+    std::set<std::string> particle_names;
+    for (const auto& p : particles_) particle_names.insert(p.name);
+
     for (const auto &chain_node : node) {
         std::string chain_name = chain_node.first.as<std::string>();
         const auto &chain_data = chain_node.second;
 
-        DecayChainConfig chain;
-        chain.name = chain_name;
+        // ---------------------------------------------------------------
+        // Detect compact format:
+        //   No "decay" key, has a particle-name key whose value is a
+        //   sequence of [bachelor, intermediate] pairs.
+        // ---------------------------------------------------------------
+        std::string mother;
+        bool is_compact = false;
 
-        // 解析衰变步骤
-        if (chain_data["decay"]) {
-            for (const auto &step_node : chain_data["decay"]) {
-                for (const auto &decay_pair : step_node) {
-                    DecayStep step;
-                    step.mother = decay_pair.first.as<std::string>();
-
-                    if (decay_pair.second.IsSequence()) {
-                        // 紧凑格式: mother: [daughter1, daughter2]
-                        step.daughters =
-                            decay_pair.second.as<std::vector<std::string>>();
-                    } else if (decay_pair.second.IsMap()) {
-                        // 扩展格式: mother: { daughters: [...], is_bf: bool, p_break: bool }
-                        step.daughters =
-                            decay_pair.second["daughters"]
-                                .as<std::vector<std::string>>();
-                        if (decay_pair.second["is_bf"])
-                            step.is_bf = decay_pair.second["is_bf"].as<bool>();
-                        if (decay_pair.second["p_break"])
-                            step.p_break =
-                                decay_pair.second["p_break"].as<bool>();
+        if (!chain_data["decay"]) {
+            for (const auto& kv : chain_data) {
+                std::string key = kv.first.as<std::string>();
+                if (key == "intermediates" || key == "legend" || key == "symmetrize")
+                    continue;
+                if (particle_names.count(key) && kv.second.IsSequence()) {
+                    // Must be a sequence of [bachelor, intermediate] pairs
+                    if (kv.second.size() > 0 &&
+                        kv.second[0].IsSequence() &&
+                        kv.second[0].size() == 2) {
+                        mother = key;
+                        is_compact = true;
+                        break;
                     }
-                    chain.decay_steps.push_back(step);
                 }
             }
         }
 
-        // 解析共振态链
-        for (const auto &res_node : chain_data) {
-            std::string key = res_node.first.as<std::string>();
-            if (key != "decay" && key != "legend") {
-                ResonanceChainConfig res_chain;
-                res_chain.intermediate = key;
+        if (is_compact) {
+            // ============================================================
+            // Compact format — expand one block into N DecayChainConfigs
+            // ============================================================
+            const auto& channels = chain_data[mother];
 
-                for (const auto &spin_node : res_node.second) {
-                    for (const auto &spin_pair : spin_node) {
-                        SpinChainConfig spin_chain;
+            // --- Parse intermediate decays ---
+            // Single mode:  R_KK: [Kp, Km]  or  [Kp, Km, {opts}]
+            // Multi mode:   R1: [[R2, R3], [R4, R5, {p_break: true}]]
+            struct IntDecay {
+                std::string d1, d2;
+                bool is_bf = true;
+                bool p_break = false;
+            };
+            std::map<std::string, std::vector<IntDecay>> int_decay_modes;
+            for (const auto& kv : chain_data) {
+                std::string key = kv.first.as<std::string>();
+                if (key == mother || key == "intermediates" ||
+                    key == "legend" || key == "symmetrize")
+                    continue;
+                if (!kv.second.IsSequence() || kv.second.size() == 0) continue;
 
-                        // 解析自旋宇称 [J, P]
-                        if (spin_pair.first.IsSequence()) {
-                            for (const auto &jp : spin_pair.first) {
-                                if (jp["J"]) {
-                                    std::string j_str =
-                                        jp["J"].as<std::string>();
-                                    spin_chain.spin_parity.push_back(
-                                        2 * transJValue(j_str) + 1);
+                auto parseOneMode = [](const YAML::Node& node) -> IntDecay {
+                    IntDecay id;
+                    id.d1 = node[0].as<std::string>();
+                    id.d2 = node[1].as<std::string>();
+                    if (node.size() >= 3 && node[2].IsMap()) {
+                        const auto& dopts = node[2];
+                        if (dopts["is_bf"])   id.is_bf   = dopts["is_bf"].as<bool>();
+                        if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
+                    }
+                    return id;
+                };
+
+                if (kv.second[0].IsSequence()) {
+                    // Multi-mode: [[R2,R3], [R4,R5], ...]
+                    for (const auto& mode : kv.second)
+                        int_decay_modes[key].push_back(parseOneMode(mode));
+                } else if (kv.second.size() >= 2 && kv.second[0].IsScalar()) {
+                    // Single mode: [Kp, Km]
+                    int_decay_modes[key].push_back(parseOneMode(kv.second));
+                }
+            }
+
+            // Helper: get default mode for an intermediate (for BFS)
+            auto getDecayMode = [&](const std::string& name, size_t idx = 0) -> const IntDecay* {
+                auto it = int_decay_modes.find(name);
+                if (it == int_decay_modes.end() || idx >= it->second.size()) return nullptr;
+                return &it->second[idx];
+            };
+
+            // --- Parse intermediates resonance sub-block ---
+            // Two formats:
+            //   Explicit JP:  R_KK: [{J: 1, P: -1}: [phi1680]]
+            //   Auto-detect:  R_KK: [phi1680]   or   [phi1680, phi2170]
+            std::map<std::string, ResonanceChainConfig> res_chain_map;
+            if (chain_data["intermediates"]) {
+                for (const auto& res_node : chain_data["intermediates"]) {
+                    std::string int_name = res_node.first.as<std::string>();
+                    ResonanceChainConfig res_chain;
+                    res_chain.intermediate = int_name;
+
+                    for (const auto& spin_node : res_node.second) {
+                        if (spin_node.IsMap()) {
+                            // Explicit JP: {[J:1,P:-1]: [phi1680]}
+                            for (const auto& spin_pair : spin_node) {
+                                SpinChainConfig spin_chain;
+
+                                if (spin_pair.first.IsSequence()) {
+                                    for (const auto& jp : spin_pair.first) {
+                                        if (jp["J"]) {
+                                            std::string j_str = jp["J"].as<std::string>();
+                                            spin_chain.spin_parity.push_back(
+                                                2 * transJValue(j_str) + 1);
+                                        }
+                                        if (jp["P"])
+                                            spin_chain.spin_parity.push_back(
+                                                jp["P"].as<int>());
+                                    }
                                 }
-                                if (jp["P"])
-                                    spin_chain.spin_parity.push_back(
-                                        jp["P"].as<int>());
+
+                                spin_chain.resonances =
+                                    spin_pair.second.as<std::vector<std::string>>();
+                                res_chain.spin_chains.push_back(spin_chain);
+                            }
+                        } else if (spin_node.IsSequence()) {
+                            // Auto-detect: [phi1680] or [phi1680, phi2170]
+                            // Group resonances by (J, P) from the Resonances section
+                            std::map<std::pair<int,int>, std::vector<std::string>> jp_groups;
+                            for (const auto& rname_node : spin_node) {
+                                std::string rname = rname_node.as<std::string>();
+                                auto rit = resonances_.find(rname);
+                                if (rit != resonances_.end()) {
+                                    jp_groups[{rit->second.J, rit->second.P}].push_back(rname);
+                                } else {
+                                    std::cerr << "Warning: resonance '" << rname
+                                              << "' not found in Resonances section" << std::endl;
+                                }
+                            }
+                            for (const auto& [jp, names] : jp_groups) {
+                                SpinChainConfig spin_chain;
+                                spin_chain.spin_parity = {jp.first, jp.second};
+                                spin_chain.resonances = names;
+                                res_chain.spin_chains.push_back(spin_chain);
                             }
                         }
+                    }
+                    res_chain_map[int_name] = res_chain;
+                }
+            }
 
-                        // 解析共振态列表
-                        spin_chain.resonances =
-                            spin_pair.second.as<std::vector<std::string>>();
-                        res_chain.spin_chains.push_back(spin_chain);
+            // --- symmetrize ---
+            bool symmetrize = false;
+            if (chain_data["symmetrize"])
+                symmetrize = chain_data["symmetrize"].as<bool>();
+
+            // --- Expand each channel: for multi-mode intermediates, generate one chain per mode ---
+            for (const auto& ch : channels) {
+                std::string bachelor = ch[0].as<std::string>();
+                std::string intermediate = ch[1].as<std::string>();
+
+                // Parse per-channel constraints (3rd element) — overrides all defaults
+                bool ch_symmetrize = symmetrize;
+                bool ch_is_bf1 = true, ch_is_bf2 = true;
+                bool ch_p_break1 = false, ch_p_break2 = false;
+                bool has_ch_is_bf = false, has_ch_p_break = false;
+                std::vector<std::string> ch_legend;
+
+                if (ch.size() >= 3 && ch[2].IsMap()) {
+                    const auto& opts = ch[2];
+                    if (opts["symmetrize"])
+                        ch_symmetrize = opts["symmetrize"].as<bool>();
+                    if (opts["legend"])
+                        ch_legend = opts["legend"].as<std::vector<std::string>>();
+                    if (opts["is_bf"]) {
+                        has_ch_is_bf = true;
+                        if (opts["is_bf"].IsSequence()) {
+                            ch_is_bf1 = opts["is_bf"][0].as<bool>();
+                            ch_is_bf2 = opts["is_bf"][1].as<bool>();
+                        } else {
+                            ch_is_bf1 = ch_is_bf2 = opts["is_bf"].as<bool>();
+                        }
+                    }
+                    if (opts["p_break"]) {
+                        has_ch_p_break = true;
+                        if (opts["p_break"].IsSequence()) {
+                            ch_p_break1 = opts["p_break"][0].as<bool>();
+                            ch_p_break2 = opts["p_break"][1].as<bool>();
+                        } else {
+                            ch_p_break1 = ch_p_break2 = opts["p_break"].as<bool>();
+                        }
                     }
                 }
-                chain.resonance_chains.push_back(res_chain);
+
+                // How many decay modes for the first intermediate?
+                size_t n_modes = 1;
+                auto modes_it = int_decay_modes.find(intermediate);
+                if (modes_it != int_decay_modes.end())
+                    n_modes = modes_it->second.size();
+
+                for (size_t mi = 0; mi < n_modes; ++mi) {
+                    // Multi-mode filter: skip modes where bachelor appears
+                    // in the decay products (would duplicate a particle)
+                    if (n_modes > 1) {
+                        const IntDecay* mode = getDecayMode(intermediate, mi);
+                        if (mode && (mode->d1 == bachelor || mode->d2 == bachelor))
+                            continue;
+                    }
+
+                    DecayChainConfig chain;
+                    chain.name = chain_name + "_" + intermediate;
+                    if (n_modes > 1)
+                        chain.name += "_" + std::to_string(mi);
+
+                    // --- Step 1: mother → bachelor + first intermediate ---
+                    DecayStep step1;
+                    step1.mother = mother;
+                    step1.daughters = {bachelor, intermediate};
+                    step1.is_bf = ch_is_bf1;
+                    step1.p_break = ch_p_break1;
+                    chain.decay_steps.push_back(step1);
+
+                    // If no decay defined for this intermediate, skip BFS
+                    const IntDecay* first_mode = getDecayMode(intermediate, mi);
+                    if (!first_mode) {
+                        // Still push if there are resonance chains
+                        if (res_chain_map.count(intermediate))
+                            chain.resonance_chains.push_back(res_chain_map[intermediate]);
+                        chain.legend_template = ch_legend.empty()
+                            ? std::vector<std::string>{intermediate, " ", bachelor}
+                            : ch_legend;
+                        chain.symmetrize = ch_symmetrize;
+                        decay_chains_.push_back(chain);
+                        continue;
+                    }
+
+                    // Step 2 defaults: use the selected decay mode's settings
+                    bool step2_is_bf   = has_ch_is_bf   ? ch_is_bf2   : first_mode->is_bf;
+                    bool step2_p_break = has_ch_p_break ? ch_p_break2 : first_mode->p_break;
+
+                    // --- BFS: recursively resolve intermediates ---
+                    // Queue carries (intermediate_name, mode_selection, is_first)
+                    // After the first, all deeper intermediates use mode 0
+                    struct BFSItem { std::string name; bool is_first; bool bf, pb; };
+                    std::queue<BFSItem> queue;
+                    queue.push({intermediate, true, step2_is_bf, step2_p_break});
+
+                    while (!queue.empty()) {
+                        auto item = queue.front(); queue.pop();
+                        const IntDecay* mode = getDecayMode(item.name,
+                            item.is_first ? mi : 0);
+                        if (!mode) continue;
+
+                        DecayStep substep;
+                        substep.mother = item.name;
+                        substep.daughters = {mode->d1, mode->d2};
+                        substep.is_bf   = item.bf;
+                        substep.p_break = item.pb;
+                        chain.decay_steps.push_back(substep);
+
+                        // Resonance chain for this intermediate
+                        if (res_chain_map.count(item.name))
+                            chain.resonance_chains.push_back(res_chain_map[item.name]);
+
+                        // Enqueue any daughter that is itself an intermediate
+                        auto enqueue = [&](const std::string& d) {
+                            if (int_decay_modes.count(d)) {
+                                const auto* dm = getDecayMode(d, 0);
+                                queue.push({d, false,
+                                    dm ? dm->is_bf   : true,
+                                    dm ? dm->p_break : false});
+                            }
+                        };
+                        enqueue(mode->d1);
+                        enqueue(mode->d2);
+                    }
+
+                    // --- symmetrize: auto-detect ---
+                    {
+                        bool sym_explicit = (ch.size() >= 3 && ch[2].IsMap() &&
+                                             ch[2]["symmetrize"]);
+                        if (sym_explicit) {
+                            chain.symmetrize = ch_symmetrize;
+                        } else {
+                            // Use symmetrize from block-level default
+                            chain.symmetrize = symmetrize;
+                            // Also auto-detect: any step has identical daughters?
+                            for (const auto& step : chain.decay_steps) {
+                                const Particle *pd1 = nullptr, *pd2 = nullptr;
+                                for (const auto& p : particles_) {
+                                    if (p.name == step.daughters[0]) pd1 = &p;
+                                    if (p.name == step.daughters[1]) pd2 = &p;
+                                }
+                                if (pd1 && pd2 &&
+                                    !pd1->identical_group.empty() &&
+                                    pd1->identical_group == pd2->identical_group) {
+                                    chain.symmetrize = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Legend ---
+                    if (!ch_legend.empty())
+                        chain.legend_template = ch_legend;
+                    else
+                        chain.legend_template = {intermediate, " ", bachelor};
+
+                    decay_chains_.push_back(chain);
+                } // for each mode
             }
+
+        } else {
+            // ============================================================
+            // Original format (unchanged)
+            // ============================================================
+            DecayChainConfig chain;
+            chain.name = chain_name;
+
+            // 解析衰变步骤
+            if (chain_data["decay"]) {
+                for (const auto &step_node : chain_data["decay"]) {
+                    for (const auto &decay_pair : step_node) {
+                        DecayStep step;
+                        step.mother = decay_pair.first.as<std::string>();
+
+                        if (decay_pair.second.IsSequence()) {
+                            step.daughters =
+                                decay_pair.second.as<std::vector<std::string>>();
+                        } else if (decay_pair.second.IsMap()) {
+                            step.daughters =
+                                decay_pair.second["daughters"]
+                                    .as<std::vector<std::string>>();
+                            if (decay_pair.second["is_bf"])
+                                step.is_bf = decay_pair.second["is_bf"].as<bool>();
+                            if (decay_pair.second["p_break"])
+                                step.p_break =
+                                    decay_pair.second["p_break"].as<bool>();
+                        }
+                        chain.decay_steps.push_back(step);
+                    }
+                }
+            }
+
+            // 解析共振态链
+            for (const auto &res_node : chain_data) {
+                std::string key = res_node.first.as<std::string>();
+                if (key != "decay" && key != "legend") {
+                    ResonanceChainConfig res_chain;
+                    res_chain.intermediate = key;
+
+                    for (const auto &spin_node : res_node.second) {
+                        for (const auto &spin_pair : spin_node) {
+                            SpinChainConfig spin_chain;
+
+                            if (spin_pair.first.IsSequence()) {
+                                for (const auto &jp : spin_pair.first) {
+                                    if (jp["J"]) {
+                                        std::string j_str =
+                                            jp["J"].as<std::string>();
+                                        spin_chain.spin_parity.push_back(
+                                            2 * transJValue(j_str) + 1);
+                                    }
+                                    if (jp["P"])
+                                        spin_chain.spin_parity.push_back(
+                                            jp["P"].as<int>());
+                                }
+                            }
+
+                            spin_chain.resonances =
+                                spin_pair.second.as<std::vector<std::string>>();
+                            res_chain.spin_chains.push_back(spin_chain);
+                        }
+                    }
+                    chain.resonance_chains.push_back(res_chain);
+                }
+            }
+
+            if (chain_data["legend"])
+                chain.legend_template =
+                    chain_data["legend"].as<std::vector<std::string>>();
+
+            if (chain_data["symmetrize"])
+                chain.symmetrize = chain_data["symmetrize"].as<bool>();
+
+            decay_chains_.push_back(chain);
         }
-
-        // 解析legend模板
-        if (chain_data["legend"])
-            chain.legend_template =
-                chain_data["legend"].as<std::vector<std::string>>();
-
-        // 解析全同粒子对称化标记
-        if (chain_data["symmetrize"])
-            chain.symmetrize = chain_data["symmetrize"].as<bool>();
-
-        decay_chains_.push_back(chain);
     }
 }
 
@@ -524,29 +843,40 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
         }
     }
 
-    // 解析 full 约束（同时包含实部和虚部）
+    // 解析 trans 约束 — 三种格式:
+    //   矩阵:  - [A, B]: [[-1, -1]]           → 复数矩阵
+    //   列表:  - [A, B]: [1]  或  [-1]       → 实数标量列表
+    //   标量:  - [A, B]: 1    或  -1          → 单个实数
     if (node["trans"]) {
         for (const auto &constraint_list : node["trans"]) {
             for (const auto &pair : constraint_list) {
                 ConstraintConfig constraint;
                 constraint.type = "trans";
-
-                // 解析链名列表
                 constraint.names = pair.first.as<std::vector<std::string>>();
-
-                // 解析约束值
                 const YAML::Node &values = pair.second;
+
                 if (values.IsSequence()) {
-                    for (const auto &row : values) {
-                        if (row.IsSequence() && row.size() >= 2) {
-                            double real_val = row[0].as<double>();
-                            double imag_val = row[1].as<double>();
-                            // constraint.constraints.emplace_back(real_val,
-                            // imag_val);
+                    if (values.size() > 0 && values[0].IsSequence()) {
+                        // Matrix format: [[-1, -1], [0, 1], ...]
+                        for (const auto &row : values) {
+                            if (row.IsSequence() && row.size() >= 2) {
+                                constraint.values.push_back(
+                                    std::complex<double>(
+                                        row[0].as<double>(),
+                                        row[1].as<double>()));
+                            }
+                        }
+                    } else {
+                        // Simple list format: [1] or [-1, 1, ...]
+                        for (const auto &v : values) {
                             constraint.values.push_back(
-                                std::complex<double>(real_val, imag_val));
+                                std::complex<double>(v.as<double>(), 0.0));
                         }
                     }
+                } else if (values.IsScalar()) {
+                    // Scalar format: 1 or -1
+                    constraint.values.push_back(
+                        std::complex<double>(values.as<double>(), 0.0));
                 }
 
                 constraints_.push_back(constraint);

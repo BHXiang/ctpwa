@@ -292,4 +292,65 @@ inline std::pair<torch::Tensor, torch::Tensor> Parameters::splitParams(
     return {vector, theta};
 }
 
+// ============================================================
+// CouplingMatrixBuilder: decompose amplitude couplings into
+// chain-level × step-level SL parameters.
+// M[i][j] = contribution of free param j to amplitude i.
+// ============================================================
+
+#include <algorithm>
+#include <iostream>
+#include <set>
+
+// Lightweight SL key (independent of AmpGen.cuh's SL)
+struct SLKey { int S; int L; };
+
+struct StepCouplingDef {
+    std::string label;
+    std::string key;
+    std::vector<SLKey> sl_list;
+    int first_free_idx = -1;
+    int n_sl() const { return static_cast<int>(sl_list.size()); }
+};
+
+struct AmpStepSLMap {
+    int amp_idx;
+    std::string chain_key;
+    std::vector<std::pair<int,int>> step_sl;  // (step_idx, sl_idx)
+};
+
+struct CouplingMatrixResult {
+    int n_amps;
+    int n_step_free;
+    int n_chain_free;
+    int n_free;  // n_step_free + n_chain_free
+    std::vector<StepCouplingDef> steps;
+    std::vector<std::string> chain_names;
+    std::vector<AmpStepSLMap> amp_map;
+    // coupling[i] = chain_params[c_i] × Π step_params[s]
+    std::vector<int> amp_chain;
+    std::vector<std::vector<int>> amp_step_params;
+
+};
+
+class CouplingMatrixBuilder {
+public:
+    int addStep(const std::string& key, const std::string& label,
+                const std::vector<SLKey>& sl_list);
+    void addAmplitude(int amp_idx, const std::string& chain_key,
+                      const std::vector<std::pair<int,int>>& step_sl);
+    const std::vector<StepCouplingDef>& getSteps() const { return steps_; }
+    CouplingMatrixResult build() const;
+
+private:
+    std::vector<StepCouplingDef> steps_;
+    std::vector<AmpStepSLMap> amp_map_;
+};
+
+// Build dense coupling matrix M from CouplingMatrixResult.
+// Also returns the gradient transform: grad_free = M^T × grad_amps.
+// On host, fills h_M with [n_amps × n_free] doubles (row-major).
+void buildCouplingMatrix(const CouplingMatrixResult& r,
+                         std::vector<double>& h_M);
+
 #endif // PARAMETERS_CUH

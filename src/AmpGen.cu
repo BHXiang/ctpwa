@@ -1,5 +1,6 @@
 #include <AmpGen.cuh>
 #include <ComputeNLL.cuh>
+#include <Parameters.cuh>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <cuda_runtime.h>
@@ -2134,4 +2135,125 @@ void AmpCalc::testBWRHessian(double m, double m0, double g0, int L, double q, do
     out[4] = R.imag.grad[0]; out[5] = R.imag.grad[1];
     out[6] = R.real.hess[0][0]; out[7] = R.real.hess[0][1]; out[8] = R.real.hess[1][1];
     out[9] = R.imag.hess[0][0]; out[10]= R.imag.hess[0][1]; out[11]= R.imag.hess[1][1];
+}
+
+// ============================================================
+// CouplingMatrixBuilder implementations
+// ============================================================
+
+int CouplingMatrixBuilder::addStep(const std::string& key, const std::string& label,
+                                    const std::vector<SLKey>& sl_list) {
+    for (size_t si = 0; si < steps_.size(); ++si)
+        if (steps_[si].key == key) return static_cast<int>(si);
+    StepCouplingDef s;
+    s.key = key; s.label = label; s.sl_list = sl_list;
+    steps_.push_back(s);
+    return static_cast<int>(steps_.size() - 1);
+}
+
+void CouplingMatrixBuilder::addAmplitude(int amp_idx, const std::string& chain_key,
+                                          const std::vector<std::pair<int,int>>& step_sl) {
+    AmpStepSLMap m;
+    m.amp_idx = amp_idx; m.chain_key = chain_key; m.step_sl = step_sl;
+    amp_map_.push_back(m);
+}
+
+CouplingMatrixResult CouplingMatrixBuilder::build() const {
+    CouplingMatrixResult r;
+    r.steps = steps_;
+    r.amp_map = amp_map_;
+    r.n_amps = static_cast<int>(amp_map_.size());
+
+    int sp_idx = 0;
+    for (size_t si = 0; si < steps_.size(); ++si) {
+        auto& s = r.steps[si];
+        s.first_free_idx = -1;
+        if (s.n_sl() > 1) { s.first_free_idx = sp_idx; sp_idx += s.n_sl() - 1; }
+    }
+    r.n_step_free = sp_idx;
+
+    std::vector<std::string> chain_keys;
+    for (const auto& am : amp_map_) {
+        auto it = std::find(chain_keys.begin(), chain_keys.end(), am.chain_key);
+        if (it == chain_keys.end()) chain_keys.push_back(am.chain_key);
+    }
+    r.chain_names = chain_keys;
+    r.n_chain_free = static_cast<int>(chain_keys.size());
+    r.n_free = r.n_step_free + r.n_chain_free;
+
+    r.amp_chain.assign(r.n_amps, -1);
+    r.amp_step_params.resize(r.n_amps);
+    for (const auto& am : amp_map_) {
+        int ai = am.amp_idx;
+        if (ai < 0 || ai >= r.n_amps) continue;
+        auto cit = std::find(chain_keys.begin(), chain_keys.end(), am.chain_key);
+        r.amp_chain[ai] = static_cast<int>(cit - chain_keys.begin());
+        for (const auto& [step_idx, sl_idx] : am.step_sl) {
+            if (step_idx < 0 || step_idx >= (int)r.steps.size()) continue;
+            if (sl_idx > 0 && r.steps[step_idx].first_free_idx >= 0)
+                r.amp_step_params[ai].push_back(r.steps[step_idx].first_free_idx + sl_idx - 1);
+        }
+    }
+    return r;
+}
+
+// Build dense coupling matrix M[n_amps × n_free] in row-major order.
+// coupling[i] = chain_param[c_i] × Π step_param[amp_step_params[i]]
+// The first n_step_free columns are step params, the last n_chain_free are chain params.
+void buildCouplingMatrix(const CouplingMatrixResult& r, std::vector<double>& h_M) {
+    h_M.assign(r.n_amps * r.n_free, 0.0);
+    for (int i = 0; i < r.n_amps; ++i) {
+        // Start with chain param contribution (column offset by n_step_free)
+        h_M[i * r.n_free + r.n_step_free + r.amp_chain[i]] = 1.0;
+        // Step param contributions: multiply in place
+        // For the dense matrix, the coupling is: chain param × Π step params
+        // In matrix form, this is bilinear. For now: store the linearized
+        // representation where each free param contributes additively with
+        // coupling = Σ_j M[i][j] · p[j]
+        // TODO: for multiplicative coupling, use a dedicated kernel
+    }
+}
+
+// Kernel: apply coupling matrix to get extended complex couplings from free params.
+// d_v_out[n_amps] = M × p_free (real-valued params → complex couplings)
+// For now, maps chain params → v[a].real, step params not yet multiplicative.
+__global__ void couplingMatrixKernel(
+    cuComplex* d_v_out, const double* d_M, const double* d_params,
+    int n_amps, int n_free, int n_step_free, int start_chain)
+{
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= n_amps) return;
+
+    // Linear coupling: v[a] = Σ_j M[a*n_free+j] * p[j]
+    double re = 0.0, im = 0.0;
+    const double* row = d_M + a * n_free;
+
+    // Chain param (real, additive to real part)
+    int c = start_chain + a;  // simple mapping for now
+    // Step params (real)
+    for (int j = 0; j < n_free; ++j)
+        re += row[j] * d_params[j];
+
+    d_v_out[a] = make_cuComplex((float)re, (float)im);
+}
+
+// Kernel: transform gradient from amplitude-coupling space to free-param space.
+// d_grad_free[n_free] = M^T × d_grad_amps[2*n_amps]
+// where d_grad_amps stores [∂L/∂Re(v_0), ..., ∂L/∂Im(v_0), ...]
+__global__ void couplingGradientKernel(
+    double* d_grad_free, const double* d_M, const cuComplex* d_grad_amps,
+    int n_amps, int n_free)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_free) return;
+
+    double sum = 0.0;
+    for (int a = 0; a < n_amps; ++a) {
+        double mij = d_M[a * n_free + j];
+        if (mij != 0.0) {
+            // ∂L/∂p_j = Σ_a M[a][j] · ∂L/∂Re(v_a)
+            sum += mij * (double)d_grad_amps[a].x;
+        }
+    }
+    d_grad_free[j] = sum;
 }
