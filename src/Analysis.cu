@@ -3719,12 +3719,15 @@ private:
                     nSLvectors_.push_back(slcombs.size());
 
                     std::string res_name = chain.name;
+                    std::string chain_key;  // resonance-only key for coupling matrix
                     std::cout << "{ ";
                     for (size_t j = 0; j < resonance_combinations[k].size();
                         ++j)
                     {
                         const auto& res_pair = resonance_combinations[k][j];
                         res_name += "_" + res_pair.first + "_" + res_pair.second;
+                        if (!chain_key.empty()) chain_key += "_";
+                        chain_key += res_pair.second;  // resonance name
 
                         std::cout << res_pair.second; // 共振态名称
                         if (j < resonance_combinations[k].size() - 1)
@@ -3755,7 +3758,7 @@ private:
                         }
                         coupling_matrix_builder_.addAmplitude(
                             amp_start_idx + static_cast<int>(si),
-                            res_name, step_sl_pairs);
+                            chain_key, step_sl_pairs);
                     }
                     resonance_names_.push_back(res_name);
                 }
