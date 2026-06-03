@@ -923,3 +923,24 @@ __global__ void negateWeightsKernel(double* out, const double* in, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = -in[i];
 }
+
+// Scale phsp amplitudes by per-event weight: amp[e,p,a] *= sqrt(weight[e] / W_total)
+// Applied to ALL nPol*nAmp entries for each event, so the subsequent cublasCgemm
+// computes A_weighted^H A_weighted = A^H diag(w) A / W_total.
+__global__ void scalePhspAmpsKernel(
+    cuComplex* d_amp, const double* d_weights,
+    int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nEvents * nPolar * nAmp;
+    if (idx >= total) return;
+
+    int evt = (idx / nAmp) / nPolar;
+    double scale = (d_weights != nullptr)
+        ? sqrt(d_weights[evt] * inv_W_total)
+        : sqrt(inv_W_total);  // uniform weight: 1/N
+
+    float s = (float)scale;
+    d_amp[idx].x *= s;
+    d_amp[idx].y *= s;
+}

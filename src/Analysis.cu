@@ -585,6 +585,7 @@ public:
         const std::vector<std::vector<int>>& events_list,
         const std::vector<std::vector<int>>& events_offsets_list,
         const std::vector<std::vector<int>>& amp_offsets_list,
+        std::vector<double*>& d_data_weights_list,
         std::vector<double*>& d_phsp_weights_list,
         std::vector<double*>& d_bkg_weights_list,
         double bkg_integral_,
@@ -638,19 +639,37 @@ public:
                 int nPhsp = events_list[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
+
+                double W_gpu = (double)nPhsp;
+                if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
+                    thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
+                    W_gpu = thrust::reduce(dp, dp + nPhsp);
+                }
+
+                int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
+                cuComplex* d_phsp_scaled;
+                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+                cudaMemcpy(d_phsp_scaled, d_all_amplitudes_list[gpu],
+                           nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                const double* d_w = (gpu < (int)d_phsp_weights_list.size()) ? d_phsp_weights_list[gpu] : nullptr;
+                int grid = (nPhsp_total + 255) / 256;
+                scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
+                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
+
                 cuComplex* d_phsp_gpu;
                 cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
                 cublasHandle_t h;
                 cublasCreate(&h);
-                cuComplex alpha = make_cuComplex(1.0f / static_cast<float>(nPhsp), 0.0f);
-                cuComplex beta = make_cuComplex(0.0f, 0.0f);
+                cuComplex alpha = make_cuComplex(1.0f, 0.0f);
+                cuComplex beta  = make_cuComplex(0.0f, 0.0f);
                 cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C,
                     n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
-                    &alpha,
-                    d_all_amplitudes_list[gpu], n_amplitudes_,
-                    d_all_amplitudes_list[gpu], n_amplitudes_,
+                    &alpha, d_phsp_scaled, n_amplitudes_,
+                    d_phsp_scaled, n_amplitudes_,
                     &beta, d_phsp_gpu, n_amplitudes_);
                 cublasDestroy(h);
+                cudaFree(d_phsp_scaled);
+
                 if (gpu == primary_dev) {
                     cudaMemcpy(d_phsp_matrix_, d_phsp_gpu,
                         n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
@@ -1002,7 +1021,7 @@ public:
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
-                torch::Tensor(), torch::Tensor() };
+                torch::Tensor(), torch::Tensor(), torch::Tensor() };
     }
 };
 
@@ -1050,7 +1069,7 @@ public:
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
-            phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
+            data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
     int getNVector() const { return params_.nFreeVector(); }
@@ -2114,6 +2133,56 @@ public:
                 n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
         }
 
+        // Update d_phsp_matrix_ to reflect current amplitudes (including weighted)
+        {
+            int primary_dev = dev.index();
+            cudaSetDevice(primary_dev);
+            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+                int nPhsp = events_[gpu][0];
+                if (nPhsp == 0) continue;
+                cudaSetDevice(gpu);
+
+                double W_gpu = (double)nPhsp;
+                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
+                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
+                    W_gpu = thrust::reduce(dp, dp + nPhsp);
+                }
+
+                int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
+                cuComplex* d_phsp_scaled;
+                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+                cudaMemcpy(d_phsp_scaled, d_all_amplitudes_[gpu],
+                           nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
+                int grid = (nPhsp_total + 255) / 256;
+                scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
+                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
+
+                cuComplex* d_phsp_gpu;
+                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                cublasHandle_t h;
+                cublasCreate(&h);
+                cuComplex alpha = make_cuComplex(1.0f, 0.0f);
+                cuComplex beta  = make_cuComplex(0.0f, 0.0f);
+                cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
+                    &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
+                    &beta, d_phsp_gpu, n_amplitudes_);
+                cublasDestroy(h);
+                cudaFree(d_phsp_scaled);
+
+                if (gpu == (size_t)primary_dev) {
+                    cudaMemcpy(d_phsp_matrix_, d_phsp_gpu,
+                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                } else {
+                    cudaSetDevice(primary_dev);
+                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                }
+                cudaFree(d_phsp_gpu);
+            }
+        }
+
         // ========== 耦合参数 Hessian [0:n2, 0:n2] ==========
         if (n2 > 0) {
             torch::Tensor extended_vector = params_.extendVector(vector, dev);
@@ -2277,14 +2346,14 @@ public:
             cudaMemset(d_phsp_mixed_sum, 0, 2 * n_amplitudes_ * P * sizeof(double));
             cudaMemset(d_phsp_mixed_t3, 0, 2 * n_amplitudes_ * sizeof(double));
 
-            // Data: weight=+1.0
+            // Data: pass per-event weights if available
             {
                 std::vector<int> n_data_ev(n_gpu, 0), data_off(n_gpu, 0);
                 for (int g = 0; g < n_gpu; ++g) {
                     n_data_ev[g] = events_[g][1]; data_off[g] = events_[g][0];
                 }
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, data_weights_,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
 
             }
@@ -2802,6 +2871,7 @@ private:
     // 振幅数据，设备端
     std::vector<cuComplex*> d_all_amplitudes_;
     cuComplex* d_phsp_matrix_ = nullptr;
+    std::vector<double*> data_weights_;
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
     double bkg_integral_ = 0.0;
@@ -2831,6 +2901,51 @@ private:
     std::vector<ChainInfo> chains_info_;
     AmpCalc amp_calc_;
     bool initialized_ = false;
+
+    // New coupling parameterization (CouplingMatrixBuilder)
+    CouplingMatrixResult coupling_matrix_;
+    CouplingMatrixBuilder coupling_matrix_builder_;
+    bool use_coupling_matrix_ = false;
+    std::vector<std::string> param_names_;  // fitting parameter names
+
+    // Transform amplitude-coupling gradient to free-param gradient:
+    //   grad_free = M^T · grad_amps
+    // d_grad_amps: [2*n_amps] complex (Re ∂L/∂v_a, Im ∂L/∂v_a interleaved or separate)
+    // d_grad_free: [n_free] double, output on device
+    void transformCouplingGradient(const cuComplex* d_grad_amps,
+                                   double* d_grad_free) const {
+        if (!use_coupling_matrix_) return;
+        const auto& r = coupling_matrix_;
+        int n_amps = r.n_amps;
+        int n_free = r.n_free;
+        // Build dense M on host, upload to device, call kernel
+        std::vector<double> h_M;
+        buildCouplingMatrix(r, h_M);
+        double* d_M;
+        cudaMalloc(&d_M, n_amps * n_free * sizeof(double));
+        cudaMemcpy(d_M, h_M.data(), n_amps * n_free * sizeof(double), cudaMemcpyHostToDevice);
+        int grid = (n_free + 255) / 256;
+        couplingGradientKernel<<<grid, 256>>>(d_grad_free, d_M, d_grad_amps, n_amps, n_free);
+        cudaDeviceSynchronize();
+        cudaFree(d_M);
+    }
+
+    // Apply coupling matrix to get extended coupling vector:
+    //   v_extended = M · p_coupling  (or product form for multiplicative)
+    void applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const {
+        if (!use_coupling_matrix_) return;
+        const auto& r = coupling_matrix_;
+        std::vector<double> h_M;
+        buildCouplingMatrix(r, h_M);
+        double* d_M;
+        cudaMalloc(&d_M, r.n_amps * r.n_free * sizeof(double));
+        cudaMemcpy(d_M, h_M.data(), r.n_amps * r.n_free * sizeof(double), cudaMemcpyHostToDevice);
+        int grid = (r.n_amps + 255) / 256;
+        couplingMatrixKernel<<<grid, 256>>>(d_v_out, d_M, d_params,
+            r.n_amps, r.n_free, r.n_step_free, 0);
+        cudaDeviceSynchronize();
+        cudaFree(d_M);
+    }
 
     void initialize(std::string config_file = "config.yml")
     {
@@ -2945,14 +3060,40 @@ private:
         // }
         // delete[] h_amp;
 
+        // data_weights_
+        if (data_files.count("data_weights") > 0)
+        {
+            std::vector<int> data_events_per_gpu;
+            for (size_t i = 0; i < events_.size(); ++i)
+                data_events_per_gpu.push_back(events_[i][1]);
+            data_weights_ = readWeightsFromFile(data_files.at("data_weights"), data_events_per_gpu);
+        }
+        else
+        {
+            for (size_t i = 0; i < events_.size(); ++i)
+                data_weights_.push_back(nullptr);
+        }
+
+        // phsp_weights_
+        if (data_files.count("phsp_weights") > 0)
+        {
+            std::vector<int> phsp_events_per_gpu;
+            for (size_t i = 0; i < events_.size(); ++i)
+                phsp_events_per_gpu.push_back(events_[i][0]);
+            phsp_weights_ = readWeightsFromFile(data_files.at("phsp_weights"), phsp_events_per_gpu);
+        }
+        else
+        {
+            for (size_t i = 0; i < events_.size(); ++i)
+                phsp_weights_.push_back(nullptr);
+        }
+
         // bkg_weights_
-        if (data_files.count("bkg_weights") > 0 && data_files.count("bkg_weights") > 0)
+        if (data_files.count("bkg_weights") > 0)
         {
             std::vector<int> bkg_events_per_gpu;
             for (size_t i = 0; i < events_.size(); ++i)
-            {
                 bkg_events_per_gpu.push_back(events_[i][2]);
-            }
             bkg_weights_ = readWeightsFromFile(data_files.at("bkg_weights"), bkg_events_per_gpu);
 
             // bkg_weigths_求和
@@ -2985,31 +3126,49 @@ private:
         // }
         // delete[] h_amp;
 
-        // phsp*phsp^T矩阵，大小为 n_amplitudes_ * n_amplitudes_
-        // cuComplex* d_phsp;
+        // phsp*phsp^T矩阵: A^H diag(w) A / (Σ w)，加权或均匀
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
         {
+            int nPhsp = events_[gpu][0];
+            if (nPhsp == 0) continue;
             cudaSetDevice(gpu);
-            // std::cout << "GPU " << gpu << ": Events for type 0 (phsp) = " << events_[gpu][0] << std::endl;
+
+            double W_gpu = (double)nPhsp;
+            if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
+                thrust::device_ptr<double> dp(phsp_weights_[gpu]);
+                W_gpu = thrust::reduce(dp, dp + nPhsp);
+            }
+
+            int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
+            cuComplex* d_phsp_scaled;
+            cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+            cudaMemcpy(d_phsp_scaled, d_all_amplitudes_[gpu],
+                       nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+            const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
+            int grid = (nPhsp_total + 255) / 256;
+            scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
+                nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
 
             cuComplex* d_phsp_gpu;
             cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
-            cublasHandle_t cublas_handle;
-            cublasCreate(&cublas_handle);
-            cuComplex alpha = make_cuComplex(1.0 / static_cast<float>(Vp4_phsp.begin()->second.size()), 0.0f);
-            cuComplex beta = make_cuComplex(0.0f, 0.0f);
-            cublasCgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, events_[gpu][0] * n_polar_,
-                &alpha, d_all_amplitudes_[gpu], n_amplitudes_, d_all_amplitudes_[gpu], n_amplitudes_,
+            cublasHandle_t h;
+            cublasCreate(&h);
+            cuComplex alpha = make_cuComplex(1.0f, 0.0f);
+            cuComplex beta  = make_cuComplex(0.0f, 0.0f);
+            cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
+                &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
                 &beta, d_phsp_gpu, n_amplitudes_);
-            // 将每个GPU计算的phsp矩阵累加到主GPU的d_phsp中
+            cublasDestroy(h);
+            cudaFree(d_phsp_scaled);
+
             if (gpu == 0) {
                 cudaMemcpy(d_phsp_matrix_, d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+            } else {
+                cudaSetDevice(0);
+                cuComplex one = make_cuComplex(1.0f, 0.0f);
+                axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
             }
-            else {
-                cublasCaxpy(cublas_handle, n_amplitudes_ * n_amplitudes_, &alpha, d_phsp_gpu, 1, d_phsp_matrix_, 1);
-            }
-            cublasDestroy(cublas_handle);
             cudaFree(d_phsp_gpu);
         }
         // // cudaFree(d_phsp);
@@ -3408,9 +3567,22 @@ private:
                     resonance_combinations = std::move(temp);
                 }
 
+                // Register decay steps with CouplingMatrixBuilder
+                std::map<int,int> step_idx_map;  // node index → CouplingMatrixBuilder step index
+                for (size_t ni = 0; ni < chain.decay_steps.size(); ++ni) {
+                    const auto& st = chain.decay_steps[ni];
+                    std::string key = st.mother + "→" + st.daughters[0] + "+" + st.daughters[1];
+                    std::string label = st.mother + "→" + st.daughters[0] + st.daughters[1];
+                    std::vector<SLKey> sl_list;
+                    for (const auto& sl : slcombs[0])  // representative SL from first combo
+                        sl_list.push_back({sl.S, sl.L}); // simplified — all combos share steps
+                    step_idx_map[ni] = coupling_matrix_builder_.addStep(key, label, sl_list);
+                }
+
                 std::cout << "Resonance: ";
                 for (size_t k = 0; k < resonance_combinations.size(); ++k)
                 {
+                    int amp_start_idx = n_amplitudes_;
                     n_amplitudes_ += slcombs.size();
                     nSLvectors_.push_back(slcombs.size());
 
@@ -3431,14 +3603,27 @@ private:
                     else
                         std::cout << "}";
 
-                    for (const auto& slcomb : slcombs)
+                    for (size_t si = 0; si < slcombs.size(); ++si)
                     {
+                        const auto& slcomb = slcombs[si];
                         std::string full_name = res_name + "_" + "SL";
                         for (const auto& sl : slcomb)
                         {
                             full_name += "_" + std::to_string(sl.S) + std::to_string(sl.L);
                         }
                         amplitude_names_.push_back(full_name);
+
+                        // Register amplitude with CouplingMatrixBuilder
+                        std::vector<std::pair<int,int>> step_sl_pairs;
+                        for (size_t ni = 0; ni < slcomb.size() && ni < chain.decay_steps.size(); ++ni) {
+                            int si_step = step_idx_map[ni];
+                            // Find sl_idx within the step's SL list
+                            int sl_idx = 0; // simplified: use first SL as fixed
+                            step_sl_pairs.push_back({si_step, sl_idx});
+                        }
+                        coupling_matrix_builder_.addAmplitude(
+                            amp_start_idx + static_cast<int>(si),
+                            res_name, step_sl_pairs);
                     }
                     resonance_names_.push_back(res_name);
                 }
@@ -3446,6 +3631,23 @@ private:
             }
 
             chains_info_.push_back(chain_info);
+        }
+
+        // Build coupling matrix from the new parameterization
+        if (!amplitude_names_.empty()) {
+            coupling_matrix_ = coupling_matrix_builder_.build();
+            use_coupling_matrix_ = true;
+            std::cout << "Coupling matrix: " << coupling_matrix_.n_amps
+                      << " amplitudes → " << coupling_matrix_.n_free
+                      << " free coupling params ("
+                      << coupling_matrix_.n_chain_free << " chain + "
+                      << coupling_matrix_.n_step_free << " step)" << std::endl;
+            // Build param_names_ from coupling matrix
+            param_names_.clear();
+            for (int ci = 0; ci < coupling_matrix_.n_chain_free; ++ci)
+                param_names_.push_back("chain_" + coupling_matrix_.chain_names[ci]);
+            for (int si = 0; si < coupling_matrix_.n_step_free; ++si)
+                param_names_.push_back("step_" + std::to_string(si));
         }
 
         // 设置约束条件
