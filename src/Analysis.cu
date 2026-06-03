@@ -571,6 +571,84 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
 //////////////////////////////////////////////////////////////
 /// NLLFunction 类定义
 ///////////////////////////////////////////////////////////////
+// CouplingFunction: autograd wrapper for multiplicative coupling transform.
+//   Forward:  p_coupling [2·n_free double] → v_ext [n_amps complex]
+//   Backward: ∂L/∂v_ext → ∂L/∂p_coupling via Wirtinger
+///////////////////////////////////////////////////////////////
+class CouplingFunction : public torch::autograd::Function<CouplingFunction>
+{
+public:
+    static torch::Tensor forward(
+        torch::autograd::AutogradContext* ctx,
+        torch::Tensor p_coupling,
+        int64_t n_amps, int64_t n_step_free, int64_t n_free,
+        int64_t d_chain_ptr, int64_t d_offsets_ptr, int64_t d_data_ptr)
+    {
+        int nA = static_cast<int>(n_amps);
+        int nSF = static_cast<int>(n_step_free);
+        int nF  = static_cast<int>(n_free);
+        int* d_chain   = reinterpret_cast<int*>(d_chain_ptr);
+        int* d_offsets = reinterpret_cast<int*>(d_offsets_ptr);
+        int* d_data    = reinterpret_cast<int*>(d_data_ptr);
+
+        auto v_ext = torch::zeros({nA}, torch::TensorOptions()
+            .dtype(torch::kComplexFloat).device(p_coupling.device()));
+        cuComplex* d_v = reinterpret_cast<cuComplex*>(v_ext.data_ptr());
+        const double* d_p = p_coupling.data_ptr<double>();
+
+        int grid = (nA + 255) / 256;
+        multiplicativeCouplingKernel<<<grid, 256>>>(
+            d_v, d_p, d_chain, d_offsets, d_data, nA, nSF);
+        cudaDeviceSynchronize();
+
+        ctx->saved_data["p_tensor"] = p_coupling;
+        ctx->saved_data["v_ext_ptr"] = reinterpret_cast<int64_t>(d_v);
+        ctx->saved_data["chain_ptr"] = d_chain_ptr;
+        ctx->saved_data["offsets_ptr"] = d_offsets_ptr;
+        ctx->saved_data["data_ptr"] = d_data_ptr;
+        ctx->saved_data["n_amps"] = n_amps;
+        ctx->saved_data["n_step_free"] = n_step_free;
+        ctx->saved_data["n_free"] = n_free;
+
+        return v_ext;
+    }
+
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext* ctx,
+        torch::autograd::tensor_list grad_outputs)
+    {
+        auto p = ctx->saved_data["p_tensor"].toTensor();
+        auto grad_v = grad_outputs[0];
+        if (!grad_v.defined()) return {torch::Tensor()};
+
+        int nA  = ctx->saved_data["n_amps"].toInt();
+        int nSF = ctx->saved_data["n_step_free"].toInt();
+        int nF  = ctx->saved_data["n_free"].toInt();
+        int* d_chain   = reinterpret_cast<int*>(ctx->saved_data["chain_ptr"].toInt());
+        int* d_offsets = reinterpret_cast<int*>(ctx->saved_data["offsets_ptr"].toInt());
+        int* d_data    = reinterpret_cast<int*>(ctx->saved_data["data_ptr"].toInt());
+
+        // grad_v is complex [n_amps], but torch gives it as complex tensor
+        // We need it as cuComplex* and v_ext as cuComplex*
+        cuComplex* d_grad_v = reinterpret_cast<cuComplex*>(grad_v.data_ptr());
+        cuComplex* d_v_ext  = reinterpret_cast<cuComplex*>(ctx->saved_data["v_ext_ptr"].toInt());
+        const double* d_p = p.data_ptr<double>();
+
+        auto grad_p = torch::zeros_like(p);
+        double* d_grad_p = grad_p.data_ptr<double>();
+
+        int grid = (nF + 255) / 256;
+        multiplicativeGradientKernel<<<grid, 256>>>(
+            d_grad_p, d_grad_v, d_v_ext, d_p,
+            d_chain, d_offsets, d_data, nA, nSF, nF);
+        cudaDeviceSynchronize();
+
+        return {grad_p, torch::Tensor(), torch::Tensor(), torch::Tensor(),
+                torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    }
+};
+
+///////////////////////////////////////////////////////////////
 class NLLFunction : public torch::autograd::Function<NLLFunction>
 {
 public:
@@ -1067,14 +1145,44 @@ public:
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
+
+        if (use_coupling_matrix_) {
+            int ncf = coupling_matrix_.n_free;  // number of complex coupling params
+            int na  = coupling_matrix_.n_amps;
+            // params = [Re(p0),Im(p0), ..., Re(p_{ncf-1}),Im(p_{ncf-1}), theta]
+            auto p_coupling = params.slice(0, 0, 2 * ncf);
+            auto theta = params.slice(0, 2 * ncf, params.size(0));
+
+            // Apply coupling transform: p → v_ext
+            auto v_ext = CouplingFunction::apply(p_coupling,
+                (int64_t)na, (int64_t)coupling_matrix_.n_step_free, (int64_t)ncf,
+                reinterpret_cast<int64_t>(d_amp_chain_),
+                reinterpret_cast<int64_t>(d_step_offsets_),
+                reinterpret_cast<int64_t>(d_step_data_));
+
+            // Build old-format params: [Re(v0),...,Re(v_{na-1}), Im(v0),...,Im(v_{na-1}), theta]
+            auto v_re = torch::real(v_ext).to(torch::kFloat64);
+            auto v_im = torch::imag(v_ext).to(torch::kFloat64);
+            auto params_old = theta.size(0) > 0
+                ? torch::cat({v_re, v_im, theta})
+                : torch::cat({v_re, v_im});
+
+            return NLLFunction::apply(params_old, &params_, d_all_amplitudes_, &amp_calc_,
+                d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
+                data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
+        }
+
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
             data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
-    int getNVector() const { return params_.nFreeVector(); }
+    int getNVector() const {
+        if (use_coupling_matrix_) return coupling_matrix_.n_free;
+        return params_.nFreeVector();
+    }
     int getNFreeTheta() const { return params_.nFreeTheta(); }
-    int getNParams() const { return params_.nParams(); }
+    int getNParams() const { return 2 * getNVector() + getNFreeTheta(); }
     const Parameters& getParams() const { return params_; }
 
     torch::Tensor getSLVectors() const
@@ -2906,45 +3014,69 @@ private:
     CouplingMatrixResult coupling_matrix_;
     CouplingMatrixBuilder coupling_matrix_builder_;
     bool use_coupling_matrix_ = false;
+    int* d_amp_chain_ = nullptr;
+    int* d_step_offsets_ = nullptr;
+    int* d_step_data_ = nullptr;
+    int step_data_len_ = 0;
     std::vector<std::string> param_names_;  // fitting parameter names
 
     // Transform amplitude-coupling gradient to free-param gradient:
     //   grad_free = M^T · grad_amps
     // d_grad_amps: [2*n_amps] complex (Re ∂L/∂v_a, Im ∂L/∂v_a interleaved or separate)
     // d_grad_free: [n_free] double, output on device
-    void transformCouplingGradient(const cuComplex* d_grad_amps,
-                                   double* d_grad_free) const {
+    // Transform gradient: ∂L/∂v → ∂L/∂p using Wirtinger calculus
+    void transformCouplingGradient(const cuComplex* d_grad_v, const cuComplex* d_v,
+                                   const double* d_params, double* d_grad_p) const {
         if (!use_coupling_matrix_) return;
-        const auto& r = coupling_matrix_;
-        int n_amps = r.n_amps;
-        int n_free = r.n_free;
-        // Build dense M on host, upload to device, call kernel
-        std::vector<double> h_M;
-        buildCouplingMatrix(r, h_M);
-        double* d_M;
-        cudaMalloc(&d_M, n_amps * n_free * sizeof(double));
-        cudaMemcpy(d_M, h_M.data(), n_amps * n_free * sizeof(double), cudaMemcpyHostToDevice);
-        int grid = (n_free + 255) / 256;
-        couplingGradientKernel<<<grid, 256>>>(d_grad_free, d_M, d_grad_amps, n_amps, n_free);
+        int grid = (coupling_matrix_.n_free + 255) / 256;
+        multiplicativeGradientKernel<<<grid, 256>>>(
+            d_grad_p, d_grad_v, d_v, d_params,
+            d_amp_chain_, d_step_offsets_, d_step_data_,
+            coupling_matrix_.n_amps, coupling_matrix_.n_step_free,
+            coupling_matrix_.n_free);
         cudaDeviceSynchronize();
-        cudaFree(d_M);
     }
 
     // Apply coupling matrix to get extended coupling vector:
     //   v_extended = M · p_coupling  (or product form for multiplicative)
-    void applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const {
+    // Upload sparse coupling data to device. Call after initializeDecayChains.
+    void uploadCouplingData() {
         if (!use_coupling_matrix_) return;
         const auto& r = coupling_matrix_;
-        std::vector<double> h_M;
-        buildCouplingMatrix(r, h_M);
-        double* d_M;
-        cudaMalloc(&d_M, r.n_amps * r.n_free * sizeof(double));
-        cudaMemcpy(d_M, h_M.data(), r.n_amps * r.n_free * sizeof(double), cudaMemcpyHostToDevice);
-        int grid = (r.n_amps + 255) / 256;
-        couplingMatrixKernel<<<grid, 256>>>(d_v_out, d_M, d_params,
-            r.n_amps, r.n_free, r.n_step_free, 0);
+        if (d_amp_chain_) cudaFree(d_amp_chain_);
+        cudaMalloc(&d_amp_chain_, r.n_amps * sizeof(int));
+        cudaMemcpy(d_amp_chain_, r.amp_chain.data(), r.n_amps * sizeof(int), cudaMemcpyHostToDevice);
+
+        if (d_step_offsets_) cudaFree(d_step_offsets_);
+        cudaMalloc(&d_step_offsets_, (r.n_amps + 1) * sizeof(int));
+        std::vector<int> h_offsets(r.n_amps + 1, 0);
+        int total = 0;
+        for (int i = 0; i < r.n_amps; ++i) {
+            h_offsets[i] = total;
+            total += (int)r.amp_step_params[i].size();
+        }
+        h_offsets[r.n_amps] = total;
+        cudaMemcpy(d_step_offsets_, h_offsets.data(), (r.n_amps + 1) * sizeof(int), cudaMemcpyHostToDevice);
+
+        if (d_step_data_) cudaFree(d_step_data_);
+        cudaMalloc(&d_step_data_, total * sizeof(int));
+        std::vector<int> h_data(total);
+        int pos = 0;
+        for (int i = 0; i < r.n_amps; ++i)
+            for (int p : r.amp_step_params[i]) h_data[pos++] = p;
+        cudaMemcpy(d_step_data_, h_data.data(), total * sizeof(int), cudaMemcpyHostToDevice);
+        step_data_len_ = total;
+    }
+
+    // Apply multiplicative coupling: v[a] = chain[c_a] × Π step[s]
+    void applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const {
+        if (!use_coupling_matrix_) return;
+        int grid = (coupling_matrix_.n_amps + 255) / 256;
+        multiplicativeCouplingKernel<<<grid, 256>>>(
+            d_v_out, d_params,
+            d_amp_chain_, d_step_offsets_, d_step_data_,
+            coupling_matrix_.n_amps, coupling_matrix_.n_step_free);
         cudaDeviceSynchronize();
-        cudaFree(d_M);
     }
 
     void initialize(std::string config_file = "config.yml")
@@ -3637,6 +3769,7 @@ private:
         if (!amplitude_names_.empty()) {
             coupling_matrix_ = coupling_matrix_builder_.build();
             use_coupling_matrix_ = true;
+            uploadCouplingData();
             std::cout << "Coupling matrix: " << coupling_matrix_.n_amps
                       << " amplitudes → " << coupling_matrix_.n_free
                       << " free coupling params ("
@@ -3696,7 +3829,15 @@ private:
         }
 
         // 初始化参数管理器
-        params_.initialize(n_amplitudes_ - static_cast<int>(con_trans_id.size()), con_trans_id, con_trans_values);
+        if (use_coupling_matrix_) {
+            // Coupling matrix mode: free→extended mapping via applyCouplingMatrix
+            // extendVector is identity (free = n_amplitudes_), but getNVector()
+            // reports coupling_matrix_.n_free
+            params_.initialize(n_amplitudes_, {}, {});
+        } else {
+            params_.initialize(n_amplitudes_ - static_cast<int>(con_trans_id.size()),
+                               con_trans_id, con_trans_values);
+        }
     }
 
     std::vector<cuComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
