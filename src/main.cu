@@ -14,12 +14,25 @@
 #include "Config.cu"
 #include "Figure.cu"
 #include "Analysis.cu"
+#include "Info.cu"
 #include "ResModel.cu"
 #include "Resonance.cu"
 
 PYBIND11_MODULE(ctpwa, m)
 {
     m.doc() = "ctpwa";
+
+    pybind11::class_<DecayInfo>(m, "DecayInfo")
+        .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
+        .def("isValid", &DecayInfo::isValid)
+        .def("nAmplitudes", &DecayInfo::nAmplitudes)
+        .def("nFreeParams", &DecayInfo::nFreeParams)
+        .def("amplitudeNames", &DecayInfo::amplitudeNames)
+        .def("paramNames", &DecayInfo::paramNames)
+        .def("resonanceNames", &DecayInfo::resonanceNames)
+        .def("resonanceParamNames", &DecayInfo::resonanceParamNames)
+        .def("hasCouplingMatrix", &DecayInfo::hasCouplingMatrix)
+        .def("print", &DecayInfo::print);
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
