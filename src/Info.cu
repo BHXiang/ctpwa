@@ -34,16 +34,25 @@ void DecayInfo::initialize(const std::string&)
         ChainInfo info;
         info.name = chain.name;
 
-        // Build cas for this chain
+        // Build cas for this chain. Need spins/parities for ALL particles including intermediates.
+        std::map<std::string, std::pair<int,int>> spin_parity_map;
+        for (const auto& p : particles_) spin_parity_map[p.name] = {p.spin, p.parity};
+        // Add intermediate particle spins from resonance chains
+        for (const auto& rc : chain.resonance_chains) {
+            for (const auto& sc : rc.spin_chains) {
+                spin_parity_map[rc.intermediate] = {(int)sc.spin_parity[0], (int)sc.spin_parity[1]};
+            }
+        }
+
         auto cas = std::make_shared<AmpCasDecay>(particles_);
         for (const auto& step : chain.decay_steps) {
             std::array<int, 3> spins = {0, 0, 0};
             std::array<int, 3> parities = {0, 0, 0};
-            for (const auto& p : particles_) {
-                if (p.name == step.mother) { spins[0] = p.spin; parities[0] = p.parity; }
-                for (size_t di = 0; di < step.daughters.size(); ++di) {
-                    if (p.name == step.daughters[di]) { spins[di+1] = p.spin; parities[di+1] = p.parity; }
-                }
+            auto it_m = spin_parity_map.find(step.mother);
+            if (it_m != spin_parity_map.end()) { spins[0] = it_m->second.first; parities[0] = it_m->second.second; }
+            for (size_t di = 0; di < step.daughters.size(); ++di) {
+                auto it_d = spin_parity_map.find(step.daughters[di]);
+                if (it_d != spin_parity_map.end()) { spins[di+1] = it_d->second.first; parities[di+1] = it_d->second.second; }
             }
             bool identical_d = false; bool is_boson = true;
             if (chain.symmetrize) {
@@ -134,8 +143,12 @@ void DecayInfo::initialize(const std::string&)
 
             for (size_t ki = 0; ki < resonance_combos.size(); ++ki) {
                 std::string res_name = chain.name;
-                for (const auto& rp : resonance_combos[ki])
+                std::string chain_key;  // resonance-only key for coupling matrix
+                for (const auto& rp : resonance_combos[ki]) {
                     res_name += "_" + rp.first + "_" + rp.second;
+                    if (!chain_key.empty()) chain_key += "_";
+                    chain_key += rp.second;  // resonance name
+                }
 
                 for (const auto& slcomb : slcombs) {
                     std::string full_name = res_name + "_SL";
@@ -153,7 +166,7 @@ void DecayInfo::initialize(const std::string&)
                         }
                     }
                     coupling_matrix_builder_.addAmplitude(
-                        (int)amplitude_names_.size() - 1, res_name, step_sl_pairs);
+                        (int)amplitude_names_.size() - 1, chain_key, step_sl_pairs);
                 }
                 resonance_names_.push_back(res_name);
 
