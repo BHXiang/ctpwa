@@ -3700,15 +3700,40 @@ private:
                 }
 
                 // Register decay steps with CouplingMatrixBuilder
+                // Build per-step SL list: collect all unique (S,L) for each node
+                // from cas->getSLCombinations()
+                std::map<int, std::vector<SLKey>> node_sl_map;
+                for (const auto& slcomb : slcombs) {
+                    for (size_t ni = 0; ni < slcomb.size() && ni < chain.decay_steps.size(); ++ni) {
+                        SLKey slk = {slcomb[ni].S, slcomb[ni].L};
+                        auto& vec = node_sl_map[(int)ni];
+                        bool found = false;
+                        for (const auto& s : vec) if (s.S == slk.S && s.L == slk.L) { found = true; break; }
+                        if (!found) vec.push_back(slk);
+                    }
+                }
                 std::map<int,int> step_idx_map;  // node index → CouplingMatrixBuilder step index
                 for (size_t ni = 0; ni < chain.decay_steps.size(); ++ni) {
                     const auto& st = chain.decay_steps[ni];
-                    std::string key = st.mother + "→" + st.daughters[0] + "+" + st.daughters[1];
+                    // Get spins/parities (include intermediate particles from resonance chains)
+                    std::map<std::string, std::pair<int,int>> sp_map;
+                    for (const auto& p : particles_) sp_map[p.name] = {p.spin, p.parity};
+                    for (const auto& rc : chain.resonance_chains)
+                        for (const auto& sc : rc.spin_chains)
+                            sp_map[rc.intermediate] = {(int)sc.spin_parity[0], (int)sc.spin_parity[1]};
+                    int s_m = 0, p_m = 0, s_d1 = 0, p_d1 = 0, s_d2 = 0, p_d2 = 0;
+                    auto it_m = sp_map.find(st.mother);
+                    if (it_m != sp_map.end()) { s_m = it_m->second.first; p_m = it_m->second.second; }
+                    auto it_d1 = sp_map.find(st.daughters[0]);
+                    if (it_d1 != sp_map.end()) { s_d1 = it_d1->second.first; p_d1 = it_d1->second.second; }
+                    auto it_d2 = sp_map.find(st.daughters[1]);
+                    if (it_d2 != sp_map.end()) { s_d2 = it_d2->second.first; p_d2 = it_d2->second.second; }
+                    std::string key = st.mother + ">" + st.daughters[0] + "," + st.daughters[1]
+                        + "_J" + std::to_string(s_m) + "-" + std::to_string(s_d1) + "-" + std::to_string(s_d2)
+                        + "_P" + std::to_string(p_m) + "-" + std::to_string(p_d1) + "-" + std::to_string(p_d2);
                     std::string label = st.mother + "→" + st.daughters[0] + st.daughters[1];
-                    std::vector<SLKey> sl_list;
-                    for (const auto& sl : slcombs[0])  // representative SL from first combo
-                        sl_list.push_back({sl.S, sl.L}); // simplified — all combos share steps
-                    step_idx_map[ni] = coupling_matrix_builder_.addStep(key, label, sl_list);
+                    const auto& sl_list = node_sl_map[(int)ni];
+                    step_idx_map[(int)ni] = coupling_matrix_builder_.addStep(key, label, sl_list);
                 }
 
                 std::cout << "Resonance: ";
@@ -3751,9 +3776,15 @@ private:
                         // Register amplitude with CouplingMatrixBuilder
                         std::vector<std::pair<int,int>> step_sl_pairs;
                         for (size_t ni = 0; ni < slcomb.size() && ni < chain.decay_steps.size(); ++ni) {
-                            int si_step = step_idx_map[ni];
-                            // Find sl_idx within the step's SL list
-                            int sl_idx = 0; // simplified: use first SL as fixed
+                            auto sit = step_idx_map.find((int)ni);
+                            if (sit == step_idx_map.end()) continue;
+                            int si_step = sit->second;
+                            const auto& sl_list = coupling_matrix_builder_.getSteps()[si_step].sl_list;
+                            int sl_idx = 0;  // default: first SL (fixed)
+                            for (size_t ssi = 0; ssi < sl_list.size(); ++ssi) {
+                                if (sl_list[ssi].S == slcomb[ni].S && sl_list[ssi].L == slcomb[ni].L)
+                                    { sl_idx = (int)ssi; break; }
+                            }
                             step_sl_pairs.push_back({si_step, sl_idx});
                         }
                         coupling_matrix_builder_.addAmplitude(
