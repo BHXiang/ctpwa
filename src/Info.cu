@@ -144,6 +144,27 @@ void DecayInfo::buildDecayChains(
 
             auto slcombs = cas->getSLCombinations();
 
+            // Print decay chain structure for this J^P combination
+            std::cout << "  ";
+            for (size_t si = 0; si < step_infos.size(); ++si) {
+                if (si > 0) std::cout << ", ";
+                const auto& info = step_infos[si];
+                std::cout << info.mother << "("; printJ(info.spins[0]);
+                std::cout << (info.parities[0] == 1 ? "+)" : info.parities[0] == -1 ? "-)" : ")");
+                std::cout << "→" << info.d1 << "("; printJ(info.spins[1]);
+                std::cout << (info.parities[1] == 1 ? "+)" : info.parities[1] == -1 ? "-)" : ")");
+                std::cout << info.d2 << "("; printJ(info.spins[2]);
+                std::cout << (info.parities[2] == 1 ? "+)" : info.parities[2] == -1 ? "-)" : ")");
+                // Print SL list for this step
+                std::cout << " {";
+                for (size_t sli = 0; sli < info.sl_list.size(); ++sli) {
+                    if (sli > 0) std::cout << " ";
+                    std::cout << "(" << info.sl_list[sli].S << "," << info.sl_list[sli].L << ")";
+                }
+                std::cout << "}";
+            }
+            std::cout << std::endl;
+
             // Build resonance combinations
             std::vector<std::vector<std::pair<std::string,std::string>>> res_combos = {{}};
             for (const auto& p : comb) {
@@ -157,8 +178,22 @@ void DecayInfo::buildDecayChains(
                 res_combos = std::move(temp);
             }
 
+            // Print resonances for each combination
+            if (!res_combos.empty()) {
+                std::cout << "  Resonances:";
+                for (size_t ki = 0; ki < res_combos.size(); ++ki) {
+                    std::cout << " {";
+                    for (size_t rj = 0; rj < res_combos[ki].size(); ++rj) {
+                        if (rj > 0) std::cout << ", ";
+                        std::cout << res_combos[ki][rj].second;
+                    }
+                    std::cout << "}";
+                }
+                std::cout << std::endl;
+            }
+
             for (size_t ki = 0; ki < res_combos.size(); ++ki) {
-                // Build readable topology name: Jpsi→omega+R_KK[f0_980]_R_KK[f0_980]→Kp+Km
+                // Build readable topology name
                 auto replace_tag = [&](const std::string& name) -> std::string {
                     for (const auto& rp : res_combos[ki])
                         // if (rp.first == name) return name + "[" + rp.second + "]";
