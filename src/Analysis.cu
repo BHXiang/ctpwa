@@ -3456,7 +3456,10 @@ private:
         // Set coupling matrix + param names on Parameters
         if (info.hasCouplingMatrix()) {
             params_.setCouplingMatrix(info.couplingMatrix());
-            params_.setParamNames(info.paramNames());
+            auto all_names = info.paramNames();
+            const auto& rnames = info.resonanceParamNames();
+            all_names.insert(all_names.end(), rnames.begin(), rnames.end());
+            params_.setParamNames(all_names);
 
             std::cout << "Coupling matrix: " << info.couplingMatrix().n_amps
                       << " amplitudes → " << info.couplingMatrix().n_free
