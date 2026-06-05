@@ -43,6 +43,7 @@ class Resonance
     static ResModelType modelTypeFromString(const std::string& modelStr);
     double getParam(const std::string& paramName);
     const std::map<std::string, double>& getParams() const { return params_; }
+    const std::vector<std::string>& getOrderedParamNames() const { return param_names_; }
 
     std::string getName() const { return name_; }
     std::string getTag() const { return tag_; }
@@ -76,6 +77,7 @@ class Resonance
     ResModelType modelType_;
     std::string conjugate_partner_;
     std::map<std::string, double> params_;
+    std::vector<std::string> param_names_;          // insertion order for iteration
     std::vector<std::pair<double, double>> channels_;
 };
 

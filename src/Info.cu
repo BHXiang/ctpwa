@@ -1,7 +1,9 @@
 #include <Info.cuh>
 #include <AmpGen.cuh>
+#include <complex>
 #include <iostream>
 #include <memory>
+#include <set>
 
 // Helper: print spin as proper J (config stores 2J+1)
 static inline void printJ(int spin) {
@@ -17,13 +19,32 @@ DecayInfo::DecayInfo(const std::string& config_file)
     initialized_ = true;
 }
 
+DecayInfo::DecayInfo(const ConfigParser& parser)
+    : config_parser_("")  // dummy, data comes from parser arg
+{
+    if (!parser.isValid()) return;
+    particles_   = parser.getParticles();
+    constraints_ = parser.getConstraints();
+    buildDecayChains(parser.getDecayChains(),
+                     parser.getResonances(),
+                     parser.getGlobalMaxL());
+    initialized_ = true;
+}
+
 void DecayInfo::initialize(const std::string&)
 {
     particles_   = config_parser_.getParticles();
     constraints_ = config_parser_.getConstraints();
+    buildDecayChains(config_parser_.getDecayChains(),
+                     config_parser_.getResonances(),
+                     config_parser_.getGlobalMaxL());
+}
 
-    auto chains = config_parser_.getDecayChains();
-    const auto& config_resonances = config_parser_.getResonances();
+void DecayInfo::buildDecayChains(
+    const std::vector<DecayChainConfig>& chains,
+    const std::map<std::string, ResonanceConfig>& config_resonances,
+    int global_max_l)
+{
 
     for (const auto& chain : chains) {
         ChainInfo info;
@@ -47,13 +68,11 @@ void DecayInfo::initialize(const std::string&)
                             if (c.size() >= 2) ch.emplace_back(c[0], c[1]);
                         rlist.emplace_back(rname, rc.intermediate, ip.spin, ip.parity,
                                            it->second.type, it->second.parameters, ch);
-                        // Free theta params
+                        // Free theta params with readable names (preserves order)
                         if (!it->second.free.empty()) {
-                            int nf = 0;
-                            for (int fi : it->second.free)
-                                nf += (fi == -1) ? (int)it->second.parameters.size() : 1;
-                            for (int pi = 0; pi < (int)it->second.parameters.size(); ++pi)
-                                resonance_param_names_.push_back(rname + "_param" + std::to_string(pi));
+                            const auto& pnames = rlist.back().getOrderedParamNames();
+                            for (const auto& pn : pnames)
+                                resonance_param_names_.push_back(rname + "_" + pn);
                         }
                     }
                 }
@@ -82,6 +101,15 @@ void DecayInfo::initialize(const std::string&)
         for (const auto& comb : intermediate_combs) {
             auto cas = std::make_shared<AmpCasDecay>(particles_);
 
+            // Save step info locally (without resonance name yet)
+            struct StepInfo {
+                std::string mother, d1, d2;
+                std::array<int,3> spins, parities;
+                bool id_d, is_boson, p_break, is_bf;
+                std::vector<SL> sl_list;
+            };
+            std::vector<StepInfo> step_infos;
+
             for (const auto& step : chain.decay_steps) {
                 std::array<int, 3> spins = {0};
                 std::array<int, 3> parities = {0};
@@ -103,23 +131,15 @@ void DecayInfo::initialize(const std::string&)
                     if (d1 && d2 && !d1->identical_group.empty() && d1->identical_group == d2->identical_group)
                         { identical_d = true; is_boson = !d1->is_fermion(); }
                 }
-                int maxL = config_parser_.getGlobalMaxL();
+                int maxL = global_max_l;
                 Amp2BD amp2bd(spins, parities, identical_d, is_boson, maxL, step.p_break, step.is_bf);
                 cas->addDecay(amp2bd, step.mother, step.daughters[0], step.daughters[1]);
 
-                // Step key with full quantum numbers
-                std::string step_key =
-                    step.mother + ">" + step.daughters[0] + "," + step.daughters[1]
-                    + "_J" + std::to_string(spins[0]) + "-" + std::to_string(spins[1]) + "-" + std::to_string(spins[2])
-                    + "_P" + std::to_string(parities[0]) + "-" + std::to_string(parities[1]) + "-" + std::to_string(parities[2])
-                    + (identical_d ? (is_boson ? "_idB" : "_idF") : "")
-                    + (step.p_break ? "_pb" : "") + (!step.is_bf ? "_nbf" : "");
-                std::string step_label = step.mother + "→" + step.daughters[0] + step.daughters[1];
-                std::vector<SLKey> sl_keys;
-                for (const auto& sl : amp2bd.getSL())
-                    sl_keys.push_back({sl.S, sl.L});
-                int step_idx = coupling_matrix_builder_.addStep(step_key, step_label, sl_keys);
-                chain_step_map[chain.name].push_back(step_idx);
+                // Save step info for later registration with resonance name
+                std::vector<SL> sl_list;
+                for (const auto& sl : amp2bd.getSL()) sl_list.push_back(sl);
+                step_infos.push_back({step.mother, step.daughters[0], step.daughters[1],
+                    spins, parities, identical_d, is_boson, step.p_break, step.is_bf, sl_list});
             }
 
             auto slcombs = cas->getSLCombinations();
@@ -138,24 +158,83 @@ void DecayInfo::initialize(const std::string&)
             }
 
             for (size_t ki = 0; ki < res_combos.size(); ++ki) {
-                // res_name for amplitude identification, chain_key for coupling matrix
-                std::string res_name = chain.name;
-                std::string chain_key;
-                for (const auto& rp : res_combos[ki]) {
-                    res_name += "_" + rp.first + "_" + rp.second;
-                    if (!chain_key.empty()) chain_key += "_";
-                    chain_key += rp.second;  // resonance name only
+                // Build readable topology name: Jpsi→omega+R_KK[f0_980]_R_KK[f0_980]→Kp+Km
+                auto replace_tag = [&](const std::string& name) -> std::string {
+                    for (const auto& rp : res_combos[ki])
+                        // if (rp.first == name) return name + "[" + rp.second + "]";
+                        if (rp.first == name) return rp.second;
+                    return name;
+                };
+                std::string topo_name;
+                for (const auto& step : chain.decay_steps) {
+                    if (!topo_name.empty()) topo_name += "_";
+                    topo_name += replace_tag(step.mother) + "→"
+                              + replace_tag(step.daughters[0]) + "+"
+                              + replace_tag(step.daughters[1]);
                 }
+
+                // res_name = topology (human-readable amplitude prefix)
+                std::string res_name = topo_name;
+
+                // chain_key: chain.name + simplified key for sharing/trans
+                // Same intermediate+resonance in different CP channels share chain param
+                std::string chain_key = chain.name;
+                for (const auto& rp : res_combos[ki])
+                    chain_key += "_" + rp.first + "[" + rp.second + "]";
+
+                // chain display name = topology (for param_names_ output)
+                chain_display_map_[chain_key] = topo_name;
+
+                // --- Register steps WITH resonance name (key fix) ---
+                std::vector<int> step_indices;
+                for (const auto& info : step_infos) {
+                    // Find resonance for this step's intermediate (mother or daughter)
+                    std::string rname_for_step;
+                    for (const auto& rp : res_combos[ki]) {
+                        if (rp.first == info.mother || rp.first == info.d1 || rp.first == info.d2) {
+                            rname_for_step = rp.second; break;
+                        }
+                    }
+                    std::string step_key = chain.name + "___"  // chain identity
+                        + info.mother + ">" + info.d1 + "," + info.d2
+                        + "_J" + std::to_string(info.spins[0]) + "-" + std::to_string(info.spins[1]) + "-" + std::to_string(info.spins[2])
+                        + "_P" + std::to_string(info.parities[0]) + "-" + std::to_string(info.parities[1]) + "-" + std::to_string(info.parities[2])
+                        + (info.id_d ? (info.is_boson ? "_idB" : "_idF") : "")
+                        + (info.p_break ? "_pb" : "") + (!info.is_bf ? "_nbf" : "")
+                        + "_R" + rname_for_step;
+                    auto step_label_r = [&](const std::string& nm) -> std::string {
+                        for (const auto& rp : res_combos[ki])
+                            if (rp.first == nm) return rp.second;
+                        return nm;
+                    };
+                    std::string step_label = step_label_r(info.mother) + "→"
+                        + step_label_r(info.d1) + "+" + step_label_r(info.d2);
+                        // + "(" + chain.name + ")";
+                    std::vector<SLKey> sl_keys;
+                    for (const auto& sl : info.sl_list) sl_keys.push_back({sl.S, sl.L});
+                    int s_idx = coupling_matrix_builder_.addStep(step_key, step_label, sl_keys);
+                    step_indices.push_back(s_idx);
+                }
+
+                nsl_vectors_.push_back(static_cast<int>(slcombs.size()));
 
                 for (size_t si = 0; si < slcombs.size(); ++si) {
                     const auto& slcomb = slcombs[si];
-                    std::string full_name = res_name + "_SL";
-                    for (const auto& sl : slcomb)
-                        full_name += "_" + std::to_string(sl.S) + std::to_string(sl.L);
+                    // Build name with per-step SL: step1_SL(S,L)_step2_SL(S,L)...
+                    std::string full_name;
+                    for (size_t sni = 0; sni < slcomb.size() && sni < chain.decay_steps.size(); ++sni) {
+                        if (!full_name.empty()) full_name += "_";
+                        const auto& step = chain.decay_steps[sni];
+                        const auto& sl = slcomb[sni];
+                        full_name += replace_tag(step.mother) + "→"
+                                  + replace_tag(step.daughters[0]) + "+"
+                                  + replace_tag(step.daughters[1])
+                                  + "_SL(" + std::to_string(sl.S) + ","
+                                  + std::to_string(sl.L) + ")";
+                    }
                     amplitude_names_.push_back(full_name);
 
                     // Step→SL mapping for coupling matrix
-                    const auto& step_indices = chain_step_map[chain.name];
                     std::vector<std::pair<int,int>> step_sl_pairs;
                     for (size_t ni = 0; ni < slcomb.size() && ni < step_indices.size(); ++ni) {
                         int si_step = step_indices[ni];
@@ -176,18 +255,36 @@ void DecayInfo::initialize(const std::string&)
         chains_info_.push_back(info);
     }
 
-    // --- Build coupling matrix ---
+    // --- Build coupling matrix & apply trans constraints ---
     if (!amplitude_names_.empty()) {
-        coupling_matrix_ = coupling_matrix_builder_.build();
+        // Build trans data from constraints
+        std::vector<std::vector<std::string>> trans_names;
+        std::vector<std::complex<double>> trans_vals;
+        for (const auto& c : constraints_) {
+            if (c.type == "trans") {
+                trans_names.push_back(c.names);
+                trans_vals.push_back(c.values.empty()
+                    ? std::complex<double>(1.0, 0.0) : c.values[0]);
+            }
+        }
+        coupling_matrix_ = coupling_matrix_builder_.buildWithTrans(
+            trans_names, trans_vals);
         use_coupling_matrix_ = true;
 
-        for (const auto& cn : coupling_matrix_.chain_names)
-            param_names_.push_back("chain_" + cn);
+        // Build param_names_ from result (only active params, readable names)
+        for (const auto& cn : coupling_matrix_.chain_names) {
+            auto dit = chain_display_map_.find(cn);
+            param_names_.push_back(dit != chain_display_map_.end()
+                ? dit->second : cn);
+        }
+        n_chain_free_after_trans_ = static_cast<int>(coupling_matrix_.chain_names.size());
+
         for (size_t si = 0; si < coupling_matrix_.steps.size(); ++si) {
             const auto& s = coupling_matrix_.steps[si];
+            if (s.first_free_idx < 0) continue; // folded or all-fixed
             for (int sli = 1; sli < s.n_sl(); ++sli) {
                 param_names_.push_back(
-                    "step_" + s.label + "_SL("
+                    s.label + "_SL("
                     + std::to_string(s.sl_list[sli].S) + ","
                     + std::to_string(s.sl_list[sli].L) + ")");
             }
@@ -203,11 +300,35 @@ void DecayInfo::print() const
         printf("  %s J=%d P=%d mass=%.4f\n", p.name.c_str(), p.spin, p.parity, p.mass);
 
     printf("Chains: %zu\n", chains_info_.size());
+    auto all_chains = config_parser_.getDecayChains();
+    for (const auto& ch : all_chains) {
+        std::string topo;
+        for (const auto& step : ch.decay_steps) {
+            if (!topo.empty()) topo += "_";
+            topo += step.mother + "→" + step.daughters[0] + "+" + step.daughters[1];
+        }
+        printf("  %s: %s\n", ch.name.c_str(), topo.c_str());
+    }
     printf("Amplitudes: %zu\n", amplitude_names_.size());
     for (size_t i = 0; i < amplitude_names_.size(); ++i)
         printf("  [%zu] %s\n", i, amplitude_names_[i].c_str());
 
+    printf("Constraints (%zu):\n", constraints_.size());
+    for (const auto& c : constraints_) {
+        std::string names_str;
+        for (size_t ni = 0; ni < c.names.size(); ++ni) {
+            if (ni > 0) names_str += ", ";
+            names_str += c.names[ni];
+        }
+        printf("  trans: [%s]", names_str.c_str());
+        if (!c.values.empty())
+            printf(" = (%.1f)", std::real(c.values[0]));
+        printf("\n");
+    }
+
     printf("Param names (%zu):\n", param_names_.size());
+    // if (n_chain_free_after_trans_ > 0 && n_chain_free_after_trans_ < (int)param_names_.size())
+    //     printf("  (chain params after trans: %d)\n", n_chain_free_after_trans_);
     for (size_t i = 0; i < param_names_.size(); ++i)
         printf("  [%zu] %s\n", i, param_names_[i].c_str());
 

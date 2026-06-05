@@ -2,15 +2,24 @@
 #define INFO_CUH
 
 #include <Config.cuh>
-#include <Resonance.cuh>
 #include <Parameters.cuh>
+#include <Resonance.cuh>
 #include <map>
 #include <string>
 #include <vector>
 
+// Built by DecayInfo, consumed by Analysis::calculateAmplitudes
+struct ChainInfo {
+    std::string name;
+    std::map<std::pair<std::string, std::vector<int>>, std::vector<Resonance>>
+        intermediate_resonance_map;
+    std::vector<std::vector<Particle>> intermediate_combs;
+};
+
 class DecayInfo {
 public:
     DecayInfo(const std::string& config_file = "config.yml");
+    DecayInfo(const ConfigParser& parser);  // share existing parser
 
     bool isValid() const { return initialized_; }
 
@@ -41,11 +50,17 @@ public:
     // Resonance param info: {init_value, lower, upper} per free theta param
     const std::vector<std::string>& resonanceParamNames() const { return resonance_param_names_; }
 
+    // Number of SL combinations per partial wave
+    const std::vector<int>& nSLvectors() const { return nsl_vectors_; }
+
     // Print summary
     void print() const;
 
 private:
     void initialize(const std::string& config_file);
+    void buildDecayChains(const std::vector<DecayChainConfig>& chains,
+                          const std::map<std::string, ResonanceConfig>& config_resonances,
+                          int global_max_l);
 
     ConfigParser config_parser_;
     std::vector<Particle> particles_;
@@ -54,10 +69,13 @@ private:
     std::vector<std::string> resonance_names_;
     std::vector<std::string> param_names_;
     std::vector<std::string> resonance_param_names_;
+    std::vector<int> nsl_vectors_;
     std::vector<ConstraintConfig> constraints_;
     CouplingMatrixResult coupling_matrix_;
     CouplingMatrixBuilder coupling_matrix_builder_;
+    std::map<std::string, std::string> chain_display_map_;
     bool use_coupling_matrix_ = false;
+    int n_chain_free_after_trans_ = 0;
     bool initialized_ = false;
 };
 

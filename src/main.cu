@@ -15,6 +15,7 @@
 #include "Figure.cu"
 #include "Analysis.cu"
 #include "Info.cu"
+#include "Parameters.cu"
 #include "ResModel.cu"
 #include "Resonance.cu"
 
@@ -41,6 +42,7 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getNVector", &analysis::getNVector)
         .def("getNFreeTheta", &analysis::getNFreeTheta)
         .def("getNParams", &analysis::getNParams)
+        .def("getParamNames", &analysis::getParamNames)
         .def("getSLVectors", &analysis::getSLVectors)
         .def("writeResult", &analysis::writeResult)
         .def("getHessian", &analysis::getHessian, pybind11::arg("params"),

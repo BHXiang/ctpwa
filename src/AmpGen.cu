@@ -977,6 +977,16 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
         dim3 blockDim(256);
         dim3 gridDim(nSLCombs_, (nEvents_[i] + blockDim.x - 1) / blockDim.x);
 
+        // skip empty calls (no SL combos or no resonances for this combination)
+        if (nEvents_[i] == 0 || nSLCombs_ == 0 || resonance_count == 0) {
+            cudaFree(d_resonances);
+            if (d_all_params) cudaFree(d_all_params);
+            if (d_all_channels) cudaFree(d_all_channels);
+            cudaFree(d_amp_offsets);
+            cudaFree(d_event_offsets);
+            continue;
+        }
+
         // 调用核函数计算振幅
         computeAmpsKernel << <gridDim, blockDim >> >
             (d_amplitudes[i],       // 输出振幅
@@ -2138,130 +2148,47 @@ void AmpCalc::testBWRHessian(double m, double m0, double g0, int L, double q, do
 }
 
 // ============================================================
-// CouplingMatrixBuilder implementations
+// Multiplicative coupling: v[a] = ratio[a] × chain[c_a] × Π step[k]
+// d_params: [Re_0..Re_{n-1}, Im_0..Im_{n-1}] (all Re, all Im)
 // ============================================================
 
-int CouplingMatrixBuilder::addStep(const std::string& key, const std::string& label,
-                                    const std::vector<SLKey>& sl_list) {
-    for (size_t si = 0; si < steps_.size(); ++si)
-        if (steps_[si].key == key) return static_cast<int>(si);
-    StepCouplingDef s;
-    s.key = key; s.label = label; s.sl_list = sl_list;
-    steps_.push_back(s);
-    return static_cast<int>(steps_.size() - 1);
-}
-
-void CouplingMatrixBuilder::addAmplitude(int amp_idx, const std::string& chain_key,
-                                          const std::vector<std::pair<int,int>>& step_sl) {
-    AmpStepSLMap m;
-    m.amp_idx = amp_idx; m.chain_key = chain_key; m.step_sl = step_sl;
-    amp_map_.push_back(m);
-}
-
-CouplingMatrixResult CouplingMatrixBuilder::build() const {
-    CouplingMatrixResult r;
-    r.steps = steps_;
-    r.amp_map = amp_map_;
-    r.n_amps = static_cast<int>(amp_map_.size());
-
-    int sp_idx = 0;
-    for (size_t si = 0; si < steps_.size(); ++si) {
-        auto& s = r.steps[si];
-        s.first_free_idx = -1;
-        if (s.n_sl() > 1) { s.first_free_idx = sp_idx; sp_idx += s.n_sl() - 1; }
-    }
-    r.n_step_free = sp_idx;
-
-    std::vector<std::string> chain_keys;
-    for (const auto& am : amp_map_) {
-        auto it = std::find(chain_keys.begin(), chain_keys.end(), am.chain_key);
-        if (it == chain_keys.end()) chain_keys.push_back(am.chain_key);
-    }
-    r.chain_names = chain_keys;
-    r.n_chain_free = static_cast<int>(chain_keys.size());
-    r.n_free = r.n_step_free + r.n_chain_free;
-
-    r.amp_chain.assign(r.n_amps, -1);
-    r.amp_step_params.resize(r.n_amps);
-    for (const auto& am : amp_map_) {
-        int ai = am.amp_idx;
-        if (ai < 0 || ai >= r.n_amps) continue;
-        auto cit = std::find(chain_keys.begin(), chain_keys.end(), am.chain_key);
-        r.amp_chain[ai] = static_cast<int>(cit - chain_keys.begin());
-        for (const auto& [step_idx, sl_idx] : am.step_sl) {
-            if (step_idx < 0 || step_idx >= (int)r.steps.size()) continue;
-            if (sl_idx > 0 && r.steps[step_idx].first_free_idx >= 0)
-                r.amp_step_params[ai].push_back(r.steps[step_idx].first_free_idx + sl_idx - 1);
-        }
-    }
-    return r;
-}
-
-// Build dense coupling matrix M[n_amps × n_free] in row-major order.
-// coupling[i] = chain_param[c_i] × Π step_param[amp_step_params[i]]
-// The first n_step_free columns are step params, the last n_chain_free are chain params.
-void buildCouplingMatrix(const CouplingMatrixResult& r, std::vector<double>& h_M) {
-    h_M.assign(r.n_amps * r.n_free, 0.0);
-    for (int i = 0; i < r.n_amps; ++i) {
-        // Start with chain param contribution (column offset by n_step_free)
-        h_M[i * r.n_free + r.n_step_free + r.amp_chain[i]] = 1.0;
-        // Step param contributions: multiply in place
-        // For the dense matrix, the coupling is: chain param × Π step params
-        // In matrix form, this is bilinear. For now: store the linearized
-        // representation where each free param contributes additively with
-        // coupling = Σ_j M[i][j] · p[j]
-        // TODO: for multiplicative coupling, use a dedicated kernel
-    }
-}
-
-// ============================================================
-// Multiplicative coupling: v[a] = Π param[k] for amplitude a
-// params layout: [Re(p0),Im(p0), Re(p1),Im(p1), ...] (2·n_free doubles)
-// ============================================================
-
-// Compute v[a] = chain_param[c_a] × Π step_param[amp_steps[a][k]]
-// d_params: [2·n_free] interleaved real/imag
-// n_step_free + n_chain_free = n_free
 __global__ void multiplicativeCouplingKernel(
     cuComplex* d_v, const double* d_params,
-    const int* d_amp_chain,     // [n_amps] chain param index for each amp
-    const int* d_step_offsets,  // [n_amps+1] start offset in d_step_data
-    const int* d_step_data,     // flat array of step param indices
-    int n_amps, int n_step_free)
+    const int* d_amp_chain,
+    const int* d_step_offsets,
+    const int* d_step_data,
+    const double* d_amp_chain_ratio,
+    int n_amps, int n_step_free, int n_free)
 {
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_amps) return;
 
-    // Start with chain param (complex)
+    double ratio = d_amp_chain_ratio[a];
     int c_idx = n_step_free + d_amp_chain[a];
-    double re = d_params[2 * c_idx];
-    double im = d_params[2 * c_idx + 1];
+    double re = d_params[c_idx] * ratio;
+    double im = d_params[n_free + c_idx] * ratio;
 
-    // Multiply by step params
     for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
         int s = d_step_data[k];
-        double s_re = d_params[2 * s];
-        double s_im = d_params[2 * s + 1];
+        double s_re = d_params[s];
+        double s_im = d_params[n_free + s];
         double new_re = re * s_re - im * s_im;
         double new_im = re * s_im + im * s_re;
         re = new_re; im = new_im;
     }
 
-    // Scale existing v[a] by computed coupling factor
-    // v[a] = coupling × v_initial (v_initial is 1.0 for reference channel)
-    // Actually: v[a] IS the coupling, so just set it
     d_v[a].x = (float)re;
     d_v[a].y = (float)im;
 }
 
 // Gradient transform: ∂L/∂p using Wirtinger calculus
 // ∂L/∂p_j* = (1/p_j) Σ_{a∈A_j} grad_v[a]* · v[a]
-// ∂L/∂Re(p_j) = 2·Re(∂L/∂p_j*), ∂L/∂Im(p_j) = -2·Im(∂L/∂p_j*)
+// d_params, d_grad_p: [Re_0..Re_{n-1}, Im_0..Im_{n-1}] (all Re, all Im)
 __global__ void multiplicativeGradientKernel(
-    double* d_grad_p,           // output [2·n_free]
-    const cuComplex* d_grad_v,  // ∂L/∂v [n_amps] (complex Wirtinger gradient)
+    double* d_grad_p,           // output [2·n_free] — [Re, Im] format
+    const cuComplex* d_grad_v,  // ∂L/∂v [n_amps]
     const cuComplex* d_v,       // current v [n_amps]
-    const double* d_params,     // [2·n_free]
+    const double* d_params,     // [2·n_free] — [Re, Im] format
     const int* d_amp_chain,     // [n_amps]
     const int* d_step_offsets,  // [n_amps+1]
     const int* d_step_data,     // flat step param indices
@@ -2270,26 +2197,21 @@ __global__ void multiplicativeGradientKernel(
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_free) return;
 
-    // Accumulate Σ conj(grad_v[a]) · v[a] for all amps using param j
     double sum_re = 0.0, sum_im = 0.0;
 
-    // Check chain params (indices n_step_free ... n_free-1)
     if (j >= n_step_free) {
         int c = j - n_step_free;
         for (int a = 0; a < n_amps; ++a) {
             if (d_amp_chain[a] == c) {
-                // ∂L/∂p* = (1/p) · conj(grad_v) · v
                 double gv_re = (double)d_grad_v[a].x;
                 double gv_im = (double)d_grad_v[a].y;
                 double v_re  = (double)d_v[a].x;
                 double v_im  = (double)d_v[a].y;
-                // conj(grad_v) · v = (gv_re·v_re + gv_im·v_im) + i(gv_re·v_im - gv_im·v_re)
                 sum_re += gv_re * v_re + gv_im * v_im;
                 sum_im += gv_re * v_im - gv_im * v_re;
             }
         }
     } else {
-        // Step param: check all amplitudes
         for (int a = 0; a < n_amps; ++a) {
             bool uses_j = false;
             for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
@@ -2306,16 +2228,13 @@ __global__ void multiplicativeGradientKernel(
         }
     }
 
-    // ∂L/∂p_j* = (1/p_j) · Σ
-    double p_re = d_params[2 * j];
-    double p_im = d_params[2 * j + 1];
+    double p_re = d_params[j];
+    double p_im = d_params[n_free + j];
     double p_sq = p_re * p_re + p_im * p_im;
     if (p_sq < 1e-30) p_sq = 1e-30;
-    // (sum_re + i·sum_im) / (p_re + i·p_im) = (sum·conj(p)) / |p|²
     double dL_re = (sum_re * p_re + sum_im * p_im) / p_sq;
     double dL_im = (sum_im * p_re - sum_re * p_im) / p_sq;
 
-    // Convert Wirtinger to real/imag gradient
-    d_grad_p[2 * j]     = 2.0 * dL_re;
-    d_grad_p[2 * j + 1] = -2.0 * dL_im;
+    d_grad_p[j]            = 2.0 * dL_re;
+    d_grad_p[n_free + j]   = -2.0 * dL_im;
 }

@@ -1,4 +1,4 @@
-#include <Config.cuh>
+#include "Config.cuh"
 #include <algorithm>
 #include <fstream>
 #include <iostream>
