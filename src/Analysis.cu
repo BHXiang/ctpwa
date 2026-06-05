@@ -18,6 +18,7 @@
 #include <Figure.cuh>
 #include <AutoDiff.cuh>
 #include <ComputeHessian.cuh>
+#include <Info.cuh>
 #include <Parameters.cuh>
 #include <ComputeBF.cuh>
 
@@ -39,14 +40,6 @@
     } while(0)
 
 //////////////////////////////////////////////
-struct ChainInfo
-{
-    std::string name;
-    std::map<std::pair<std::string, std::vector<int>>, std::vector<Resonance>>
-        intermediate_resonance_map;
-    std::vector<std::vector<Particle>> intermediate_combs;
-};
-
 ////////////////////////////////////////
 std::map<std::string, std::vector<LorentzVector>> readMomentaFromDat(
     const std::vector<std::string>& fileinfo,
@@ -569,85 +562,77 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
 }
 
 //////////////////////////////////////////////////////////////
+/// Trace helpers — print first N values from device arrays
+///////////////////////////////////////////////////////////////
+static void traceDouble(const char* tag, const double* d, int n, int show = 8) {
+    if (n <= 0) return;
+    int k = std::min(n, show);
+    std::vector<double> h(k);
+    cudaMemcpy(h.data(), d, k * sizeof(double), cudaMemcpyDeviceToHost);
+    printf("[TRACE] %s (%d total): ", tag, n);
+    for (int i = 0; i < k; ++i) printf("%.4f ", h[i]);
+    if (n > k) printf("...");
+    double sum = 0; for (int i = 0; i < k; ++i) sum += std::abs(h[i]);
+    printf(" |sum|=% .4f\n", sum);
+}
+static void traceComplex(const char* tag, const cuComplex* d, int n, int show = 5) {
+    if (n <= 0) return;
+    int k = std::min(n, show);
+    std::vector<cuComplex> h(k);
+    cudaMemcpy(h.data(), d, k * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+    printf("[TRACE] %s (%d total): ", tag, n);
+    for (int i = 0; i < k; ++i) printf("(%.4f%+.4fj) ", h[i].x, h[i].y);
+    if (n > k) printf("...");
+    double sum = 0; for (int i = 0; i < k; ++i) sum += std::sqrt(h[i].x*h[i].x + h[i].y*h[i].y);
+    printf(" |sum|=% .4f\n", sum);
+}
+// Replace ROOT-unsafe chars in object names
+static std::string sanitizeROOTName(const std::string& s) {
+    // → is UTF-8 \xE2\x86\x92 (3 bytes), iterate as bytes
+    std::string r = s;
+    for (size_t i = 0; i < r.size(); ) {
+        unsigned char c = static_cast<unsigned char>(r[i]);
+        if (c == 0xE2 && i + 2 < r.size() &&
+            static_cast<unsigned char>(r[i+1]) == 0x86 &&
+            static_cast<unsigned char>(r[i+2]) == 0x92) {
+            r.replace(i, 3, "_"); continue;  // →
+        }
+        // if (!std::isalnum(c) && c != '_' && c != '.' && c != '-') {
+        if (!std::isalnum(c) && c != '_') {
+            r[i] = '_';
+        }
+        ++i;
+    }
+    return r;
+}
+
+static void traceTensor(const char* tag, const torch::Tensor& t, int show = 8) {
+    if (t.numel() == 0) { printf("[TRACE] %s: empty\n", tag); return; }
+    auto cpu = t.cpu();
+    int n = cpu.numel();
+    int k = std::min(n, show);
+    printf("[TRACE] %s (%d total): ", tag, n);
+    if (cpu.is_complex()) {
+        auto acc = cpu.accessor<c10::complex<float>, 1>();
+        double sum = 0;
+        for (int i = 0; i < k; ++i) {
+            printf("(%.4f%+.4fj) ", acc[i].real_, acc[i].imag_);
+            sum += std::sqrt(acc[i].real_*acc[i].real_ + acc[i].imag_*acc[i].imag_);
+        }
+        if (n > k) printf("...");
+        printf(" |sum|=% .4f\n", sum);
+    } else {
+        auto acc = cpu.accessor<double, 1>();
+        double sum = 0;
+        for (int i = 0; i < k; ++i) { printf("%.4f ", acc[i]); sum += std::abs(acc[i]); }
+        if (n > k) printf("...");
+        printf(" |sum|=% .4f\n", sum);
+    }
+}
+
+//////////////////////////////////////////////////////////////
 /// NLLFunction 类定义
 ///////////////////////////////////////////////////////////////
-// CouplingFunction: autograd wrapper for multiplicative coupling transform.
-//   Forward:  p_coupling [2·n_free double] → v_ext [n_amps complex]
-//   Backward: ∂L/∂v_ext → ∂L/∂p_coupling via Wirtinger
-///////////////////////////////////////////////////////////////
-class CouplingFunction : public torch::autograd::Function<CouplingFunction>
-{
-public:
-    static torch::Tensor forward(
-        torch::autograd::AutogradContext* ctx,
-        torch::Tensor p_coupling,
-        int64_t n_amps, int64_t n_step_free, int64_t n_free,
-        int64_t d_chain_ptr, int64_t d_offsets_ptr, int64_t d_data_ptr)
-    {
-        int nA = static_cast<int>(n_amps);
-        int nSF = static_cast<int>(n_step_free);
-        int nF  = static_cast<int>(n_free);
-        int* d_chain   = reinterpret_cast<int*>(d_chain_ptr);
-        int* d_offsets = reinterpret_cast<int*>(d_offsets_ptr);
-        int* d_data    = reinterpret_cast<int*>(d_data_ptr);
-
-        auto v_ext = torch::zeros({nA}, torch::TensorOptions()
-            .dtype(torch::kComplexFloat).device(p_coupling.device()));
-        cuComplex* d_v = reinterpret_cast<cuComplex*>(v_ext.data_ptr());
-        const double* d_p = p_coupling.data_ptr<double>();
-
-        int grid = (nA + 255) / 256;
-        multiplicativeCouplingKernel<<<grid, 256>>>(
-            d_v, d_p, d_chain, d_offsets, d_data, nA, nSF);
-        cudaDeviceSynchronize();
-
-        ctx->saved_data["p_tensor"] = p_coupling;
-        ctx->saved_data["v_ext_ptr"] = reinterpret_cast<int64_t>(d_v);
-        ctx->saved_data["chain_ptr"] = d_chain_ptr;
-        ctx->saved_data["offsets_ptr"] = d_offsets_ptr;
-        ctx->saved_data["data_ptr"] = d_data_ptr;
-        ctx->saved_data["n_amps"] = n_amps;
-        ctx->saved_data["n_step_free"] = n_step_free;
-        ctx->saved_data["n_free"] = n_free;
-
-        return v_ext;
-    }
-
-    static torch::autograd::tensor_list backward(
-        torch::autograd::AutogradContext* ctx,
-        torch::autograd::tensor_list grad_outputs)
-    {
-        auto p = ctx->saved_data["p_tensor"].toTensor();
-        auto grad_v = grad_outputs[0];
-        if (!grad_v.defined()) return {torch::Tensor()};
-
-        int nA  = ctx->saved_data["n_amps"].toInt();
-        int nSF = ctx->saved_data["n_step_free"].toInt();
-        int nF  = ctx->saved_data["n_free"].toInt();
-        int* d_chain   = reinterpret_cast<int*>(ctx->saved_data["chain_ptr"].toInt());
-        int* d_offsets = reinterpret_cast<int*>(ctx->saved_data["offsets_ptr"].toInt());
-        int* d_data    = reinterpret_cast<int*>(ctx->saved_data["data_ptr"].toInt());
-
-        // grad_v is complex [n_amps], but torch gives it as complex tensor
-        // We need it as cuComplex* and v_ext as cuComplex*
-        cuComplex* d_grad_v = reinterpret_cast<cuComplex*>(grad_v.data_ptr());
-        cuComplex* d_v_ext  = reinterpret_cast<cuComplex*>(ctx->saved_data["v_ext_ptr"].toInt());
-        const double* d_p = p.data_ptr<double>();
-
-        auto grad_p = torch::zeros_like(p);
-        double* d_grad_p = grad_p.data_ptr<double>();
-
-        int grid = (nF + 255) / 256;
-        multiplicativeGradientKernel<<<grid, 256>>>(
-            d_grad_p, d_grad_v, d_v_ext, d_p,
-            d_chain, d_offsets, d_data, nA, nSF, nF);
-        cudaDeviceSynchronize();
-
-        return {grad_p, torch::Tensor(), torch::Tensor(), torch::Tensor(),
-                torch::Tensor(), torch::Tensor(), torch::Tensor()};
-    }
-};
-
 ///////////////////////////////////////////////////////////////
 class NLLFunction : public torch::autograd::Function<NLLFunction>
 {
@@ -673,7 +658,41 @@ public:
         TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
 
         // 0. 拆分 params → vector + theta
-        auto [vector, theta] = params_mgr->splitParams(params_tensor);
+        torch::Tensor vector, theta;
+        if (params_mgr->hasCouplingMatrix()) {
+            const auto& cm = params_mgr->couplingMatrix();
+            int ncf = cm.n_free;
+            int na  = cm.n_amps;
+            int nt  = params_mgr->nFreeTheta();
+
+            // params_tensor: [Re_p, Im_p, θ] (2*ncf+nt) → extend → [Re_v, Im_v, θ] (2*na+nt)
+            auto ext = torch::empty({2 * na + nt},
+                torch::TensorOptions().dtype(torch::kFloat64).device(params_tensor.device()));
+            params_mgr->extendCouplingParams(
+                params_tensor.data_ptr<double>(), ext.data_ptr<double>(), ncf, nt);
+            traceDouble("2.extended[Re_v]", ext.data_ptr<double>(), na);
+            traceDouble("2.extended[Im_v]", ext.data_ptr<double>() + na, na);
+
+            // Save original params for backward gradient transform
+            ctx->saved_data["original_params"] = params_tensor;
+
+            vector = torch::complex(
+                ext.slice(0, 0, na).to(torch::kFloat),
+                ext.slice(0, na, 2 * na).to(torch::kFloat));
+            theta = (nt > 0) ? ext.slice(0, 2 * na, 2 * na + nt) : torch::Tensor();
+        } else {
+            std::tie(vector, theta) = params_mgr->splitParams(params_tensor);
+        }
+
+        // [3] inside forward
+        printf("\n[TRACE] ===== FORWARD: NLLFunction =====\n");
+        traceTensor("3.vector(complex)", vector);
+        if (theta.numel() > 0) {
+            auto th_cpu = theta.cpu(); auto th = th_cpu.accessor<double, 1>();
+            printf("[TRACE] 3.theta (%ld): ", theta.numel());
+            for (int i = 0; i < std::min((int)theta.numel(), 4); ++i) printf("%.4f ", th[i]);
+            printf("\n");
+        }
 
         int num_gpus = d_all_amplitudes_list.size();
         TORCH_CHECK(num_gpus > 0, "No GPUs provided");
@@ -683,6 +702,11 @@ public:
         torch::Tensor extended_vector = params_mgr->extendVector(vector, vector.device());
         int extended_n_gls = extended_vector.numel();
         const int primary_dev = vector.get_device();
+
+        // [4] after extendVector (identity when coupling matrix active)
+        printf("[TRACE] 4.extendVector: vector(%d) → extended(%d)\n",
+               (int)vector.numel(), extended_n_gls);
+        traceTensor("4.extended:vector", extended_vector);
 
         // 2. 将extended_vector分发到每个GPU（实际拷贝）
         std::vector<torch::Tensor> extended_vec_per_gpu;
@@ -1080,18 +1104,69 @@ public:
         int nv = params_mgr->nFreeVector();
         int nt = params_mgr->nFreeTheta();
 
-        // 收缩 extended→free，并组装为 grad_params = [Re(grad_v), Im(grad_v), grad_θ]
-        // global_extended_grad 存的是 Wirtinger 共轭梯度 ∂L/∂v*；
-        // 对应实参数: ∂L/∂Re(v) = 2·Re(∂L/∂v*), ∂L/∂Im(v) = 2·Im(∂L/∂v*)
-        torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
-        torch::Tensor grad_real = (torch::real(grad_vec) * 2.0).to(torch::kFloat64);
-        torch::Tensor grad_imag = (torch::imag(grad_vec) * 2.0).to(torch::kFloat64);
-
         torch::Tensor grad_params;
-        if (nt > 0 && grad_theta.numel() > 0) {
-            grad_params = torch::cat({grad_real, grad_imag, grad_theta});
+
+        if (params_mgr->hasCouplingMatrix()) {
+            // Coupling matrix mode: transform ∂L/∂v → ∂L/∂p
+            const auto& cm = params_mgr->couplingMatrix();
+            int na = cm.n_amps;
+            int ncf = cm.n_free;
+
+            printf("\n[TRACE] ===== BACKWARD: NLLFunction =====\n");
+            printf("[TRACE] na=%d ncf=%d nt=%d\n", na, ncf, nt);
+
+            // [5] grad_v: Wirtinger ∂L/∂v* (cuComplex [na])
+            traceComplex("5.grad_v(∂L/∂v*)", reinterpret_cast<cuComplex*>(global_extended_grad.data_ptr()), na);
+            // [5b] grad_theta
+            if (nt > 0 && grad_theta.numel() > 0)
+                traceDouble("5.grad_theta", grad_theta.data_ptr<double>(), nt, 4);
+
+            auto original_params = ctx->saved_data["original_params"].toTensor();
+            const double* d_p = original_params.data_ptr<double>();
+
+            // [6] current coupling params p and computed v
+            traceDouble("6.params[Re_p]", d_p, ncf);
+            traceDouble("6.params[Im_p]", d_p + ncf, ncf);
+
+            // Current v values for gradient transform
+            auto v_buf = torch::empty({na}, torch::TensorOptions()
+                .dtype(torch::kComplexFloat).device(global_extended_grad.device()));
+            cuComplex* d_v = reinterpret_cast<cuComplex*>(v_buf.data_ptr());
+            params_mgr->applyCouplingMatrix(d_p, d_v);
+            traceComplex("7.v_ext(from p)", d_v, na);
+
+            // Gradient w.r.t coupling params [2*ncf] in [Re_p, Im_p] format
+            auto grad_p = torch::empty({2 * ncf},
+                torch::TensorOptions().dtype(torch::kFloat64).device(global_extended_grad.device()));
+            double* d_grad_p = grad_p.data_ptr<double>();
+            cuComplex* d_grad_v = reinterpret_cast<cuComplex*>(global_extended_grad.data_ptr());
+            params_mgr->transformCouplingGradient(d_grad_v, d_v, d_p, d_grad_p);
+
+            // [8] gradient w.r.t p: [Re(∂L/∂p), Im(∂L/∂p)]
+            traceDouble("8.grad_p[Re]", d_grad_p, ncf);
+            traceDouble("8.grad_p[Im]", d_grad_p + ncf, ncf);
+
+            grad_params = (nt > 0 && grad_theta.numel() > 0)
+                ? torch::cat({grad_p, grad_theta})
+                : grad_p;
+
+            // [9] final grad_params [Re_p, Im_p, θ]
+            printf("[TRACE] 9.final grad_params (%ld):\n", grad_params.numel());
+            traceDouble("9.grad[Re_p]", grad_params.data_ptr<double>(), ncf);
+            traceDouble("9.grad[Im_p]", grad_params.data_ptr<double>() + ncf, ncf);
+            if (nt > 0)
+                traceDouble("9.grad[theta]", grad_params.data_ptr<double>() + 2*ncf, nt, 4);
         } else {
-            grad_params = torch::cat({grad_real, grad_imag});
+            // Legacy mode: collapseVectorGrad + real/imag extraction
+            torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
+            torch::Tensor grad_real = (torch::real(grad_vec) * 2.0).to(torch::kFloat64);
+            torch::Tensor grad_imag = (torch::imag(grad_vec) * 2.0).to(torch::kFloat64);
+
+            if (nt > 0 && grad_theta.numel() > 0) {
+                grad_params = torch::cat({grad_real, grad_imag, grad_theta});
+            } else {
+                grad_params = torch::cat({grad_real, grad_imag});
+            }
         }
 
         return { grad_params * grad_outputs[0],
@@ -1146,30 +1221,17 @@ public:
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
 
-        if (use_coupling_matrix_) {
-            int ncf = coupling_matrix_.n_free;  // number of complex coupling params
-            int na  = coupling_matrix_.n_amps;
-            // params = [Re(p0),Im(p0), ..., Re(p_{ncf-1}),Im(p_{ncf-1}), theta]
-            auto p_coupling = params.slice(0, 0, 2 * ncf);
-            auto theta = params.slice(0, 2 * ncf, params.size(0));
+        if (params_.hasCouplingMatrix()) {
+            const auto& cm = params_.couplingMatrix();
+            int ncf = cm.n_free;
+            int na  = cm.n_amps;
+            int nt  = static_cast<int>(params.size(0)) - 2 * ncf;
 
-            // Apply coupling transform: p → v_ext
-            auto v_ext = CouplingFunction::apply(p_coupling,
-                (int64_t)na, (int64_t)coupling_matrix_.n_step_free, (int64_t)ncf,
-                reinterpret_cast<int64_t>(d_amp_chain_),
-                reinterpret_cast<int64_t>(d_step_offsets_),
-                reinterpret_cast<int64_t>(d_step_data_));
-
-            // Build old-format params: [Re(v0),...,Re(v_{na-1}), Im(v0),...,Im(v_{na-1}), theta]
-            auto v_re = torch::real(v_ext).to(torch::kFloat64);
-            auto v_im = torch::imag(v_ext).to(torch::kFloat64);
-            auto params_old = theta.size(0) > 0
-                ? torch::cat({v_re, v_im, theta})
-                : torch::cat({v_re, v_im});
-
-            return NLLFunction::apply(params_old, &params_, d_all_amplitudes_, &amp_calc_,
-                d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
-                data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
+            printf("\n[TRACE] ===== FORWARD: getNLL =====\n");
+            printf("[TRACE] ncf=%d na=%d nt=%d\n", ncf, na, nt);
+            traceDouble("1.input[Re_p]", params.data_ptr<double>(), ncf);
+            traceDouble("1.input[Im_p]", params.data_ptr<double>() + ncf, ncf);
+            if (nt > 0) traceDouble("1.input[theta]", params.data_ptr<double>() + 2*ncf, nt, 4);
         }
 
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
@@ -1178,10 +1240,11 @@ public:
     }
 
     int getNVector() const {
-        if (use_coupling_matrix_) return coupling_matrix_.n_free;
+        if (params_.hasCouplingMatrix()) return params_.couplingMatrix().n_free;
         return params_.nFreeVector();
     }
     int getNFreeTheta() const { return params_.nFreeTheta(); }
+    std::vector<std::string> getParamNames() const { return params_.paramNames(); }
     int getNParams() const { return 2 * getNVector() + getNFreeTheta(); }
     const Parameters& getParams() const { return params_; }
 
@@ -1192,25 +1255,50 @@ public:
         return torch::tensor(nSLvectors_, options);
     }
 
-    void writeResult(torch::Tensor& vector, const std::string& filename, const int is_saved_weight = 0)
+    void writeResult(torch::Tensor params, const std::string& filename, const int is_saved_weight = 0)
     {
-        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == torch::kComplexFloat, "vector must be complex128");
+        TORCH_CHECK(params.is_cuda(), "params must be on CUDA");
 
-        // const int original_size = vector.numel();
-        // int extended_size = original_size;
+        torch::Device dev = params.device();
+        torch::Tensor extended_vector;
 
-        torch::Device dev(torch::kCUDA, vector.get_device());
+        if (params_.hasCouplingMatrix()) {
+            TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64 with coupling matrix");
+            const auto& cm = params_.couplingMatrix();
+            int ncf = cm.n_free;
+            int na  = cm.n_amps;
+            int nt  = static_cast<int>(params.size(0)) - 2 * ncf;
 
-        torch::Tensor extended_vector = params_.extendVector(vector, dev);
+            // Extend: [Re_p, Im_p, θ] → [Re_v, Im_v, θ]
+            auto ext = torch::empty({2 * na + nt},
+                torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+            params_.extendCouplingParams(
+                params.data_ptr<double>(), ext.data_ptr<double>(), ncf, nt);
 
-        // 将extended_vector分配到多个GPU（如果需要，可以直接在GPU上处理约束）
+            // Build complex vector from extended format
+            extended_vector = torch::complex(
+                ext.slice(0, 0, na).to(torch::kFloat),
+                ext.slice(0, na, 2 * na).to(torch::kFloat));
+
+            // Recompute amplitudes if theta params present
+            if (nt > 0) {
+                auto theta = params.slice(0, 2 * ncf, params.size(0));
+                amp_calc_.reComputeAmps(d_all_amplitudes_,
+                    reinterpret_cast<const double*>(theta.data_ptr()),
+                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+            }
+        } else {
+            TORCH_CHECK(params.dtype() == torch::kComplexFloat, "params must be complex128 in legacy mode");
+            extended_vector = params_.extendVector(params, dev);
+        }
+
+        // 将extended_vector分配到多个GPU
         std::vector<torch::Tensor> extended_vec_per_gpu;
         for (int i = 0; i < d_all_amplitudes_.size(); ++i) {
             extended_vec_per_gpu.push_back(extended_vector.to(torch::Device(torch::kCUDA, i)));
         }
 
-        const int target_dev = vector.get_device();
+        const int target_dev = dev.index();
 
         int npartials = nSLvectors_.size();
         // 每个GPU在自己的设备上分配输出缓冲区
@@ -1973,7 +2061,7 @@ public:
                     TDirectory* histDir = rootFile->GetDirectory(masshist[j].name.c_str());
                     histDir->cd();
 
-                    std::string partial_dir_name = "h_" + resonance_names_[partial_idx];
+                    std::string partial_dir_name = "h_" + sanitizeROOTName (resonance_names_[partial_idx]);
 
                     TH1F* hist = masshist_partial[j];
                     hist->Scale(normFactor);
@@ -2021,7 +2109,7 @@ public:
                     TDirectory* histDir = rootFile->GetDirectory(anglehist[j].name.c_str());
                     histDir->cd();
 
-                    std::string partial_dir_name = "h_" + resonance_names_[partial_idx];
+                    std::string partial_dir_name = "h_" + sanitizeROOTName(resonance_names_[partial_idx]);
 
                     TH1F* hist = anglehist_partial[j];
                     hist->Scale(normFactor);
@@ -2998,7 +3086,7 @@ private:
     std::vector<std::string> resonance_names_;
     std::vector<std::string> legends_;
 
-    // 参数管理器（统一管理 vector / theta / 约束）
+    // 参数管理器（统一管理 vector / theta / 约束 / 耦合矩阵）
     Parameters params_;
 
     // config 初始化
@@ -3010,74 +3098,6 @@ private:
     AmpCalc amp_calc_;
     bool initialized_ = false;
 
-    // New coupling parameterization (CouplingMatrixBuilder)
-    CouplingMatrixResult coupling_matrix_;
-    CouplingMatrixBuilder coupling_matrix_builder_;
-    bool use_coupling_matrix_ = false;
-    int* d_amp_chain_ = nullptr;
-    int* d_step_offsets_ = nullptr;
-    int* d_step_data_ = nullptr;
-    int step_data_len_ = 0;
-    std::vector<std::string> param_names_;  // fitting parameter names
-
-    // Transform amplitude-coupling gradient to free-param gradient:
-    //   grad_free = M^T · grad_amps
-    // d_grad_amps: [2*n_amps] complex (Re ∂L/∂v_a, Im ∂L/∂v_a interleaved or separate)
-    // d_grad_free: [n_free] double, output on device
-    // Transform gradient: ∂L/∂v → ∂L/∂p using Wirtinger calculus
-    void transformCouplingGradient(const cuComplex* d_grad_v, const cuComplex* d_v,
-                                   const double* d_params, double* d_grad_p) const {
-        if (!use_coupling_matrix_) return;
-        int grid = (coupling_matrix_.n_free + 255) / 256;
-        multiplicativeGradientKernel<<<grid, 256>>>(
-            d_grad_p, d_grad_v, d_v, d_params,
-            d_amp_chain_, d_step_offsets_, d_step_data_,
-            coupling_matrix_.n_amps, coupling_matrix_.n_step_free,
-            coupling_matrix_.n_free);
-        cudaDeviceSynchronize();
-    }
-
-    // Apply coupling matrix to get extended coupling vector:
-    //   v_extended = M · p_coupling  (or product form for multiplicative)
-    // Upload sparse coupling data to device. Call after initializeDecayChains.
-    void uploadCouplingData() {
-        if (!use_coupling_matrix_) return;
-        const auto& r = coupling_matrix_;
-        if (d_amp_chain_) cudaFree(d_amp_chain_);
-        cudaMalloc(&d_amp_chain_, r.n_amps * sizeof(int));
-        cudaMemcpy(d_amp_chain_, r.amp_chain.data(), r.n_amps * sizeof(int), cudaMemcpyHostToDevice);
-
-        if (d_step_offsets_) cudaFree(d_step_offsets_);
-        cudaMalloc(&d_step_offsets_, (r.n_amps + 1) * sizeof(int));
-        std::vector<int> h_offsets(r.n_amps + 1, 0);
-        int total = 0;
-        for (int i = 0; i < r.n_amps; ++i) {
-            h_offsets[i] = total;
-            total += (int)r.amp_step_params[i].size();
-        }
-        h_offsets[r.n_amps] = total;
-        cudaMemcpy(d_step_offsets_, h_offsets.data(), (r.n_amps + 1) * sizeof(int), cudaMemcpyHostToDevice);
-
-        if (d_step_data_) cudaFree(d_step_data_);
-        cudaMalloc(&d_step_data_, total * sizeof(int));
-        std::vector<int> h_data(total);
-        int pos = 0;
-        for (int i = 0; i < r.n_amps; ++i)
-            for (int p : r.amp_step_params[i]) h_data[pos++] = p;
-        cudaMemcpy(d_step_data_, h_data.data(), total * sizeof(int), cudaMemcpyHostToDevice);
-        step_data_len_ = total;
-    }
-
-    // Apply multiplicative coupling: v[a] = chain[c_a] × Π step[s]
-    void applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const {
-        if (!use_coupling_matrix_) return;
-        int grid = (coupling_matrix_.n_amps + 255) / 256;
-        multiplicativeCouplingKernel<<<grid, 256>>>(
-            d_v_out, d_params,
-            d_amp_chain_, d_step_offsets_, d_step_data_,
-            coupling_matrix_.n_amps, coupling_matrix_.n_step_free);
-        cudaDeviceSynchronize();
-    }
 
     void initialize(std::string config_file = "config.yml")
     {
@@ -3436,439 +3456,52 @@ private:
 
     void initializeDecayChains()
     {
-        auto chains = config_parser_.getDecayChains();
+        // Use DecayInfo to build coupling matrix from config
+        DecayInfo info(config_parser_);
+        if (!info.isValid()) return;
 
-        const auto& config_resonances = config_parser_.getResonances();
+        // Copy data from DecayInfo
+        amplitude_names_   = info.amplitudeNames();
+        resonance_names_   = info.resonanceNames();
+        chains_info_       = info.chainInfos();
+        n_amplitudes_      = info.nAmplitudes();
+        nSLvectors_        = info.nSLvectors();
 
-        // 输出全同粒子分组信息
-        auto identical_groups = config_parser_.getIdenticalGroups();
-        if (!identical_groups.empty()) {
-            std::cout << "Identical particle groups detected:" << std::endl;
-            for (const auto& [group, particle_names] : identical_groups) {
-                std::cout << "  Group \"" << group << "\": ";
-                std::string stats = "boson";
-                for (size_t i = 0; i < particle_names.size(); ++i) {
-                    if (i > 0) std::cout << ", ";
-                    std::cout << particle_names[i];
-                    if (i == 0) {
-                        for (const auto& p : particles_) {
-                            if (p.name == particle_names[i]) {
-                                stats = p.is_fermion() ? "fermion" : "boson";
-                                break;
-                            }
-                        }
-                    }
-                }
-                std::cout << " (" << stats << ")" << std::endl;
-            }
-        }
+        // Set coupling matrix + param names on Parameters
+        if (info.hasCouplingMatrix()) {
+            params_.setCouplingMatrix(info.couplingMatrix());
+            params_.setParamNames(info.paramNames());
 
-        // 获取总振幅长度
-        for (const auto& chain : chains)
-        {
-            // std::cout << "Processing decay chain: " << chain.name <<
-            // std::endl;
-
-            ChainInfo chain_info;
-            chain_info.name = chain.name;
-
-            std::map<std::pair<std::string, std::vector<int>>, std::vector<Resonance>>               intermediate_resonance_map;
-            std::vector<std::vector<Particle>> intermediate_particles;
-            for (const auto& res_chain : chain.resonance_chains)
-            {
-                // std::cout << "  Intermediate: " << res_chain.intermediate <<
-                // std::endl;
-                std::vector<Particle> particles;
-                for (const auto& spin_chain : res_chain.spin_chains)
-                {
-                    // std::cout << "    Spin-Parity options: ";
-
-                    Particle intermediate_particle = { res_chain.intermediate, static_cast<int>(spin_chain.spin_parity[0]),
-                         static_cast<int>(spin_chain.spin_parity[1]), -1 };
-
-                    std::vector<Resonance> resonance_list;
-                    // std::cout << " Resonance: " << std::endl;
-                    for (const auto& resonance_name : spin_chain.resonances)
-                    {
-                        // std::cout << resonance_name << std::endl;
-
-                        for (const auto& [name, res_config] : config_resonances)
-                        {
-                            if (name == resonance_name)
-                            {
-                                if (res_config.J == spin_chain.spin_parity[0] &&
-                                    spin_chain.spin_parity[1])
-                                {
-                                    // 将 channels 从 vector<vector<double>> 转换为 vector<pair<double,double>>
-                                    std::vector<std::pair<double, double>> channels;
-                                    for (const auto& ch : res_config.channels) {
-                                        if (ch.size() >= 2)
-                                            channels.emplace_back(ch[0], ch[1]);
-                                    }
-                                    resonance_list.emplace_back(
-                                        name, res_chain.intermediate,
-                                        intermediate_particle.spin,
-                                        intermediate_particle.parity,
-                                        res_config.type, res_config.parameters,
-                                        channels);
-                                    // std::cout << "      Added resonance: " <<
-                                    // name << " J: " << res_config.J << " P: "
-                                    // << res_config.P << std::endl;
-                                }
-                                else
-                                {
-                                    std::cout << "      Skipped resonance (J,P "
-                                        "mismatch): "
-                                        << name << " J: " << res_config.J
-                                        << " P: " << res_config.P
-                                        << std::endl;
-                                }
-                            }
-                        }
-                    }
-                    // std::cout << std::endl;
-
-                    std::pair<std::string, std::vector<int>> key = {
-                        res_chain.intermediate,
-                        {spin_chain.spin_parity[0], spin_chain.spin_parity[1]} };
-                    intermediate_resonance_map[key] = resonance_list;
-                    particles.push_back(intermediate_particle);
-                }
-                intermediate_particles.push_back(particles);
-            }
-
-            chain_info.intermediate_resonance_map = intermediate_resonance_map;
-
-            std::vector<std::vector<Particle>> intermediate_combs = { {} };
-            for (const auto& particleList : intermediate_particles)
-            {
-                std::vector<std::vector<Particle>> temp;
-                for (const auto& comb : intermediate_combs)
-                {
-                    for (const auto& particle : particleList)
-                    {
-                        std::vector<Particle> new_res = comb;
-                        // std::cout << " Adding particle to combination: " <<
-                        // particle.name
-                        // << " J: " << particle.spin << " P: " <<
-                        // particle.parity << std::endl;
-                        new_res.push_back(particle);
-                        temp.push_back(new_res);
-                    }
-                }
-                intermediate_combs = std::move(temp);
-            }
-
-            chain_info.intermediate_combs = intermediate_combs;
-
-            for (auto comb : intermediate_combs)
-            {
-                auto cas = std::make_shared<AmpCasDecay>(particles_);
-                for (const auto& step : chain.decay_steps)
-                {
-                    std::array<int, 3> spins = { 0 };
-                    std::array<int, 3> parities = { 0 };
-                    for (auto particle : particles_)
-                    {
-                        if (particle.name == step.mother)
-                        {
-                            // std::cout << "mother: " << particle.name << " "
-                            // << particle.spin << " " << particle.parity <<
-                            // std::endl;
-                            spins[0] = particle.spin;
-                            parities[0] = particle.parity;
-                        }
-
-                        for (int i = 0; i < step.daughters.size(); i++)
-                        {
-                            if (particle.name == step.daughters[i])
-                            {
-                                // std::cout << "daugters: " << particle.name <<
-                                // " " << particle.spin << " " <<
-                                // particle.parity << std::endl;
-                                spins[i + 1] = particle.spin;
-                                parities[i + 1] = particle.parity;
-                            }
-                        }
-                    }
-                    for (auto res_jp : comb)
-                    {
-                        if (res_jp.name == step.mother)
-                        {
-                            // std::cout << "mother: " << res_jp.name << " " <<
-                            // res_jp.spin << std::endl;
-                            spins[0] = res_jp.spin;
-                            parities[0] = res_jp.parity;
-                        }
-
-                        for (int i = 0; i < step.daughters.size(); i++)
-                        {
-                            if (res_jp.name == step.daughters[i])
-                            {
-                                // std::cout << "daugters: " << res_jp.name << "
-                                // " << res_jp.spin << " " << res_jp.parity <<
-                                // std::endl;
-                                spins[i + 1] = res_jp.spin;
-                                parities[i + 1] = res_jp.parity;
-                            }
-                        }
-                    }
-                    // 检查两个子粒子是否全同
-                    bool identical_daughters = false;
-                    bool is_boson = true;
-                    if (chain.symmetrize) {
-                        const Particle* p_d1 = nullptr, * p_d2 = nullptr;
-                        for (const auto& p : particles_) {
-                            if (p.name == step.daughters[0]) p_d1 = &p;
-                            if (p.name == step.daughters[1]) p_d2 = &p;
-                        }
-                        if (p_d1 && p_d2 &&
-                            !p_d1->identical_group.empty() &&
-                            p_d1->identical_group == p_d2->identical_group) {
-                            identical_daughters = true;
-                            is_boson = !p_d1->is_fermion();
-                        }
-                    }
-                    int maxL = config_parser_.getGlobalMaxL();
-                    cas->addDecay(Amp2BD(spins, parities, identical_daughters, is_boson, maxL,
-                                        step.p_break, step.is_bf),
-                        step.mother, step.daughters[0], step.daughters[1]);
-
-                    // 输出decay chain结构
-                    std::cout << step.mother << "(";
-                    if (spins[0] % 2 != 0)
-                        std::cout << (spins[0] - 1) / 2;
-                    else
-                        std::cout << spins[0] - 1 << "/2";
-                    if (parities[0] == 1)
-                        std::cout << "+)";
-                    else if (parities[0] == -1)
-                        std::cout << "-)";
-                    std::cout << "->";
-                    for (int i = 0; i < step.daughters.size(); i++)
-                    {
-                        std::cout << step.daughters[i] << "(";
-                        if (spins[i + 1] % 2 != 0)
-                            std::cout << (spins[i + 1] - 1) / 2;
-                        else
-                            std::cout << spins[i + 1] - 1 << "/2";
-                        if (parities[i + 1] == 1)
-                            std::cout << "+)";
-                        else if (parities[i + 1] == -1)
-                            std::cout << "-)";
-                    }
-                    std::cout << ", ";
-                }
-
-                auto slcombs = cas->getSLCombinations();
-                std::cout << "SL:";
-                for (auto slcomb : slcombs)
-                {
-                    std::cout << "{";
-                    for (auto sl : slcomb)
-                    {
-                        std::cout << "(" << (sl.S - 1) / 2.0 << ", " << sl.L << ")";
-                    }
-                    std::cout << "}";
-                }
-                std::cout << std::endl;
-
-                std::vector<std::vector<std::pair<std::string, std::string>>>
-                    resonance_combinations = { {} };
-                for (const auto& particle : comb)
-                {
-                    std::pair<std::string, std::vector<int>> key = {
-                        particle.name, {particle.spin, particle.parity} };
-                    const auto& resonance_list =
-                        intermediate_resonance_map[key];
-
-                    std::vector<
-                        std::vector<std::pair<std::string, std::string>>>
-                        temp;
-                    for (const auto& res_comb : resonance_combinations)
-                    {
-                        for (const auto& resonance : resonance_list)
-                        {
-                            std::vector<std::pair<std::string, std::string>>
-                                new_res_comb = res_comb;
-                            new_res_comb.push_back(
-                                { resonance.getTag(), resonance.getName() });
-                            temp.push_back(new_res_comb);
-                        }
-                    }
-                    resonance_combinations = std::move(temp);
-                }
-
-                // Register decay steps with CouplingMatrixBuilder
-                // Build per-step SL list: collect all unique (S,L) for each node
-                // from cas->getSLCombinations()
-                std::map<int, std::vector<SLKey>> node_sl_map;
-                for (const auto& slcomb : slcombs) {
-                    for (size_t ni = 0; ni < slcomb.size() && ni < chain.decay_steps.size(); ++ni) {
-                        SLKey slk = {slcomb[ni].S, slcomb[ni].L};
-                        auto& vec = node_sl_map[(int)ni];
-                        bool found = false;
-                        for (const auto& s : vec) if (s.S == slk.S && s.L == slk.L) { found = true; break; }
-                        if (!found) vec.push_back(slk);
-                    }
-                }
-                std::map<int,int> step_idx_map;  // node index → CouplingMatrixBuilder step index
-                for (size_t ni = 0; ni < chain.decay_steps.size(); ++ni) {
-                    const auto& st = chain.decay_steps[ni];
-                    // Get spins/parities (include intermediate particles from resonance chains)
-                    std::map<std::string, std::pair<int,int>> sp_map;
-                    for (const auto& p : particles_) sp_map[p.name] = {p.spin, p.parity};
-                    for (const auto& rc : chain.resonance_chains)
-                        for (const auto& sc : rc.spin_chains)
-                            sp_map[rc.intermediate] = {(int)sc.spin_parity[0], (int)sc.spin_parity[1]};
-                    int s_m = 0, p_m = 0, s_d1 = 0, p_d1 = 0, s_d2 = 0, p_d2 = 0;
-                    auto it_m = sp_map.find(st.mother);
-                    if (it_m != sp_map.end()) { s_m = it_m->second.first; p_m = it_m->second.second; }
-                    auto it_d1 = sp_map.find(st.daughters[0]);
-                    if (it_d1 != sp_map.end()) { s_d1 = it_d1->second.first; p_d1 = it_d1->second.second; }
-                    auto it_d2 = sp_map.find(st.daughters[1]);
-                    if (it_d2 != sp_map.end()) { s_d2 = it_d2->second.first; p_d2 = it_d2->second.second; }
-                    std::string key = st.mother + ">" + st.daughters[0] + "," + st.daughters[1]
-                        + "_J" + std::to_string(s_m) + "-" + std::to_string(s_d1) + "-" + std::to_string(s_d2)
-                        + "_P" + std::to_string(p_m) + "-" + std::to_string(p_d1) + "-" + std::to_string(p_d2);
-                    std::string label = st.mother + "→" + st.daughters[0] + st.daughters[1];
-                    const auto& sl_list = node_sl_map[(int)ni];
-                    step_idx_map[(int)ni] = coupling_matrix_builder_.addStep(key, label, sl_list);
-                }
-
-                std::cout << "Resonance: ";
-                for (size_t k = 0; k < resonance_combinations.size(); ++k)
-                {
-                    int amp_start_idx = n_amplitudes_;
-                    n_amplitudes_ += slcombs.size();
-                    nSLvectors_.push_back(slcombs.size());
-
-                    std::string res_name = chain.name;
-                    std::string chain_key;  // resonance-only key for coupling matrix
-                    std::cout << "{ ";
-                    for (size_t j = 0; j < resonance_combinations[k].size();
-                        ++j)
-                    {
-                        const auto& res_pair = resonance_combinations[k][j];
-                        res_name += "_" + res_pair.first + "_" + res_pair.second;
-                        if (!chain_key.empty()) chain_key += "_";
-                        chain_key += res_pair.second;  // resonance name
-
-                        std::cout << res_pair.second; // 共振态名称
-                        if (j < resonance_combinations[k].size() - 1)
-                            std::cout << ", ";
-                    }
-                    if (k < resonance_combinations.size() - 1)
-                        std::cout << " }, ";
-                    else
-                        std::cout << "}";
-
-                    for (size_t si = 0; si < slcombs.size(); ++si)
-                    {
-                        const auto& slcomb = slcombs[si];
-                        std::string full_name = res_name + "_" + "SL";
-                        for (const auto& sl : slcomb)
-                        {
-                            full_name += "_" + std::to_string(sl.S) + std::to_string(sl.L);
-                        }
-                        amplitude_names_.push_back(full_name);
-
-                        // Register amplitude with CouplingMatrixBuilder
-                        std::vector<std::pair<int,int>> step_sl_pairs;
-                        for (size_t ni = 0; ni < slcomb.size() && ni < chain.decay_steps.size(); ++ni) {
-                            auto sit = step_idx_map.find((int)ni);
-                            if (sit == step_idx_map.end()) continue;
-                            int si_step = sit->second;
-                            const auto& sl_list = coupling_matrix_builder_.getSteps()[si_step].sl_list;
-                            int sl_idx = 0;  // default: first SL (fixed)
-                            for (size_t ssi = 0; ssi < sl_list.size(); ++ssi) {
-                                if (sl_list[ssi].S == slcomb[ni].S && sl_list[ssi].L == slcomb[ni].L)
-                                    { sl_idx = (int)ssi; break; }
-                            }
-                            step_sl_pairs.push_back({si_step, sl_idx});
-                        }
-                        coupling_matrix_builder_.addAmplitude(
-                            amp_start_idx + static_cast<int>(si),
-                            chain_key, step_sl_pairs);
-                    }
-                    resonance_names_.push_back(res_name);
-                }
-                std::cout << std::endl;
-            }
-
-            chains_info_.push_back(chain_info);
-        }
-
-        // Build coupling matrix from the new parameterization
-        if (!amplitude_names_.empty()) {
-            coupling_matrix_ = coupling_matrix_builder_.build();
-            use_coupling_matrix_ = true;
-            uploadCouplingData();
-            std::cout << "Coupling matrix: " << coupling_matrix_.n_amps
-                      << " amplitudes → " << coupling_matrix_.n_free
+            std::cout << "Coupling matrix: " << info.couplingMatrix().n_amps
+                      << " amplitudes → " << info.couplingMatrix().n_free
                       << " free coupling params ("
-                      << coupling_matrix_.n_chain_free << " chain + "
-                      << coupling_matrix_.n_step_free << " step)" << std::endl;
-            // Build param_names_ from coupling matrix
-            param_names_.clear();
-            for (int ci = 0; ci < coupling_matrix_.n_chain_free; ++ci)
-                param_names_.push_back("chain_" + coupling_matrix_.chain_names[ci]);
-            for (int si = 0; si < coupling_matrix_.n_step_free; ++si)
-                param_names_.push_back("step_" + std::to_string(si));
-        }
-
-        // 设置约束条件
-        auto constraints = config_parser_.getConstraints();
-        std::vector<std::vector<int>> con_trans_id;
-        std::vector<std::vector<std::complex<double>>> con_trans_values;
-
-        for (const auto& constraint : constraints)
-        {
-            std::vector<std::vector<int>> amp_ids_con;
-
-            for (const auto& amp_name : constraint.names)
-            {
-                std::vector<int> amp_ids;
-                for (int i = 0; i < amplitude_names_.size(); ++i)
-                {
-                    if (amplitude_names_[i].find(amp_name) != std::string::npos)
-                    {
-                        amp_ids.push_back(i);
-                    }
-                }
-                amp_ids_con.push_back(amp_ids);
-            }
-
-            // 生成所有组合
-            int num_constraints = amp_ids_con.size();
-            for (int i = 0; i < amp_ids_con[0].size(); ++i)
-            {
-                std::vector<int> combination;
-                for (int j = 0; j < num_constraints; ++j)
-                {
-                    combination.push_back(amp_ids_con[j][i]);
-                }
-                con_trans_id.push_back(combination);
-
-                // 第一个是{1+1j}, 后面是constraint.values
-                std::vector<std::complex<double>> values = {
-                    std::complex<double>(1.0, 1.0) };
-                for (const auto& val : constraint.values)
-                {
-                    values.push_back(val);
-                }
-                con_trans_values.push_back(values);
-            }
-
-        }
-
-        // 初始化参数管理器
-        if (use_coupling_matrix_) {
-            // Coupling matrix mode: free→extended mapping via applyCouplingMatrix
-            // extendVector is identity (free = n_amplitudes_), but getNVector()
-            // reports coupling_matrix_.n_free
-            params_.initialize(n_amplitudes_, {}, {});
+                      << info.couplingMatrix().n_chain_free << " chain + "
+                      << info.couplingMatrix().n_step_free << " step)" << std::endl;
         } else {
+            // Legacy constraint mode
+            auto constraints = config_parser_.getConstraints();
+            std::vector<std::vector<int>> con_trans_id;
+            std::vector<std::vector<std::complex<double>>> con_trans_values;
+            for (const auto& constraint : constraints) {
+                std::vector<std::vector<int>> amp_ids_con;
+                for (const auto& amp_name : constraint.names) {
+                    std::vector<int> amp_ids;
+                    for (int i = 0; i < (int)amplitude_names_.size(); ++i)
+                        if (amplitude_names_[i].find(amp_name) != std::string::npos)
+                            amp_ids.push_back(i);
+                    amp_ids_con.push_back(amp_ids);
+                }
+                if (amp_ids_con.empty() || amp_ids_con[0].empty()) continue;
+                for (size_t i = 0; i < amp_ids_con[0].size(); ++i) {
+                    std::vector<int> combination;
+                    for (size_t j = 0; j < amp_ids_con.size(); ++j)
+                        combination.push_back(amp_ids_con[j][i]);
+                    con_trans_id.push_back(combination);
+                    std::vector<std::complex<double>> values = {std::complex<double>(1.0, 1.0)};
+                    for (const auto& val : constraint.values) values.push_back(val);
+                    con_trans_values.push_back(values);
+                }
+            }
             params_.initialize(n_amplitudes_ - static_cast<int>(con_trans_id.size()),
                                con_trans_id, con_trans_values);
         }

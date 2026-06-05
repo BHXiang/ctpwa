@@ -56,6 +56,7 @@ struct DecayChainConfig {
   bool symmetrize = false; // enable identical particle symmetrization for this chain
 };
 
+
 struct ConstraintConfig {
   std::vector<std::string> names;
   std::vector<std::complex<double>> values;

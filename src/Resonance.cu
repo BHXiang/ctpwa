@@ -39,6 +39,7 @@ double Resonance::getParam(const std::string& paramName)
 
 void Resonance::setParamsByModelType(const std::vector<double>& params)
 {
+    param_names_.clear();
     switch (modelType_) {
     case ResModelType::BWR:
         if (params.size() < 2) {
@@ -46,8 +47,10 @@ void Resonance::setParamsByModelType(const std::vector<double>& params)
                 "BWR model requires at least mass and width parameters");
         }
         params_ = { {"mass", params[0]}, {"width", params[1]} };
+        param_names_ = {"mass", "width"};
         if (params.size() > 2) {
             params_["r"] = params[2];
+            param_names_.push_back("r");
         }
         break;
 
@@ -57,6 +60,7 @@ void Resonance::setParamsByModelType(const std::vector<double>& params)
                 "BW model requires at least mass and width parameters");
         }
         params_ = { {"mass", params[0]}, {"width", params[1]} };
+        param_names_ = {"mass", "width"};
         break;
 
     case ResModelType::ONE:
@@ -65,6 +69,7 @@ void Resonance::setParamsByModelType(const std::vector<double>& params)
                 "One parameter model requires mass parameter");
         }
         params_ = { {"mass", params[0]} };
+        param_names_ = {"mass"};
         break;
 
     case ResModelType::Flatte: {
@@ -73,8 +78,11 @@ void Resonance::setParamsByModelType(const std::vector<double>& params)
                 "Flatte model requires at least mass and one coupling parameter");
         }
         params_ = { {"mass", params[0]} };
+        param_names_ = {"mass"};
         for (size_t i = 1; i < params.size(); ++i) {
-            params_["g" + std::to_string(i)] = params[i];
+            std::string gname = "g" + std::to_string(i);
+            params_[gname] = params[i];
+            param_names_.push_back(gname);
         }
         break;
     }
@@ -111,28 +119,10 @@ int Resonance::paramIndexForType(ResModelType type, const std::string& paramName
 
 std::vector<double> Resonance::getOrderedParams() const
 {
-    // Flatte 自由参数: [mass, g1, g2, ...] （不含 channel masses）
-    if (modelType_ == ResModelType::Flatte) {
-        std::vector<double> result;
-        auto it = params_.find("mass");
-        if (it != params_.end()) result.push_back(it->second);
-        for (size_t i = 1; ; ++i) {
-            auto gi = params_.find("g" + std::to_string(i));
-            if (gi == params_.end()) break;
-            result.push_back(gi->second);
-        }
-        return result;
-    }
-
-    auto names = paramNamesForType(modelType_);
     std::vector<double> result;
-    for (const auto& name : names) {
+    for (const auto& name : param_names_) {
         auto it = params_.find(name);
-        if (it != params_.end()) {
-            result.push_back(it->second);
-        } else {
-            result.push_back(0.0);
-        }
+        result.push_back(it != params_.end() ? it->second : 0.0);
     }
     return result;
 }
