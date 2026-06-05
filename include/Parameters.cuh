@@ -133,6 +133,17 @@ public:
                                    const double* d_params, double* d_grad_p) const;
     void freeCouplingData();
 
+    // ---------- Hessian 雅可比变换 ----------
+
+    // 预计算雅可比元素 w[a][j] = v[a] / p[j] 及 v[a] 值
+    void precomputeJacobian(const double* d_params);
+    // J_full^T · H_ext · J_full + Σ g·∇²v → H_fitting (single kernel)
+    // d_params: 拟合参数 [2*ncf+nt] (用于二阶项 w_jk = w_j/p_k)
+    // d_g_v: 振幅空间梯度 [2*na] ([Re(∂L/∂v), Im(∂L/∂v)])
+    void transformExtendedHessian(const double* d_H_ext,
+                                  const double* d_params, const double* d_g_v,
+                                  double* d_H_fitting, int na, int ncf, int nt) const;
+
     // Device pointer accessors (for CouplingFunction backward etc.)
     int* dAmpChain() const { return d_amp_chain_; }
     int* dStepOffsets() const { return d_step_offsets_; }
@@ -163,6 +174,14 @@ private:
     int* d_step_data_ = nullptr;
     double* d_amp_chain_ratio_ = nullptr;
     int step_data_len_ = 0;
+
+    // Device data for Hessian Jacobian transform
+    double* d_jac_re_ = nullptr;   // Re(w[a][j]) — sparse, same as step_data layout
+    double* d_jac_im_ = nullptr;   // Im(w[a][j])
+    double* d_jac_p_re_ = nullptr; // Re(p[j]) — [ncf] (for w_jk = w_j / p_k)
+    double* d_jac_p_im_ = nullptr; // Im(p[j])
+    double* d_v_re_ = nullptr;     // Re(v[a]) — [na]
+    double* d_v_im_ = nullptr;     // Im(v[a])
 };
 
 // ============================================================

@@ -208,6 +208,12 @@ void Parameters::freeCouplingData()
     if (d_step_offsets_)    { cudaFree(d_step_offsets_);    d_step_offsets_    = nullptr; }
     if (d_step_data_)       { cudaFree(d_step_data_);       d_step_data_       = nullptr; }
     if (d_amp_chain_ratio_) { cudaFree(d_amp_chain_ratio_); d_amp_chain_ratio_ = nullptr; }
+    if (d_jac_re_)   { cudaFree(d_jac_re_);   d_jac_re_   = nullptr; }
+    if (d_jac_im_)   { cudaFree(d_jac_im_);   d_jac_im_   = nullptr; }
+    if (d_jac_p_re_) { cudaFree(d_jac_p_re_); d_jac_p_re_ = nullptr; }
+    if (d_jac_p_im_) { cudaFree(d_jac_p_im_); d_jac_p_im_ = nullptr; }
+    if (d_v_re_)     { cudaFree(d_v_re_);     d_v_re_     = nullptr; }
+    if (d_v_im_)     { cudaFree(d_v_im_);     d_v_im_     = nullptr; }
     step_data_len_ = 0;
 }
 
@@ -326,6 +332,198 @@ void Parameters::transformCouplingGradient(
     cudaDeviceSynchronize();
 }
 
+// ============================================================
+// Hessian: precomputeJacobian + full transform (single kernel)
+// ============================================================
+
+// Precompute w[a][j] = v[a] / p[j], plus v[a] and p[j] values
+__global__ void precomputeJacobianKernel(
+    double* d_jac_re, double* d_jac_im,
+    double* d_p_re, double* d_p_im,
+    double* d_v_re, double* d_v_im,
+    const double* d_params,
+    const int* d_amp_chain,
+    const int* d_step_offsets, const int* d_step_data,
+    const double* d_amp_chain_ratio,
+    int n_amps, int n_step_free, int n_free, int ncf)
+{
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= n_amps) return;
+
+    double ratio = d_amp_chain_ratio[a];
+    int c_idx = n_step_free + d_amp_chain[a];
+    double v_re = d_params[c_idx] * ratio;
+    double v_im = d_params[n_free + c_idx] * ratio;
+    for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
+        int s = d_step_data[k];
+        double s_re = d_params[s], s_im = d_params[n_free + s];
+        double nre = v_re * s_re - v_im * s_im;
+        double nim = v_re * s_im + v_im * s_re;
+        v_re = nre; v_im = nim;
+    }
+    d_v_re[a] = v_re; d_v_im[a] = v_im;
+
+    double pc_re = d_params[c_idx], pc_im = d_params[n_free + c_idx];
+    double pc_sq = pc_re * pc_re + pc_im * pc_im;
+    if (pc_sq < 1e-30) pc_sq = 1e-30;
+    int chain_pos = d_step_offsets[n_amps] + a;
+    d_jac_re[chain_pos] = (v_re * pc_re + v_im * pc_im) / pc_sq;
+    d_jac_im[chain_pos] = (v_im * pc_re - v_re * pc_im) / pc_sq;
+
+    for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
+        int s = d_step_data[k];
+        double ps_re = d_params[s], ps_im = d_params[n_free + s];
+        double ps_sq = ps_re * ps_re + ps_im * ps_im;
+        if (ps_sq < 1e-30) ps_sq = 1e-30;
+        d_jac_re[k] = (v_re * ps_re + v_im * ps_im) / ps_sq;
+        d_jac_im[k] = (v_im * ps_re - v_re * ps_im) / ps_sq;
+    }
+
+    if (a == 0) {
+        for (int j = 0; j < ncf; ++j) {
+            d_p_re[j] = d_params[j];
+            d_p_im[j] = d_params[n_free + j];
+        }
+    }
+}
+
+void Parameters::precomputeJacobian(const double* d_params)
+{
+    if (!has_coupling_matrix_) return;
+    const auto& cm = coupling_matrix_;
+    int total = step_data_len_ + cm.n_amps;
+    int ncf = cm.n_free;
+
+    if (d_jac_re_) cudaFree(d_jac_re_);
+    if (d_jac_im_) cudaFree(d_jac_im_);
+    if (d_jac_p_re_) cudaFree(d_jac_p_re_);
+    if (d_jac_p_im_) cudaFree(d_jac_p_im_);
+    if (d_v_re_) cudaFree(d_v_re_);
+    if (d_v_im_) cudaFree(d_v_im_);
+
+    cudaMalloc(&d_jac_re_, total * sizeof(double));
+    cudaMalloc(&d_jac_im_, total * sizeof(double));
+    cudaMalloc(&d_jac_p_re_, ncf * sizeof(double));
+    cudaMalloc(&d_jac_p_im_, ncf * sizeof(double));
+    cudaMalloc(&d_v_re_, cm.n_amps * sizeof(double));
+    cudaMalloc(&d_v_im_, cm.n_amps * sizeof(double));
+
+    int grid = (cm.n_amps + 255) / 256;
+    precomputeJacobianKernel<<<grid, 256>>>(
+        d_jac_re_, d_jac_im_, d_jac_p_re_, d_jac_p_im_,
+        d_v_re_, d_v_im_, d_params,
+        d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
+        cm.n_amps, cm.n_step_free, cm.n_free, ncf);
+    cudaDeviceSynchronize();
+}
+
+// Single kernel: H_fit = J_full^T · H_ext · J_full + sum g·grad^2 v
+__global__ void hessianFullTransformKernel(
+    double* H_out, const double* H_ext,
+    const double* d_jac_re, const double* d_jac_im,
+    const double* d_p_re, const double* d_p_im,
+    const double* d_v_re, const double* d_v_im,
+    const double* d_g_v,
+    const int* d_amp_chain, const int* d_step_offsets, const int* d_step_data,
+    int na, int ncf, int n_step_free, int jac_chain_base, int nt)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_out = 2 * ncf + nt;
+    if (row >= n_out || col >= n_out) return;
+
+    int n_ext = 2 * na + nt;
+    bool rowV = (row < 2 * ncf), colV = (col < 2 * ncf);
+
+    if (rowV && colV) {
+        // ---- vv block: J_v^T·H_vv·J_v + second-order ----
+        int j = row / 2, cr = row % 2; int k = col / 2, cc = col % 2;
+        bool jCh = (j >= n_step_free), kCh = (k >= n_step_free);
+        int jc = j - n_step_free, kc = k - n_step_free;
+        double sum = 0.0;
+
+        for (int a = 0; a < na; ++a) {
+            double Jjr = 0, Jji = 0; bool ji = false;
+            if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jjr=d_jac_re[p]; Jji=d_jac_im[p]; ji=true; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jjr=d_jac_re[s]; Jji=d_jac_im[s]; ji=true; break; } }
+            if (!ji) continue;
+            double JT_R = (cr==0)?Jjr:-Jji, JT_I = (cr==0)?Jji:Jjr;
+
+            for (int b = 0; b < na; ++b) {
+                double Jkr=0, Jki=0; bool ki=false;
+                if (kCh) { if (d_amp_chain[b]==kc) { int p=jac_chain_base+b; Jkr=d_jac_re[p]; Jki=d_jac_im[p]; ki=true; } }
+                else { for (int s=d_step_offsets[b];s<d_step_offsets[b+1];++s) if (d_step_data[s]==k) { Jkr=d_jac_re[s]; Jki=d_jac_im[s]; ki=true; break; } }
+                if (!ki) continue;
+                double J_C = (cc==0)?Jkr:-Jki, J_Ic = (cc==0)?Jki:Jkr;
+
+                int ra=2*a, rb=2*b;
+                double Hrr=H_ext[ra*n_ext+rb], Hri=H_ext[ra*n_ext+rb+1];
+                double Hir=H_ext[(ra+1)*n_ext+rb], Hii=H_ext[(ra+1)*n_ext+rb+1];
+                sum += (JT_R*Hrr+JT_I*Hir)*J_C + (JT_R*Hri+JT_I*Hii)*J_Ic;
+            }
+        }
+        H_out[row*n_out+col] = sum;
+        return;
+    }
+
+    if (rowV) {
+        // ---- vtheta: J_v^T · H_vtheta ----
+        int j = row/2, comp = row%2, t = col-2*ncf;
+        bool jCh = (j>=n_step_free); int jc = j-n_step_free;
+        double sum = 0.0;
+        for (int a=0;a<na;++a) {
+            double Jr=0,Ji=0; bool ji=false;
+            if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jr=d_jac_re[p]; Ji=d_jac_im[p]; ji=true; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
+            if (!ji) continue;
+            double Hr=H_ext[a*n_ext+2*na+t], Hi=H_ext[(na+a)*n_ext+2*na+t];
+            sum += (comp==0) ? (Jr*Hr+Ji*Hi) : (-Ji*Hr+Jr*Hi);
+        }
+        H_out[row*n_out+col] = sum;
+        return;
+    }
+
+    if (colV) {
+        // ---- thetav: H_thetav · J_v ----
+        int t = row-2*ncf, j = col/2, comp = col%2;
+        bool jCh = (j>=n_step_free); int jc = j-n_step_free;
+        double sum = 0.0;
+        for (int a=0;a<na;++a) {
+            double Jr=0,Ji=0; bool ji=false;
+            if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jr=d_jac_re[p]; Ji=d_jac_im[p]; ji=true; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
+            if (!ji) continue;
+            double Hr=H_ext[(2*na+t)*n_ext+a], Hi=H_ext[(2*na+t)*n_ext+na+a];
+            sum += (comp==0) ? (Hr*Jr+Hi*Ji) : (Hr*(-Ji)+Hi*Jr);
+        }
+        H_out[row*n_out+col] = sum;
+        return;
+    }
+
+    // ---- thetatheta: direct copy ----
+    int ti=row-2*ncf, tj=col-2*ncf;
+    H_out[row*n_out+col] = H_ext[(2*na+ti)*n_ext + (2*na+tj)];
+}
+
+void Parameters::transformExtendedHessian(
+    const double* d_H_ext,
+    const double* d_params, const double* d_g_v,
+    double* d_H_fitting, int na, int ncf, int nt) const
+{
+    if (!has_coupling_matrix_) return;
+    int jcb = step_data_len_;
+    int n_out = 2*ncf + nt;
+    dim3 block(16, 16);
+    dim3 grid((n_out+15)/16, (n_out+15)/16);
+    hessianFullTransformKernel<<<grid, block>>>(
+        d_H_fitting, d_H_ext,
+        d_jac_re_, d_jac_im_,
+        d_jac_p_re_, d_jac_p_im_,
+        d_v_re_, d_v_im_, d_g_v,
+        d_amp_chain_, d_step_offsets_, d_step_data_,
+        na, ncf, coupling_matrix_.n_step_free, jcb, nt);
+    cudaDeviceSynchronize();
+}
 // ============================================================
 // CouplingMatrixBuilder: buildWithTrans implementation
 // ============================================================

@@ -20,7 +20,7 @@ DecayInfo::DecayInfo(const std::string& config_file)
 }
 
 DecayInfo::DecayInfo(const ConfigParser& parser)
-    : config_parser_("")  // dummy, data comes from parser arg
+    : config_parser_()  // dummy, data comes from parser arg
 {
     if (!parser.isValid()) return;
     particles_   = parser.getParticles();
