@@ -145,7 +145,7 @@ void DecayInfo::buildDecayChains(
             auto slcombs = cas->getSLCombinations();
 
             // Print decay chain structure for this J^P combination
-            std::cout << "  ";
+            // std::cout << "  ";
             for (size_t si = 0; si < step_infos.size(); ++si) {
                 if (si > 0) std::cout << ", ";
                 const auto& info = step_infos[si];
@@ -159,7 +159,8 @@ void DecayInfo::buildDecayChains(
                 std::cout << " {";
                 for (size_t sli = 0; sli < info.sl_list.size(); ++sli) {
                     if (sli > 0) std::cout << " ";
-                    std::cout << "(" << info.sl_list[sli].S << "," << info.sl_list[sli].L << ")";
+                    std::cout << "("; printJ(info.sl_list[sli].S); 
+                    std::cout << "," << info.sl_list[sli].L << ")";
                 }
                 std::cout << "}";
             }
@@ -180,7 +181,7 @@ void DecayInfo::buildDecayChains(
 
             // Print resonances for each combination
             if (!res_combos.empty()) {
-                std::cout << "  Resonances:";
+                std::cout << "Res:";
                 for (size_t ki = 0; ki < res_combos.size(); ++ki) {
                     std::cout << " {";
                     for (size_t rj = 0; rj < res_combos[ki].size(); ++rj) {

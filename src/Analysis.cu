@@ -3084,7 +3084,6 @@ private:
     AmpCalc amp_calc_;
     bool initialized_ = false;
 
-
     void initialize(std::string config_file = "config.yml")
     {
         // 读取配置文件
@@ -3129,14 +3128,14 @@ private:
         // 计算相空间振幅
         std::cout << "Reading phase space samples..." << std::endl;
         auto Vp4_phsp = readMomentaFromDat(data_files.at("phsp"), data_order, particles_names);
-        std::cout << "Phase space events: " << Vp4_phsp.begin()->second.size() << std::endl;
+        std::cout << "events: " << Vp4_phsp.begin()->second.size() << std::endl;
         init_events.push_back(Vp4_phsp.begin()->second.size());
         Vp4_to_merge.push_back(Vp4_phsp);
 
         // 计算数据振幅
         std::cout << "Reading data samples..." << std::endl;
         auto Vp4_data = readMomentaFromDat(data_files.at("data"), data_order, particles_names);
-        std::cout << "data events: " << Vp4_data.begin()->second.size() << std::endl;
+        std::cout << "events: " << Vp4_data.begin()->second.size() << std::endl;
         init_events.push_back(Vp4_data.begin()->second.size());
         Vp4_to_merge.push_back(Vp4_data);
 
@@ -3145,7 +3144,7 @@ private:
         {
             std::cout << "Reading background samples..." << std::endl;
             auto Vp4_bkg = readMomentaFromDat(data_files.at("bkg"), data_order, particles_names);
-            std::cout << "Background events: " << Vp4_bkg.begin()->second.size() << std::endl;
+            std::cout << "events: " << Vp4_bkg.begin()->second.size() << std::endl;
             init_events.push_back(Vp4_bkg.begin()->second.size());
             Vp4_to_merge.push_back(Vp4_bkg);
         }
@@ -3323,6 +3322,7 @@ private:
 
         std::cout << "Number of GPUs available: " << n_gpus_ << std::endl;
         std::cout << "Number of partial waves: " << n_gls_ << std::endl;
+        std::cout << "Number of res parameters: " << params_.nFreeTheta() << std::endl;
         std::cout << "Initialization complete." << std::endl;
     }
 
@@ -3427,16 +3427,16 @@ private:
             polarization_map_.clear();
         }
 
-        std::cout << "polarization: " << n_polar_
-            << " (total tensor states: " << n_polar_total_ << ")";
-        if (!polarization_map_.empty()) {
-            std::cout << ", map: [";
-            for (size_t i = 0; i < polarization_map_.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << polarization_map_[i];
-            }
-            std::cout << "]";
-        }
+        std::cout << "polarization: " << n_polar_;
+        // std::cout  << " (total tensor states: " << n_polar_total_ << ")";
+        // if (!polarization_map_.empty()) {
+        //     std::cout << ", map: [";
+        //     for (size_t i = 0; i < polarization_map_.size(); ++i) {
+        //         if (i > 0) std::cout << ", ";
+        //         std::cout << polarization_map_[i];
+        //     }
+        //     std::cout << "]";
+        // }
         std::cout << std::endl;
     }
 
@@ -3461,11 +3461,11 @@ private:
             all_names.insert(all_names.end(), rnames.begin(), rnames.end());
             params_.setParamNames(all_names);
 
-            std::cout << "Coupling matrix: " << info.couplingMatrix().n_amps
-                      << " amplitudes → " << info.couplingMatrix().n_free
-                      << " free coupling params ("
-                      << info.couplingMatrix().n_chain_free << " chain + "
-                      << info.couplingMatrix().n_step_free << " step)" << std::endl;
+            // std::cout << "Coupling matrix: " << info.couplingMatrix().n_amps
+            //           << " amplitudes → " << info.couplingMatrix().n_free
+            //           << " free coupling params ("
+            //           << info.couplingMatrix().n_chain_free << " chain + "
+            //           << info.couplingMatrix().n_step_free << " step)" << std::endl;
         } else {
             // Legacy constraint mode
             auto constraints = config_parser_.getConstraints();
