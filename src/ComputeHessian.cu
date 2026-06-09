@@ -944,3 +944,33 @@ __global__ void scalePhspAmpsKernel(
     d_amp[idx].x *= s;
     d_amp[idx].y *= s;
 }
+
+// Reorder vv block from interleaved [Re0,Im0,Re1,Im1,...] to grouped [Re0..Re_n, Im0..Im_n]
+__global__ void reorderVVBlockKernel(
+    const double* __restrict__ H_in, double* __restrict__ H_out,
+    int nv, int in_stride, int out_stride)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int n2 = 2 * nv;
+    if (i >= n2 || j >= n2) return;
+
+    int in_row = (i < nv) ? 2 * i : 2 * (i - nv) + 1;
+    int in_col = (j < nv) ? 2 * j : 2 * (j - nv) + 1;
+
+    H_out[i * out_stride + j] = H_in[in_row * in_stride + in_col];
+}
+
+void reorderVVBlockInterleavedToGrouped(double* H, int nv, int stride)
+{
+    int n2 = 2 * nv;
+    double* d_tmp;
+    cudaMalloc(&d_tmp, n2 * stride * sizeof(double));
+    cudaMemcpy(d_tmp, H, n2 * stride * sizeof(double), cudaMemcpyDeviceToDevice);
+
+    dim3 block(16, 16);
+    dim3 grid((n2 + 15) / 16, (n2 + 15) / 16);
+    reorderVVBlockKernel<<<grid, block>>>(d_tmp, H, nv, stride, stride);
+    cudaDeviceSynchronize();
+    cudaFree(d_tmp);
+}

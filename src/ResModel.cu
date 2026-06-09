@@ -35,6 +35,7 @@ __device__ auto computeNodeFactor(
             T m0 = params[0], g0 = params[1];
             auto bw = BWR<T>(mm, m0, g0, L, q_ad, q0_ad, bf_d);
             auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+            // printf("bf = %f\n", bf);
             if constexpr (std::is_arithmetic_v<T>) {
                 return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
             } else {
@@ -117,6 +118,8 @@ __host__ __device__ auto BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0, double 
     T x = m0 * m0 - m * m;
     T y = m0 * gamma;
     T s = x * x + y * y;
+
+    // printf("BWR: m=%.3f, m0=%.3f, gamma0=%.3f, L=%d, q=%.3f, q0=%.3f, d=%.3f, gamma=%.3f, x=%.3f, y=%.3f, (%.3f, %.3f)\n", m, m0, gamma0, L, q, q0, d, gamma, x, y, x/s, y/s);
 
     return ResResult<T>::make(x / s, y / s);
 }

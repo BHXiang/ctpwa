@@ -35,4 +35,8 @@ void reduceHessianWithConstraints(
     const double* d_re_ratios, const double* d_im_ratios,
     int n_constraints, int n_orig, int n_ext);
 
+// Reorder vv block from interleaved [Re0,Im0,Re1,Im1,...] to [Re0..Re_n, Im0..Im_n]
+// H: [2*nv × 2*nv], stride = n2 (for full matrix: n2 = total, for vv-only: n2 = 2*nv)
+void reorderVVBlockInterleavedToGrouped(
+    double* H, int nv, int stride);
 #endif
