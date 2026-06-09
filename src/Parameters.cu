@@ -435,9 +435,16 @@ __global__ void hessianFullTransformKernel(
     int n_ext = 2 * na + nt;
     bool rowV = (row < 2 * ncf), colV = (col < 2 * ncf);
 
+    // Helper: extract (param_idx, Re/Im) from grouped row/col index
+    // Grouped: rows 0..n-1 = Re_0..Re_{n-1}, rows n..2n-1 = Im_0..Im_{n-1}
+    auto groupedIdx = [](int idx, int n) {
+        return (idx < n) ? std::make_pair(idx, 0) : std::make_pair(idx - n, 1);
+    };
+
     if (rowV && colV) {
         // ---- vv block: J_v^T·H_vv·J_v + second-order ----
-        int j = row / 2, cr = row % 2; int k = col / 2, cc = col % 2;
+        auto [j, cr] = groupedIdx(row, ncf);
+        auto [k, cc] = groupedIdx(col, ncf);
         bool jCh = (j >= n_step_free), kCh = (k >= n_step_free);
         int jc = j - n_step_free, kc = k - n_step_free;
         double sum = 0.0;
@@ -456,9 +463,9 @@ __global__ void hessianFullTransformKernel(
                 if (!ki) continue;
                 double J_C = (cc==0)?Jkr:-Jki, J_Ic = (cc==0)?Jki:Jkr;
 
-                int ra=2*a, rb=2*b;
-                double Hrr=H_ext[ra*n_ext+rb], Hri=H_ext[ra*n_ext+rb+1];
-                double Hir=H_ext[(ra+1)*n_ext+rb], Hii=H_ext[(ra+1)*n_ext+rb+1];
+                // Grouped: Re_a at row a, Im_a at na+a
+                double Hrr=H_ext[a*n_ext+b],        Hri=H_ext[a*n_ext+na+b];
+                double Hir=H_ext[(na+a)*n_ext+b],    Hii=H_ext[(na+a)*n_ext+na+b];
                 sum += (JT_R*Hrr+JT_I*Hir)*J_C + (JT_R*Hri+JT_I*Hii)*J_Ic;
             }
         }
@@ -468,7 +475,8 @@ __global__ void hessianFullTransformKernel(
 
     if (rowV) {
         // ---- vtheta: J_v^T · H_vtheta ----
-        int j = row/2, comp = row%2, t = col-2*ncf;
+        auto [j, comp] = groupedIdx(row, ncf);
+        int t = col-2*ncf;
         bool jCh = (j>=n_step_free); int jc = j-n_step_free;
         double sum = 0.0;
         for (int a=0;a<na;++a) {
@@ -485,7 +493,8 @@ __global__ void hessianFullTransformKernel(
 
     if (colV) {
         // ---- thetav: H_thetav · J_v ----
-        int t = row-2*ncf, j = col/2, comp = col%2;
+        int t = row-2*ncf;
+        auto [j, comp] = groupedIdx(col, ncf);
         bool jCh = (j>=n_step_free); int jc = j-n_step_free;
         double sum = 0.0;
         for (int a=0;a<na;++a) {

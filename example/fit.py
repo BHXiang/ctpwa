@@ -2,156 +2,143 @@ import torch
 import numpy as np
 import time
 import os
-import argparse
-import re
 import ctpwa
 
+# ============================================================
 # 初始化分析对象
+# ============================================================
 int_time1 = int(time.time())
 ana = ctpwa.analysis()
 int_time2 = int(time.time())
 print(f"振幅初始化耗时: {int_time2 - int_time1} 秒")
 
-# 获取共轭对信息和振幅名称
+# 参数信息
 conjugate_pairs = ana.getConstraintsIndex()
-constraintValues = ana.getConstraintsValues()
-amplitude_names = ana.getAmplitudeNames()
-n_gls_total = ana.getNVector()
+params_names = ana.getParamNames()          # 前 n_coupling_free 个耦合名 + 后 n_res_free 个共振态名
+n_coupling_free = ana.getNVector()          # 自由耦合复数参数数
 
-print(f"总振幅数量: {n_gls_total}")
-print(f"可变参数数量: {n_gls_total - 1}")
+# 共振态参数信息
+free_res_info = ana.getFreeResParams()      # [3, n_res] float64 CPU
+n_res_free = free_res_info.shape[1]
+HAS_FREE_RES = n_res_free > 0
 
-# 显示共轭对信息
-print("共轭对信息:")
-for idx1, idx2 in conjugate_pairs:
-    print(f"  {amplitude_names[idx1]} ({idx1}) <-> {amplitude_names[idx2]} ({idx2})")
+n_params_total = 2 * n_coupling_free + n_res_free
+print(f"耦合参数数量: {n_coupling_free}")
+print(f"共振态参数数量: {n_res_free}")
 
-n_polar = ana.getNPolarizations()
-total_gls = n_gls_total + len(conjugate_pairs)
-
-
+# ============================================================
+# 生成初始参数
+# ============================================================
 def generate_initial_params(
-    n_gls_total, seed=44, device="cuda", initial_params_file=None, amplitude_names=None
+    n_coupling_free, free_res_info,
+    seed=42, device="cuda"
 ):
-    """生成初始参数 - 支持从文件加载或随机生成"""
-    # 如果提供了初始参数文件，尝试加载
-    if initial_params_file:
-        params = ParameterLoader.load_from_file(
-            initial_params_file, amplitude_names, device
-        )
-        if params is not None:
-            print(f"使用文件中的初始参数: {initial_params_file}")
-            return params
-        else:
-            print(f"无法从文件加载参数，将使用随机初始参数")
+    """生成统一参数向量 [real_coupling | imag_coupling | theta]
 
-    # 随机生成初始参数
+    Layout: [real_0,...,real_{n_free-1}, imag_0,...,imag_{n_free-1}, theta_0,...,theta_{n_res-1}]
+    real_0=1.0, imag_0=0.0 为固定参考振幅
+    """
+    n_res = free_res_info.shape[1]
+    n_total = 2 * n_coupling_free + n_res
+    params = torch.zeros(n_total, dtype=torch.float64, device=device)
+
     torch.manual_seed(seed)
 
-    # 创建初始参数 - 使用complex64（单精度复数）
-    initial_params = torch.zeros(n_gls_total, dtype=torch.complex64, device=device)
+    # 耦合实部
+    params[0] = 1.0  # 固定参考
+    for idx in range(1, n_coupling_free):
+        amplitude = torch.rand(1, device=device).item() * 0.5
+        phase = torch.rand(1, device=device).item() * 2 * torch.pi
+        params[idx] = amplitude * np.cos(phase)
 
-    # 第一个参数固定为幅度1相位0 (1+0j)
-    initial_params[0] = torch.complex(
-        torch.tensor(1.0, device=device), torch.tensor(0.0, device=device)
-    )
+    # 耦合虚部
+    params[n_coupling_free] = 0.0  # 固定参考
+    for idx in range(1, n_coupling_free):
+        amplitude = torch.rand(1, device=device).item() * 0.5
+        phase = torch.rand(1, device=device).item() * 2 * torch.pi
+        params[n_coupling_free + idx] = amplitude * np.sin(phase)
 
-    # 为其他参数生成随机值（幅度和相位）
-    for idx in range(1, n_gls_total):
-        # 幅度在 [0.1, 2.0] 范围内随机
-        amplitude = torch.rand(1, device=device) * 0.5
+    # 共振态参数
+    if n_res > 0:
+        init_vals = free_res_info[0].to(device=device, dtype=torch.float64)
+        if seed > 42:
+            torch.manual_seed(seed)
+            lower = free_res_info[1].to(device=device, dtype=torch.float64)
+            upper = free_res_info[2].to(device=device, dtype=torch.float64)
+            noise = (torch.rand(n_res, device=device, dtype=torch.float64) - 0.5) * 0.1 * (upper - lower)
+            init_vals = torch.clamp(init_vals + noise,
+                                    lower + 1e-7 * (upper - lower),
+                                    upper - 1e-7 * (upper - lower))
+        params[2 * n_coupling_free:] = init_vals
 
-        # 相位在 [0, 2π] 范围内随机
-        phase = torch.rand(1, device=device) * 2 * torch.pi
-
-        # 将幅度和相位转换为复数
-        real_part = amplitude * torch.cos(phase)
-        imag_part = amplitude * torch.sin(phase)
-
-        initial_params[idx] = torch.complex(real_part, imag_part).squeeze()
-
-    print(f"随机初始参数 (seed={seed})")
-    return initial_params
+    print(f"生成初始参数 (seed={seed}): n_coupling={n_coupling_free}, n_res={n_res}")
+    return params
 
 
-class SimplePWAOptimizer:
-    def __init__(self, ana, conjugate_pairs, amplitude_names):
+# ============================================================
+# 构建自由耦合参数 -> 振幅下标的映射
+# ============================================================
+# ============================================================
+# 优化器
+# ============================================================
+class UnifiedPWAOptimizer:
+    def __init__(self, ana, free_res_info, params_names):
         self.analysis = ana
-        self.conjugate_pairs = conjugate_pairs
-        self.amplitude_names = amplitude_names
+        self.params_names = params_names
         self.device = "cuda"
         self.best_nll = float("inf")
         self.best_params = None
-        self.all_results = []  # 存储所有结果
-        self.n_fixed = 1  # 固定参数数量
-        self.n_variable = n_gls_total - self.n_fixed  # 可变参数数量
-        self.n_real_variable = 2 * self.n_variable  # 可变实数参数数量 (实部+虚部)
+        self.all_results = []
 
+        self.n_coupling_free = ana.getNVector()
+        self.n_res_free = free_res_info.shape[1]
+        self.n_params = 2 * self.n_coupling_free + self.n_res_free
+        self.has_free_res = self.n_res_free > 0
+
+        # 共振态参数bounds (GPU)
+        if self.has_free_res:
+            self._lower = free_res_info[1].to(dtype=torch.float64, device=self.device)
+            self._upper = free_res_info[2].to(dtype=torch.float64, device=self.device)
+
+    # --------------------------------------------------------
     def compute_loss_and_grad(self, params):
-        """计算损失和梯度 - 第一个参数固定为1+0j"""
-        # 确保第一个参数保持为1+0j
+        """计算 NLL 和梯度。params: float64, [n_params]"""
+        # 固定第一个耦合参数 (1+0j)
         with torch.no_grad():
-            params.data[0] = torch.complex(
-                torch.tensor(1.0, device=self.device),
-                torch.tensor(0.0, device=self.device),
-            )
+            params.data[0] = 1.0
+            params.data[self.n_coupling_free] = 0.0
 
-        # 计算NLL，C++会自动处理共轭
+        # 共振态参数有界约束: clamp
+        if self.has_free_res:
+            with torch.no_grad():
+                start = 2 * self.n_coupling_free
+                params.data[start:] = torch.clamp(
+                    params.data[start:], self._lower, self._upper
+                )
+
         nll = self.analysis.getNLL(params)
-
-        # 计算梯度
         grad = torch.autograd.grad(nll, params, retain_graph=False)[0]
 
-        # print("Params: ", params)
-        # print("NLL: ", nll)
-        # print("Gradiant: ", grad)
-
-        # 确保第一个参数的梯度为0（因为我们固定了它）
+        # 固定参数的梯度清零
         with torch.no_grad():
-            grad[0] = torch.complex(
-                torch.tensor(0.0, device=self.device),
-                torch.tensor(0.0, device=self.device),
-            )
-
-        # # 添加L2正则化项（仅对可变参数）
-        # lambda_reg = 1e-4  # 正则化强度，可以根据需要调整
-        # reg_loss = lambda_reg * torch.sum(torch.abs(params[1:]) ** 2)
-        # reg_grad = torch.zeros_like(grad)
-        # reg_grad[1:] = 2 * lambda_reg * params[1:].conj()  # 复数参数的梯度
-
-        # nll = nll + reg_loss
-        # grad = grad + reg_grad
+            grad[0] = 0.0
+            grad[self.n_coupling_free] = 0.0
 
         return nll, grad
 
-    def compute_branching_fractions(self, params=None):
-        """使用C++端计算分支比，返回 (中心值, 误差)"""
-        if params is None:
-            if self.best_params is None:
-                print("没有优化结果!")
-                return None, None
-            params = self.best_params
-
-        bf_result = self.analysis.getBranchFractions(params)
-        # 第一列是中心值，第二列是误差
-        bf_values = bf_result[:, 0]
-        bf_errors = bf_result[:, 1]
-        return bf_values, bf_errors
-
+    # --------------------------------------------------------
     def optimize_single_run(
         self,
         initial_params,
         run_id=0,
         max_iter=500,
         lr=1.0,
-        tolerance_grad=1e-5,
-        tolerance_change=1e-7,
+        tolerance_grad=1e-8,
+        tolerance_change=1e-10,
         history_size=100,
     ):
-        """单次优化运行 - 第一个参数固定"""
+        """单次优化"""
         params = initial_params.clone().detach().requires_grad_(True)
-
-        # 使用LBFGS优化器
         optimizer = torch.optim.LBFGS(
             [params],
             lr=lr,
@@ -167,7 +154,6 @@ class SimplePWAOptimizer:
         def closure():
             optimizer.zero_grad()
             nll, grad = self.compute_loss_and_grad(params)
-            # 手动设置梯度
             params.grad = grad
             nll_history.append(nll.item())
             return nll
@@ -176,51 +162,71 @@ class SimplePWAOptimizer:
         optimizer.step(closure)
         end_time = time.time()
 
+        # 最终clamp一次确保共振态参数在界内
+        with torch.no_grad():
+            params.data[0] = 1.0
+            params.data[self.n_coupling_free] = 0.0
+            if self.has_free_res:
+                start = 2 * self.n_coupling_free
+                params.data[start:] = torch.clamp(params.data[start:], self._lower, self._upper)
+
         final_nll = nll_history[-1] if nll_history else float("inf")
         final_params = params.clone().detach()
 
-        # 计算Hessian矩阵 (使用C++端)
+        # Hessian
         hessian_start = time.time()
-        hessian = self.analysis.getHessian(final_params)
+        hessian_full = self.analysis.getHessian(final_params)
+        # print("hessian矩阵：", hessian_full)
         hessian_time = time.time() - hessian_start
 
-        # 如果Hessian包含固定参数，去除之
-        if hessian.shape[0] == 2 * n_gls_total:
-            hessian = hessian[2:, 2:]
+        # 去除固定参数 (index 0 和 n_coupling_free)
+        fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
+        fixed_mask[0] = False
+        fixed_mask[self.n_coupling_free] = False
+        hessian = hessian_full[fixed_mask][:, fixed_mask]
 
-        # 计算特征值，判断正定性
+        # 特征值分析
         try:
             eigenvalues = torch.linalg.eigvalsh(hessian)
+            # print("Hessian特征值：", eigenvalues)
             is_pos_def = bool(torch.all(eigenvalues > 0).item())
-        except torch._C._LinAlgError:
-            print(f"警告: Hessian矩阵病态，无法计算特征值，视为不正定")
-            eigenvalues = torch.zeros(hessian.shape[0], device=self.device)
+            min_eig = eigenvalues[0].item()
+            max_eig = eigenvalues[-1].item()
+            cond_num = max_eig / min_eig if min_eig > 0 else float("inf")
+        except Exception:
             is_pos_def = False
-        min_eig = eigenvalues[0].item()
-        max_eig = eigenvalues[-1].item()
-        cond_num = max_eig / min_eig if min_eig > 0 else float("inf")
+            min_eig = max_eig = cond_num = float("nan")
 
-        # 计算参数误差
-        real_errors = None
-        imag_errors = None
+        # 参数误差
+        coupling_real_errors = None
+        coupling_imag_errors = None
+        res_errors = None
         if is_pos_def:
             try:
                 covariance = torch.linalg.inv(hessian)
                 std_dev = torch.sqrt(torch.diag(covariance))
 
-                real_errors = torch.zeros(
-                    n_gls_total, dtype=torch.float32, device=self.device
+                # 耦合参数误差: 前 2*(n_coupling_free-1) 个元素
+                n_c_var = self.n_coupling_free - 1  # 扣除固定的
+                coupling_real_errors = torch.zeros(
+                    self.n_coupling_free, dtype=torch.float32, device=self.device
                 )
-                imag_errors = torch.zeros(
-                    n_gls_total, dtype=torch.float32, device=self.device
+                coupling_imag_errors = torch.zeros(
+                    self.n_coupling_free, dtype=torch.float32, device=self.device
                 )
-                for i in range(self.n_variable):
-                    real_errors[i + 1] = std_dev[2 * i]
-                    imag_errors[i + 1] = std_dev[2 * i + 1]
+
+                # std_dev 前 2*n_c_var 个元素: 实部误差和虚部误差交替
+                for i in range(n_c_var):
+                    coupling_real_errors[i + 1] = std_dev[2 * i].float()
+                    coupling_imag_errors[i + 1] = std_dev[2 * i + 1].float()
+
+                # 共振态参数误差
+                if self.has_free_res:
+                    res_start = 2 * n_c_var
+                    res_errors = std_dev[res_start:].float()
             except Exception as e:
                 print(f"计算参数误差时出错: {e}")
 
-        # 保存当前运行的结果
         result = {
             "run_id": run_id,
             "final_params": final_params,
@@ -230,16 +236,17 @@ class SimplePWAOptimizer:
             "hessian_time": hessian_time,
             "iterations": len(nll_history),
             "initial_params": initial_params.clone().detach(),
+            "hessian_full": hessian_full,
             "hessian": hessian,
             "is_positive_definite": is_pos_def,
             "min_eigenvalue": min_eig,
             "max_eigenvalue": max_eig,
             "condition_number": cond_num,
-            "real_errors": real_errors,
-            "imag_errors": imag_errors,
+            "coupling_real_errors": coupling_real_errors,
+            "coupling_imag_errors": coupling_imag_errors,
+            "res_errors": res_errors,
         }
 
-        # 更新最佳结果
         if final_nll < self.best_nll:
             self.best_nll = final_nll
             self.best_params = final_params.clone()
@@ -247,129 +254,146 @@ class SimplePWAOptimizer:
 
         return result
 
-    def save_parameters(
-        self, params, real_errors, imag_errors, run_id, filename_base, save_txt=True
-    ):
-        """保存参数（包含误差）到.txt文件"""
+    # --------------------------------------------------------
+    def extract_coupling_complex(self, params):
+        """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
+        real = params[:self.n_coupling_free].float()
+        imag = params[self.n_coupling_free:2 * self.n_coupling_free].float()
+        return torch.complex(real, imag)
+
+    def extract_theta_phys(self, params):
+        """从统一参数中提取共振态物理参数"""
+        if not self.has_free_res:
+            return None
+        return params[2 * self.n_coupling_free:]
+
+    # --------------------------------------------------------
+    def compute_branching_fractions(self, params=None):
+        if params is None:
+            if self.best_params is None:
+                print("没有优化结果!")
+                return None, None
+            params = self.best_params
+
+        coupling = self.extract_coupling_complex(params)
+        bf_result = self.analysis.getBranchFractions(coupling)
+        return bf_result[:, 0], bf_result[:, 1]
+
+    # --------------------------------------------------------
+    def save_parameters(self, params, coupling_real_err, coupling_imag_err,
+                        res_errors, run_id, filename_base):
+        """保存所有参数到文件"""
         try:
-            # 将参数和误差转换为numpy数组
-            params_np = params.cpu().numpy()
-            real_errors_np = (
-                real_errors.cpu().numpy()
-                if real_errors is not None
-                else np.zeros_like(params_np.real)
-            )
-            imag_errors_np = (
-                imag_errors.cpu().numpy()
-                if imag_errors is not None
-                else np.zeros_like(params_np.imag)
-            )
+            coupling = self.extract_coupling_complex(params)
+            params_np = coupling.cpu().numpy()                         # [n_coupling_free]
+            real_err_np = (coupling_real_err.cpu().numpy()
+                           if coupling_real_err is not None
+                           else np.zeros(self.n_coupling_free))
+            imag_err_np = (coupling_imag_err.cpu().numpy()
+                           if coupling_imag_err is not None
+                           else np.zeros(self.n_coupling_free))
 
-            # 保存为.txt文件
-            if save_txt:
-                txt_filename = f"{filename_base}.txt"
+            if self.has_free_res:
+                theta = self.extract_theta_phys(params)
+                theta_np = theta.cpu().numpy()
+                lower_np = self._lower.cpu().numpy()
+                upper_np = self._upper.cpu().numpy()
+                res_err_np = res_errors.cpu().numpy() if res_errors is not None else None
 
-                # 如果是第一次运行，创建文件并写入表头
-                if run_id == 0:
-                    with open(txt_filename, "w") as f:
-                        # 写入文件头
-                        f.write("# PWA Amplitude Parameters - All Runs\n")
-                        f.write(f"# Total amplitudes: {len(params_np)}\n")
+            txt_filename = f"{filename_base}.txt"
+            if run_id == 0:
+                with open(txt_filename, "w") as f:
+                    f.write("# PWA Unified Parameters - All Runs\n")
+                    f.write(f"# n_coupling_free: {self.n_coupling_free}\n")
+                    f.write(f"# n_res_free: {self.n_res_free}\n")
+                    f.write(f"# File generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write("#" * 120 + "\n")
+                    f.write("# Index  ParameterName                      ")
+                    f.write("RealPart        RealError        ")
+                    f.write("ImagPart        ImagError        ")
+                    f.write("Magnitude       Phase(rad)      Phase(deg)\n")
+                    f.write("#" * 120 + "\n")
+
+            with open(txt_filename, "a") as f:
+                f.write(f"# RUN: run_{run_id}\n")
+                f.write("#" * 120 + "\n")
+                for fi in range(self.n_coupling_free):
+                    name = self.params_names[fi]
+                    value = params_np[fi]
+                    re_err = real_err_np[fi]
+                    im_err = imag_err_np[fi]
+                    magnitude = np.abs(value)
+                    phase_rad = np.angle(value)
+                    phase_deg = np.degrees(phase_rad)
+                    f.write(
+                        f"{fi:4d}  {name:50s}  "
+                        f"{value.real:12.8f} ± {re_err:12.8f}  "
+                        f"{value.imag:12.8f} ± {im_err:12.8f}  "
+                        f"{magnitude:12.8f}  {phase_rad:12.8f}  {phase_deg:12.8f}\n"
+                    )
+
+                if self.has_free_res:
+                    for i in range(self.n_res_free):
+                        idx = self.n_coupling_free + i
+                        name = self.params_names[idx]
+                        err_str = f"± {res_err_np[i]:12.8f}" if res_err_np is not None else "             "
                         f.write(
-                            f"# Fixed parameter: {self.amplitude_names[0]} = 1+0j\n"
+                            f"{idx:4d}  {name:50s}  "
+                            f"{theta_np[i]:12.8f}  {err_str}  "
+                            f"bounds=[{lower_np[i]:.6g}, {upper_np[i]:.6g}]\n"
                         )
-                        f.write(
-                            f"# File generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        )
-                        f.write("#" * 120 + "\n")
-                        f.write("# Index  AmplitudeName                      ")
-                        f.write("RealPart        RealError        ")
-                        f.write("ImagPart        ImagError        ")
-                        f.write("Magnitude       Phase(rad)      Phase(deg)\n")
-                        f.write("#" * 120 + "\n")
+                f.write("#" * 120 + "\n")
 
-                # 追加写入当前运行的参数
-                with open(txt_filename, "a") as f:
-                    # 写入每个参数
-                    f.write(f"# RUN: run_{run_id}\n")
-                    f.write("#" * 120 + "\n")  # 添加分隔线
-                    for i, (name, value, re_err, im_err) in enumerate(
-                        zip(
-                            self.amplitude_names,
-                            params_np,
-                            real_errors_np,
-                            imag_errors_np,
-                        )
-                    ):
-                        magnitude = np.abs(value)
-                        phase_rad = np.angle(value)
-                        phase_deg = np.degrees(phase_rad)
-
-                        # 格式化输出，包含误差
-                        f.write(
-                            f"{i:4d}  {name:50s}  "
-                            f"{value.real:12.8f} ± {re_err:12.8f}  "
-                            f"{value.imag:12.8f} ± {im_err:12.8f}  "
-                            f"{magnitude:12.8f}  {phase_rad:12.8f}  {phase_deg:12.8f}\n"
-                        )
-                    f.write("#" * 120 + "\n")  # 添加分隔线
-
-                if run_id == 0:
-                    print(f"✅ 创建参数文件: {txt_filename}")
-
+            if run_id == 0:
+                print(f"参数文件已创建: {txt_filename}")
             return True
         except Exception as e:
-            print(f"❌ 保存参数失败: {e}")
+            print(f"保存参数失败: {e}")
             return False
 
+    # --------------------------------------------------------
     def save_nll_history(self, nll_history, run_id, filename_base):
-        """保存NLL历史到txt文件"""
         try:
             txt_filename = f"{filename_base}.txt"
-
-            # 如果是第一次运行，创建文件并写入表头
             if run_id == 0:
                 with open(txt_filename, "w") as f:
                     f.write("# NLL History - All Runs\n")
-                    f.write(
-                        f"# File generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    )
+                    f.write(f"# Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write("#" * 60 + "\n")
                     f.write("# Iteration  NLL\n")
                     f.write("#" * 60 + "\n")
 
-            # 追加写入当前运行的NLL历史
             with open(txt_filename, "a") as f:
                 f.write(f"# RUN: run_{run_id}\n")
-                f.write("#" * 60 + "\n")  # 添加分隔线
-                for iter_idx, nll_val in enumerate(nll_history):
-                    f.write(f"{iter_idx:8d}  {nll_val:15.8f}\n")
-                f.write("#" * 60 + "\n")  # 添加分隔线
-
+                f.write("#" * 60 + "\n")
+                for j, nll_val in enumerate(nll_history):
+                    f.write(f"{j:8d}  {nll_val:15.8f}\n")
+                f.write("#" * 60 + "\n")
             return True
         except Exception as e:
-            print(f"❌ 保存NLL历史失败: {e}")
+            print(f"保存NLL历史失败: {e}")
             return False
 
+    # --------------------------------------------------------
     def save_weight_file(self, params, filename):
-        """保存权重文件"""
+        """保存权重文件。先reCalcAmp再writeResult"""
         try:
+            if self.has_free_res:
+                theta = self.extract_theta_phys(params)
+                self.analysis.reCalcAmp(theta)
             self.analysis.writeResult(params, filename, 0)
-            print(f"✅ 权重文件已保存: {filename}")
+            print(f"权重文件已保存: {filename}")
             return True
         except Exception as e:
-            print(f"❌ 保存权重文件失败 {filename}: {e}")
+            print(f"保存权重文件失败 {filename}: {e}")
             return False
 
+    # --------------------------------------------------------
     def run_multiple_optimizations(self, num_runs=10, **kwargs):
-        """运行多次优化"""
         results = []
-
-        # 创建输出目录
         output_dir = "results"
         os.makedirs(output_dir, exist_ok=True)
 
-        # 定义统一的输出文件名
         params_filename = os.path.join(output_dir, "parameters.txt")
         nll_filename = os.path.join(output_dir, "nll_history.txt")
 
@@ -378,56 +402,45 @@ class SimplePWAOptimizer:
             print(f"开始第 {i}/{num_runs-1} 次优化")
             print(f"{'='*80}")
 
-            # 生成初始参数
-            if i == 0:
-                seed = 42  # 固定种子以便可重复
-            else:
-                seed = 42 + i
-
+            seed = 42 if i == 0 else 42 + i
             initial_params = generate_initial_params(
-                n_gls_total,
-                seed=seed,
-                device=self.device,
-                amplitude_names=self.amplitude_names,
+                self.n_coupling_free, free_res_info,
+                seed=seed, device=self.device,
             )
 
-            # 运行优化
             try:
                 result = self.optimize_single_run(initial_params, run_id=i, **kwargs)
                 results.append(result)
                 self.all_results.append(result)
 
                 print(f"第 {i} 次优化完成!")
-                print(f"最终NLL: {result['final_nll']:.6f}")
-                print(f"正定性: {result['is_positive_definite']}")
-                print(f"优化耗时: {result['time']:.2f} 秒")
-                print(f"海森耗时: {result['hessian_time']:.2f} 秒")
-                print(f"迭代次数: {result['iterations']}")
+                print(f"  NLL = {result['final_nll']:.6f}")
+                print(f"  正定性 = {result['is_positive_definite']}")
+                print(f"  耗时 = {result['time']:.2f}s, Hessian = {result['hessian_time']:.2f}s")
+                print(f"  迭代次数 = {result['iterations']}")
 
-                # 保存参数（含误差）
                 self.save_parameters(
                     result["final_params"],
-                    result["real_errors"],
-                    result["imag_errors"],
-                    i,
-                    params_filename.replace(".txt", ""),
-                    save_txt=True,
+                    result["coupling_real_errors"],
+                    result["coupling_imag_errors"],
+                    result["res_errors"],
+                    i, params_filename.replace(".txt", ""),
                 )
 
-                # 保存NLL历史
-                self.save_nll_history(
-                    result["nll_history"], i, nll_filename.replace(".txt", "")
-                )
+                self.save_nll_history(result["nll_history"], i,
+                                      nll_filename.replace(".txt", ""))
             except Exception as e:
                 print(f"第 {i} 次优化失败: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
         return results
 
-    def print_optimized_parameters(
-        self, params=None, real_errors=None, imag_errors=None, run_id=None
-    ):
-        """打印优化后的参数（包含误差）"""
+    # --------------------------------------------------------
+    def print_optimized_parameters(self, params=None, coupling_real_err=None,
+                                   coupling_imag_err=None, res_errors=None,
+                                   run_id=None):
         if params is None:
             if self.best_params is None:
                 print("没有优化结果!")
@@ -437,99 +450,89 @@ class SimplePWAOptimizer:
         else:
             run_info = f"第 {run_id} 次运行"
 
+        coupling = self.extract_coupling_complex(params)
+        params_np = coupling.cpu().numpy()                         # [n_coupling_free]
+        real_err_np = (coupling_real_err.cpu().numpy()
+                       if coupling_real_err is not None
+                       else np.zeros(self.n_coupling_free))
+        imag_err_np = (coupling_imag_err.cpu().numpy()
+                       if coupling_imag_err is not None
+                       else np.zeros(self.n_coupling_free))
+
         print(f"\n{'='*80}")
-        print(f"{run_info}优化后的参数值:")
+        print(f"{run_info}优化结果:")
         print(f"{'='*80}")
-        print(
-            f"固定参数: {self.amplitude_names[0]} = 1.000000 ± 0.000000 + 0.000000 ± 0.000000i\n"
-        )
+        print(f"固定参数: {self.params_names[0]} = 1.000000 + 0.000000i")
 
-        params_np = params.cpu().numpy()
-        real_errors_np = (
-            real_errors.cpu().numpy()
-            if real_errors is not None
-            else np.zeros_like(params_np.real)
-        )
-        imag_errors_np = (
-            imag_errors.cpu().numpy()
-            if imag_errors is not None
-            else np.zeros_like(params_np.imag)
-        )
-
-        for i, (name, value, re_err, im_err) in enumerate(
-            zip(amplitude_names, params_np, real_errors_np, imag_errors_np)
-        ):
-            if i == 0:
-                continue  # 跳过固定参数
+        for fi in range(1, self.n_coupling_free):
+            name = self.params_names[fi]
+            value = params_np[fi]
+            re_err = real_err_np[fi]
+            im_err = imag_err_np[fi]
             magnitude = np.abs(value)
             phase = np.angle(value)
-
-            # 计算幅度和相位的误差（通过误差传播）
             x, y = value.real, value.imag
             dx, dy = re_err, im_err
-
-            # 幅度误差: σ_r = sqrt((x²σ_x² + y²σ_y²)/(x²+y²))
-            if magnitude > 0:
-                mag_err = np.sqrt((x**2 * dx**2 + y**2 * dy**2) / (x**2 + y**2))
-            else:
-                mag_err = 0.0
-
-            # 相位误差: σ_φ = sqrt((y²σ_x² + x²σ_y²)/(x²+y²)²)
-            if magnitude > 0:
-                phase_err = np.sqrt((y**2 * dx**2 + x**2 * dy**2) / (x**2 + y**2) ** 2)
-                phase_err_deg = np.degrees(phase_err)
-            else:
-                phase_err = 0.0
-                phase_err_deg = 0.0
-
+            mag_err = np.sqrt((x**2 * dx**2 + y**2 * dy**2) / (x**2 + y**2)) if magnitude > 0 else 0.0
+            phase_err = np.sqrt((y**2 * dx**2 + x**2 * dy**2) / (x**2 + y**2)**2) if magnitude > 0 else 0.0
             print(
-                f"{i:3d}: {name:50s} = "
+                f"{fi:3d}: {name:50s} = "
                 f"({value.real:10.6f} ± {re_err:10.6f}) + "
                 f"({value.imag:10.6f} ± {im_err:10.6f})i  "
                 f"(|A|={magnitude:.6f} ± {mag_err:.6f}, "
-                f"φ={np.degrees(phase):<.2f}° ± {phase_err_deg:.2f}°)"
+                f"φ={np.degrees(phase):.2f}° ± {np.degrees(phase_err):.2f}°)"
             )
 
+        # 共振态参数
+        if self.has_free_res:
+            theta = self.extract_theta_phys(params)
+            print()
+            theta_np = theta.cpu().numpy()
+            lower_np = self._lower.cpu().numpy()
+            upper_np = self._upper.cpu().numpy()
+            res_err_np = res_errors.cpu().numpy() if res_errors is not None else None
+            for j in range(self.n_res_free):
+                idx = self.n_coupling_free + j
+                name = self.params_names[idx]
+                err_str = f" ± {res_err_np[j]:.6f}" if res_err_np is not None else ""
+                print(f"{idx:3d}: {name:50s} = {theta_np[j]:12.8f}{err_str}"
+                      f"  (bounds=[{lower_np[j]:.6g}, {upper_np[j]:.6g}])")
+
+    # --------------------------------------------------------
     def save_all_results_summary(self):
-        """保存所有结果的摘要"""
         if not self.all_results:
             print("没有结果!")
             return
 
-        # 按NLL排序
         sorted_results = sorted(self.all_results, key=lambda x: x["final_nll"])
-
         summary_file = "results/optimization_summary.txt"
         with open(summary_file, "w") as f:
             f.write("PWA优化结果\n")
             f.write("=" * 100 + "\n")
             f.write(f"总运行次数: {len(self.all_results)}\n")
-            f.write(f"总振幅数: {total_gls}\n")
-            f.write(f"可变参数: {self.n_variable}\n")
+            f.write(f"耦合参数数量: {self.n_coupling_free}\n")
+            f.write(f"自由共振态参数: {self.n_res_free}\n")
+            f.write(f"总参数维度: {self.n_params}\n")
             f.write(f"最佳NLL: {self.best_nll:.6f}\n")
-            f.write(f"所有参数结果: parameters.txt\n")
-            f.write(f"所有NLL结果: nll_history.txt\n\n")
+            f.write(f"参数文件: parameters.txt\n")
+            f.write(f"NLL历史: nll_history.txt\n\n")
 
             f.write("=" * 100 + "\n")
             f.write("运行结果 (按NLL排序):\n")
             f.write("=" * 100 + "\n")
-            f.write(
-                f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代次数':<8} "
-                f"{'耗时(秒)':<10} {'Hessian耗时':<12} {'正定':<6}\n"
-            )
+            f.write(f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代':<8} "
+                    f"{'耗时':<10} {'Hessian耗时':<12} {'正定':<6}\n")
             f.write("-" * 100 + "\n")
 
             for rank, res in enumerate(sorted_results):
-                f.write(
-                    f"{rank+1:<4} {res['run_id']:<6} {res['final_nll']:<12.6f} "
-                    f"{res['iterations']:<8} {res['time']:<10.2f} "
-                    f"{res['hessian_time']:<12.2f} {str(res['is_positive_definite']):<6}\n"
-                )
+                f.write(f"{rank+1:<4} {res['run_id']:<6} {res['final_nll']:<12.6f} "
+                        f"{res['iterations']:<8} {res['time']:<10.2f} "
+                        f"{res['hessian_time']:<12.2f} "
+                        f"{str(res['is_positive_definite']):<6}\n")
 
-            # 写入最佳结果的分支比
             if self.best_result.get("is_positive_definite", False):
                 f.write("=" * 100 + "\n")
-                f.write("最佳结果的分支比:\n")
+                f.write("最佳分支比:\n")
                 f.write("=" * 100 + "\n")
                 try:
                     bf, bf_err = self.compute_branching_fractions(self.best_params)
@@ -538,19 +541,37 @@ class SimplePWAOptimizer:
                             f.write(f"{i:2d}: {bf[i]:.6e} ± {bf_err[i]:.6e}\n")
                 except Exception as e:
                     f.write(f"计算分支比失败: {e}\n")
-        print(f"✅ 优化结果摘要已保存到: {summary_file}")
+
+            if self.best_params is not None and self.has_free_res:
+                f.write("=" * 100 + "\n")
+                f.write("最佳共振态参数:\n")
+                f.write("=" * 100 + "\n")
+                theta = self.extract_theta_phys(self.best_params)
+                theta_np = theta.cpu().numpy()
+                lower_np = self._lower.cpu().numpy()
+                upper_np = self._upper.cpu().numpy()
+                f.write(f"{'Index':<6} {'Name':<30} {'Value':<16} {'Lower':<16} {'Upper':<16}\n")
+                for i in range(self.n_res_free):
+                    name = self.params_names[self.n_coupling_free + i]
+                    f.write(f"{i:<6} {name:<30} {theta_np[i]:<16.8f} "
+                            f"{lower_np[i]:<16.8f} {upper_np[i]:<16.8f}\n")
+
+        print(f"优化结果摘要已保存到: {summary_file}")
 
 
-# 创建优化器实例
-optimizer = SimplePWAOptimizer(ana, conjugate_pairs, amplitude_names)
+# ============================================================
+# 主程序
+# ============================================================
+optimizer = UnifiedPWAOptimizer(
+    ana, free_res_info, params_names
+)
 
-# 运行多次优化
 results = optimizer.run_multiple_optimizations(
-    num_runs=10,
+    num_runs=1,
     max_iter=10000,
-    lr=0.5,
-    tolerance_grad=1e-5,
-    tolerance_change=1e-7,
+    lr=0.9,
+    tolerance_grad=1e-10,
+    tolerance_change=1e-10,
     history_size=500,
 )
 
@@ -559,16 +580,12 @@ print(f"\n{'='*80}")
 print("所有优化结果总结:")
 print(f"{'='*80}")
 
-# 按NLL排序
 sorted_results = sorted(optimizer.all_results, key=lambda x: x["final_nll"])
-
 for i, res in enumerate(sorted_results):
-    print(
-        f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
-        f"迭代次数 = {res['iterations']:3d}, "
-        f"耗时 = {res['time']:6.2f}s, 海森耗时 = {res['hessian_time']:6.2f}s, "
-        f"正定 = {res['is_positive_definite']}"
-    )
+    print(f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
+          f"迭代 = {res['iterations']:3d}, "
+          f"耗时 = {res['time']:6.2f}s, Hessian = {res['hessian_time']:6.2f}s, "
+          f"正定 = {res['is_positive_definite']}")
 
 print(f"\n{'='*80}")
 print("最佳结果:")
@@ -576,29 +593,33 @@ print(f"{'='*80}")
 
 best_res = sorted_results[0]
 print(f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} 次运行)")
-print(f"Hessian正定性: {best_res['is_positive_definite']}")
-# print(f"Hessian最小特征值: {best_res['min_eigenvalue']:.2e}")
-# print(f"Hessian最大特征值: {best_res['max_eigenvalue']:.2e}")
+# print(f"Hessian正定性: {best_res['is_positive_definite']}")
 # print(f"Hessian条件数: {best_res['condition_number']:.2e}")
-# print(f"Hessian计算耗时: {best_res['hessian_time']:.2f} 秒")
 
-# 打印最佳参数（含误差）
-if best_res["is_positive_definite"] and best_res["real_errors"] is not None:
+# 打印最佳参数
+if best_res["is_positive_definite"] and best_res["coupling_real_errors"] is not None:
     optimizer.print_optimized_parameters(
         best_res["final_params"],
-        best_res["real_errors"],
-        best_res["imag_errors"],
+        best_res["coupling_real_errors"],
+        best_res["coupling_imag_errors"],
+        best_res["res_errors"],
         best_res["run_id"],
     )
 else:
     print(f"\n⚠️ Hessian矩阵不正定，无法提供参数误差估计")
     optimizer.print_optimized_parameters(best_res["final_params"])
+print(f"{'='*80}")
 
-"""
-# 计算并打印分支比
+# 保存最佳权重文件
+best_weight_file = "results/weight_best.root"
+optimizer.save_weight_file(best_res["final_params"], best_weight_file)
+
+# 分支比
 if best_res["is_positive_definite"]:
     try:
-        bf_values, bf_errors = optimizer.compute_branching_fractions(best_res["final_params"])
+        bf_values, bf_errors = optimizer.compute_branching_fractions(
+            best_res["final_params"]
+        )
         if bf_values is not None:
             print(f"\n{'='*80}")
             print("最佳结果的分支比:")
@@ -607,11 +628,6 @@ if best_res["is_positive_definite"]:
                 print(f"{i:2d}: {bf_values[i]:.6e} ± {bf_errors[i]:.6e}")
     except Exception as e:
         print(f"计算分支比失败: {e}")
-"""
 
-# 只保存最佳权重文件
-best_weight_file = "results/weight_best.root"
-optimizer.save_weight_file(best_res["final_params"], best_weight_file)
-
-# 保存所有结果摘要
+# 保存摘要
 optimizer.save_all_results_summary()

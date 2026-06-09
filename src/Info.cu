@@ -68,11 +68,14 @@ void DecayInfo::buildDecayChains(
                             if (c.size() >= 2) ch.emplace_back(c[0], c[1]);
                         rlist.emplace_back(rname, rc.intermediate, ip.spin, ip.parity,
                                            it->second.type, it->second.parameters, ch);
-                        // Free theta params with readable names (preserves order)
+                        // Free theta params with readable names
                         if (!it->second.free.empty()) {
                             const auto& pnames = rlist.back().getOrderedParamNames();
-                            for (const auto& pn : pnames)
-                                resonance_param_names_.push_back(rname + "_" + pn);
+                            bool all_free = (it->second.free.size() == 1 && it->second.free[0] == -1);
+                            for (size_t pi = 0; pi < pnames.size(); ++pi) {
+                                if (all_free || std::find(it->second.free.begin(), it->second.free.end(), (int)pi) != it->second.free.end())
+                                    resonance_param_names_.push_back(rname + "_" + pnames[pi]);
+                            }
                         }
                     }
                 }

@@ -1,89 +1,53 @@
-# config.yml
 # ============================================================
-# 新功能说明:
+# ctpwa config.yml — compact format
+# ============================================================
+# 衰变链支持两种写法：
+#   紧凑格式（推荐）:
+#     chain_name:
+#       mother:
+#         - [daughter1, intermediate]      # 含中间态
+#         - [daughter2, intermediate]
+#       intermediate: [d1, d2]             # 中间态衰变
 #
-# 1. 全同粒子:
-#    - Constraints 中新增 `identical` 字段，列出全同粒子组
-#      例如: identical: [[pi0_1, pi0_2], [Ks1, Ks2]]
-#      系统自动分配组名 identical1, identical2 ...
-#    - DecayChain 中新增 `symmetrize: true`，施加 (-1)^{L+S} 选择定则
-#
-# 2. 极化 (Polarization):
-#    - Particle 中新增 `polarization` 字段，指定允许的磁量子数 m
-#    - 例如 e+e- → J/psi 横极化: polarization: [1, -1] (仅 m=±1)
-#    - 缺省为全部 2J+1 个极化态
-#
-# 3. 轨道角动量上限:
-#    - Constraints 中新增 `maxL` 全局设置
-#    - 限制所有衰变步的 L 上限，-1 或不设为无限制
-#
-# 4. 子衰变参数 (per-decay-step):
-#    - decay 步支持扩展格式，可对每个顶点单独设置:
-#    - is_bf: 是否施加势垒因子 (Blatt-Weisskopf)，默认 true
-#    - p_break: 是否宇称破缺（弱衰变），默认 false
-#    - 扩展格式示例:
-#      decay:
-#        - Jpsi: [eta, R_KK]                  # 紧凑格式，is_bf=true, p_break=false
-#        - R_KK:
-#            daughters: [Kp, Km]              # 扩展格式
-#            is_bf: false                     # 不放势垒因子
-#            p_break: true                    # 弱衰变，宇称不守恒
-#
-# 示例（e+e- → J/psi → 3pi0, J/psi横极化, maxL=4, 全同粒子）:
-#   Particles:
-#     Jpsi:
-#       J: 1; P: -1; mass: 3.0969; polarization: [1, -1]; tex: ['J/#psi']
-#     pi0_1:
-#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
-#     pi0_2:
-#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
-#     pi0_3:
-#       J: 0; P: -1; mass: 0.13498; tex: ['#pi^{0}']
-#   Data:
-#     order: [pi0_1, pi0_2, pi0_3]
-#   Constraints:
-#     maxL: 4
-#     bf_d: 0.5
-#     identical: [[pi0_1, pi0_2, pi0_3]]
-#   DecayChains:
-#     chain1:
+#       intermediates:                     # 中间态共振态配置
+#         intermediate:
+#           - [J: 1, P: -1]: [res1, res2]
+#   展开格式 (等价):
+#     chain_name:
 #       decay:
-#         - Jpsi: [pi0_1, R_pi0pi0]
-#         - R_pi0pi0: [pi0_2, pi0_3]
-#       symmetrize: true
-#       R_pi0pi0:
-#         - [J: 1, P: -1]: [f0_980, f0_1500]
+#         - mother: [daughter1, intermediate]
+#         - intermediate: [d1, d2]
+#       intermediate:
+#         - [J: 1, P: -1]: [res1, res2]
+#
+# 约束:
+#   trans: 跨链全同约束。[chain_substr_A, chain_substr_B]: ratio
+#   identical: 全同粒子组，自动施加 (-1)^{L+S} 选择定则
+#   maxL: 全局轨道角动量上限
 # ============================================================
+
 Particles:
   Jpsi:
-    J: 1
-    P: -1
-    mass: 3.0969
-    tex: ['J/#psi']
+    J: 1; P: -1; mass: 3.0969
+    # polarization: [1, -1]  # 横极化 (仅 m=±1)
+    tex: ['J/\\psi']
   eta:
-    J: 0
-    P: -1
-    mass: 0.5478
-    tex: ['#eta']
+    J: 0; P: -1; mass: 0.5478
+    tex: ['\\eta']
   Kp:
-    J: 0
-    P: -1
-    mass: 0.4937
+    J: 0; P: -1; mass: 0.4937
     tex: ['K^{+}']
   Km:
-    J: 0
-    P: -1
-    mass: 0.4937
+    J: 0; P: -1; mass: 0.4937
     tex: ['K^{-}']
 
 Data:
   order: [Kp, Km, eta]
-  # 使用dat文件
-  data: [dat, "/file.dat"]
-  phsp: [dat, "/file.dat"]
-  bkg:  [dat, "/file.dat"]
-  #bkg_weights: [dat, "/file.dat"]
-  
+  data:  [dat, "./data.dat"]
+  phsp:  [dat, "./phsp.dat"]
+  # bkg:   [dat, "./bkg.dat"]
+  # bkg_weights: [dat, "./bkg_weights.dat"]
+
   # 使用root文件 （TBranch名字与order中粒子名字顺序一致）
   # data: [ROOT, "/file.root", TTree, TBranch1, TBranch2, TBranch3, ...]
   # phsp: [ROOT, "/file.root", TTree, TBranch1, TBranch2, TBranch3, ...]
@@ -91,87 +55,94 @@ Data:
   # bkg_weights: [ROOT, "/file.root", TTree, TBranch1(weight)]
   # 也可混合使用
 
-
+# ============================================================
+# 衰变链: J/psi → eta KK / Kp Keta / Km Keta
+# BFS 自动展开所有中间态 J^P 组合 × 共振态组合
+# ============================================================
 DecayChains:
-  chain1:
-    decay:
-      - Jpsi: [eta, R_KK]
-      - R_KK: [Kp, Km]
-    R_KK:
-      - [J: 1, P: -1]: [phi1020, X1750, omega1420, phi1680, rho1900, omega2220, NR1_KK]
-      - [J: 3, P: -1]: [omega3_1670, phi3_1850, rho3_2250, NR3_KK]
-    legend: [R_KK, eta]
+  decay1:
+    Jpsi: 
+      - [eta, R_KK] # [eta, R_KK, {if some requirement, like p_break: true}]
+      - [Kp, R_Kpeta]
+      - [Km, R_Kmeta]
+    R_KK: [Kp, Km]
+    R_Kpeta: 
+      - [Kp, eta] # R_Keta_0      
+      - [Km, eta] # R_Keta_1
 
-  chain2:
-    decay:
-      - Jpsi: [Km, R_Kpeta]
-      - R_Kpeta: [Kp, eta]
-    R_Kpeta:
-      - [J: 1, P: -1]: [K1_1410, K1_1680, K2380]
-    legend: ["R_Kpeta[0]", "^{*+}", "R_Kpeta[1]", Km]
-
-
-  chain3:
-    decay:
-      - Jpsi: [Kp, R_Kmeta]
-      - R_Kmeta: [Km, eta]
-    R_Kmeta:
-      - [J: 1, P: -1]: [K1_1410, K1_1680, K2380]
-    legend: ["R_Kmeta[0]", "^{*-}", "R_Kmeta[1]", Kp]
+    intermediates:
+      R_KK:
+        - [J: 1, P: -1]: [phi1020, omega1420]
+        - [J: 3, P: -1]: [omega3_1670]
+      R_Keta:
+        - [J: 1, P: -1]: [K1_1410]
+        - [J: 2, P: +1]: [K2_1430]
+    legends:
+      - ['R_KK', ' \\to ', 'eta']         # chain 0: R_KK 的第0个共振态
+      - ['R_Keta_0', ' \\to ', 'Kp']       # chain 1
+      - ['R_Keta_1', ' \\to ', 'Km']       # chain 2
 
 Constraints:
+  # R_Keta_0 和 R_Keta_1 通过 trans 约束共享参数（互为相反数）
   trans:
-    - [chain2, chain3]: [[-1, -1]]
-    # 顺序一样即可简写，否则一个一个写
-    # - [chain2-R_Kpeta-K1_1410, chain3-R_Kmeta-K1_1410]: [[-1, -1]]
+    - [R_Keta_0, R_Keta_1]: -1
+  # 全局参数
+  # maxL: 4
+  bf_d: 3.0
 
+# ============================================================
+# 共振态配置
+# model: BWR (Breit-Wigner), Flatte, ONE (常数), BWR_Bf (含势垒)
+# free: 自由参数下标，-1 表示全部自由
+# free_range: 自由参数拟合范围
+# ============================================================
 Resonances:
+  # ---- R_KK 共振态 ----
   phi1020:
-    J: 1
-    P: -1
-    model: BWR
-    parameters: [1.0195, 0.005] # [mass, width]
-    tex: ["#phi(1020)"]
+    J: 1; P: -1; model: BWR
+    parameters: [1.0195, 0.0045]
+    tex: ["\\phi(1020)"]
 
-  NR1_KK:
-    J: 1
-    P: -1
-    model: ONE
-    parameters: [1.5]
-    tex: ["NR_{1}(KK)"]
-    
+  omega1420:
+    J: 1; P: -1; model: BWR
+    parameters: [1.41, 0.35]
+    tex: ["\\omega(1420)"]
+
+  omega3_1670:
+    J: 3; P: -1; model: BWR
+    parameters: [1.667, 0.168]
+    tex: ["\\omega_{3}(1670)"]
+
+  # ---- R_Keta 共振态 (Kpi) ----
   K1_1410:
-    J: 1
-    P: -1
-    model: BWR
+    J: 1; P: -1; model: BWR
     parameters: [1.414, 0.232]
-    tex: ["K_{1}", "(1410)"]
+    tex: ["K_{1}(1410)"]
 
-  K1630:
-    J: 1
-    P: -1
-    model: BWR
-    parameters: [1.629, 0.016]
-    tex: ["K_{1}", "(1630)"]
+  K2_1430:
+    J: 2; P: +1; model: BWR
+    parameters: [1.432, 0.109]
+    tex: ["K_{2}^{*}(1430)"]
 
-# 生成的root文件包含多个TDirectory和lengends。每个TDirectory包含多个直方图和xlabel, ylabel。
+# ============================================================
+# ROOT 输出绘图
+# ============================================================
 Plot:
   mass:
     - input: [Kp, Km]
-      bins: 100
-      range: [1.0, 2.6]
+      bins: 100; range: [1.0, 2.6]
       display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
     - input: [Kp, eta]
-      bins: 100
-      range: [1.0, 2.6]
-      display: ["M(K^{+}#eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
+      bins: 100; range: [1.0, 2.6]
+      display: ["M(K^{+}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
+    - input: [Km, eta]
+      bins: 100; range: [1.0, 2.6]
+      display: ["M(K^{-}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
   cosbeta:
     - input: [[Jpsi], [Kp, Km], [Kp]]
-      bins: 100
-      range: [-1.0, 1.0]
-      display: ["cos#beta(K^{+}K^{-})", "Events/0.02"]
+      bins: 100; range: [-1.0, 1.0]
+      display: ["cos\\beta(K^{+}K^{-})", "Events/0.02"]
   dalitz:
     - input: [[Kp, Km], [Kp, eta]]
-      bins: [100, 100]
-      range: [[1.0, 6.8], [1.0, 6.8]]
-      display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}#eta) (GeV^{2}/c^{4})"]
+      bins: [100, 100]; range: [[1.0, 6.8], [1.0, 6.8]]
+      display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}\\eta) (GeV^{2}/c^{4})"]

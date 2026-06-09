@@ -1049,8 +1049,10 @@ public:
         // printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
         //     total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
 
-        double loss = total_data_nll - total_bkg_nll
-            + (totalDataEvents - bkg_integral_) * log(phsp_factor);
+        double loss = total_data_nll - total_bkg_nll  + (totalDataEvents - bkg_integral_) * log(phsp_factor);
+        // std::cout << "Data NLL: " << total_data_nll << ", Bkg NLL: " << total_bkg_nll
+        //           << ", PHSP factor: " << phsp_factor
+        //           << ", Total loss: " << loss << std::endl;
         if (isnan(loss) || isinf(loss)) {
             // std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf") << ", resetting to 1e30" << std::endl;
             loss = 1e30;
@@ -2341,6 +2343,9 @@ public:
         auto dev = params.device();
         torch::Tensor hessian = torch::zeros({total, total}, torch::kFloat64).to(dev);
 
+        // 打印hessian全部元素
+        // std::cout << "Hessian elements " << __LINE__ << ": \n" << hessian << std::endl;
+
         // ---- 2. recompute amplitudes + rebuild phsp matrix ----
         if (nt > 0 && theta.numel() > 0) {
             amp_calc_.reComputeAmps(d_all_amplitudes_,
@@ -2397,6 +2402,8 @@ public:
                 cudaFree(d_phsp_gpu);
             }
         }
+
+        // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
         // ---- 3. vv block [0:n2, 0:n2] ----
         if (n2 > 0) {
@@ -2486,7 +2493,7 @@ public:
 
             // Constraint projection (identity in coupling mode since nv=na=n_ext)
             if (is_coupling || n_ext == nv) {
-                // Identity: copy top-left n2×n2
+                // Copy top-left n2×n2 (interleaved format from d_hess_ext)
                 for (int i = 0; i < n2; ++i)
                     cudaMemcpy(hessian.data_ptr<double>() + i * total,
                                d_hess_ext + i * (2 * n_ext),
@@ -2519,6 +2526,13 @@ public:
                 hessian.slice(0, 0, n2).slice(1, 0, n2).copy_(hess_reduced);
             }
         }
+
+        // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
+
+        // Reorder vv block to grouped [Re0..Re_n, Im0..Im_n] BEFORE vθ assembly
+        // reorderVVBlockInterleavedToGrouped(hessian.data_ptr<double>(), nv, total);
+
+        // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
         // ---- 4. vθ/θθ block [n2:total, n2:total] ----
         if (nt > 0 && theta.numel() > 0) {
@@ -2654,11 +2668,20 @@ public:
                     h_proj[i*P+j] = h_mixed[i*P+j];
                     h_proj[(nv+i)*P+j] = h_mixed[(n_amplitudes_+i)*P+j];
                 }
-                torch::Tensor mixed_t = torch::from_blob(h_proj.data(), {2*nv, P},
-                    torch::TensorOptions().dtype(torch::kFloat64)).clone().to(dev);
-                hessian.slice(0,0,n2).slice(1,n2,total).copy_(mixed_t);
-                hessian.slice(0,n2,total).slice(1,0,n2).copy_(mixed_t.transpose(0,1));
-            }
+                // Row-by-row copy to avoid sliced-tensor stride issues
+                double* d_hess = hessian.data_ptr<double>();
+                for (int i = 0; i < n2; ++i)
+                    cudaMemcpy(d_hess + i * total + n2, h_proj.data() + i * P,
+                               P * sizeof(double), cudaMemcpyHostToDevice);
+                // θv block = vθ^T  (copy full block)
+                std::vector<double> h_theta_v(n2 * P);
+                for (int i = 0; i < n2; ++i)
+                    for (int j = 0; j < P; ++j)
+                        h_theta_v[j * n2 + i] = h_proj[i * P + j];
+                for (int j = 0; j < P; ++j)
+                    cudaMemcpy(d_hess + (n2 + j) * total, h_theta_v.data() + j * n2,
+                               n2 * sizeof(double), cudaMemcpyHostToDevice);
+        }
 
             // Copy theta-theta result
             torch::Tensor res_hess = torch::empty({P, P}, torch::TensorOptions().dtype(torch::kFloat64).device(dev));
@@ -2666,6 +2689,10 @@ public:
             cudaFree(d_hess);
             hessian.slice(0,n2,total).slice(1,n2,total).copy_(res_hess);
         }
+
+        // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
+
+        // std::cout << "Coupling: " << is_coupling << std::endl;
 
         // ---- 5. Coupling transform ----
         if (is_coupling) {
@@ -2680,6 +2707,8 @@ public:
                 nv, ncf, nt);
             return hess_fit;
         }
+
+        // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
         return hessian;
     }

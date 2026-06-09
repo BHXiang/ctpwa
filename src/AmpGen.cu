@@ -1085,10 +1085,8 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             d_momenta->getMomentum(event_idx, node.daug2_idx);
 
         double mm = pMother.M();
-        double qq =
-            std::sqrt((mm * mm - std::pow(pDaug1.M() + pDaug2.M(), 2)) *
-                (mm * mm - std::pow(pDaug1.M() - pDaug2.M(), 2))) /
-            2 / mm;
+        double qq = std::sqrt((mm * mm - std::pow(pDaug1.M() + pDaug2.M(), 2)) *
+                (mm * mm - std::pow(pDaug1.M() - pDaug2.M(), 2))) / 2 / mm;
 
         double mass_mother = decayChain[nodeIdx].mass[0];
         double mass_daug1 = decayChain[nodeIdx].mass[1];
@@ -1136,11 +1134,12 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             }
         }
 
-        double q0 = std::sqrt((mass_mother * mass_mother -
-            std::pow(mass_daug1 + mass_daug2, 2)) *
-            (mass_mother * mass_mother -
-                std::pow(mass_daug1 - mass_daug2, 2))) /
-            2 / mass_mother;
+        double q0 = std::sqrt((mass_mother * mass_mother - std::pow(mass_daug1 + mass_daug2, 2)) * (mass_mother * mass_mother - std::pow(mass_daug1 - mass_daug2, 2))) / 2 / mass_mother;
+         
+        // printf("mother mass = %f, daug1 mass = %f, daug2 mass = %f, q0 = %f\n",
+        //     mass_mother, mass_daug1, mass_daug2, q0);
+        // // 打印qq
+        // printf("mm = %f, mdaug1 = %f, daug2 mass = %f, qq = %f\n", mm, pDaug1.M(), pDaug2.M(), qq);
 
         if (nodeIdx == 0)
         {
@@ -1148,9 +1147,9 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
             // resAmp *= BlattWeisskopf(sl.L, qq, q0);
             resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
 
-            // printf("Event %d, sl %d, First Node: L=%d, qq=%f, q0=%f, BW
-            // Factor=(%f, %f i)\n", event_idx, sl_idx, sl.L, qq, q0,
-            // resAmp.real(), resAmp.imag());
+            // printf("Event %d, SL %d, Node %d: First node, resAmp = (%f, %f)\n",
+            //     event_idx, sl_idx, nodeIdx, resAmp.real(), resAmp.imag());
+
             continue;
         }
 
@@ -2022,6 +2021,15 @@ void AmpCalc::computeUnifiedHessian(
             const cuComplex* d_v_blk = d_v_interleaved + blk.site;
             if (Npr == 2 && Nres == 2) {
                 hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
+                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
+                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
+                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+            } else if (Npr == 1 && Nres == 1) {
+                hessianStage1Kernel<1,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],

@@ -513,7 +513,15 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             if (chain_data["symmetrize"])
                 symmetrize = chain_data["symmetrize"].as<bool>();
 
+            // --- legends: one per channel, in order ---
+            std::vector<std::vector<std::string>> all_legends;
+            if (chain_data["legends"] && chain_data["legends"].IsSequence()) {
+                for (const auto& leg : chain_data["legends"])
+                    all_legends.push_back(leg.as<std::vector<std::string>>());
+            }
+
             // --- Expand each channel: for multi-mode intermediates, generate one chain per mode ---
+            size_t ch_idx = 0;
             for (const auto& ch : channels) {
                 std::string bachelor = ch[0].as<std::string>();
                 std::string intermediate = ch[1].as<std::string>();
@@ -524,6 +532,9 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 bool ch_p_break1 = false, ch_p_break2 = false;
                 bool has_ch_is_bf = false, has_ch_p_break = false;
                 std::vector<std::string> ch_legend;
+                // Fall back to top-level legends list
+                if (ch_idx < all_legends.size())
+                    ch_legend = all_legends[ch_idx];
 
                 if (ch.size() >= 3 && ch[2].IsMap()) {
                     const auto& opts = ch[2];
@@ -668,6 +679,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
 
                     decay_chains_.push_back(chain);
                 } // for each mode
+                ++ch_idx;
             }
 
         } else {
