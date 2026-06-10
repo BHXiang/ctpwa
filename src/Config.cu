@@ -562,27 +562,43 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     }
                 }
 
-                // How many decay modes for the first intermediate?
+                // --- Determine multi-mode iteration driver ---
+                // Priority: intermediate modes > bachelor modes
                 size_t n_modes = 1;
-                auto modes_it = int_decay_modes.find(intermediate);
-                if (modes_it != int_decay_modes.end())
-                    n_modes = modes_it->second.size();
+                bool bachelor_drives_modes = false;
+                {
+                    auto modes_it = int_decay_modes.find(intermediate);
+                    if (modes_it != int_decay_modes.end()) {
+                        n_modes = modes_it->second.size();
+                    } else {
+                        auto bmodes_it = int_decay_modes.find(bachelor);
+                        if (bmodes_it != int_decay_modes.end()) {
+                            n_modes = bmodes_it->second.size();
+                            bachelor_drives_modes = true;
+                        }
+                    }
+                }
 
                 for (size_t mi = 0; mi < n_modes; ++mi) {
-                    // Multi-mode filter: skip modes where bachelor appears
-                    // in the decay products (would duplicate a particle)
+                    // Multi-mode filter: skip modes that duplicate the other daughter
                     if (n_modes > 1) {
-                        const IntDecay* mode = getDecayMode(intermediate, mi);
-                        if (mode && (mode->d1 == bachelor || mode->d2 == bachelor))
-                            continue;
+                        if (bachelor_drives_modes) {
+                            const IntDecay* mode = getDecayMode(bachelor, mi);
+                            if (mode && (mode->d1 == intermediate || mode->d2 == intermediate))
+                                continue;
+                        } else {
+                            const IntDecay* mode = getDecayMode(intermediate, mi);
+                            if (mode && (mode->d1 == bachelor || mode->d2 == bachelor))
+                                continue;
+                        }
                     }
 
                     DecayChainConfig chain;
-                    chain.name = chain_name + "_" + intermediate;
+                    chain.name = chain_name + "_" + (bachelor_drives_modes ? bachelor : intermediate);
                     if (n_modes > 1)
                         chain.name += "_" + std::to_string(mi);
 
-                    // --- Step 1: mother → bachelor + first intermediate ---
+                    // --- Step 1: mother → bachelor + intermediate ---
                     DecayStep step1;
                     step1.mother = mother;
                     step1.daughters = {bachelor, intermediate};
@@ -590,12 +606,18 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     step1.p_break = ch_p_break1;
                     chain.decay_steps.push_back(step1);
 
-                    // If no decay defined for this intermediate, skip BFS
-                    const IntDecay* first_mode = getDecayMode(intermediate, mi);
-                    if (!first_mode) {
-                        // Still push if there are resonance chains
-                        if (res_chain_map.count(intermediate))
-                            chain.resonance_chains.push_back(res_chain_map[intermediate]);
+                    // --- Determine which daughters are intermediates (not known particles) ---
+                    bool intermediate_decays = (int_decay_modes.count(intermediate) > 0);
+                    bool bachelor_decays = (int_decay_modes.count(bachelor) > 0);
+
+                    // Push resonance chains for daughters that have JP but no decay mode
+                    if (!intermediate_decays && res_chain_map.count(intermediate))
+                        chain.resonance_chains.push_back(res_chain_map[intermediate]);
+                    if (!bachelor_decays && res_chain_map.count(bachelor))
+                        chain.resonance_chains.push_back(res_chain_map[bachelor]);
+
+                    // If neither daughter decays further, emit and finish
+                    if (!intermediate_decays && !bachelor_decays) {
                         chain.legend_template = ch_legend.empty()
                             ? std::vector<std::string>{intermediate, " ", bachelor}
                             : ch_legend;
@@ -604,16 +626,24 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         continue;
                     }
 
-                    // Step 2 defaults: use the selected decay mode's settings
-                    bool step2_is_bf   = has_ch_is_bf   ? ch_is_bf2   : first_mode->is_bf;
-                    bool step2_p_break = has_ch_p_break ? ch_p_break2 : first_mode->p_break;
-
                     // --- BFS: recursively resolve intermediates ---
-                    // Queue carries (intermediate_name, mode_selection, is_first)
-                    // After the first, all deeper intermediates use mode 0
                     struct BFSItem { std::string name; bool is_first; bool bf, pb; };
                     std::queue<BFSItem> queue;
-                    queue.push({intermediate, true, step2_is_bf, step2_p_break});
+
+                    if (intermediate_decays) {
+                        const IntDecay* ifm = getDecayMode(intermediate,
+                            bachelor_drives_modes ? 0 : mi);
+                        bool step2_is_bf   = has_ch_is_bf   ? ch_is_bf2   : (ifm ? ifm->is_bf : true);
+                        bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
+                        queue.push({intermediate, !bachelor_drives_modes, step2_is_bf, step2_p_break});
+                    }
+                    if (bachelor_decays) {
+                        const IntDecay* bm = getDecayMode(bachelor,
+                            bachelor_drives_modes ? mi : 0);
+                        queue.push({bachelor, bachelor_drives_modes,
+                            bm ? bm->is_bf : true,
+                            bm ? bm->p_break : false});
+                    }
 
                     while (!queue.empty()) {
                         auto item = queue.front(); queue.pop();
