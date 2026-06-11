@@ -220,7 +220,8 @@ public:
                   int site,
                   const std::vector<std::vector<int>>& free_indices,
                   const std::vector<std::vector<std::vector<double>>>& free_ranges,
-                  const std::set<std::string>& skip_slots_for = {});
+                  const std::set<std::string>& skip_slots_for = {},
+                  const std::map<std::string, std::string>& conjugate_name_map = {});
 
     // 用新参数重算所有振幅
     void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,

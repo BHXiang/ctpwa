@@ -170,7 +170,7 @@ extension = CUDAExtension(
 
 setup(
     name="ctpwa",
-    version="0.1.1",
+    version="0.2.0",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
     long_description="A CUDA-Torch partial wave analysis package for high-energy physics",

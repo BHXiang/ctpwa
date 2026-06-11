@@ -1280,7 +1280,8 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        int site,
                        const std::vector<std::vector<int>>& free_indices,
                        const std::vector<std::vector<std::vector<double>>>& free_ranges,
-                       const std::set<std::string>& skip_slots_for)
+                       const std::set<std::string>& skip_slots_for,
+                       const std::map<std::string, std::string>& conjugate_name_map)
 {
     // 1. 查找或添加 cas 到 cas_list_
     int cas_idx = -1;
@@ -1369,7 +1370,13 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     for (size_t i = 0; i < resonances.size(); ++i) {
         // Skip slot creation for conjugate resonances (params shared via trans-linked chain)
         if (skip_slots_for.count(resonances[i].getName())) {
-            auto owner_it = resonance_owners_.find(resonances[i].getName());
+            // Determine owner name: use conjugate_name_map for name translation,
+            // fall back to own name (for same-name matches)
+            std::string owner_name = resonances[i].getName();
+            auto cnm_it = conjugate_name_map.find(owner_name);
+            if (cnm_it != conjugate_name_map.end())
+                owner_name = cnm_it->second;
+            auto owner_it = resonance_owners_.find(owner_name);
             if (owner_it != resonance_owners_.end()) {
                 conjugate_broadcast_[{block_idx, (int)i}] = owner_it->second;
             }
