@@ -1026,6 +1026,7 @@ public:
                     }
                     cublasDestroy(ch);
 
+                    cudaSetDevice(primary_dev);  // d_grad_res is on primary_dev
                     std::vector<cuComplex*> d_v_ptrs(num_gpus);
                     for (int g = 0; g < num_gpus; ++g)
                         d_v_ptrs[g] = const_cast<cuComplex*>(
