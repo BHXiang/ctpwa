@@ -1804,6 +1804,7 @@ void AmpCalc::computeResonanceGradient(
     if (n_free == 0 || blocks_.empty()) return;
     bool has_offset = (t_offset.size() == d_w.size());
     bool has_dv = (d_v_per_gpu.size() == d_w.size());
+    int primary_dev = 0; cudaGetDevice(&primary_dev);  // d_grad_res lives here
 
     constexpr int kBlockSize = 256;
 
@@ -1887,18 +1888,19 @@ void AmpCalc::computeResonanceGradient(
         }
     }
 
-    // 将各 GPU 结果通过 daxpy 累加到 d_grad_res
-    cudaSetDevice(0);
+    // 将各 GPU 结果通过 daxpy 累加到 d_grad_res（在 primary_dev 上）
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        if (gpu == 0) {
-            daxpy_kernel<<<1, 64>>>(d_grad_res, d_grad_per_gpu[0], 1.0, n_free);
+        if (gpu == primary_dev) {
+            cudaSetDevice(primary_dev);
+            int grid = (n_free + 255) / 256;
+            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_grad_per_gpu[primary_dev], 1.0, n_free);
             cudaDeviceSynchronize();
         } else {
             std::vector<double> h_temp(n_free);
             cudaSetDevice(gpu);
             cudaMemcpy(h_temp.data(), d_grad_per_gpu[gpu],
                        n_free * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaSetDevice(0);
+            cudaSetDevice(primary_dev);
             double* d_temp;
             cudaMalloc(&d_temp, n_free * sizeof(double));
             cudaMemcpy(d_temp, h_temp.data(), n_free * sizeof(double), cudaMemcpyHostToDevice);
@@ -1913,7 +1915,7 @@ void AmpCalc::computeResonanceGradient(
         cudaSetDevice(gpu);
         cudaFree(d_grad_per_gpu[gpu]);
     }
-    cudaSetDevice(0);
+    cudaSetDevice(primary_dev);
 }
 
 
