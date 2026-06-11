@@ -744,17 +744,27 @@ public:
 
             // 更新 d_phsp_matrix_（振幅已变，phsp 矩阵需同步）
             cudaSetDevice(primary_dev);
+            // Pre-compute total phsp weight for correct global normalization
+            double W_total = 0.0;
+            for (int gpu = 0; gpu < num_gpus; ++gpu) {
+                int nP = events_list[gpu][0];
+                if (nP == 0) continue;
+                if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
+                    W_total += thrust::reduce(dp, dp + nP);
+                } else {
+                    W_total += (double)nP;
+                }
+            }
+            if (W_total <= 0.0) W_total = 1.0;
+            cudaSetDevice(primary_dev);
+
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nPhsp = events_list[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
-
-                double W_gpu = (double)nPhsp;
-                if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
-                    thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
-                    W_gpu = thrust::reduce(dp, dp + nPhsp);
-                }
 
                 int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
                 cuComplex* d_phsp_scaled;
@@ -764,7 +774,7 @@ public:
                 const double* d_w = (gpu < (int)d_phsp_weights_list.size()) ? d_phsp_weights_list[gpu] : nullptr;
                 int grid = (nPhsp_total + 255) / 256;
                 scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
-                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
+                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
                 cuComplex* d_phsp_gpu;
                 cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
@@ -781,16 +791,22 @@ public:
                 cudaFree(d_phsp_scaled);
 
                 if (gpu == primary_dev) {
-                    cudaMemcpy(d_phsp_matrix_, d_phsp_gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-                } else {
-                    cudaMemcpyPeer(d_phsp_matrix_, primary_dev, d_phsp_gpu, gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
-                    cudaSetDevice(primary_dev);
                     cuComplex one = make_cuComplex(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                    cudaFree(d_phsp_gpu);
+                } else {
+                    cudaSetDevice(primary_dev);
+                    cuComplex* d_temp;
+                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
+                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    cudaSetDevice(gpu);
+                    cudaFree(d_phsp_gpu);
+                    cudaSetDevice(primary_dev);
+                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                    cudaFree(d_temp);
                 }
-                cudaFree(d_phsp_gpu);
             }
         }
 
@@ -955,28 +971,30 @@ public:
             if (totalDataEvents > 0) {
                 std::vector<int> n_data_events(num_gpus);
                 std::vector<int> phsp_offsets(num_gpus);
+                std::vector<cuComplex*> d_v_ptrs(num_gpus);
                 for (int g = 0; g < num_gpus; ++g) {
                     n_data_events[g] = events_list[g][1];
                     phsp_offsets[g] = events_list[g][0];
+                    d_v_ptrs[g] = const_cast<cuComplex*>(
+                        reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
-                const cuComplex* d_v_ptr = reinterpret_cast<const cuComplex*>(
-                    extended_vec_per_gpu[primary_dev].data_ptr());
                 amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res,
-                    +1.0, phsp_offsets, d_v_ptr);
+                    +1.0, phsp_offsets, d_v_ptrs);
             }
 
             // bkg 贡献 (sign=-1, loss = data_nll - bkg_nll)
             if (totalBkgEvents > 0) {
                 std::vector<int> n_bkg_events(num_gpus);
                 std::vector<int> bkg_offsets(num_gpus);
+                std::vector<cuComplex*> d_v_ptrs(num_gpus);
                 for (int g = 0; g < num_gpus; ++g) {
                     n_bkg_events[g] = events_list[g][2];
                     bkg_offsets[g] = events_list[g][0] + events_list[g][1]; // phsp + data 偏移
+                    d_v_ptrs[g] = const_cast<cuComplex*>(
+                        reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
-                const cuComplex* d_v_ptr = reinterpret_cast<const cuComplex*>(
-                    extended_vec_per_gpu[primary_dev].data_ptr());
                 amp_calc->computeResonanceGradient(s_d_w_bkg_bufs, n_bkg_events, d_grad_res,
-                    -1.0, bkg_offsets, d_v_ptr);
+                    -1.0, bkg_offsets, d_v_ptrs);
             }
 
             // phsp 贡献: ∂((N_data-W_bkg)*log(phsp))/∂θ
@@ -1008,16 +1026,20 @@ public:
                     }
                     cublasDestroy(ch);
 
-                    const cuComplex* d_v_ptr2 = reinterpret_cast<const cuComplex*>(
-                        extended_vec_per_gpu[primary_dev].data_ptr());
+                    std::vector<cuComplex*> d_v_ptrs(num_gpus);
+                    for (int g = 0; g < num_gpus; ++g)
+                        d_v_ptrs[g] = const_cast<cuComplex*>(
+                            reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
                     amp_calc->computeResonanceGradient(d_S_bufs, n_phsp_evts, d_grad_res,
-                        phsp_sign, {}, d_v_ptr2);
+                        phsp_sign, {}, d_v_ptrs);
 
                     for (int g = 0; g < num_gpus; ++g)
                         if (d_S_bufs[g]) { cudaSetDevice(g); cudaFree(d_S_bufs[g]); }
+                    cudaSetDevice(primary_dev);
                 }
             }
 
+            cudaSetDevice(primary_dev);
             grad_theta = torch::empty({ n_free_res },
                 torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
             cudaMemcpy(grad_theta.data_ptr(), d_grad_res,
@@ -2365,18 +2387,27 @@ public:
         // Update d_phsp_matrix_ to reflect current amplitudes
         {
             int primary_dev = dev.index();
+            // Pre-compute total phsp weight for correct global normalization
+            double W_total = 0.0;
+            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+                int nP = events_[gpu][0];
+                if (nP == 0) continue;
+                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
+                    W_total += thrust::reduce(dp, dp + nP);
+                } else {
+                    W_total += (double)nP;
+                }
+            }
+            if (W_total <= 0.0) W_total = 1.0;
+
             cudaSetDevice(primary_dev);
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
-
-                double W_gpu = (double)nPhsp;
-                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
-                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
-                    W_gpu = thrust::reduce(dp, dp + nPhsp);
-                }
 
                 int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
                 cuComplex* d_phsp_scaled;
@@ -2386,7 +2417,7 @@ public:
                 const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
                 int grid = (nPhsp_total + 255) / 256;
                 scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
-                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
+                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
                 cuComplex* d_phsp_gpu;
                 cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
@@ -2401,14 +2432,22 @@ public:
                 cudaFree(d_phsp_scaled);
 
                 if (gpu == (size_t)primary_dev) {
-                    cudaMemcpy(d_phsp_matrix_, d_phsp_gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-                } else {
-                    cudaSetDevice(primary_dev);
                     cuComplex one = make_cuComplex(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                    cudaFree(d_phsp_gpu);
+                } else {
+                    cudaSetDevice(primary_dev);
+                    cuComplex* d_temp;
+                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
+                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    cudaSetDevice(gpu);
+                    cudaFree(d_phsp_gpu);
+                    cudaSetDevice(primary_dev);
+                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                    cudaFree(d_temp);
                 }
-                cudaFree(d_phsp_gpu);
             }
         }
 
@@ -2552,20 +2591,23 @@ public:
             torch::Tensor extended_v = is_coupling ? vector : params_.extendVector(vector, dev);
             int n_ext = extended_v.numel();
 
-            // Build interleaved v array
-            torch::Tensor v_re = torch::real(extended_v).to(torch::kFloat32);
-            torch::Tensor v_im = torch::imag(extended_v).to(torch::kFloat32);
-            torch::Tensor v_il_tensor = torch::empty({ n_ext * 2 },
-                torch::TensorOptions().dtype(torch::kFloat32).device(dev));
-            v_il_tensor.slice(0, 0, 2 * n_ext, 2).copy_(v_re);
-            v_il_tensor.slice(0, 1, 2 * n_ext, 2).copy_(v_im);
-            const cuComplex* d_v_interleaved = reinterpret_cast<const cuComplex*>(v_il_tensor.data_ptr());
-
+            // Build per-GPU interleaved v arrays (avoid cross-device access)
+            std::vector<torch::Tensor> v_il_tensors;  // keep tensors alive
+            std::vector<cuComplex*> d_v_per_gpu(n_gpu, nullptr);
             for (int gpu = 0; gpu < n_gpu; ++gpu) {
                 cudaSetDevice(gpu);
                 torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
-                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(v_gpu.data_ptr());
-                amp_calc_.computeEffectiveCoupling(d_v_gpu, n_ext);
+                amp_calc_.computeEffectiveCoupling(
+                    reinterpret_cast<const cuComplex*>(v_gpu.data_ptr()), n_ext);
+                // Build interleaved per-GPU
+                torch::Tensor vr = torch::real(v_gpu).to(torch::kFloat32);
+                torch::Tensor vi = torch::imag(v_gpu).to(torch::kFloat32);
+                torch::Tensor vil = torch::empty({n_ext * 2},
+                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, gpu)));
+                vil.slice(0, 0, 2 * n_ext, 2).copy_(vr);
+                vil.slice(0, 1, 2 * n_ext, 2).copy_(vi);
+                d_v_per_gpu[gpu] = const_cast<cuComplex*>(reinterpret_cast<const cuComplex*>(vil.data_ptr()));
+                v_il_tensors.push_back(vil);
             }
             cudaSetDevice(primary_dev);
 
@@ -2587,7 +2629,7 @@ public:
                 std::vector<int> n_data_ev(n_gpu, 0), data_off(n_gpu, 0);
                 for (int g = 0; g < n_gpu; ++g) { n_data_ev[g] = events_[g][1]; data_off[g] = events_[g][0]; }
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, data_weights_,
+                    d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, data_weights_,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
             }
 
@@ -2607,7 +2649,7 @@ public:
                 }
                 cudaSetDevice(primary_dev);
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -1.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, neg_bkg_weights,
+                    d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, neg_bkg_weights,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
                 for (int g = 0; g < n_gpu; ++g) { if (neg_bkg_weights[g]) { cudaSetDevice(g); cudaFree(neg_bkg_weights[g]); } }
                 cudaSetDevice(primary_dev);
@@ -2622,7 +2664,7 @@ public:
                 std::vector<int> n_phsp_ev(n_gpu,0), phsp_off(n_gpu,0);
                 for (int g=0; g<n_gpu; ++g) { n_phsp_ev[g]=events_[g][0]; phsp_off[g]=0; }
                 amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
-                    d_v_interleaved, d_all_amplitudes_[primary_dev], n_amplitudes_, {},
+                    d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, {},
                     d_pI, d_pg, d_phA, d_mixed, d_phsp_mixed_sum, d_phsp_mixed_t3);
                 double h_pI; cudaMemcpy(&h_pI, d_pI, sizeof(double), cudaMemcpyDeviceToHost);
                 phsp_h_pg = new double[P];
@@ -3380,18 +3422,28 @@ private:
         // delete[] h_amp;
 
         // phsp*phsp^T矩阵: A^H diag(w) A / (Σ w)，加权或均匀
+        // Pre-compute total phsp weight for correct global normalization
+        double W_total = 0.0;
+        for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+            int nP = events_[gpu][0];
+            if (nP == 0) continue;
+            if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
+                cudaSetDevice(gpu);
+                thrust::device_ptr<double> dp(phsp_weights_[gpu]);
+                W_total += thrust::reduce(dp, dp + nP);
+            } else {
+                W_total += (double)nP;
+            }
+        }
+        if (W_total <= 0.0) W_total = 1.0;
+
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+        cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
         {
             int nPhsp = events_[gpu][0];
             if (nPhsp == 0) continue;
             cudaSetDevice(gpu);
-
-            double W_gpu = (double)nPhsp;
-            if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
-                thrust::device_ptr<double> dp(phsp_weights_[gpu]);
-                W_gpu = thrust::reduce(dp, dp + nPhsp);
-            }
 
             int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
             cuComplex* d_phsp_scaled;
@@ -3401,7 +3453,7 @@ private:
             const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
             int grid = (nPhsp_total + 255) / 256;
             scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
-                nPhsp, n_polar_, n_amplitudes_, 1.0 / W_gpu, 0);
+                nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
             cuComplex* d_phsp_gpu;
             cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
@@ -3416,13 +3468,22 @@ private:
             cudaFree(d_phsp_scaled);
 
             if (gpu == 0) {
-                cudaMemcpy(d_phsp_matrix_, d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-            } else {
-                cudaSetDevice(0);
                 cuComplex one = make_cuComplex(1.0f, 0.0f);
                 axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                cudaFree(d_phsp_gpu);
+            } else {
+                cudaSetDevice(0);
+                cuComplex* d_temp;
+                cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                cudaMemcpyPeer(d_temp, 0, d_phsp_gpu, gpu,
+                    n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                cudaSetDevice(gpu);
+                cudaFree(d_phsp_gpu);
+                cudaSetDevice(0);
+                cuComplex one = make_cuComplex(1.0f, 0.0f);
+                axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                cudaFree(d_temp);
             }
-            cudaFree(d_phsp_gpu);
         }
         // // cudaFree(d_phsp);
         // // 打印矩阵d_phsp

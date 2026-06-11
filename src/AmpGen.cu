@@ -128,6 +128,7 @@ AmpCasDecay::~AmpCasDecay()
     // cudaFree(d_slCombination_);
     for (size_t i = 0; i < d_slamps_.size(); ++i)
     {
+        cudaSetDevice(static_cast<int>(i));
         if (d_slamps_[i])
             cudaFree(d_slamps_[i]);
         if (d_momenta_[i])
@@ -139,6 +140,7 @@ AmpCasDecay::~AmpCasDecay()
     }
     for (size_t i = 0; i < d_polarization_map_.size(); ++i)
     {
+        cudaSetDevice(static_cast<int>(i));
         if (d_polarization_map_[i])
             cudaFree(d_polarization_map_[i]);
     }
@@ -508,6 +510,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             // 用交换后的映射重建 DeviceMomenta（动量位置被交换）
             auto d_mom_perm = convertToDeviceMomenta(
                 finalMomenta, permuted_mappings_[p], decayChain_);
+            cudaSetDevice(i);  // restore device after convertToDeviceMomenta
 
             double sign = identical_boson_ ? 1.0 : -1.0;
 
@@ -545,9 +548,13 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
 
             cudaFree(d_temp);
 
-            // 释放交换链的 DeviceMomenta
-            cudaFree(d_mom_perm[i]->momenta);
-            cudaFree(d_mom_perm[i]);
+            // 释放所有GPU的交换链 DeviceMomenta
+            for (size_t g = 0; g < d_mom_perm.size(); ++g) {
+                cudaSetDevice(static_cast<int>(g));
+                cudaFree(d_mom_perm[g]->momenta);
+                cudaFree(d_mom_perm[g]);
+            }
+            cudaSetDevice(i);  // restore device
         }
 
         // 清理临时设备内存
@@ -1790,12 +1797,13 @@ void AmpCalc::computeResonanceGradient(
     double* d_grad_res,
     double sign,
     const std::vector<int>& t_offset,
-    const cuComplex* d_v)
+    const std::vector<cuComplex*>& d_v_per_gpu)
 {
     int n_gpu = static_cast<int>(d_w.size());
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
     bool has_offset = (t_offset.size() == d_w.size());
+    bool has_dv = (d_v_per_gpu.size() == d_w.size());
 
     constexpr int kBlockSize = 256;
 
@@ -1835,6 +1843,7 @@ void AmpCalc::computeResonanceGradient(
                 int nPol = static_cast<int>(cas->getNPolarizations());
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
                 int evt_off = has_offset ? t_offset[gpu] : 0;
+                const cuComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
                 switch (Nlocal) {
                 case 1:
                     resonanceGradientKernel<1><<<grid, kBlockSize>>>(
@@ -1844,7 +1853,7 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        evt_off, cas->getSLAmps()[gpu], d_v_gpu, block.site,
                         static_cast<int>(cas->getNSLCombs()));
                     break;
                 case 2:
@@ -1855,7 +1864,7 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        evt_off, cas->getSLAmps()[gpu], d_v_gpu, block.site,
                         static_cast<int>(cas->getNSLCombs()));
                     break;
                 case 3:
@@ -1866,7 +1875,7 @@ void AmpCalc::computeResonanceGradient(
                         r, block.d_all_params[gpu],
                         d_param_map, d_grad_per_gpu[gpu], d_global_idx,
                         nEv, nPol, cas->getDecayChainSize(), 3.0, sign,
-                        evt_off, cas->getSLAmps()[gpu], d_v, block.site,
+                        evt_off, cas->getSLAmps()[gpu], d_v_gpu, block.site,
                         static_cast<int>(cas->getNSLCombs()));
                     break;
                 default: break;
@@ -1917,8 +1926,8 @@ void AmpCalc::computeUnifiedHessian(
     double* d_hess, int hess_ld,
     const std::vector<int>& t_offset,
     double default_weight,
-    const cuComplex* d_v_interleaved,
-    const cuComplex* d_amp,
+    const std::vector<cuComplex*>& d_v_per_gpu,
+    const std::vector<cuComplex*>& d_amp_per_gpu,
     int n_amp_total,
     const std::vector<double*>& d_event_weights,
     double* d_phsp_I,
@@ -1934,6 +1943,9 @@ void AmpCalc::computeUnifiedHessian(
     bool has_offset = (t_offset.size() == (size_t)n_gpu);
     constexpr int kBlockSize = 256;
 
+    int primary_dev = 0; cudaGetDevice(&primary_dev);  // capture caller's device
+    int hess_sz = hess_ld * hess_ld;
+
     // Temp buffer info per block (stored for stage 2 cross-block)
     struct BlockTemp {
         double* d_g = nullptr;
@@ -1947,16 +1959,53 @@ void AmpCalc::computeUnifiedHessian(
     };
     std::vector<std::vector<BlockTemp>> temps_per_gpu(n_gpu);
 
-    // ===== Stage 1: per-block same-resonance Hessian =====
+    // ===== Stage 1-4: per-GPU, with local output buffers for remote GPUs =====
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         cudaSetDevice(gpu);
         int nEv = n_events[gpu];
         if (nEv <= 0) continue;
         int evt_off = has_offset ? t_offset[gpu] : 0;
         const double* d_w = (gpu < (int)d_event_weights.size()) ? d_event_weights[gpu] : nullptr;
+        const cuComplex* d_v = d_v_per_gpu[gpu];
+        const cuComplex* d_amp = d_amp_per_gpu[gpu];
+
+        // --- For remote GPUs, allocate local copies of global output buffers ---
+        bool is_remote = (gpu != primary_dev);
+        double* d_hess_g = d_hess;
+        double* d_phA_g = d_phsp_hessA;
+        double* d_pg_g = d_phsp_grad;
+        double* d_pI_g = d_phsp_I;
+        double* d_mix_g = d_mixed_out;
+        double* d_msum_g = d_phsp_mixed_sum;
+        double* d_t3_g = d_phsp_mixed_t3;
+        if (is_remote) {
+            cudaMalloc(&d_hess_g, hess_sz * sizeof(double));
+            cudaMemset(d_hess_g, 0, hess_sz * sizeof(double));
+            if (d_phsp_hessA) {
+                cudaMalloc(&d_phA_g, hess_sz * sizeof(double));
+                cudaMemset(d_phA_g, 0, hess_sz * sizeof(double));
+                cudaMalloc(&d_pg_g, n_free * sizeof(double));
+                cudaMemset(d_pg_g, 0, n_free * sizeof(double));
+                cudaMalloc(&d_pI_g, sizeof(double));
+                cudaMemset(d_pI_g, 0, sizeof(double));
+            }
+            if (d_mixed_out) {
+                int mix_sz = 2 * n_amp_total * n_free;
+                cudaMalloc(&d_mix_g, mix_sz * sizeof(double));
+                cudaMemset(d_mix_g, 0, mix_sz * sizeof(double));
+            }
+            if (d_phsp_mixed_sum) {
+                int mix_sz = 2 * n_amp_total * n_free;
+                cudaMalloc(&d_msum_g, mix_sz * sizeof(double));
+                cudaMemset(d_msum_g, 0, mix_sz * sizeof(double));
+            }
+            if (d_phsp_mixed_t3) {
+                cudaMalloc(&d_t3_g, 2 * n_amp_total * sizeof(double));
+                cudaMemset(d_t3_g, 0, 2 * n_amp_total * sizeof(double));
+            }
+        }
 
         // Pre-pass: compute full S[p] = Σ_a v[a]·amp[a,e,p] and I[e] from raw amplitudes
-        // Uses d_all_amplitudes_ which already include R factors
         auto& cas0 = cas_list_[blocks_[0].cas_idx];
         int nPol = static_cast<int>(cas0->getNPolarizations());
         double *d_S_re, *d_S_im, *d_I_full;
@@ -1966,14 +2015,14 @@ void AmpCalc::computeUnifiedHessian(
         {
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
             double *t3_re = nullptr, *t3_im = nullptr;
-            if (d_phsp_mixed_t3) {
-                t3_re = d_phsp_mixed_t3;
-                t3_im = d_phsp_mixed_t3 + n_amp_total;
+            if (d_t3_g) {
+                t3_re = d_t3_g;
+                t3_im = d_t3_g + n_amp_total;
             }
             computeSfromAmpsKernel<<<grid, kBlockSize>>>(
                 d_S_re, d_S_im, d_I_full,
                 d_amp + evt_off * nPol * n_amp_total,
-                d_v_interleaved, nEv, nPol, n_amp_total,
+                d_v, nEv, nPol, n_amp_total,
                 t3_re, t3_im);
             cudaDeviceSynchronize();
         }
@@ -2025,34 +2074,34 @@ void AmpCalc::computeUnifiedHessian(
 
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
 
-            const cuComplex* d_v_blk = d_v_interleaved + blk.site;
+            const cuComplex* d_v_blk = d_v + blk.site;
             if (Npr == 2 && Nres == 2) {
                 hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
             } else if (Npr == 1 && Nres == 1) {
                 hessianStage1Kernel<1,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
             } else if (Npr == 2 && Nres == 1) {
                 hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess, hess_ld,
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_phsp_I : nullptr), d_phsp_grad, d_phsp_hessA, evt_off);
+                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
             } else {
                 printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
             }
@@ -2075,9 +2124,9 @@ void AmpCalc::computeUnifiedHessian(
                     btB.d_g, btB.d_dS_re, btB.d_dS_im,
                     d_I_full, btA.d_gidx, btB.d_gidx,
                     btA.NT, btB.NT, nEv, nPol,
-                    d_hess, hess_ld, default_weight, d_w,
-                    (default_weight == 0.0) ? d_phsp_hessA : nullptr,
-                    (d_phsp_hessA ? nFreeResParams() : 1));
+                    d_hess_g, hess_ld, default_weight, d_w,
+                    (default_weight == 0.0) ? d_phA_g : nullptr,
+                    (d_phA_g ? nFreeResParams() : 1));
                 cudaDeviceSynchronize();
             }
         }
@@ -2102,9 +2151,9 @@ void AmpCalc::computeUnifiedHessian(
                     cas0->getSLAmps()[gpu],
                     bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
-                    d_mixed_out, nFreeResParams(),
+                    d_mix_g, nFreeResParams(),
                     nEv, nSL, Npr, nPol, n_amp_total, blk.site,
-                    nTotal_slamp, default_weight, d_w, d_phsp_mixed_sum, evt_off);
+                    nTotal_slamp, default_weight, d_w, d_msum_g, evt_off);
                 cudaDeviceSynchronize();
             }
 
@@ -2124,8 +2173,8 @@ void AmpCalc::computeUnifiedHessian(
                         btB.d_g, btB.d_dS_re, btB.d_dS_im, btB.d_gidx, btB.NT,
                         nSL_A, blkA.site,
                         nEv, nPol, n_amp_total,
-                        d_mixed_out, nFreeResParams(),
-                        default_weight, d_w, d_phsp_mixed_sum, evt_off);
+                        d_mix_g, nFreeResParams(),
+                        default_weight, d_w, d_msum_g, evt_off);
                     cudaDeviceSynchronize();
                 }
             }
@@ -2141,8 +2190,72 @@ void AmpCalc::computeUnifiedHessian(
             if (bt.d_gidx) cudaFree(bt.d_gidx);
         }
         cudaFree(d_S_re); cudaFree(d_S_im); cudaFree(d_I_full);
+
+        // --- Accumulate remote GPU results to global buffers on primary_dev ---
+        if (is_remote) {
+            double one = 1.0;
+            // d_hess: copy peer → daxpy on primary_dev
+            cudaSetDevice(primary_dev);
+            double* d_tmp; cudaMalloc(&d_tmp, hess_sz * sizeof(double));
+            cudaMemcpyPeer(d_tmp, primary_dev, d_hess_g, gpu, hess_sz * sizeof(double));
+            cublasHandle_t h; cublasCreate(&h);
+            cublasDaxpy(h, hess_sz, &one, d_tmp, 1, d_hess, 1);
+            cublasDestroy(h); cudaFree(d_tmp);
+            // d_phsp_hessA
+            if (d_phsp_hessA) {
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, hess_sz * sizeof(double));
+                cudaMemcpyPeer(d_tmp, primary_dev, d_phA_g, gpu, hess_sz * sizeof(double));
+                cublasCreate(&h); cublasDaxpy(h, hess_sz, &one, d_tmp, 1, d_phsp_hessA, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+                // d_phsp_I: copy single value
+                double h_pI;
+                cudaSetDevice(gpu); cudaMemcpy(&h_pI, d_pI_g, sizeof(double), cudaMemcpyDeviceToHost);
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, sizeof(double));
+                cudaMemcpy(d_tmp, &h_pI, sizeof(double), cudaMemcpyHostToDevice);
+                cublasCreate(&h); cublasDaxpy(h, 1, &one, d_tmp, 1, d_phsp_I, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+                // d_phsp_grad
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, n_free * sizeof(double));
+                cudaMemcpyPeer(d_tmp, primary_dev, d_pg_g, gpu, n_free * sizeof(double));
+                cublasCreate(&h); cublasDaxpy(h, n_free, &one, d_tmp, 1, d_phsp_grad, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+            }
+            // d_mixed_out, d_phsp_mixed_sum
+            int mix_sz = 2 * n_amp_total * n_free;
+            if (d_mixed_out) {
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
+                cudaMemcpyPeer(d_tmp, primary_dev, d_mix_g, gpu, mix_sz * sizeof(double));
+                cublasCreate(&h); cublasDaxpy(h, mix_sz, &one, d_tmp, 1, d_mixed_out, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+            }
+            if (d_phsp_mixed_sum) {
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
+                cudaMemcpyPeer(d_tmp, primary_dev, d_msum_g, gpu, mix_sz * sizeof(double));
+                cublasCreate(&h); cublasDaxpy(h, mix_sz, &one, d_tmp, 1, d_phsp_mixed_sum, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+            }
+            if (d_phsp_mixed_t3) {
+                int t3_sz = 2 * n_amp_total;
+                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, t3_sz * sizeof(double));
+                cudaMemcpyPeer(d_tmp, primary_dev, d_t3_g, gpu, t3_sz * sizeof(double));
+                cublasCreate(&h); cublasDaxpy(h, t3_sz, &one, d_tmp, 1, d_phsp_mixed_t3, 1);
+                cublasDestroy(h); cudaFree(d_tmp);
+            }
+            cudaSetDevice(gpu);
+        }
+
+        // Free remote GPU local buffers
+        if (is_remote) {
+            cudaFree(d_hess_g);
+            if (d_phA_g) cudaFree(d_phA_g);
+            if (d_pg_g) cudaFree(d_pg_g);
+            if (d_pI_g) cudaFree(d_pI_g);
+            if (d_mix_g) cudaFree(d_mix_g);
+            if (d_msum_g) cudaFree(d_msum_g);
+            if (d_t3_g) cudaFree(d_t3_g);
+        }
     }
-    cudaSetDevice(0);
+    cudaSetDevice(primary_dev);
 }
 
 
