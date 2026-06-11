@@ -3640,19 +3640,29 @@ private:
 
         auto chains = config_parser_.getDecayChains();
 
-        // Build chain link map from trans constraints:
-        //   chain_linked["chain2"] = {"chain3"}, chain_linked["chain3"] = {"chain2"}
+        // Build chain link map from trans constraints (substring match short→full names)
+        //   chain_linked["decay1_R_Keta_0"] = {"decay1_R_Keta_1"}
         std::map<std::string, std::set<std::string>> chain_linked;
         for (const auto& c : config_parser_.getConstraints()) {
             if (c.type == "trans" && c.names.size() >= 2) {
-                for (size_t i = 0; i < c.names.size(); ++i)
-                    for (size_t j = 0; j < c.names.size(); ++j)
-                        if (i != j) chain_linked[c.names[i]].insert(c.names[j]);
+                // Resolve constraint names to full chain names via substring
+                std::vector<std::string> matched;
+                for (const auto& cn : c.names) {
+                    for (const auto& ch : chains) {
+                        if (ch.name.find(cn) != std::string::npos) {
+                            matched.push_back(ch.name);
+                            break;
+                        }
+                    }
+                }
+                for (size_t i = 0; i < matched.size(); ++i)
+                    for (size_t j = 0; j < matched.size(); ++j)
+                        if (i != j) chain_linked[matched[i]].insert(matched[j]);
             }
         }
 
-        // Track resonance names already registered in each chain
-        std::map<std::string, std::set<std::string>> chain_resonances; // chain → {resonance names}
+        // Track resonance names already registered in each chain (ordered by position)
+        std::map<std::string, std::vector<std::string>> chain_resonances; // chain → [ordered resonance names]
 
         int gls_index = 0;
         for (auto chain : chains)
@@ -3839,8 +3849,9 @@ private:
                         std::vector<std::vector<int>> all_free;
                         std::vector<std::vector<std::vector<double>>> all_free_ranges;
                         std::set<std::string> skip_slots_for;
-                        for (const auto& res : resonance)
-                        {
+                        std::map<std::string, std::string> conjugate_name_map;
+                        for (size_t ri = 0; ri < resonance.size(); ++ri) {
+                            const auto& res = resonance[ri];
                             auto it = config_res.find(res.getName());
                             if (it != config_res.end() && !it->second.free.empty())
                             {
@@ -3852,21 +3863,31 @@ private:
                                 all_free.push_back({});
                                 all_free_ranges.push_back({});
                             }
-                            // Check if this resonance already registered in a trans-linked chain
-                            const auto& linked = chain_linked[chain.name];
-                            for (const auto& linked_chain : linked) {
-                                if (chain_resonances[linked_chain].count(res.getName())) {
-                                    skip_slots_for.insert(res.getName());
-                                    break;
+                            // Position-based matching: trans-linked chains, same pos = same resonance
+                            if (skip_slots_for.count(res.getName()) == 0) {
+                                const auto& linked = chain_linked[chain.name];
+                                for (const auto& linked_chain : linked) {
+                                    auto lit = chain_resonances.find(linked_chain);
+                                    if (lit != chain_resonances.end() && ri < lit->second.size()) {
+                                        const auto& owner_name = lit->second[ri];
+                                        skip_slots_for.insert(res.getName());
+                                        if (res.getName() != owner_name)
+                                            conjugate_name_map[res.getName()] = owner_name;
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        // Track resonance names for this chain
-                        for (const auto& res : resonance)
-                            chain_resonances[chain.name].insert(res.getName());
+                        // Track ordered resonance names for this chain
+                        {
+                            std::vector<std::string> names;
+                            for (const auto& res : resonance)
+                                names.push_back(res.getName());
+                            chain_resonances[chain.name] = std::move(names);
+                        }
                         // Always add block — even without free params, its SL channels
                         // contribute to cross-block mixed Hessian (vθ).
-                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges, skip_slots_for);
+                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges, skip_slots_for, conjugate_name_map);
                     }
 
                     gls_index += cas->getNSLCombs();
