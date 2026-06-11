@@ -3438,6 +3438,7 @@ private:
         }
         if (W_total <= 0.0) W_total = 1.0;
 
+        cudaSetDevice(0);  // ensure d_phsp_matrix_ is allocated on GPU 0
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
         cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
