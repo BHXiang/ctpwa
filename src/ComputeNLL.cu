@@ -110,23 +110,33 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
 
     // ----- 创建 cuBLAS 句柄 -----
     cublasHandle_t handle;
-    cublasCreate(&handle);
+    cublasStatus_t cublas_err = cublasCreate(&handle);
+    if (cublas_err != CUBLAS_STATUS_SUCCESS) {
+        std::cerr << "computeFactorNLL: cublasCreate failed: " << cublas_err << std::endl;
+        return 0.0;
+    }
 
     // ----- 分配临时缓冲区 -----
     cuComplex* d_S;
-    cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
+    cudaError_t cu_err = cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
+    if (cu_err != cudaSuccess)
+        std::cerr << "computeFactorNLL: cudaMalloc(d_S) failed: " << cudaGetErrorString(cu_err) << std::endl;
     double* d_nll;
-    cudaMalloc(&d_nll, sizeof(double));
+    cu_err = cudaMalloc(&d_nll, sizeof(double));
+    if (cu_err != cudaSuccess)
+        std::cerr << "computeFactorNLL: cudaMalloc(d_nll) failed: " << cudaGetErrorString(cu_err) << std::endl;
 
     // ----- 第一大步：S = A * v -----
     {
         cuComplex alpha = make_cuComplex(1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublasCgemv(handle, CUBLAS_OP_T,
+        cublas_err = cublasCgemv(handle, CUBLAS_OP_T,
             n_amplitudes, nTotal,
             &alpha, d_amp, n_amplitudes,
             d_vector, 1,
             &beta, d_S, 1);
+        if (cublas_err != CUBLAS_STATUS_SUCCESS)
+            std::cerr << "computeFactorNLL: cublasCgemv(step1) failed: " << cublas_err << std::endl;
     }
 
     // ----- 第二大步：计算 factor、写入权重 w、同时规约得到 NLL -----
@@ -134,31 +144,46 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
     computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
         d_S, d_nll, d_weights, nEvents, n_polar);
+    cu_err = cudaGetLastError();
+    if (cu_err != cudaSuccess)
+        std::cerr << "computeFactorNLL: factors kernel failed: " << cudaGetErrorString(cu_err) << std::endl;
 
     // 拷回 NLL
     double raw_nll;
-    cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+    cu_err = cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+    if (cu_err != cudaSuccess)
+        std::cerr << "computeFactorNLL: cudaMemcpy(nll) failed: " << cudaGetErrorString(cu_err) << std::endl;
 
     // 若调用者需要 w = S/I（用于共振态梯度），在 conjugate 之前复制
     if (d_w_out != nullptr) {
-        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+        cu_err = cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+        if (cu_err != cudaSuccess)
+            std::cerr << "computeFactorNLL: cudaMemcpy(w_out) failed: " << cudaGetErrorString(cu_err) << std::endl;
     }
 
     // ----- 第三大步：梯度 grad = -A^H * w -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
         conjugateKernel << <gradConj, kBlockSize >> > (d_S, nTotal);
+        cu_err = cudaGetLastError();
+        if (cu_err != cudaSuccess)
+            std::cerr << "computeFactorNLL: conjugateKernel(d_S) failed: " << cudaGetErrorString(cu_err) << std::endl;
 
         cuComplex alpha = make_cuComplex(-1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublasCgemv(handle, CUBLAS_OP_N,
+        cublas_err = cublasCgemv(handle, CUBLAS_OP_N,
             n_amplitudes, nTotal,
             &alpha, d_amp, n_amplitudes,
             d_S, 1,
             &beta, d_grad_out, 1);
+        if (cublas_err != CUBLAS_STATUS_SUCCESS)
+            std::cerr << "computeFactorNLL: cublasCgemv(step2) failed: " << cublas_err << std::endl;
 
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
         conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
+        cu_err = cudaGetLastError();
+        if (cu_err != cudaSuccess)
+            std::cerr << "computeFactorNLL: conjugateKernel(grad) failed: " << cudaGetErrorString(cu_err) << std::endl;
     }
 
     // d_w_out already copied before conjugateKernel (above)

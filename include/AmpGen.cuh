@@ -239,27 +239,29 @@ public:
     // 计算共振态参数梯度 ∂NLL/∂θ
     // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
     // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
+    // d_v_per_gpu: 每GPU的耦合向量指针，避免跨设备访问
     void computeResonanceGradient(
         const std::vector<cuComplex*>& d_w,
         const std::vector<int>& n_events,
         double* d_grad_res,
         double sign = 1.0,
         const std::vector<int>& t_offset = {},
-        const cuComplex* d_v = nullptr);
+        const std::vector<cuComplex*>& d_v_per_gpu = {});
 
     // 计算共振态参数 Hessian 增量贡献 ∂²L/∂θ∂θ
     // L = Σ_e w_e · log I_e (per-event 加权 log-likelihood)
     // d_hess: 累加到 [P×P]，在 GPU 0，列存储
     // d_event_weights[gpu]: per-event 权重数组（null=使用 default_weight）
     // default_weight: 当 d_event_weights[gpu] 为 null 时使用（如 data=-1, bkg=+0.5）
-    // d_v: 耦合向量 (每 GPU 第一个为 primary device 上的指针，需通过 cas 转 GPU)
+    // d_v_per_gpu: 每GPU的耦合向量指针（interleaved格式）
+    // d_amp_per_gpu: 每GPU的振幅指针
     void computeUnifiedHessian(
         const std::vector<int>& n_events,
         double* d_hess, int hess_ld,
         const std::vector<int>& t_offset,
         double default_weight,
-        const cuComplex* d_v_interleaved,
-        const cuComplex* d_amp,
+        const std::vector<cuComplex*>& d_v_per_gpu,
+        const std::vector<cuComplex*>& d_amp_per_gpu,
         int n_amp_total,
         const std::vector<double*>& d_event_weights = {},
         double* d_phsp_I = nullptr,
