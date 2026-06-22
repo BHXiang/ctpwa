@@ -925,7 +925,7 @@ public:
             }
 
             // --- bkg ---
-            int nBkg_gpu = events_list[gpu][2];
+            int nBkg_gpu = (events_list[gpu].size() > 2) ? events_list[gpu][2] : 0;
             if (nBkg_gpu > 0) {
                 cudaSetDevice(gpu);
                 cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
@@ -1370,7 +1370,7 @@ public:
             N_phsp += static_cast<int>(phsp_events);
             int data_events = events_[gpu][1];
             N_data += static_cast<int>(data_events);
-            int bkg_events = events_[gpu][2];
+            int bkg_events = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
             N_bkg += static_cast<int>(bkg_events);
         }
 
@@ -2248,7 +2248,7 @@ public:
             }
 
             // --- bkg ---
-            int nBkg = events_[gpu][2];
+            int nBkg = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
             if (nBkg > 0) {
                 double* d_w_bkg;
                 cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
@@ -2498,7 +2498,7 @@ public:
                     computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
                 }
 
-                int nBkg = events_[gpu][2];
+                int nBkg = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
                 if (nBkg > 0) {
                     double* d_w_bkg;
                     cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
@@ -2636,8 +2636,12 @@ public:
 
             // Bkg
             {
+                bool has_bkg = false;
+                for (int g = 0; g < n_gpu; ++g) { if (events_[g].size() > 2 && events_[g][2] > 0) { has_bkg = true; break; } }
                 std::vector<int> n_bkg_ev(n_gpu, 0), bkg_off(n_gpu, 0);
-                for (int g = 0; g < n_gpu; ++g) { n_bkg_ev[g] = events_[g][2]; bkg_off[g] = events_[g][0] + events_[g][1]; }
+                if (has_bkg) {
+                    for (int g = 0; g < n_gpu; ++g) { n_bkg_ev[g] = (events_[g].size() > 2) ? events_[g][2] : 0; bkg_off[g] = events_[g][0] + events_[g][1]; }
+                }
                 std::vector<double*> neg_bkg_weights;
                 for (int g = 0; g < n_gpu; ++g) {
                     double* d_neg = nullptr;
@@ -3102,6 +3106,8 @@ public:
 
     torch::Tensor getBkgTensor() const
     {
+        if (events_[0].size() <= 2 || events_[0][2] == 0)
+            return torch::empty({ 0 }, torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA));
         // torch::Tensor output = torch::from_blob(bkg_fix_, {bkg_length *
         // n_gls_},
         // torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
@@ -3115,7 +3121,7 @@ public:
     torch::Tensor getBkgWeightsTensor() const
     {
         // if (bkg_weights_ != nullptr && bkg_length > 0)
-        if (bkg_weights_[0] != nullptr && events_[0][2] > 0)
+        if (events_[0].size() > 2 && events_[0][2] > 0 && !bkg_weights_.empty() && bkg_weights_[0] != nullptr)
         {
             torch::Tensor output = torch::from_blob(bkg_weights_[0], { events_[0][2] },
                 torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA)).clone();
@@ -3385,7 +3391,7 @@ private:
         }
 
         // bkg_weights_
-        if (data_files.count("bkg_weights") > 0)
+        if (data_files.count("bkg_weights") > 0 && data_files.count("bkg") > 0)
         {
             std::vector<int> bkg_events_per_gpu;
             for (size_t i = 0; i < events_.size(); ++i)
@@ -3408,7 +3414,8 @@ private:
             for (size_t i = 0; i < events_.size(); ++i)
             {
                 bkg_weights_.push_back(nullptr);
-                bkg_integral_ += events_[i][2];
+                if (events_[i].size() > 2)
+                    bkg_integral_ += events_[i][2];
             }
         }
 
