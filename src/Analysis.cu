@@ -1474,7 +1474,7 @@ public:
         delete legend;
 
 
-        // 写入干涉矩阵
+        // 写入干涉矩阵（对称矩阵，需填充上下三角）
         if (h_interference_matrix != nullptr)
         {
             TMatrixD interferenceMatrix(npartials, npartials);
@@ -1484,6 +1484,7 @@ public:
                 {
                     int idx = i * npartials - i * (i - 1) / 2 + (j - i);
                     interferenceMatrix[i][j] = h_interference_matrix[idx];
+                    interferenceMatrix[j][i] = h_interference_matrix[idx];  // 对称填充下三角
                 }
             }
 
@@ -3731,8 +3732,12 @@ private:
             }
         }
 
-        // Track resonance names already registered in each chain (ordered by position)
-        std::map<std::string, std::vector<std::string>> chain_resonances; // chain → [ordered resonance names]
+        // 每个 chain 有多个 JP 组合，每个组合生成一组 block。
+        // chain_resonances: chain → [[comb0_res0, comb0_res1, ...], [comb1_res0, ...], ...]
+        // 组合索引 ci 用于跨链 trans 匹配同一 JP 位置的共振态。
+        std::map<std::string, std::vector<std::vector<std::string>>> chain_resonances;
+        // 每个 chain 当前的组合索引
+        std::map<std::string, int> chain_comb_index;
 
         int gls_index = 0;
         for (auto chain : chains)
@@ -3920,6 +3925,10 @@ private:
                         std::vector<std::vector<std::vector<double>>> all_free_ranges;
                         std::set<std::string> skip_slots_for;
                         std::map<std::string, std::string> conjugate_name_map;
+
+                        // 当前 chain 的组合索引（每个 JP 组合对应一个 ci）
+                        int ci = chain_comb_index[chain.name]++;
+
                         for (size_t ri = 0; ri < resonance.size(); ++ri) {
                             const auto& res = resonance[ri];
                             auto it = config_res.find(res.getName());
@@ -3933,13 +3942,15 @@ private:
                                 all_free.push_back({});
                                 all_free_ranges.push_back({});
                             }
-                            // Position-based matching: trans-linked chains, same pos = same resonance
+                            // 跨链 trans 匹配：同一组合索引 ci、同一共振态位置 ri
                             if (skip_slots_for.count(res.getName()) == 0) {
                                 const auto& linked = chain_linked[chain.name];
                                 for (const auto& linked_chain : linked) {
                                     auto lit = chain_resonances.find(linked_chain);
-                                    if (lit != chain_resonances.end() && ri < lit->second.size()) {
-                                        const auto& owner_name = lit->second[ri];
+                                    if (lit != chain_resonances.end()
+                                        && ci < (int)lit->second.size()
+                                        && ri < lit->second[ci].size()) {
+                                        const auto& owner_name = lit->second[ci][ri];
                                         skip_slots_for.insert(res.getName());
                                         if (res.getName() != owner_name)
                                             conjugate_name_map[res.getName()] = owner_name;
@@ -3948,12 +3959,14 @@ private:
                                 }
                             }
                         }
-                        // Track ordered resonance names for this chain
+                        // 按组合索引追加共振态名字（不再覆盖）
                         {
                             std::vector<std::string> names;
                             for (const auto& res : resonance)
                                 names.push_back(res.getName());
-                            chain_resonances[chain.name] = std::move(names);
+                            if (ci >= (int)chain_resonances[chain.name].size())
+                                chain_resonances[chain.name].resize(ci + 1);
+                            chain_resonances[chain.name][ci] = std::move(names);
                         }
                         // Always add block — even without free params, its SL channels
                         // contribute to cross-block mixed Hessian (vθ).

@@ -1888,6 +1888,86 @@ void AmpCalc::computeResonanceGradient(
         }
     }
 
+    // ============================================================
+    // 处理 conjugate 块：用 conjugate 块的数据计算梯度，
+    // 但累加到 owner 的梯度槽位中。如果不处理，trans 约束下
+    // 共享的共振态参数梯度会缺少 conjugate 链的贡献，
+    // 导致放开质量/宽度参数后拟合结果不对称。
+    // ============================================================
+    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+        int cj_bi = cj_key.first, cj_ri = cj_key.second;
+        int ow_bi = owner_key.first, ow_ri = owner_key.second;
+
+        // 查找 owner 的 slot 索引（conjugate 自己没有 ParamSlot）
+        std::vector<int> local_map, global_idx;
+        for (int s = 0; s < n_free; ++s) {
+            if (slots_[s].block_idx == ow_bi && slots_[s].res_idx == ow_ri) {
+                local_map.push_back(slots_[s].param_idx);
+                global_idx.push_back(s);
+            }
+        }
+        int Nlocal = static_cast<int>(local_map.size());
+        if (Nlocal == 0) continue;
+
+        auto& cj_block = blocks_[cj_bi];
+        auto& cj_cas = cas_list_[cj_block.cas_idx];
+
+        for (int gpu = 0; gpu < n_gpu; ++gpu) {
+            cudaSetDevice(gpu);
+
+            int *d_param_map, *d_global_idx;
+            cudaMalloc(&d_param_map, Nlocal * sizeof(int));
+            cudaMalloc(&d_global_idx, Nlocal * sizeof(int));
+            cudaMemcpy(d_param_map, local_map.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_global_idx, global_idx.data(), Nlocal * sizeof(int), cudaMemcpyHostToDevice);
+
+            int nEv = n_events[gpu];
+            int nPol = static_cast<int>(cj_cas->getNPolarizations());
+            int grid = (nEv + kBlockSize - 1) / kBlockSize;
+            int evt_off = has_offset ? t_offset[gpu] : 0;
+            const cuComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
+            switch (Nlocal) {
+            case 1:
+                resonanceGradientKernel<1><<<grid, kBlockSize>>>(
+                    d_w[gpu], cj_block.d_T[gpu],
+                    cj_cas->getMomenta()[gpu], cj_cas->getDecayNodes()[gpu],
+                    cj_cas->getDeviceSLCombs()[gpu], cj_block.d_resonances[gpu],
+                    cj_ri, cj_block.d_all_params[gpu],
+                    d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                    nEv, nPol, cj_cas->getDecayChainSize(), 3.0, sign,
+                    evt_off, cj_cas->getSLAmps()[gpu], d_v_gpu, cj_block.site,
+                    static_cast<int>(cj_cas->getNSLCombs()));
+                break;
+            case 2:
+                resonanceGradientKernel<2><<<grid, kBlockSize>>>(
+                    d_w[gpu], cj_block.d_T[gpu],
+                    cj_cas->getMomenta()[gpu], cj_cas->getDecayNodes()[gpu],
+                    cj_cas->getDeviceSLCombs()[gpu], cj_block.d_resonances[gpu],
+                    cj_ri, cj_block.d_all_params[gpu],
+                    d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                    nEv, nPol, cj_cas->getDecayChainSize(), 3.0, sign,
+                    evt_off, cj_cas->getSLAmps()[gpu], d_v_gpu, cj_block.site,
+                    static_cast<int>(cj_cas->getNSLCombs()));
+                break;
+            case 3:
+                resonanceGradientKernel<3><<<grid, kBlockSize>>>(
+                    d_w[gpu], cj_block.d_T[gpu],
+                    cj_cas->getMomenta()[gpu], cj_cas->getDecayNodes()[gpu],
+                    cj_cas->getDeviceSLCombs()[gpu], cj_block.d_resonances[gpu],
+                    cj_ri, cj_block.d_all_params[gpu],
+                    d_param_map, d_grad_per_gpu[gpu], d_global_idx,
+                    nEv, nPol, cj_cas->getDecayChainSize(), 3.0, sign,
+                    evt_off, cj_cas->getSLAmps()[gpu], d_v_gpu, cj_block.site,
+                    static_cast<int>(cj_cas->getNSLCombs()));
+                break;
+            default: break;
+            }
+            cudaDeviceSynchronize();
+            cudaFree(d_param_map);
+            cudaFree(d_global_idx);
+        }
+    }
+
     // 将各 GPU 结果通过 daxpy 累加到 d_grad_res（在 primary_dev 上）
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == primary_dev) {
@@ -2047,16 +2127,45 @@ void AmpCalc::computeUnifiedHessian(
             for (int s = 0; s < n_free; ++s) {
                 if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
             }
+
+            // 检查是否为 conjugate 块：如果 Npr==0，查 conjugate_broadcast_
+            //（该块的所有共振态通过 trans 约束与 owner 块共享参数）
+            bool is_conjugate = false;
+            int ow_bi = -1;
+            if (Npr == 0) {
+                for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+                    if (cj_key.first == (int)bi) {
+                        is_conjugate = true;
+                        ow_bi = owner_key.first;
+                        break;
+                    }
+                }
+                if (is_conjugate && ow_bi >= 0) {
+                    for (int s = 0; s < n_free; ++s) {
+                        if (slots_[s].block_idx == ow_bi && slots_[s].res_idx == 0) ++Npr;
+                    }
+                }
+            }
             if (Npr < 1 || Npr > 3) continue;
 
             int NT = Npr * Nres;
 
-            // Build global index mapping
+            // 构建全局索引映射（conjugate 块映射到 owner 的 slot 索引）
             std::vector<int> global_idx(NT, -1);
             for (int r = 0; r < Nres; ++r) {
+                int target_bi = is_conjugate ? ow_bi : (int)bi;
+                int target_ri = r;
+                if (is_conjugate) {
+                    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+                        if (cj_key.first == (int)bi && cj_key.second == r) {
+                            target_ri = owner_key.second;
+                            break;
+                        }
+                    }
+                }
                 int count = 0;
                 for (int s = 0; s < n_free; ++s) {
-                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == r) {
+                    if (slots_[s].block_idx == target_bi && slots_[s].res_idx == target_ri) {
                         if (count < Npr) { global_idx[r * Npr + count] = s; ++count; }
                     }
                 }
@@ -2077,6 +2186,9 @@ void AmpCalc::computeUnifiedHessian(
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
 
             const cuComplex* d_v_blk = d_v + blk.site;
+            // Conjugate 块：phsp 积分已由 owner 计算，跳过 d_pI_g。
+            // phsp 梯度/Hessian（d_pg_g, d_phA_g）通过 owner slot 累加。
+            double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
             if (Npr == 2 && Nres == 2) {
                 hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
@@ -2085,7 +2197,7 @@ void AmpCalc::computeUnifiedHessian(
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
             } else if (Npr == 1 && Nres == 1) {
                 hessianStage1Kernel<1,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
@@ -2094,7 +2206,7 @@ void AmpCalc::computeUnifiedHessian(
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
             } else if (Npr == 2 && Nres == 1) {
                 hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
                     cas->getSLAmps()[gpu], d_v_blk,
@@ -2103,11 +2215,20 @@ void AmpCalc::computeUnifiedHessian(
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    (first_free_block ? d_pI_g : nullptr), d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
+            } else if (Npr == 1 && Nres == 2) {
+                hessianStage1Kernel<1,2><<<grid, kBlockSize>>>(
+                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
+                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
+                    nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
             } else {
                 printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
             }
-            first_free_block = false;
+            if (!is_conjugate) first_free_block = false;
             cudaDeviceSynchronize();
         }
 
@@ -2144,6 +2265,17 @@ void AmpCalc::computeUnifiedHessian(
                 int Npr = 0;
                 for (int s = 0; s < n_free; ++s)
                     if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
+                // Conjugate 块：使用 owner 的 Npr（与 Stage 1 逻辑一致）
+                if (Npr == 0) {
+                    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+                        if (cj_key.first == (int)bi) {
+                            int ow_bi = owner_key.first;
+                            for (int s = 0; s < n_free; ++s)
+                                if (slots_[s].block_idx == ow_bi && slots_[s].res_idx == 0) ++Npr;
+                            break;
+                        }
+                    }
+                }
                 if (Npr < 1) continue;
                 int nTotal_slamp = static_cast<int>(cas0->getNEventsVec()[gpu]) * nPol;
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
