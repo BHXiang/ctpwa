@@ -2239,7 +2239,6 @@ void AmpCalc::computeUnifiedHessian(
             for (size_t bj = bi + 1; bj < blocks_.size(); ++bj) {
                 auto& btB = temps_per_gpu[gpu][bj];
                 if (!btB.d_g) continue;
-                if (blocks_[bi].cas_idx != blocks_[bj].cas_idx) continue;
 
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
                 hessianCrossBlockKernel<<<grid, kBlockSize>>>(
@@ -2261,7 +2260,8 @@ void AmpCalc::computeUnifiedHessian(
                 auto& bt = temps_per_gpu[gpu][bi];
                 if (!bt.d_g || !bt.d_dF_re) continue;
                 auto& blk = blocks_[bi];
-                int nSL = static_cast<int>(cas0->getNSLCombs());
+                // 用当前 block 自己的 cas，而非 cas0（多链时不同链 SL 数不同）
+                int nSL = static_cast<int>(cas_list_[blk.cas_idx]->getNSLCombs());
                 int Npr = 0;
                 for (int s = 0; s < n_free; ++s)
                     if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
@@ -2277,12 +2277,12 @@ void AmpCalc::computeUnifiedHessian(
                     }
                 }
                 if (Npr < 1) continue;
-                int nTotal_slamp = static_cast<int>(cas0->getNEventsVec()[gpu]) * nPol;
+                int nTotal_slamp = static_cast<int>(cas_list_[blk.cas_idx]->getNEventsVec()[gpu]) * nPol;
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
                 hessianMixedBlockKernel<<<grid, kBlockSize>>>(
                     d_S_re, d_S_im, d_I_full,
                     d_amp + evt_off * nPol * n_amp_total,
-                    cas0->getSLAmps()[gpu],
+                    cas_list_[blk.cas_idx]->getSLAmps()[gpu],
                     bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mix_g, nFreeResParams(),
@@ -2294,12 +2294,13 @@ void AmpCalc::computeUnifiedHessian(
             // Cross-block mixed
             for (size_t bi = 0; bi < blocks_.size(); ++bi) {
                 auto& blkA = blocks_[bi];
-                int nSL_A = static_cast<int>(cas0->getNSLCombs());
+                // 用 block bi 自己的 cas（多链时不同链 SL 数不同）
+                int nSL_A = static_cast<int>(cas_list_[blkA.cas_idx]->getNSLCombs());
                 for (size_t bj = 0; bj < blocks_.size(); ++bj) {
                     if (bi == bj) continue;
                     auto& btB = temps_per_gpu[gpu][bj];
                     if (!btB.d_g) continue;
-                    if (blocks_[bi].cas_idx != blocks_[bj].cas_idx) continue;
+                    // 跨链 vθ 项是必需的：去掉 cas_idx 过滤（kernel 只用 d_amp，与链无关）
                     int grid = (nEv + kBlockSize - 1) / kBlockSize;
                     hessianCrossMixedKernel<<<grid, kBlockSize>>>(
                         d_S_re, d_S_im, d_I_full,
