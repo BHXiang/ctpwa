@@ -3150,6 +3150,36 @@ public:
         delete[] h_buf;
         printf("saveSLAmps: saved %d complex numbers to %s (nEv=%d nPol=%d nSL=%d)\n", total, filename.c_str(), nEv, nPol, nSL);
     }
+
+    // 返回所有链拼接的 SLAmps tensor，shape [totalSL, nEv, nPol]
+    torch::Tensor getSLAmpsTensor() const
+    {
+        auto& cas_list = amp_calc_.casList();
+        TORCH_CHECK(!cas_list.empty(), "No cas available");
+        int nEv = static_cast<int>(cas_list[0]->getNEventsVec()[0]);
+        int nPol = static_cast<int>(cas_list[0]->getNPolarizations());
+        int totalSL = 0;
+        for (auto& cas : cas_list) totalSL += static_cast<int>(cas->getNSLCombs());
+        auto options = torch::TensorOptions().dtype(torch::kComplexDouble).device(torch::kCPU);
+        torch::Tensor result = torch::empty({totalSL, nEv, nPol}, options);
+        auto acc = result.accessor<c10::complex<double>, 3>();
+        int sl_off = 0;
+        for (auto& cas : cas_list) {
+            int nSL = static_cast<int>(cas->getNSLCombs());
+            int n = nEv * nPol * nSL;
+            thrust::complex<double>* h_buf = new thrust::complex<double>[n];
+            cudaMemcpy(h_buf, cas->getSLAmps()[0], n * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
+            for (int s = 0; s < nSL; ++s)
+                for (int e = 0; e < nEv; ++e)
+                    for (int p = 0; p < nPol; ++p) {
+                        auto v = h_buf[s * nEv * nPol + e * nPol + p];
+                        acc[sl_off + s][e][p] = c10::complex<double>(v.real(), v.imag());
+                    }
+            delete[] h_buf;
+            sl_off += nSL;
+        }
+        return result;
+    }
     /////////////////////////////
 
     std::vector<std::vector<int>> getConstraintsIndex() const

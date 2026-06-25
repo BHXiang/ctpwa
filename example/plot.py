@@ -301,7 +301,7 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
         vmax = max(data_max, fit_max)
 
         # 为当前目录创建一张独立的图
-        fig_dalitz = plt.figure(figsize=(15, 5))
+        fig_dalitz = plt.figure(figsize=(12, 3))
         gs = gridspec.GridSpec(1, n_cols, figure=fig_dalitz,
                               hspace=0.25, wspace=0.25,
                               top=0.92, bottom=0.12, left=0.08, right=0.92)
@@ -749,7 +749,7 @@ def plot_nll_history(run_id):
     iterations, nll_values = zip(*run_data)
 
     # 创建图形
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 6))
     plt.plot(iterations, nll_values, 'b-', linewidth=2, label=f'Run {run_id}')
     plt.xlabel('Iteration', fontsize=12)
     plt.ylabel('NLL', fontsize=12)
