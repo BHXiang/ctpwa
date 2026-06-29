@@ -168,6 +168,13 @@ private:
     std::vector<std::string> param_names_;
     bool initialized_ = false;
 
+    // Vspace fit mode flag: set once, checked in backward via params_mgr
+    bool vspace_mode_ = false;
+public:
+    void setVspaceMode(bool v) { vspace_mode_ = v; }
+    bool isVspaceMode() const { return vspace_mode_; }
+private:
+
     // Device data for coupling kernels
     int* d_amp_chain_ = nullptr;
     int* d_step_offsets_ = nullptr;
