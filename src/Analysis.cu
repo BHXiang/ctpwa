@@ -668,15 +668,9 @@ public:
     {
         TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
 
-        bool vspace_mode = params_mgr->isVspaceMode();
-
         // 0. 拆分 params → vector + theta
         torch::Tensor vector, theta;
-        if (vspace_mode) {
-            // vspace: params_tensor 已是完整扩展格式 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
-            // 直接用 no-coupling 路径；固定/约束由 Python 层 (fit.py build_full_params) 处理
-            std::tie(vector, theta) = params_mgr->splitParams(params_tensor);
-        } else if (params_mgr->hasCouplingMatrix()) {
+        if (params_mgr->hasCouplingMatrix()) {
             const auto& cm = params_mgr->couplingMatrix();
             int ncf = cm.n_free;
             int na  = cm.n_amps;
@@ -1134,15 +1128,7 @@ public:
 
         torch::Tensor grad_params;
 
-        if (params_mgr->isVspaceMode() || !params_mgr->hasCouplingMatrix()) {
-            // vspace / legacy no-coupling: collapseVectorGrad + real×2/imag×2
-            torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
-            torch::Tensor grad_real = (torch::real(grad_vec) * 2.0).to(torch::kFloat64);
-            torch::Tensor grad_imag = (torch::imag(grad_vec) * 2.0).to(torch::kFloat64);
-            grad_params = (nt > 0 && grad_theta.numel() > 0)
-                ? torch::cat({grad_real, grad_imag, grad_theta})
-                : torch::cat({grad_real, grad_imag});
-        } else if (params_mgr->hasCouplingMatrix()) {
+        if (params_mgr->hasCouplingMatrix()) {
             // Coupling matrix mode: transform ∂L/∂v → ∂L/∂p
             const auto& cm = params_mgr->couplingMatrix();
             int na = cm.n_amps;
@@ -1268,7 +1254,6 @@ public:
         //    if (nt > 0) traceDouble("1.input[theta]", params.data_ptr<double>() + 2*ncf, nt, 4);
         // }
 
-        params_.setVspaceMode(fit_mode_ == 1);
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
             data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
@@ -1279,7 +1264,7 @@ public:
     int getFitMode() const { return fit_mode_; }
 
     int getNVector() const {
-        if (fit_mode_ == 1) return n_amplitudes_;  // vspace: 全部振幅，固定由 Python 层处理
+        if (fit_mode_ == 1) return params_.nFreeVector();  // vspace: 自由振幅 (trans 折叠后)
         if (params_.hasCouplingMatrix()) return params_.couplingMatrix().n_free;
         return params_.nFreeVector();
     }
@@ -1313,21 +1298,7 @@ public:
         torch::Device dev = params.device();
         torch::Tensor extended_vector;
 
-        if (fit_mode_ == 1) {
-            // vspace: params 已是 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
-            // 固定 v0 由 Python fit.py build_full_params 处理
-            auto vector = torch::complex(
-                params.slice(0, 0, n_amplitudes_).to(torch::kFloat),
-                params.slice(0, n_amplitudes_, 2*n_amplitudes_).to(torch::kFloat));
-            extended_vector = params_.extendVector(vector, dev);
-            int nt = params_.nFreeTheta();
-            if (nt > 0) {
-                auto theta = params.slice(0, 2*n_amplitudes_, params.size(0));
-                amp_calc_.reComputeAmps(d_all_amplitudes_,
-                    reinterpret_cast<const double*>(theta.data_ptr()),
-                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
-            }
-        } else if (params_.hasCouplingMatrix()) {
+        if (params_.hasCouplingMatrix()) {
             TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64 with coupling matrix");
             const auto& cm = params_.couplingMatrix();
             int ncf = cm.n_free;
@@ -2380,18 +2351,11 @@ public:
 
         // ---- 1. Setup: determine nv, vector, theta ----
         bool is_coupling = params_.hasCouplingMatrix();
-        bool is_vspace = (fit_mode_ == 1);
         int ncf = 0;
         int nv, nt, n2, total;
         torch::Tensor vector, theta;
 
-        if (is_vspace) {
-            // vspace: params 已是完整扩展格式 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
-            // 直接用 no-coupling 路径
-            nv = n_amplitudes_;
-            nt = params_.nFreeTheta();
-            std::tie(vector, theta) = params_.splitParams(params);
-        } else if (is_coupling) {
+        if (is_coupling) {
             const auto& cm = params_.couplingMatrix();
             ncf = cm.n_free;
             nv  = cm.n_amps;
@@ -2789,11 +2753,6 @@ public:
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
         // std::cout << "Coupling: " << is_coupling << std::endl;
-
-        // ---- 5. Vspace: return H_ext directly (full params, fixed by Python) ----
-        if (is_vspace) {
-            return hessian;
-        }
 
         // ---- 5. Coupling transform ----
         if (is_coupling) {
@@ -3900,6 +3859,24 @@ private:
             }
             params_.initialize(n_amplitudes_ - static_cast<int>(con_trans_id.size()),
                                con_trans_id, con_trans_values);
+        }
+
+        // vspace mode: replace coupling with identity (direct amplitude mapping)
+        if (fit_mode_ == 1) {
+            CouplingMatrixResult id;
+            id.n_amps = n_amplitudes_;
+            id.n_step_free = 0;
+            id.n_chain_free = n_amplitudes_;
+            id.n_free = n_amplitudes_;
+            id.amp_chain.resize(n_amplitudes_);
+            for (int i = 0; i < n_amplitudes_; ++i) id.amp_chain[i] = i;
+            id.amp_step_params.resize(n_amplitudes_);
+            id.amp_chain_ratio.assign(n_amplitudes_, 1.0);
+            params_.setCouplingMatrix(id);
+            auto vspace_names = amplitude_names_;
+            const auto& rnames = info.resonanceParamNames();
+            vspace_names.insert(vspace_names.end(), rnames.begin(), rnames.end());
+            params_.setParamNames(vspace_names);
         }
     }
 

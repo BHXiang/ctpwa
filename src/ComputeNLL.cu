@@ -26,17 +26,17 @@ __global__ void computeFactorsAndWeightsKernel(
     if (evt < nEvents) {
         cuComplex* S_evt = d_S + evt * n_polar;
         const float2* S_f2 = reinterpret_cast<const float2*>(S_evt);
-        double factor = 0.0;
+        float factor = 0.0f;
 #pragma unroll
         for (int p = 0; p < n_polar; ++p) {
             float2 s = S_f2[p];
-            factor += (double)s.x * s.x + (double)s.y * s.y;
+            factor += s.x * s.x + s.y * s.y;
         }
 
-        double weight = (d_weights != nullptr) ? d_weights[evt] : 1.0;
+        float weight = (d_weights != nullptr) ? (float)d_weights[evt] : 1.0f;
 
-        if (factor == 0.0) {
-            my_logf = -log(1e-10) * weight;
+        if (factor == 0.0f) {
+            my_logf = (double)(-logf(1e-10f) * weight);
 #pragma unroll
             for (int p = 0; p < n_polar; ++p) {
                 S_evt[p].x = 0.0f;
@@ -44,14 +44,14 @@ __global__ void computeFactorsAndWeightsKernel(
             }
         }
         else {
-            my_logf = -log(factor) * weight;
-            double inv_f = 1.0 / factor * weight;  // w = weight * S/factor
+            my_logf = (double)(-logf(factor) * weight);
+            float inv_f = weight / factor;
             const float kMaxW = 1e10f;
 #pragma unroll
             for (int p = 0; p < n_polar; ++p) {
                 float2 s = S_f2[p];
-                float wx = (float)(s.x * inv_f);
-                float wy = (float)(s.y * inv_f);
+                float wx = s.x * inv_f;
+                float wy = s.y * inv_f;
                 wx = fminf(fmaxf(wx, -kMaxW), kMaxW);
                 wy = fminf(fmaxf(wy, -kMaxW), kMaxW);
                 S_evt[p].x = wx;
@@ -110,33 +110,23 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
 
     // ----- 创建 cuBLAS 句柄 -----
     cublasHandle_t handle;
-    cublasStatus_t cublas_err = cublasCreate(&handle);
-    if (cublas_err != CUBLAS_STATUS_SUCCESS) {
-        std::cerr << "computeFactorNLL: cublasCreate failed: " << cublas_err << std::endl;
-        return 0.0;
-    }
+    cublasCreate(&handle);
 
     // ----- 分配临时缓冲区 -----
     cuComplex* d_S;
-    cudaError_t cu_err = cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
-    if (cu_err != cudaSuccess)
-        std::cerr << "computeFactorNLL: cudaMalloc(d_S) failed: " << cudaGetErrorString(cu_err) << std::endl;
+    cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
     double* d_nll;
-    cu_err = cudaMalloc(&d_nll, sizeof(double));
-    if (cu_err != cudaSuccess)
-        std::cerr << "computeFactorNLL: cudaMalloc(d_nll) failed: " << cudaGetErrorString(cu_err) << std::endl;
+    cudaMalloc(&d_nll, sizeof(double));
 
     // ----- 第一大步：S = A * v -----
     {
         cuComplex alpha = make_cuComplex(1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublas_err = cublasCgemv(handle, CUBLAS_OP_T,
+        cublasCgemv(handle, CUBLAS_OP_T,
             n_amplitudes, nTotal,
             &alpha, d_amp, n_amplitudes,
             d_vector, 1,
             &beta, d_S, 1);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            std::cerr << "computeFactorNLL: cublasCgemv(step1) failed: " << cublas_err << std::endl;
     }
 
     // ----- 第二大步：计算 factor、写入权重 w、同时规约得到 NLL -----
@@ -144,46 +134,31 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
     computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
         d_S, d_nll, d_weights, nEvents, n_polar);
-    cu_err = cudaGetLastError();
-    if (cu_err != cudaSuccess)
-        std::cerr << "computeFactorNLL: factors kernel failed: " << cudaGetErrorString(cu_err) << std::endl;
 
     // 拷回 NLL
     double raw_nll;
-    cu_err = cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
-    if (cu_err != cudaSuccess)
-        std::cerr << "computeFactorNLL: cudaMemcpy(nll) failed: " << cudaGetErrorString(cu_err) << std::endl;
+    cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
 
     // 若调用者需要 w = S/I（用于共振态梯度），在 conjugate 之前复制
     if (d_w_out != nullptr) {
-        cu_err = cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-        if (cu_err != cudaSuccess)
-            std::cerr << "computeFactorNLL: cudaMemcpy(w_out) failed: " << cudaGetErrorString(cu_err) << std::endl;
+        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
     }
 
     // ----- 第三大步：梯度 grad = -A^H * w -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
         conjugateKernel << <gradConj, kBlockSize >> > (d_S, nTotal);
-        cu_err = cudaGetLastError();
-        if (cu_err != cudaSuccess)
-            std::cerr << "computeFactorNLL: conjugateKernel(d_S) failed: " << cudaGetErrorString(cu_err) << std::endl;
 
         cuComplex alpha = make_cuComplex(-1.0f, 0.0f);
         cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublas_err = cublasCgemv(handle, CUBLAS_OP_N,
+        cublasCgemv(handle, CUBLAS_OP_N,
             n_amplitudes, nTotal,
             &alpha, d_amp, n_amplitudes,
             d_S, 1,
             &beta, d_grad_out, 1);
-        if (cublas_err != CUBLAS_STATUS_SUCCESS)
-            std::cerr << "computeFactorNLL: cublasCgemv(step2) failed: " << cublas_err << std::endl;
 
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
         conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
-        cu_err = cudaGetLastError();
-        if (cu_err != cudaSuccess)
-            std::cerr << "computeFactorNLL: conjugateKernel(grad) failed: " << cudaGetErrorString(cu_err) << std::endl;
     }
 
     // d_w_out already copied before conjugateKernel (above)
