@@ -271,14 +271,16 @@ __global__ void extendCouplingParamsKernel(
     }
 
     // v_ext[a] = ratio[a] × chain[c_a] × Π step[k]
-    // Format: [Re_all, Im_all] → Re at [idx], Im at [ncf + idx]
+    // d_in layout: [Re_chain[0..nch-1], Re_step[0..nst-1], Im_chain[...], Im_step[...]]
+    // nch = ncf - n_step_free
     double ratio = d_amp_chain_ratio[a];
-    int c_idx = n_step_free + d_amp_chain[a];
+    int nch = ncf - n_step_free;
+    int c_idx = d_amp_chain[a];                 // chains first
     double re = d_in[c_idx] * ratio;
     double im = d_in[ncf + c_idx] * ratio;
 
     for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
-        int s = d_step_data[k];
+        int s = nch + d_step_data[k];            // steps after chains
         double s_re = d_in[s];
         double s_im = d_in[ncf + s];
         double new_re = re * s_re - im * s_im;
@@ -350,12 +352,13 @@ __global__ void precomputeJacobianKernel(
     int a = blockIdx.x * blockDim.x + threadIdx.x;
     if (a >= n_amps) return;
 
+    int nch = n_free - n_step_free;
     double ratio = d_amp_chain_ratio[a];
-    int c_idx = n_step_free + d_amp_chain[a];
+    int c_idx = d_amp_chain[a];                 // chains first
     double v_re = d_params[c_idx] * ratio;
     double v_im = d_params[n_free + c_idx] * ratio;
     for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
-        int s = d_step_data[k];
+        int s = nch + d_step_data[k];            // steps after chains
         double s_re = d_params[s], s_im = d_params[n_free + s];
         double nre = v_re * s_re - v_im * s_im;
         double nim = v_re * s_im + v_im * s_re;
@@ -371,7 +374,7 @@ __global__ void precomputeJacobianKernel(
     d_jac_im[chain_pos] = (v_im * pc_re - v_re * pc_im) / pc_sq;
 
     for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
-        int s = d_step_data[k];
+        int s = nch + d_step_data[k];            // steps after chains
         double ps_re = d_params[s], ps_im = d_params[n_free + s];
         double ps_sq = ps_re * ps_re + ps_im * ps_im;
         if (ps_sq < 1e-30) ps_sq = 1e-30;
@@ -441,25 +444,28 @@ __global__ void hessianFullTransformKernel(
         return (idx < n) ? std::make_pair(idx, 0) : std::make_pair(idx - n, 1);
     };
 
+    int nch = ncf - n_step_free;  // chain params come first in free-param ordering
+
     if (rowV && colV) {
         // ---- vv block: J_v^T·H_vv·J_v + second-order ----
         auto [j, cr] = groupedIdx(row, ncf);
         auto [k, cc] = groupedIdx(col, ncf);
-        bool jCh = (j >= n_step_free), kCh = (k >= n_step_free);
-        int jc = j - n_step_free, kc = k - n_step_free;
+        bool jCh = (j < nch), kCh = (k < nch);
+        int jc = jCh ? j : j - nch;
+        int kc = kCh ? k : k - nch;
         double sum = 0.0;
 
         for (int a = 0; a < na; ++a) {
             double Jjr = 0, Jji = 0; bool ji = false;
             if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jjr=d_jac_re[p]; Jji=d_jac_im[p]; ji=true; } }
-            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jjr=d_jac_re[s]; Jji=d_jac_im[s]; ji=true; break; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==jc) { Jjr=d_jac_re[s]; Jji=d_jac_im[s]; ji=true; break; } }
             if (!ji) continue;
             double JT_R = (cr==0)?Jjr:-Jji, JT_I = (cr==0)?Jji:Jjr;
 
             for (int b = 0; b < na; ++b) {
                 double Jkr=0, Jki=0; bool ki=false;
                 if (kCh) { if (d_amp_chain[b]==kc) { int p=jac_chain_base+b; Jkr=d_jac_re[p]; Jki=d_jac_im[p]; ki=true; } }
-                else { for (int s=d_step_offsets[b];s<d_step_offsets[b+1];++s) if (d_step_data[s]==k) { Jkr=d_jac_re[s]; Jki=d_jac_im[s]; ki=true; break; } }
+                else { for (int s=d_step_offsets[b];s<d_step_offsets[b+1];++s) if (d_step_data[s]==kc) { Jkr=d_jac_re[s]; Jki=d_jac_im[s]; ki=true; break; } }
                 if (!ki) continue;
                 double J_C = (cc==0)?Jkr:-Jki, J_Ic = (cc==0)?Jki:Jkr;
 
@@ -469,6 +475,40 @@ __global__ void hessianFullTransformKernel(
                 sum += (JT_R*Hrr+JT_I*Hir)*J_C + (JT_R*Hri+JT_I*Hii)*J_Ic;
             }
         }
+
+        // ---- second-order gradient term: Σ_a g_v[a] × ∂²v_a/(∂p_j ∂p_k) ----
+        // Only non-zero for mixed chain×step derivatives
+        if (d_g_v && jCh != kCh) {
+            double gt = 0.0;
+            int chain_j = jCh ? jc : kc;     // which is the chain
+            int step_j  = jCh ? kc : jc;     // which is the step
+            bool row_is_chain = jCh;
+            for (int a = 0; a < na; ++a) {
+                if (d_amp_chain[a] != chain_j) continue;
+                bool uses_step = false;
+                for (int ss = d_step_offsets[a]; ss < d_step_offsets[a + 1]; ++ss)
+                    if (d_step_data[ss] == step_j) { uses_step = true; break; }
+                if (!uses_step) continue;
+                double g_re = d_g_v[a], g_im = d_g_v[na + a];
+                // ∂²v/∂p_j∂p_k in Re/Im grouped format:
+                // ∂²Re/∂Re(c)∂Re(s)=1, ∂²Im/∂Re(c)∂Im(s)=1,
+                // ∂²Im/∂Im(c)∂Re(s)=1, ∂²Re/∂Im(c)∂Im(s)=-1
+                // All other combos = 0
+                if (row_is_chain) {
+                    if (cr == 0 && cc == 0) gt += g_re;        // Re_c×Re_s → +g_re
+                    else if (cr == 0 && cc == 1) gt += g_im;   // Re_c×Im_s → +g_im
+                    else if (cr == 1 && cc == 0) gt += g_im;   // Im_c×Re_s → +g_im
+                    else if (cr == 1 && cc == 1) gt -= g_re;   // Im_c×Im_s → -g_re
+                } else {
+                    // row is step, col is chain — symmetric
+                    if (cr == 0 && cc == 0) gt += g_re;
+                    else if (cr == 1 && cc == 0) gt += g_im;
+                    else if (cr == 0 && cc == 1) gt += g_im;
+                    else if (cr == 1 && cc == 1) gt -= g_re;
+                }
+            }
+            sum += gt;
+        }
         H_out[row*n_out+col] = sum;
         return;
     }
@@ -477,12 +517,12 @@ __global__ void hessianFullTransformKernel(
         // ---- vtheta: J_v^T · H_vtheta ----
         auto [j, comp] = groupedIdx(row, ncf);
         int t = col-2*ncf;
-        bool jCh = (j>=n_step_free); int jc = j-n_step_free;
+        bool jCh = (j < nch); int jc = jCh ? j : j - nch;
         double sum = 0.0;
         for (int a=0;a<na;++a) {
             double Jr=0,Ji=0; bool ji=false;
             if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jr=d_jac_re[p]; Ji=d_jac_im[p]; ji=true; } }
-            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==jc) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
             if (!ji) continue;
             double Hr=H_ext[a*n_ext+2*na+t], Hi=H_ext[(na+a)*n_ext+2*na+t];
             sum += (comp==0) ? (Jr*Hr+Ji*Hi) : (-Ji*Hr+Jr*Hi);
@@ -495,12 +535,12 @@ __global__ void hessianFullTransformKernel(
         // ---- thetav: H_thetav · J_v ----
         int t = row-2*ncf;
         auto [j, comp] = groupedIdx(col, ncf);
-        bool jCh = (j>=n_step_free); int jc = j-n_step_free;
+        bool jCh = (j < nch); int jc = jCh ? j : j - nch;
         double sum = 0.0;
         for (int a=0;a<na;++a) {
             double Jr=0,Ji=0; bool ji=false;
             if (jCh) { if (d_amp_chain[a]==jc) { int p=jac_chain_base+a; Jr=d_jac_re[p]; Ji=d_jac_im[p]; ji=true; } }
-            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==j) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
+            else { for (int s=d_step_offsets[a];s<d_step_offsets[a+1];++s) if (d_step_data[s]==jc) { Jr=d_jac_re[s]; Ji=d_jac_im[s]; ji=true; break; } }
             if (!ji) continue;
             double Hr=H_ext[(2*na+t)*n_ext+a], Hi=H_ext[(2*na+t)*n_ext+na+a];
             sum += (comp==0) ? (Hr*Jr+Hi*Ji) : (Hr*(-Ji)+Hi*Jr);

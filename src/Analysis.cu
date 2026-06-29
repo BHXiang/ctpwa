@@ -1,8 +1,10 @@
 // #include <pybind11/pybind11.h>
 #include <chrono>
+#include <cstdio>
 #include <cuComplex.h>
 #include <cublas_v2.h>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <omp.h>
 #include <random>
@@ -650,7 +652,7 @@ public:
     static torch::Tensor forward(
         torch::autograd::AutogradContext* ctx,
         torch::Tensor params_tensor,           // 统一参数 [2*nFreeVector + nFreeTheta] float64
-        Parameters* params_mgr,                // 参数管理器（含约束 & 维度信息）
+        Parameters* params_mgr,                // 参数管理器（含约束 & 维度信息 & vspace flag）
         std::vector<cuComplex*>& d_all_amplitudes_list,
         AmpCalc* amp_calc,                     // 共振态管理器
         cuComplex* d_phsp_matrix_,
@@ -666,9 +668,15 @@ public:
     {
         TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
 
+        bool vspace_mode = params_mgr->isVspaceMode();
+
         // 0. 拆分 params → vector + theta
         torch::Tensor vector, theta;
-        if (params_mgr->hasCouplingMatrix()) {
+        if (vspace_mode) {
+            // vspace: params_tensor 已是完整扩展格式 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
+            // 直接用 no-coupling 路径；固定/约束由 Python 层 (fit.py build_full_params) 处理
+            std::tie(vector, theta) = params_mgr->splitParams(params_tensor);
+        } else if (params_mgr->hasCouplingMatrix()) {
             const auto& cm = params_mgr->couplingMatrix();
             int ncf = cm.n_free;
             int na  = cm.n_amps;
@@ -1101,19 +1109,6 @@ public:
             torch::kComplexFloat).to(vector.device());
         cudaMemcpy(global_extended_grad.data_ptr(), d_grad_global,
             extended_n_gls * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
-        // d_grad_global 是持久化buffer，不释放
-
-        // // 输出d_grad_global检查
-        // std::vector<cuComplex> h_grad_global(extended_n_gls);
-        // cudaMemcpy(h_grad_global.data(), global_extended_grad.data_ptr(),
-        //     extended_n_gls * sizeof(cuComplex), cudaMemcpyDeviceToHost);
-        // std::cout << "Global gradient (after copy to tensor): ";
-        // for (int i = 0; i < extended_n_gls; ++i) {
-        //     std::cout << "(" << h_grad_global[i].x << ", " << h_grad_global[i].y << ") ";
-        // }
-        // std::cout << std::endl;
-
-        // global_extended_grad = global_extended_grad * 2; // 转置共轭以匹配PyTorch的梯度定义
 
         ctx->save_for_backward({ params_tensor });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
@@ -1139,7 +1134,15 @@ public:
 
         torch::Tensor grad_params;
 
-        if (params_mgr->hasCouplingMatrix()) {
+        if (params_mgr->isVspaceMode() || !params_mgr->hasCouplingMatrix()) {
+            // vspace / legacy no-coupling: collapseVectorGrad + real×2/imag×2
+            torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
+            torch::Tensor grad_real = (torch::real(grad_vec) * 2.0).to(torch::kFloat64);
+            torch::Tensor grad_imag = (torch::imag(grad_vec) * 2.0).to(torch::kFloat64);
+            grad_params = (nt > 0 && grad_theta.numel() > 0)
+                ? torch::cat({grad_real, grad_imag, grad_theta})
+                : torch::cat({grad_real, grad_imag});
+        } else if (params_mgr->hasCouplingMatrix()) {
             // Coupling matrix mode: transform ∂L/∂v → ∂L/∂p
             const auto& cm = params_mgr->couplingMatrix();
             int na = cm.n_amps;
@@ -1253,8 +1256,6 @@ public:
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
-
-        // if (params_.hasCouplingMatrix()) {
         //     const auto& cm = params_.couplingMatrix();
         //     int ncf = cm.n_free;
         //     int na  = cm.n_amps;
@@ -1267,17 +1268,34 @@ public:
         //    if (nt > 0) traceDouble("1.input[theta]", params.data_ptr<double>() + 2*ncf, nt, 4);
         // }
 
+        params_.setVspaceMode(fit_mode_ == 1);
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
             data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     }
 
+    // ---- fit mode ----
+    void setFitMode(int mode) { fit_mode_ = mode; }
+    int getFitMode() const { return fit_mode_; }
+
     int getNVector() const {
+        if (fit_mode_ == 1) return n_amplitudes_;  // vspace: 全部振幅，固定由 Python 层处理
         if (params_.hasCouplingMatrix()) return params_.couplingMatrix().n_free;
         return params_.nFreeVector();
     }
     int getNFreeTheta() const { return params_.nFreeTheta(); }
-    std::vector<std::string> getParamNames() const { return params_.paramNames(); }
+    std::vector<std::string> getParamNames() const {
+        if (fit_mode_ == 1) {
+            // vspace: 返回全部振幅名 + 共振态参数名
+            std::vector<std::string> names = amplitude_names_;
+            auto theta_names = params_.paramNames();
+            int n_coupling = params_.hasCouplingMatrix() ? params_.couplingMatrix().n_free : (int)amplitude_names_.size();
+            for (int i = n_coupling; i < (int)theta_names.size(); ++i)
+                names.push_back(theta_names[i]);
+            return names;
+        }
+        return params_.paramNames();
+    }
     int getNParams() const { return 2 * getNVector() + getNFreeTheta(); }
     const Parameters& getParams() const { return params_; }
 
@@ -1295,7 +1313,21 @@ public:
         torch::Device dev = params.device();
         torch::Tensor extended_vector;
 
-        if (params_.hasCouplingMatrix()) {
+        if (fit_mode_ == 1) {
+            // vspace: params 已是 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
+            // 固定 v0 由 Python fit.py build_full_params 处理
+            auto vector = torch::complex(
+                params.slice(0, 0, n_amplitudes_).to(torch::kFloat),
+                params.slice(0, n_amplitudes_, 2*n_amplitudes_).to(torch::kFloat));
+            extended_vector = params_.extendVector(vector, dev);
+            int nt = params_.nFreeTheta();
+            if (nt > 0) {
+                auto theta = params.slice(0, 2*n_amplitudes_, params.size(0));
+                amp_calc_.reComputeAmps(d_all_amplitudes_,
+                    reinterpret_cast<const double*>(theta.data_ptr()),
+                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+            }
+        } else if (params_.hasCouplingMatrix()) {
             TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64 with coupling matrix");
             const auto& cm = params_.couplingMatrix();
             int ncf = cm.n_free;
@@ -2348,11 +2380,18 @@ public:
 
         // ---- 1. Setup: determine nv, vector, theta ----
         bool is_coupling = params_.hasCouplingMatrix();
+        bool is_vspace = (fit_mode_ == 1);
         int ncf = 0;
         int nv, nt, n2, total;
         torch::Tensor vector, theta;
 
-        if (is_coupling) {
+        if (is_vspace) {
+            // vspace: params 已是完整扩展格式 [Re0..Re{na-1}, Im0..Im{na-1}, theta]
+            // 直接用 no-coupling 路径
+            nv = n_amplitudes_;
+            nt = params_.nFreeTheta();
+            std::tie(vector, theta) = params_.splitParams(params);
+        } else if (is_coupling) {
             const auto& cm = params_.couplingMatrix();
             ncf = cm.n_free;
             nv  = cm.n_amps;
@@ -2751,17 +2790,165 @@ public:
 
         // std::cout << "Coupling: " << is_coupling << std::endl;
 
+        // ---- 5. Vspace: return H_ext directly (full params, fixed by Python) ----
+        if (is_vspace) {
+            return hessian;
+        }
+
         // ---- 5. Coupling transform ----
         if (is_coupling) {
-            // g_v is not computed here yet — pass nullptr for now (second-order term skipped)
+            // Precompute Jacobian for Hessian transform (J^T · H_ext · J + Σ g_v · ∇²v)
             params_.precomputeJacobian(params.data_ptr<double>());
+
+            // ---- compute gradient g_v = ∂NLL/∂v in extended amplitude space ----
+            // Uses the same computeFactorNLL as the NLL forward pass for data/bkg.
+            // Phsp: g_phsp = N_eff / phsp_factor * (M × v)
+            double* d_g_v = nullptr;
+            {
+                int n_gpu = static_cast<int>(d_all_amplitudes_.size());
+                int primary_dev = dev.index();
+                const auto& cm = params_.couplingMatrix();
+                int na = cm.n_amps;
+
+                // Build extended vector v_ext
+                auto v_ext_tensor = torch::empty({na}, torch::TensorOptions().dtype(torch::kComplexFloat).device(dev));
+                params_.applyCouplingMatrix(params.data_ptr<double>(),
+                    reinterpret_cast<cuComplex*>(v_ext_tensor.data_ptr()));
+                const cuComplex* d_v_ext = reinterpret_cast<const cuComplex*>(v_ext_tensor.data_ptr());
+
+                // Allocate g_v on primary GPU
+                cudaMalloc(&d_g_v, 2 * na * sizeof(double));
+                cudaMemset(d_g_v, 0, 2 * na * sizeof(double));
+
+                // --- Data gradient: g = ∂(-log I)/∂conj(v) via computeFactorNLL ---
+                for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                    int nEv = events_[gpu][1];
+                    if (nEv == 0) continue;
+                    cudaSetDevice(gpu);
+                    cuComplex* d_g_gpu;
+                    cudaMalloc(&d_g_gpu, na * sizeof(cuComplex));
+                    computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][1],
+                        d_v_ext, d_g_gpu, nEv, n_polar_, na, nullptr, nullptr);
+                    // Convert cuComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
+                    std::vector<cuComplex> h_g_tmp(na);
+                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                    std::vector<double> h_g(2 * na);
+                    for (int a = 0; a < na; ++a) {
+                        h_g[a]      = (double)h_g_tmp[a].x;
+                        h_g[na + a] = (double)h_g_tmp[a].y;
+                    }
+                    cudaSetDevice(primary_dev);
+                    double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
+                    cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
+                    int grid = (2 * na + 255) / 256;
+                    daxpy_kernel<<<grid, 256>>>(d_g_v, d_tmp, 1.0, 2 * na);
+                    cudaFree(d_tmp); cudaFree(d_g_gpu);
+                }
+
+                // --- Bkg gradient: contribution to loss = data_nll - bkg_nll ---
+                // computeFactorNLL with weight=-bkg_weight gives gradient for -(-log(I)*bkg_weight)
+                // which adds to data gradient correctly in the loss formula.
+                for (int gpu = 0; gpu < n_gpu; ++gpu) {
+                    if (events_[gpu].size() <= 2 || events_[gpu][2] == 0) continue;
+                    int nEv = events_[gpu][2];
+                    cudaSetDevice(gpu);
+                    cuComplex* d_g_gpu;
+                    cudaMalloc(&d_g_gpu, na * sizeof(cuComplex));
+                    // Negate bkg weights (same as in NLL forward)
+                    const double* d_w = (gpu < (int)bkg_weights_.size() && bkg_weights_[gpu]) ? nullptr : nullptr;
+                    // Use negated bkg weights
+                    double* d_neg_w = nullptr;
+                    if (gpu < (int)bkg_weights_.size() && bkg_weights_[gpu] != nullptr) {
+                        cudaMalloc(&d_neg_w, nEv * sizeof(double));
+                        int grid = (nEv + 255) / 256;
+                        negateWeightsKernel<<<grid, 256>>>(d_neg_w, bkg_weights_[gpu], nEv);
+                    }
+                    computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][2],
+                        d_v_ext, d_g_gpu, nEv, n_polar_, na, d_neg_w, nullptr);
+                    if (d_neg_w) cudaFree(d_neg_w);
+                    // Convert cuComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
+                    std::vector<cuComplex> h_g_tmp(na);
+                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                    std::vector<double> h_g(2 * na);
+                    for (int a = 0; a < na; ++a) {
+                        h_g[a]      = (double)h_g_tmp[a].x;
+                        h_g[na + a] = (double)h_g_tmp[a].y;
+                    }
+                    cudaSetDevice(primary_dev);
+                    double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
+                    cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
+                    int grid = (2 * na + 255) / 256;
+                    daxpy_kernel<<<grid, 256>>>(d_g_v, d_tmp, -1.0, 2 * na);  // subtract: loss = data - bkg
+                    cudaFree(d_tmp); cudaFree(d_g_gpu);
+                }
+
+                // --- Phsp gradient: g_phsp = N_eff / phsp_factor * (M × v) ---
+                {
+                    int totD = 0; for (int g = 0; g < n_gpu; ++g) totD += events_[g][1];
+                    double N_eff = (double)totD - bkg_integral_;
+                    cudaSetDevice(primary_dev);
+
+                    // Compute phsp_factor and P_vec = M × v
+                    cuComplex* d_P_vec; cudaMalloc(&d_P_vec, na * sizeof(cuComplex));
+                    {
+                        cublasHandle_t h; cublasCreate(&h);
+                        cuComplex alpha = make_cuComplex(1,0), beta = make_cuComplex(0,0);
+                        cublasCgemv(h, CUBLAS_OP_N, na, na, &alpha, d_phsp_matrix_, na,
+                                    d_v_ext, 1, &beta, d_P_vec, 1);
+                        cublasDestroy(h);
+                    }
+                    float phr;
+                    {
+                        auto v_conj = v_ext_tensor.conj();
+                        const cuComplex* d_vc = reinterpret_cast<const cuComplex*>(v_conj.data_ptr());
+                        float *d_pr, *d_pi;
+                        cudaMalloc(&d_pr, sizeof(float)); cudaMalloc(&d_pi, sizeof(float));
+                        computeQuadraticForm(d_phsp_matrix_, d_vc, d_P_vec, d_pr, d_pi, na);
+                        cudaMemcpy(&phr, d_pr, sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaFree(d_pr); cudaFree(d_pi);
+                    }
+                    double phsp_factor = (double)phr;
+
+                    if (phsp_factor > 1e-30) {
+                        double scale = N_eff / phsp_factor;
+                        std::vector<cuComplex> h_P(na);
+                        cudaMemcpy(h_P.data(), d_P_vec, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                        std::vector<double> h_g(2 * na, 0.0);
+                        for (int a = 0; a < na; ++a) {
+                            h_g[a]      = scale * (double)h_P[a].x;
+                            h_g[na + a] = scale * (double)h_P[a].y;
+                        }
+                        double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
+                        cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
+                        int grid = (2 * na + 255) / 256;
+                        daxpy_kernel<<<grid, 256>>>(d_g_v, d_tmp, 1.0, 2 * na);  // accumulate!
+                        cudaFree(d_tmp);
+                    }
+                    cudaFree(d_P_vec);
+                }
+
+                // Convert d_g_v from ∂NLL/∂conj(v) (Wirtinger) to real gradient:
+                //   ∂NLL/∂Re(v_a) = 2 * Re(∂NLL/∂conj(v_a))
+                //   ∂NLL/∂Im(v_a) = 2 * Im(∂NLL/∂conj(v_a))
+                // Both are simply ×2 (no sign flip — the conj flip cancels with
+                // the minus in ∂/∂Im = -2 Im(∂/∂v)).
+                {
+                    std::vector<double> h_g(2 * na);
+                    cudaMemcpy(h_g.data(), d_g_v, 2 * na * sizeof(double), cudaMemcpyDeviceToHost);
+                    for (int a = 0; a < 2 * na; ++a) h_g[a] *= 2.0;
+                    cudaMemcpy(d_g_v, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
+                }
+            }
+
             int n_fit = 2 * ncf + nt;
             auto hess_fit = torch::zeros({n_fit, n_fit}, torch::kFloat64).to(dev);
             params_.transformExtendedHessian(
                 hessian.data_ptr<double>(),
-                params.data_ptr<double>(), nullptr,  // d_params, d_g_v (TODO)
+                params.data_ptr<double>(), d_g_v,
                 hess_fit.data_ptr<double>(),
                 nv, ncf, nt);
+            cudaFree(d_g_v);
+
             return hess_fit;
         }
 
@@ -3279,6 +3466,9 @@ private:
     std::vector<ChainInfo> chains_info_;
     AmpCalc amp_calc_;
     bool initialized_ = false;
+
+    // fit mode: 0 = FREEPARAMS (chain×step), 1 = VSPACE (direct amplitudes, default)
+    int fit_mode_ = 1;
 
     void initialize(std::string config_file = "config.yml")
     {

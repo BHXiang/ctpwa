@@ -1788,6 +1788,40 @@ __global__ void daxpy_kernel(double* y, const double* x, double alpha, int n) {
     if (i < n) y[i] += alpha * x[i];
 }
 
+// 计算 w[e,p] = sign * S[e,p] / I[e]（用于梯度计算：g = A^H * w）
+__global__ void computeGradWeightKernel(
+    cuComplex* d_w, const cuComplex* d_S, double* d_I,
+    int nEv, int nPol, double sign)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nEv) return;
+    double I_val = 0.0;
+    for (int p = 0; p < nPol; ++p) {
+        cuComplex s = d_S[e * nPol + p];
+        I_val += (double)s.x * s.x + (double)s.y * s.y;
+    }
+    d_I[e] = I_val;
+    double inv_I = I_val > 1e-30 ? sign / I_val : 0.0;
+    for (int p = 0; p < nPol; ++p) {
+        cuComplex s = d_S[e * nPol + p];
+        d_w[e * nPol + p] = make_cuComplex((float)(inv_I * s.x), (float)(inv_I * s.y));  // sign * S/I
+    }
+}
+
+// 对 bkg 事件乘上权重
+__global__ void applyBkgWeightsKernel(
+    cuComplex* d_w, const double* d_weights, int nEv, int nPol)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nEv) return;
+    double wgt = d_weights ? d_weights[e] : 1.0;
+    for (int p = 0; p < nPol; ++p) {
+        int idx = e * nPol + p;
+        d_w[idx].x *= (float)wgt;
+        d_w[idx].y *= (float)wgt;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AmpCalc::computeResonanceGradient
 // ---------------------------------------------------------------------------
@@ -2427,12 +2461,13 @@ __global__ void multiplicativeCouplingKernel(
     if (a >= n_amps) return;
 
     double ratio = d_amp_chain_ratio[a];
-    int c_idx = n_step_free + d_amp_chain[a];
+    int nch = n_free - n_step_free;
+    int c_idx = d_amp_chain[a];                 // chains first in d_params
     double re = d_params[c_idx] * ratio;
     double im = d_params[n_free + c_idx] * ratio;
 
     for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
-        int s = d_step_data[k];
+        int s = nch + d_step_data[k];            // steps after chains
         double s_re = d_params[s];
         double s_im = d_params[n_free + s];
         double new_re = re * s_re - im * s_im;
@@ -2460,12 +2495,13 @@ __global__ void multiplicativeGradientKernel(
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_free) return;
 
+    int nch = n_free - n_step_free;
     double sum_re = 0.0, sum_im = 0.0;
 
-    if (j >= n_step_free) {
-        int c = j - n_step_free;
+    if (j < nch) {
+        // Chain param: d_amp_chain[a] == j (chains are first in d_params)
         for (int a = 0; a < n_amps; ++a) {
-            if (d_amp_chain[a] == c) {
+            if (d_amp_chain[a] == j) {
                 double gv_re = (double)d_grad_v[a].x;
                 double gv_im = (double)d_grad_v[a].y;
                 double v_re  = (double)d_v[a].x;
@@ -2475,10 +2511,12 @@ __global__ void multiplicativeGradientKernel(
             }
         }
     } else {
+        // Step param: index = j - nch (steps after chains)
+        int sj = j - nch;
         for (int a = 0; a < n_amps; ++a) {
             bool uses_j = false;
             for (int k = d_step_offsets[a]; k < d_step_offsets[a + 1]; ++k) {
-                if (d_step_data[k] == j) { uses_j = true; break; }
+                if (d_step_data[k] == sj) { uses_j = true; break; }
             }
             if (uses_j) {
                 double gv_re = (double)d_grad_v[a].x;
