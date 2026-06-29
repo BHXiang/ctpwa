@@ -151,6 +151,7 @@ extension = CUDAExtension(
             *cuda_gencode_flags,  # 动态检测到的 gencode 选项
             #"-arch=sm_120",
             "--expt-relaxed-constexpr",
+            #"--use_fast_math",
             "-Xcompiler",
             "-fPIC",
             "-std=c++17",
