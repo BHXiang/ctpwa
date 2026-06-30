@@ -7,6 +7,10 @@
 #include <stdio.h>
 #include <vector>
 
+constexpr int kWarpSize = 32;
+constexpr int kBlockSize = 256;
+constexpr int kWPBlock = kBlockSize / kWarpSize;
+
 //////////////////////////
 /////// 快速似然值+梯度：cublasCgemv + 简单kernel + CUB规约 ///////
 //////////////////////////
@@ -96,8 +100,102 @@ void axpyComplex(cuComplex* y, const cuComplex* x, cuComplex alpha, int n) {
 }
 
 
+// ===========================================================================
+// 融合前向 kernel: matvec + |S|² + logf + w + NLL (n_polar 模板化)
+// ===========================================================================
+
+template<int NP>
+__global__ void kern_fused_fwd(
+    const cuComplex* __restrict__ A, int nA, int nE,
+    const cuComplex* __restrict__ v, const double* __restrict__ W,
+    cuComplex* __restrict__ w, double* __restrict__ N)
+{
+    int warp = threadIdx.x / kWarpSize, lane = threadIdx.x % kWarpSize;
+    int evt = blockIdx.x * kWPBlock + warp, base = evt * NP;
+    extern __shared__ float sbuf[];
+    cuComplex* sv = reinterpret_cast<cuComplex*>(sbuf);
+    double* sn = reinterpret_cast<double*>(sbuf + nA * 2);
+    for (int i = threadIdx.x; i < nA; i += kBlockSize) sv[i] = v[i];
+    if (lane == 0) sn[warp] = 0.0;
+    __syncthreads();
+
+    if (evt < nE) {
+        float Sr[NP] = {0}, Si[NP] = {0};
+        for (int i = lane; i < nA; i += kWarpSize) {
+            cuComplex vi = sv[i]; float vx = vi.x, vy = vi.y;
+            #pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                cuComplex a = A[i + (base + p) * nA];
+                Sr[p] += a.x * vx - a.y * vy;
+                Si[p] += a.x * vy + a.y * vx;
+            }
+        }
+        #pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            float re = Sr[p], im = Si[p];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                re += __shfl_down_sync(0xffffffff, re, off);
+                im += __shfl_down_sync(0xffffffff, im, off);
+            }
+            Sr[p] = re; Si[p] = im;
+        }
+        if (lane == 0) {
+            float f = 0;
+            #pragma unroll
+            for (int p = 0; p < NP; ++p) f += Sr[p] * Sr[p] + Si[p] * Si[p];
+            float wt = (W != nullptr) ? (float)W[evt] : 1.0f;
+            sn[warp] = (f == 0.0f) ? (double)(-logf(1e-10f) * wt) : (double)(-logf(f) * wt);
+            float inv = (f == 0.0f) ? 0 : wt / f;
+            const float kM = 1e10f;
+            #pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                float wx = Sr[p] * inv, wy = Si[p] * inv;
+                wx = fminf(fmaxf(wx, -kM), kM); wy = fminf(fmaxf(wy, -kM), kM);
+                w[base + p] = make_cuComplex(wx, wy);
+            }
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        double val = (lane < kWPBlock) ? sn[lane] : 0.0;
+        val += __shfl_down_sync(0xffffffff, val, 4);
+        val += __shfl_down_sync(0xffffffff, val, 2);
+        val += __shfl_down_sync(0xffffffff, val, 1);
+        if (lane == 0) atomicAdd(N, val);
+    }
+}
+
+static void launch_fused_fwd(int nP, int nA, int nE,
+    const cuComplex* dA, const cuComplex* dv, const double* dW,
+    cuComplex* dw, double* dN)
+{
+    int g = (nE + kWPBlock - 1) / kWPBlock;
+    int shm = nA * (int)sizeof(cuComplex) + kWPBlock * (int)sizeof(double);
+    auto L = [&](auto* k) { k<<<g, kBlockSize, shm>>>(dA, nA, nE, dv, dW, dw, dN); };
+    switch (nP) {
+        case 2: L(&kern_fused_fwd<2>); break;   case 3: L(&kern_fused_fwd<3>); break;
+        case 4: L(&kern_fused_fwd<4>); break;   case 5: L(&kern_fused_fwd<5>); break;
+        case 6: L(&kern_fused_fwd<6>); break;   case 7: L(&kern_fused_fwd<7>); break;
+        case 8: L(&kern_fused_fwd<8>); break;   case 9: L(&kern_fused_fwd<9>); break;
+        case 10:L(&kern_fused_fwd<10>); break;  case 11:L(&kern_fused_fwd<11>); break;
+        case 12:L(&kern_fused_fwd<12>); break;  case 14:L(&kern_fused_fwd<14>); break;
+        case 16:L(&kern_fused_fwd<16>); break;  case 18:L(&kern_fused_fwd<18>); break;
+        default: { // fallback: cublas + old kernel
+            cuComplex* d_S; cudaMalloc(&d_S, nE * nP * sizeof(cuComplex));
+            cublasHandle_t h; cublasCreate(&h);
+            cuComplex alpha=make_cuComplex(1,0), beta=make_cuComplex(0,0);
+            cublasCgemv(h, CUBLAS_OP_T, nA, nE*nP, &alpha, dA, nA, dv, 1, &beta, d_S, 1);
+            int gb=(nE+kBlockSize-1)/kBlockSize;
+            computeFactorsAndWeightsKernel<<<gb,kBlockSize>>>(d_S,dN,dW,nE,nP);
+            cudaMemcpy(dw, d_S, nE*nP*sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+            cudaFree(d_S); cublasDestroy(h);
+        } break;
+    }
+}
+
 // -----------------------------------------------------------------------------
-// 优化后的主函数（预分配buffer，消除malloc/free和handle创建开销）
+// 主函数: 计算 NLL + 梯度 (前向用融合 kernel, 梯度用 cublas)
 // -----------------------------------------------------------------------------
 double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_grad_out,
@@ -106,67 +204,55 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_w_out)
 {
     const int nTotal = nEvents * n_polar;
-    constexpr int kBlockSize = 256;
 
-    // ----- 创建 cuBLAS 句柄 -----
-    cublasHandle_t handle;
-    cublasCreate(&handle);
-
-    // ----- 分配临时缓冲区 -----
-    cuComplex* d_S;
-    cudaMalloc(&d_S, nTotal * sizeof(cuComplex));
-    double* d_nll;
-    cudaMalloc(&d_nll, sizeof(double));
-
-    // ----- 第一大步：S = A * v -----
-    {
-        cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-        cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublasCgemv(handle, CUBLAS_OP_T,
-            n_amplitudes, nTotal,
-            &alpha, d_amp, n_amplitudes,
-            d_vector, 1,
-            &beta, d_S, 1);
+    // ----- 静态缓冲区和 cublas handle (只分配一次) -----
+    static cuComplex* s_d_S = nullptr;
+    static cuComplex* s_d_w = nullptr;
+    static double* s_d_nll = nullptr;
+    static cublasHandle_t s_handle = nullptr;
+    static int s_alloc_n = 0;
+    if (s_alloc_n < nTotal || s_handle == nullptr) {
+        if (s_d_S) cudaFree(s_d_S);
+        if (s_d_w) cudaFree(s_d_w);
+        if (s_d_nll) cudaFree(s_d_nll);
+        if (s_handle) cublasDestroy(s_handle);
+        cudaMalloc(&s_d_S, nTotal * sizeof(cuComplex));
+        cudaMalloc(&s_d_w, nTotal * sizeof(cuComplex));
+        cudaMalloc(&s_d_nll, sizeof(double));
+        cublasCreate(&s_handle);
+        s_alloc_n = nTotal;
     }
 
-    // ----- 第二大步：计算 factor、写入权重 w、同时规约得到 NLL -----
-    cudaMemset(d_nll, 0, sizeof(double));
+    // ----- 第一步：S = A * v (cublas) -----
+    cuComplex alpha = make_cuComplex(1.0f, 0.0f);
+    cuComplex beta  = make_cuComplex(0.0f, 0.0f);
+    cublasCgemv(s_handle, CUBLAS_OP_T, n_amplitudes, nTotal,
+                &alpha, d_amp, n_amplitudes, d_vector, 1, &beta, s_d_S, 1);
+
+    // ----- 第二步：因子 + w + NLL (float logf/div) -----
+    cudaMemset(s_d_nll, 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computeFactorsAndWeightsKernel << <gridBlocks, kBlockSize >> > (
-        d_S, d_nll, d_weights, nEvents, n_polar);
+    computeFactorsAndWeightsKernel<<<gridBlocks, kBlockSize>>>(
+        s_d_S, s_d_nll, d_weights, nEvents, n_polar);
 
-    // 拷回 NLL
     double raw_nll;
-    cudaMemcpy(&raw_nll, d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&raw_nll, s_d_nll, sizeof(double), cudaMemcpyDeviceToHost);
 
-    // 若调用者需要 w = S/I（用于共振态梯度），在 conjugate 之前复制
     if (d_w_out != nullptr) {
-        cudaMemcpy(d_w_out, d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_w_out, s_d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
     }
 
-    // ----- 第三大步：梯度 grad = -A^H * w -----
+    // ----- 第三步：梯度 grad = -A^H * w -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
-        conjugateKernel << <gradConj, kBlockSize >> > (d_S, nTotal);
-
-        cuComplex alpha = make_cuComplex(-1.0f, 0.0f);
-        cuComplex beta = make_cuComplex(0.0f, 0.0f);
-        cublasCgemv(handle, CUBLAS_OP_N,
-            n_amplitudes, nTotal,
-            &alpha, d_amp, n_amplitudes,
-            d_S, 1,
-            &beta, d_grad_out, 1);
-
+        conjugateKernel<<<gradConj, kBlockSize>>>(s_d_S, nTotal);
+        cuComplex alphag = make_cuComplex(-1.0f, 0.0f);
+        cuComplex betag  = make_cuComplex(0.0f, 0.0f);
+        cublasCgemv(s_handle, CUBLAS_OP_N, n_amplitudes, nTotal,
+                    &alphag, d_amp, n_amplitudes, s_d_S, 1, &betag, d_grad_out, 1);
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        conjugateKernel << <gradZero, kBlockSize >> > (d_grad_out, n_amplitudes);
+        conjugateKernel<<<gradZero, kBlockSize>>>(d_grad_out, n_amplitudes);
     }
-
-    // d_w_out already copied before conjugateKernel (above)
-
-    // ----- 清理资源 -----
-    cudaFree(d_S);
-    cudaFree(d_nll);
-    cublasDestroy(handle);
 
     return raw_nll;
 }
