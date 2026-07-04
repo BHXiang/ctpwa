@@ -195,7 +195,46 @@ static void launch_fused_fwd(int nP, int nA, int nE,
 }
 
 // -----------------------------------------------------------------------------
-// 主函数: 计算 NLL + 梯度 (前向用融合 kernel, 梯度用 cublas)
+// Auto-tune: 在初始化时测一次最优分块数 (chunk size 10-20MB 最稳定)
+// -----------------------------------------------------------------------------
+static int tuneChunkCount(cublasHandle_t h, int nA, int nT,
+                           const cuComplex* dA, const cuComplex* dv, cuComplex* dS) {
+    static int s_best_nch = 0;
+    if (s_best_nch != 0) return s_best_nch;
+
+    cuComplex a1 = make_cuComplex(1,0), b0 = make_cuComplex(0,0);
+    float best = 1e9f; int best_nch = 1;
+    for (int nch : {1, 2, 4, 8, 16, 32, 64}) {
+        int cp = nT / nch;
+        if (cp < 1000) break;
+        long long colOff = (long long)cp * nA;  // elements per chunk
+        // Warmup
+        for (int w = 0; w < 3; ++w) {
+            for (int k = 0; k < nch; ++k)
+                cublasCgemv(h, CUBLAS_OP_T, nA, cp, &a1, dA + k * colOff, nA,
+                            dv, 1, &b0, dS + k * cp, 1);
+            cudaDeviceSynchronize();
+        }
+        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
+        cudaEventRecord(s);
+        for (int i = 0; i < 10; ++i) {
+            for (int k = 0; k < nch; ++k)
+                cublasCgemv(h, CUBLAS_OP_T, nA, cp, &a1, dA + k * colOff, nA,
+                            dv, 1, &b0, dS + k * cp, 1);
+            cudaDeviceSynchronize();
+        }
+        cudaEventRecord(e); cudaEventSynchronize(e);
+        float ms; cudaEventElapsedTime(&ms, s, e);
+        cudaEventDestroy(s); cudaEventDestroy(e);
+        float t = ms / 10.0f;
+        if (t < best) { best = t; best_nch = nch; }
+    }
+    s_best_nch = best_nch;
+    return best_nch;
+}
+
+// -----------------------------------------------------------------------------
+// 主函数: 计算 NLL + 梯度 (cublas 分块 + float logf/div)
 // -----------------------------------------------------------------------------
 double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_grad_out,
@@ -204,32 +243,42 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
     cuComplex* d_w_out)
 {
     const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;  // column stride for A
 
     // ----- 静态缓冲区和 cublas handle (只分配一次) -----
     static cuComplex* s_d_S = nullptr;
-    static cuComplex* s_d_w = nullptr;
-    static double* s_d_nll = nullptr;
     static cublasHandle_t s_handle = nullptr;
-    static int s_alloc_n = 0;
+    static double* s_d_nll = nullptr;
+    static int s_alloc_n = 0, s_nchunks = 0;
     if (s_alloc_n < nTotal || s_handle == nullptr) {
         if (s_d_S) cudaFree(s_d_S);
-        if (s_d_w) cudaFree(s_d_w);
         if (s_d_nll) cudaFree(s_d_nll);
         if (s_handle) cublasDestroy(s_handle);
         cudaMalloc(&s_d_S, nTotal * sizeof(cuComplex));
-        cudaMalloc(&s_d_w, nTotal * sizeof(cuComplex));
         cudaMalloc(&s_d_nll, sizeof(double));
         cublasCreate(&s_handle);
         s_alloc_n = nTotal;
+        s_nchunks = 0;  // trigger re-tune
     }
 
-    // ----- 第一步：S = A * v (cublas) -----
-    cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-    cuComplex beta  = make_cuComplex(0.0f, 0.0f);
-    cublasCgemv(s_handle, CUBLAS_OP_T, n_amplitudes, nTotal,
-                &alpha, d_amp, n_amplitudes, d_vector, 1, &beta, s_d_S, 1);
+    // ----- Auto-tune chunk count (first call only) -----
+    if (s_nchunks == 0) {
+        s_nchunks = tuneChunkCount(s_handle, n_amplitudes, nTotal,
+                                    d_amp, d_vector, s_d_S);
+    }
 
-    // ----- 第二步：因子 + w + NLL (float logf/div) -----
+    // ----- 第一步：S = A^T·v (cublas 分块) -----
+    const int nch = s_nchunks;
+    const int cp = nTotal / nch;
+    const long long colStride = (long long)cp * n_amplitudes;  // elements to skip per chunk
+    cuComplex a1 = make_cuComplex(1, 0), b0 = make_cuComplex(0, 0);
+    for (int k = 0; k < nch; ++k) {
+        cublasCgemv(s_handle, CUBLAS_OP_T, n_amplitudes, cp, &a1,
+                    d_amp + k * colStride, strideA, d_vector, 1, &b0,
+                    s_d_S + k * cp, 1);
+    }
+
+    // ----- 第二步: factor + w + NLL (float logf/div, 一次性处理全部 S) -----
     cudaMemset(s_d_nll, 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
     computeFactorsAndWeightsKernel<<<gridBlocks, kBlockSize>>>(
@@ -242,14 +291,21 @@ double computeFactorNLL(const cuComplex* d_amp, const cuComplex* d_vector,
         cudaMemcpy(d_w_out, s_d_S, nTotal * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
     }
 
-    // ----- 第三步：梯度 grad = -A^H * w -----
+    // ----- 第三步: 梯度 grad = -A·conj(w) (cublas 分块, 第一块覆盖, 后续累加) -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
         conjugateKernel<<<gradConj, kBlockSize>>>(s_d_S, nTotal);
-        cuComplex alphag = make_cuComplex(-1.0f, 0.0f);
-        cuComplex betag  = make_cuComplex(0.0f, 0.0f);
-        cublasCgemv(s_handle, CUBLAS_OP_N, n_amplitudes, nTotal,
-                    &alphag, d_amp, n_amplitudes, s_d_S, 1, &betag, d_grad_out, 1);
+
+        cuComplex alpha = make_cuComplex(-1.0f, 0.0f);
+        cuComplex beta0 = make_cuComplex(0.0f, 0.0f);
+        cuComplex beta1 = make_cuComplex(1.0f, 0.0f);
+        for (int k = 0; k < nch; ++k) {
+            cuComplex beta = (k == 0) ? beta0 : beta1;
+            cublasCgemv(s_handle, CUBLAS_OP_N, n_amplitudes, cp, &alpha,
+                        d_amp + k * colStride, strideA,
+                        s_d_S + k * cp, 1, &beta, d_grad_out, 1);
+        }
+
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
         conjugateKernel<<<gradZero, kBlockSize>>>(d_grad_out, n_amplitudes);
     }

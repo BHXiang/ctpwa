@@ -281,6 +281,12 @@ std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinf
 {
     // 读取所有权重到主机内存
     std::vector<double> weights;
+
+    if (fileinfo.empty()) {
+        std::cerr << "Error: fileinfo is empty" << std::endl;
+        return {};
+    }
+
     std::string fileType = fileinfo[0];
     std::string filename = fileinfo.size() > 1 ? fileinfo[1] : "";
 
@@ -471,6 +477,27 @@ std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinf
 
         d_weights_ptrs[i] = d_weights_i;
         offset += n_weights;
+    }
+
+    // trace: verify weights on device
+    {
+        const char* mode = (fileinfo.size() == 1) ? "const" : fileType.c_str();
+        printf("[TRACE] readWeightsFromFile mode=%s total_events=%d n_gpus=%zu\n",
+               mode, total_weights, d_weights_ptrs.size());
+        for (size_t i = 0; i < d_weights_ptrs.size(); ++i) {
+            if (d_weights_ptrs[i] != nullptr && events_per_gpu[i] > 0) {
+                cudaSetDevice(i);
+                int n = events_per_gpu[i];
+                int k = std::min(n, 8);
+                std::vector<double> h(k);
+                cudaMemcpy(h.data(), d_weights_ptrs[i], k * sizeof(double), cudaMemcpyDeviceToHost);
+                double sum = 0;
+                printf("[TRACE]   readW GPU%zu (n=%d): ", i, n);
+                for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
+                if (n > k) printf("...");
+                printf("|sum|=%.4f\n", sum);
+            }
+        }
     }
 
     return d_weights_ptrs;
@@ -1900,6 +1927,24 @@ public:
         // if (N_bkg > 0 && !bkg_weights_.empty() && bkg_weights_[0] != nullptr)
         if (N_bkg > 0)
         {
+            // trace: verify bkg weights before filling histograms
+            printf("[TRACE] writeResult hbkg: N_bkg=%d, bkg_weights_.size()=%zu, bkg_integral=%.6f\n",
+                   N_bkg, bkg_weights_.size(), h_bkg_integral);
+            for (size_t i = 0; i < bkg_weights_.size(); ++i) {
+                if (events_[i][2] > 0 && bkg_weights_[i] != nullptr) {
+                    cudaSetDevice(i);
+                    int n = events_[i][2];
+                    int k = std::min(n, 8);
+                    std::vector<double> h(k);
+                    cudaMemcpy(h.data(), bkg_weights_[i], k * sizeof(double), cudaMemcpyDeviceToHost);
+                    double sum = 0;
+                    printf("[TRACE]   hbkg_w GPU%zu (n=%d): ", i, n);
+                    for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
+                    if (n > k) printf("...");
+                    printf("|sum|=%.4f\n", sum);
+                }
+            }
+
             std::vector<TH1F*> masshist_bkg;
             for (const auto& histConfig : masshist)
             {
