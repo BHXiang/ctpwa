@@ -480,25 +480,25 @@ std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinf
     }
 
     // trace: verify weights on device
-    {
-        const char* mode = (fileinfo.size() == 1) ? "const" : fileType.c_str();
-        printf("[TRACE] readWeightsFromFile mode=%s total_events=%d n_gpus=%zu\n",
-               mode, total_weights, d_weights_ptrs.size());
-        for (size_t i = 0; i < d_weights_ptrs.size(); ++i) {
-            if (d_weights_ptrs[i] != nullptr && events_per_gpu[i] > 0) {
-                cudaSetDevice(i);
-                int n = events_per_gpu[i];
-                int k = std::min(n, 8);
-                std::vector<double> h(k);
-                cudaMemcpy(h.data(), d_weights_ptrs[i], k * sizeof(double), cudaMemcpyDeviceToHost);
-                double sum = 0;
-                printf("[TRACE]   readW GPU%zu (n=%d): ", i, n);
-                for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
-                if (n > k) printf("...");
-                printf("|sum|=%.4f\n", sum);
-            }
-        }
-    }
+    // {
+    //     const char* mode = (fileinfo.size() == 1) ? "const" : fileType.c_str();
+    //     printf("[TRACE] readWeightsFromFile mode=%s total_events=%d n_gpus=%zu\n",
+    //            mode, total_weights, d_weights_ptrs.size());
+    //     for (size_t i = 0; i < d_weights_ptrs.size(); ++i) {
+    //         if (d_weights_ptrs[i] != nullptr && events_per_gpu[i] > 0) {
+    //             cudaSetDevice(i);
+    //             int n = events_per_gpu[i];
+    //             int k = std::min(n, 8);
+    //             std::vector<double> h(k);
+    //             cudaMemcpy(h.data(), d_weights_ptrs[i], k * sizeof(double), cudaMemcpyDeviceToHost);
+    //             double sum = 0;
+    //             printf("[TRACE]   readW GPU%zu (n=%d): ", i, n);
+    //             for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
+    //             if (n > k) printf("...");
+    //             printf("|sum|=%.4f\n", sum);
+    //         }
+    //     }
+    // }
 
     return d_weights_ptrs;
 }
@@ -1927,23 +1927,23 @@ public:
         // if (N_bkg > 0 && !bkg_weights_.empty() && bkg_weights_[0] != nullptr)
         if (N_bkg > 0)
         {
-            // trace: verify bkg weights before filling histograms
-            printf("[TRACE] writeResult hbkg: N_bkg=%d, bkg_weights_.size()=%zu, bkg_integral=%.6f\n",
-                   N_bkg, bkg_weights_.size(), h_bkg_integral);
-            for (size_t i = 0; i < bkg_weights_.size(); ++i) {
-                if (events_[i][2] > 0 && bkg_weights_[i] != nullptr) {
-                    cudaSetDevice(i);
-                    int n = events_[i][2];
-                    int k = std::min(n, 8);
-                    std::vector<double> h(k);
-                    cudaMemcpy(h.data(), bkg_weights_[i], k * sizeof(double), cudaMemcpyDeviceToHost);
-                    double sum = 0;
-                    printf("[TRACE]   hbkg_w GPU%zu (n=%d): ", i, n);
-                    for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
-                    if (n > k) printf("...");
-                    printf("|sum|=%.4f\n", sum);
-                }
-            }
+            // // trace: verify bkg weights before filling histograms
+            // printf("[TRACE] writeResult hbkg: N_bkg=%d, bkg_weights_.size()=%zu, bkg_integral=%.6f\n",
+            //        N_bkg, bkg_weights_.size(), h_bkg_integral);
+            // for (size_t i = 0; i < bkg_weights_.size(); ++i) {
+            //     if (events_[i][2] > 0 && bkg_weights_[i] != nullptr) {
+            //         cudaSetDevice(i);
+            //         int n = events_[i][2];
+            //         int k = std::min(n, 8);
+            //         std::vector<double> h(k);
+            //         cudaMemcpy(h.data(), bkg_weights_[i], k * sizeof(double), cudaMemcpyDeviceToHost);
+            //         double sum = 0;
+            //         printf("[TRACE]   hbkg_w GPU%zu (n=%d): ", i, n);
+            //         for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
+            //         if (n > k) printf("...");
+            //         printf("|sum|=%.4f\n", sum);
+            //     }
+            // }
 
             std::vector<TH1F*> masshist_bkg;
             for (const auto& histConfig : masshist)
@@ -3906,18 +3906,105 @@ private:
                                con_trans_id, con_trans_values);
         }
 
-        // vspace mode: replace coupling with identity (direct amplitude mapping)
+        // vspace mode: direct amplitude mapping, preserving trans folding
         if (fit_mode_ == 1) {
+            const auto& cm = info.couplingMatrix();
+
             CouplingMatrixResult id;
             id.n_amps = n_amplitudes_;
             id.n_step_free = 0;
-            id.n_chain_free = n_amplitudes_;
-            id.n_free = n_amplitudes_;
-            id.amp_chain.resize(n_amplitudes_);
-            for (int i = 0; i < n_amplitudes_; ++i) id.amp_chain[i] = i;
             id.amp_step_params.resize(n_amplitudes_);
-            id.amp_chain_ratio.assign(n_amplitudes_, 1.0);
+            id.amp_chain.resize(n_amplitudes_);
+            // 保留 buildWithTrans 计算的 trans ratio（非折叠=1.0，折叠=-1.0 等）
+            id.amp_chain_ratio = cm.amp_chain_ratio;
+
+            // 判断是否需要"拆分"：检查是否有 active chain 包含多个 owner 振幅
+            // 这发生在同一共振态有多个 SL 组合时
+            std::map<int, std::vector<int>> chain_owners;
+            for (int ai = 0; ai < n_amplitudes_; ++ai) {
+                if (std::abs(cm.amp_chain_ratio[ai] - 1.0) < 1e-10) {
+                    chain_owners[cm.amp_chain[ai]].push_back(ai);
+                }
+            }
+
+            bool needs_split = false;
+            for (const auto& [ci, owners] : chain_owners) {
+                if (owners.size() > 1) { needs_split = true; break; }
+            }
+
+            if (!needs_split) {
+                // 简单情况：每个 active chain 恰好 1 个 owner 振幅
+                // buildWithTrans 的结果可直接用于 vspace
+                id.amp_chain = cm.amp_chain;
+                id.chain_names = cm.chain_names;
+                id.n_chain_free = cm.n_chain_free;
+                id.n_free = id.n_chain_free;
+            } else {
+                // 复杂情况：同一共振态有多个 SL 组合，需要拆分 chain param
+                // 使用 amp_map 恢复原始 chain 归属和链内排序
+                std::map<std::string, std::vector<int>> orig_chain_amps;
+                for (const auto& am : cm.amp_map) {
+                    orig_chain_amps[am.chain_key].push_back(am.amp_idx);
+                }
+                for (auto& [ck, amps] : orig_chain_amps) {
+                    std::sort(amps.begin(), amps.end());
+                }
+
+                // 识别哪些原始 chain 被折叠（其振幅的 ratio ≠ 1.0）
+                std::set<std::string> folded_orig_chains;
+                for (const auto& [ck, amps] : orig_chain_amps) {
+                    if (!amps.empty() && std::abs(cm.amp_chain_ratio[amps[0]] - 1.0) > 1e-10) {
+                        folded_orig_chains.insert(ck);
+                    }
+                }
+
+                int next_free = 0;
+                // active_chain → 该 chain 内各位置对应的 free param index
+                std::map<int, std::vector<int>> ac_free_indices;
+
+                // 第一遍：非折叠 chain 的振幅，每个分配独立 free param
+                for (const auto& [ck, amps] : orig_chain_amps) {
+                    if (folded_orig_chains.count(ck)) continue;
+                    int ac = cm.amp_chain[amps[0]];
+                    for (int ai : amps) {
+                        id.amp_chain[ai] = next_free;
+                        ac_free_indices[ac].push_back(next_free);
+                        next_free++;
+                    }
+                }
+
+                // 第二遍：折叠 chain 的振幅，按位置映射到 owner chain 对应 free param
+                for (const auto& [ck, amps] : orig_chain_amps) {
+                    if (!folded_orig_chains.count(ck)) continue;
+                    int ac = cm.amp_chain[amps[0]];
+                    const auto& free_indices = ac_free_indices[ac];
+                    for (size_t pos = 0; pos < amps.size() && pos < free_indices.size(); ++pos) {
+                        id.amp_chain[amps[pos]] = free_indices[pos];
+                    }
+                }
+
+                id.n_chain_free = next_free;
+                id.n_free = next_free;
+            }
+
             params_.setCouplingMatrix(id);
+
+            // // trace: verify trans folding in vspace mode
+            // printf("[TRACE] vspace coupling matrix: %d amplitudes → %d free "
+            //        "(%d chain + %d step), needs_split=%d\n",
+            //        id.n_amps, id.n_free, id.n_chain_free, id.n_step_free,
+            //        needs_split ? 1 : 0);
+            // int n_folded = 0;
+            // for (int ai = 0; ai < n_amplitudes_; ++ai) {
+            //     if (std::abs(id.amp_chain_ratio[ai] - 1.0) > 1e-10) {
+            //         n_folded++;
+            //         if (n_folded <= 5)
+            //             printf("[TRACE]   folded amp[%d] ratio=%.1f → chain %d\n",
+            //                    ai, id.amp_chain_ratio[ai], id.amp_chain[ai]);
+            //     }
+            // }
+            // printf("[TRACE]   %d folded amplitudes (trans constraint active)\n", n_folded);
+
             auto vspace_names = amplitude_names_;
             const auto& rnames = info.resonanceParamNames();
             vspace_names.insert(vspace_names.end(), rnames.begin(), rnames.end());
