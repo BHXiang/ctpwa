@@ -1298,10 +1298,25 @@ public:
     int getNFreeTheta() const { return params_.nFreeTheta(); }
     std::vector<std::string> getParamNames() const {
         if (fit_mode_ == 1) {
-            // vspace: 返回全部振幅名 + 共振态参数名
-            std::vector<std::string> names = amplitude_names_;
+            // vspace: 只返回非折叠振幅名 + 共振态参数名
+            std::vector<std::string> names;
+            if (params_.hasCouplingMatrix()) {
+                const auto& cm = params_.couplingMatrix();
+                std::map<int, std::string> free_idx_to_name;
+                for (int ai = 0; ai < n_amplitudes_; ++ai) {
+                    if (std::abs(cm.amp_chain_ratio[ai] - 1.0) < 1e-10) {
+                        free_idx_to_name[cm.amp_chain[ai]] = amplitude_names_[ai];
+                    }
+                }
+                for (const auto& [idx, name] : free_idx_to_name)
+                    names.push_back(name);
+            } else {
+                names = amplitude_names_;
+            }
             auto theta_names = params_.paramNames();
-            int n_coupling = params_.hasCouplingMatrix() ? params_.couplingMatrix().n_free : (int)amplitude_names_.size();
+            int n_coupling = params_.hasCouplingMatrix()
+                ? params_.couplingMatrix().n_free
+                : (int)amplitude_names_.size();
             for (int i = n_coupling; i < (int)theta_names.size(); ++i)
                 names.push_back(theta_names[i]);
             return names;
@@ -4005,7 +4020,17 @@ private:
             // }
             // printf("[TRACE]   %d folded amplitudes (trans constraint active)\n", n_folded);
 
-            auto vspace_names = amplitude_names_;
+            // 只保留非折叠振幅的名字，按 free param index 排序
+            std::map<int, std::string> free_idx_to_name;
+            for (int ai = 0; ai < n_amplitudes_; ++ai) {
+                if (std::abs(id.amp_chain_ratio[ai] - 1.0) < 1e-10) {
+                    free_idx_to_name[id.amp_chain[ai]] = amplitude_names_[ai];
+                }
+            }
+            std::vector<std::string> vspace_names;
+            for (const auto& [idx, name] : free_idx_to_name) {
+                vspace_names.push_back(name);
+            }
             const auto& rnames = info.resonanceParamNames();
             vspace_names.insert(vspace_names.end(), rnames.begin(), rnames.end());
             params_.setParamNames(vspace_names);
