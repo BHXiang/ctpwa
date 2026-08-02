@@ -207,6 +207,7 @@ public:
         double init_value;  // 初始值
         double lower;       // 下界
         double upper;       // 上界
+        std::string name;   // 可读名: "resonance_param"（trans 折叠后唯一）
     };
 
     AmpCalc() = default;

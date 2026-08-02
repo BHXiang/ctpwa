@@ -1412,7 +1412,11 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                 lower = val - half;
                 upper = val + half;
             }
-            slots_.push_back({block_idx, static_cast<int>(i), p_idx, val, lower, upper});
+            const auto& pnames = resonances[i].getOrderedParamNames();
+            std::string pname = (p_idx < (int)pnames.size()) ? pnames[p_idx]
+                                                            : ("p" + std::to_string(p_idx));
+            slots_.push_back({block_idx, static_cast<int>(i), p_idx, val, lower,
+                              upper, resonances[i].getName() + "_" + pname});
         }
     }
 }

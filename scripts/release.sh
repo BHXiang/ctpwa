@@ -74,9 +74,21 @@ python -c "import torch; assert '${CUDA_TAG}' in torch.__version__, f'torch CUDA
     exit 1
 }
 
+# ========== 测试门禁 ==========
+echo ""
+echo "[2/6] 运行测试门禁 (pytest)..."
+
+cd "$(dirname "$0")/.."
+pip install -e . --no-build-isolation 2>&1 | tail -2
+(cd tests && python3 -m pytest . -v --tb=short) || {
+    echo "ERROR: 测试未通过，终止发布"
+    exit 1
+}
+echo "  测试全部通过"
+
 # ========== 构建 ==========
 echo ""
-echo "[2/5] 构建 wheel..."
+echo "[3/6] 构建 wheel..."
 
 # 清理
 rm -rf build/ dist/*.whl 2>/dev/null || true
@@ -92,7 +104,7 @@ echo "  原始: $(basename $ORIG_WHEEL)"
 
 # ========== auditwheel 修复 ==========
 echo ""
-echo "[3/5] auditwheel 修复..."
+echo "[4/6] auditwheel 修复..."
 
 check_cmd auditwheel
 check_cmd patchelf
@@ -130,7 +142,7 @@ echo "  产物: ${WHEEL_NAME} ($(du -h $WHEEL_PATH | cut -f1))"
 
 # ========== 验证 ==========
 echo ""
-echo "[4/5] 验证 wheel..."
+echo "[5/6] 验证 wheel..."
 
 # 检查内容
 python -c "
@@ -158,13 +170,13 @@ echo "  验证通过"
 # ========== 上传 ==========
 echo ""
 if $DO_UPLOAD; then
-    echo "[5/5] 上传到 PyPI..."
+    echo "[6/6] 上传到 PyPI..."
     check_cmd twine
     twine upload "$WHEEL_PATH"
     echo ""
     echo "上传完成: https://pypi.org/project/ctpwa/${VERSION}/"
 else
-    echo "[5/5] 跳过上传（使用 --upload 参数启用）"
+    echo "[6/6] 跳过上传（使用 --upload 参数启用）"
     echo ""
     echo "产物路径: dist/${WHEEL_NAME}"
     echo ""

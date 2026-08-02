@@ -888,11 +888,13 @@ public:
         static int s_alloc_n = 0;
 
         if (s_alloc_n < extended_n_gls || s_d_grad_per_gpu.size() < (size_t)num_gpus) {
-            if (s_d_grad_global) cudaFree(s_d_grad_global);
-            if (s_d_grad_buf) cudaFree(s_d_grad_buf);
-            for (auto& p : s_d_grad_per_gpu) if (p) cudaFree(p);
-            for (auto& p : s_d_w_bufs) if (p) cudaFree(p);
-            for (auto& p : s_d_w_bkg_bufs) if (p) cudaFree(p);
+            // 释放后必须置空 + sizes 归零，否则 resize 不重置已有元素，
+            // 悬空指针会被复用（cudaMemcpy invalid argument 的根因）
+            if (s_d_grad_global) { cudaFree(s_d_grad_global); s_d_grad_global = nullptr; }
+            if (s_d_grad_buf) { cudaFree(s_d_grad_buf); s_d_grad_buf = nullptr; }
+            for (auto& p : s_d_grad_per_gpu) if (p) { cudaFree(p); p = nullptr; }
+            for (auto& p : s_d_w_bufs) if (p) { cudaFree(p); p = nullptr; }
+            for (auto& p : s_d_w_bkg_bufs) if (p) { cudaFree(p); p = nullptr; }
 
             cudaSetDevice(primary_dev);
             cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(cuComplex));
@@ -900,8 +902,8 @@ public:
             s_d_grad_per_gpu.resize(num_gpus, nullptr);
             s_d_w_bufs.resize(num_gpus, nullptr);
             s_d_w_bkg_bufs.resize(num_gpus, nullptr);
-            s_w_buf_sizes.resize(num_gpus, 0);
-            s_w_bkg_buf_sizes.resize(num_gpus, 0);
+            s_w_buf_sizes.assign(num_gpus, 0);
+            s_w_bkg_buf_sizes.assign(num_gpus, 0);
             for (int g = 0; g < num_gpus; ++g) {
                 cudaSetDevice(g);
                 cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(cuComplex));
@@ -1114,14 +1116,23 @@ public:
         // std::cout << "Data NLL: " << total_data_nll << ", Bkg NLL: " << total_bkg_nll
         //           << ", PHSP factor: " << phsp_factor
         //           << ", Total loss: " << loss << std::endl;
+        bool loss_reset = false;
         if (isnan(loss) || isinf(loss)) {
             // std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf") << ", resetting to 1e30" << std::endl;
             loss = 1e30;
             cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
+            // theta 梯度也要清零，否则 NaN 会传播到最终梯度
+            if (n_free_res > 0)
+                cudaMemset(grad_theta.data_ptr<double>(), 0, n_free_res * sizeof(double));
+            loss_reset = true;
         }
-        cuComplex scale_phsp = make_cuComplex(
-            static_cast<float>(totalDataEvents - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
-        axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
+        // loss 重置时跳过 phsp 梯度累加——phsp_factor 已 clamp 到 1e-30，
+        // scale_phsp ~ 1e33 会把 d_P_vec 中的任何 NaN/Inf 重新注入梯度
+        if (!loss_reset) {
+            cuComplex scale_phsp = make_cuComplex(
+                static_cast<float>(totalDataEvents - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
+            axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
+        }
         cudaFree(d_P_vec);
 
         // 6. 保存梯度和loss到ctx
@@ -1298,7 +1309,7 @@ public:
     int getNFreeTheta() const { return params_.nFreeTheta(); }
     std::vector<std::string> getParamNames() const {
         if (fit_mode_ == 1) {
-            // vspace: 只返回非折叠振幅名 + 共振态参数名
+            // vspace: 非折叠振幅名 + 共振态参数名（从实际 slots 生成）
             std::vector<std::string> names;
             if (params_.hasCouplingMatrix()) {
                 const auto& cm = params_.couplingMatrix();
@@ -1313,12 +1324,10 @@ public:
             } else {
                 names = amplitude_names_;
             }
-            auto theta_names = params_.paramNames();
-            int n_coupling = params_.hasCouplingMatrix()
-                ? params_.couplingMatrix().n_free
-                : (int)amplitude_names_.size();
-            for (int i = n_coupling; i < (int)theta_names.size(); ++i)
-                names.push_back(theta_names[i]);
+            // theta 名从实际槽位生成（真相来源）：
+            // trans 折叠后同名共振态只有一份 slot，避免 resonanceParamNames 的重复
+            for (const auto& s : amp_calc_.slots())
+                names.push_back(s.name);
             return names;
         }
         return params_.paramNames();

@@ -14,3 +14,9 @@
 !.gitignore
 !README.md
 !LICENSE
+!tests/
+!tests/**
+tests/outputs/
+tests/__pycache__/
+tests/data/real_*
+tests/.pytest_cache/
