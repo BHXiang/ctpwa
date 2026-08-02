@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <AmpGen.cuh>
+#include <DeviceManager.cuh>
 // #include <ComputeGrad.cuh>
 #include <ComputeNLL.cuh>
 #include <ComputeResults.cuh>
@@ -3469,6 +3470,9 @@ private:
     std::vector<double*> bkg_weights_;
     double bkg_integral_ = 0.0;
 
+    // 设备管理（GPU 枚举、内存预检；预留 CPU/双精度扩展）
+    DeviceManager device_mgr_;
+
     // 事件数量、振幅偏移等信息
     int n_gpus_ = 0;
     std::vector<std::vector<int>> events_;
@@ -3563,8 +3567,43 @@ private:
             Vp4_to_merge.push_back(Vp4_bkg);
         }
 
-        CUDA_CHECK(cudaGetDeviceCount(&n_gpus_));
+        // 设备检测：枚举 GPU 属性/显存，替换散落的 cudaGetDeviceCount
+        device_mgr_.detect();
+        n_gpus_ = device_mgr_.numDevices();
+        if (n_gpus_ == 0) {
+            std::cerr << "ERROR: 无可用 CUDA 设备。ctpwa 当前仅支持 GPU 计算"
+                         "（CPU 后端尚未实现），无法继续。" << std::endl;
+            throw std::runtime_error("no CUDA devices available");
+        }
+        device_mgr_.print();
+
         initializeMultiGPUs(init_events);
+
+        // 内存预检：输入数据能否被设备集承载（含每 GPU 事件分布）
+        {
+            // 每个 GPU 的峰值事件数 = data/phsp/bkg 的最大者
+            std::vector<int> peak_events(n_gpus_, 0);
+            for (int gpu = 0; gpu < n_gpus_; ++gpu)
+                for (size_t j = 0; j < events_[gpu].size(); ++j)
+                    peak_events[gpu] = std::max(peak_events[gpu], events_[gpu][j]);
+            bool has_bkg = (init_events.size() > 2 && init_events[2] > 0);
+            auto cap = device_mgr_.checkCapacity(
+                peak_events, n_amplitudes_, n_polar_, n_gls_, particles_.size(),
+                has_bkg, params_.nFreeTheta());
+            if (cap.overall == DeviceManager::CapacityStatus::FAIL) {
+                std::cerr << "ERROR: 内存预检失败——GPU " << cap.failing_device
+                          << " 无法承载数据: " << cap.failing_buffer
+                          << " 需要 " << cap.required_bytes / 1e6
+                          << " MiB，可用 " << cap.available_bytes / 1e6
+                          << " MiB。请减少事件数或使用多 GPU。" << std::endl;
+                throw std::runtime_error("input data exceeds device memory");
+            } else if (cap.overall == DeviceManager::CapacityStatus::WARN) {
+                std::cerr << "WARNING: 内存占用超过可用显存的 80%，"
+                             "建议减少事件数或增加 GPU。" << std::endl;
+            } else {
+                std::cout << "Memory check passed." << std::endl;
+            }
+        }
 
         std::cout << "Calculating amplitudes..." << std::endl;
         Vp4_all_ = mergeMaps(Vp4_to_merge, events_);
