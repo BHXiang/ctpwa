@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <thrust/complex.h>
 
 // 共振模型类型枚举

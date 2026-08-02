@@ -1,13 +1,13 @@
 #ifndef COMPUTEBF_CUH
 #define COMPUTEBF_CUH
 
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cuda_runtime.h>
 
 // 计算分支比所需的积分和散射矩阵(单次评估)
 void computeBranchingFractions(
-    const cuComplex* d_matrix,
-    const cuComplex* d_vector,
+    const ctComplex* d_matrix,
+    const ctComplex* d_vector,
     double* d_partial_integral,
     double* d_scattering_matrix,
     double* d_total_integral,

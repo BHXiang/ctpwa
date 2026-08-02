@@ -7,6 +7,7 @@
 //   包装而非直接调用 cudaSetDevice。
 
 #include <DeviceManager.cuh>
+#include <ComplexType.h>
 
 #include <cuda_runtime.h>
 
@@ -140,7 +141,9 @@ int DeviceManager::currentDevice() const
 
 size_t DeviceManager::complexSize() const
 {
-    return (complex_precision_ == ComplexPrecision::Double) ? 16 : 8;
+    // 编译时精度决定（ctComplex = cuComplex 8B / cuDoubleComplex 16B），
+    // ComplexPrecision 枚举保留为运行时查询接口
+    return sizeof(ctComplex);
 }
 
 // ============================================================

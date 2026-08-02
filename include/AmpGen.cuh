@@ -8,7 +8,7 @@
 #include <Resonance.cuh>
 
 #include <array>
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -157,8 +157,8 @@ public:
 
     void computeSLAmps(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta);
     // void getAmps(Resonance &resonance);
-    // cuComplex *getAmps(const std::vector<Resonance> &resonances);
-    void getAmps(std::vector<cuComplex*>& d_amplitudes,
+    // ctComplex *getAmps(const std::vector<Resonance> &resonances);
+    void getAmps(std::vector<ctComplex*>& d_amplitudes,
         const std::vector<Resonance>& resonances,
         const int site,
         const int n_amplitudes,
@@ -194,7 +194,7 @@ public:
         std::vector<DeviceResonance*> d_resonances;   // 每个 GPU 一份，持久化，OWNED
         std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
-        std::vector<cuComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
+        std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
         int resonance_count;
         int site;                                     // gls_index，对应 d_all_amplitudes 的列偏移
     };
@@ -225,7 +225,7 @@ public:
                   const std::map<std::string, std::string>& conjugate_name_map = {});
 
     // 用新参数重算所有振幅
-    void reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
+    void reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                        const double* d_params,             // GPU [nFreeResParams]
                        int n_amplitudes,
                        const std::vector<std::vector<int>>& event_offsets,
@@ -235,19 +235,19 @@ public:
 
     // 预计算有效耦合 T_{r,e,p} = Σ_i v_i * sl_i （对每个 block）
     // 必须在 computeResonanceGradient 之前调用，且在耦合向量 v 改变后重新调用
-    void computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes);
+    void computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes);
 
     // 计算共振态参数梯度 ∂NLL/∂θ
     // d_w: 来自 computeFactorNLL 的 w = S/I [nEvents × nPolar]（每 GPU 一份）
     // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
     // d_v_per_gpu: 每GPU的耦合向量指针，避免跨设备访问
     void computeResonanceGradient(
-        const std::vector<cuComplex*>& d_w,
+        const std::vector<ctComplex*>& d_w,
         const std::vector<int>& n_events,
         double* d_grad_res,
         double sign = 1.0,
         const std::vector<int>& t_offset = {},
-        const std::vector<cuComplex*>& d_v_per_gpu = {});
+        const std::vector<ctComplex*>& d_v_per_gpu = {});
 
     // 计算共振态参数 Hessian 增量贡献 ∂²L/∂θ∂θ
     // L = Σ_e w_e · log I_e (per-event 加权 log-likelihood)
@@ -261,8 +261,8 @@ public:
         double* d_hess, int hess_ld,
         const std::vector<int>& t_offset,
         double default_weight,
-        const std::vector<cuComplex*>& d_v_per_gpu,
-        const std::vector<cuComplex*>& d_amp_per_gpu,
+        const std::vector<ctComplex*>& d_v_per_gpu,
+        const std::vector<ctComplex*>& d_amp_per_gpu,
         int n_amp_total,
         const std::vector<double*>& d_event_weights = {},
         double* d_phsp_I = nullptr,
@@ -311,7 +311,7 @@ __global__ void addSLAmpsKernel(
     int total_size, double sign);
 
 __global__ void
-computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
+computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamps, // SL振幅
@@ -328,8 +328,8 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
 // 共振态参数梯度 kernel：对单个共振态的 Nfree 个自由参数计算 ∂NLL/∂θ
 template <int Nfree>
 __global__ void resonanceGradientKernel(
-    const cuComplex* d_w,              // [nEvents × nPolar] w = S/I
-    const cuComplex* d_T,              // [nEvents × nPolar] 有效耦合
+    const ctComplex* d_w,              // [nEvents × nPolar] w = S/I
+    const ctComplex* d_T,              // [nEvents × nPolar] 有效耦合
     const DeviceMomenta* d_momenta,    // 四动量
     const DecayNode* d_decayNodes,     // 衰变链
     const SL* d_slComb,                // SL 组合
@@ -345,7 +345,7 @@ __global__ void resonanceGradientKernel(
     double sign = 1.0,
     int t_evt_offset = 0,
     const thrust::complex<double>* d_slamps = nullptr,
-    const cuComplex* d_v = nullptr,
+    const ctComplex* d_v = nullptr,
     int site = 0);
 
 #endif // AMPGEN_CUH

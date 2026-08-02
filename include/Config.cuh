@@ -94,6 +94,8 @@ public:
   }
   int getGlobalMaxL() const { return global_maxL_; }
   double getBfD() const { return global_bf_d_; }
+  // 用户请求的精度: "auto" | "float" | "double"（与 .so 编译精度比对用）
+  const std::string &getPrecision() const { return precision_; }
   const std::vector<PlotConfig> &getPlotConfigs() const {
     return plot_configs_;
   }
@@ -121,6 +123,7 @@ private:
   std::vector<PlotConfig> plot_configs_;
   int global_maxL_ = -1; // -1 = no limit; set via Constraints.maxL
   double global_bf_d_ = 3.0; // barrier factor d; set via Constraints.bf_d
+  std::string precision_ = "auto"; // 用户请求精度: "auto" | "float" | "double"（auto=跟随 .so 编译精度）
 };
 
 #endif // CONFIG_CUH

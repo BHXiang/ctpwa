@@ -156,6 +156,8 @@ extension = CUDAExtension(
             # "-fPIC",
             "-std=c++17",
             "--extended-lambda",
+            # 双精度 complex 编译开关: CTPWA_DOUBLE_COMPLEX=1 pip install -e .
+            *(["-DCTPWA_DOUBLE_COMPLEX"] if os.environ.get("CTPWA_DOUBLE_COMPLEX", "0") == "1" else []),
             #"--generate-line-info",
             #"-D_FORCE_INLINES",
             #"--extended-lambda",

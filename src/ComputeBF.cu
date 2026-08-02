@@ -1,4 +1,4 @@
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -9,7 +9,7 @@
 // 关键: 不除以total_result（与computeModWithInterference不同），产出原始散射矩阵
 template <int N_PARTIALS>
 __global__ void computeBFKernel(
-    const cuComplex* __restrict__ result_matrix,  // [nEvents × npolar × ngls]
+    const ctComplex* __restrict__ result_matrix,  // [nEvents × npolar × ngls]
     double* __restrict__ d_partial_integral,       // [npartials]
     double* __restrict__ d_scattering_matrix,      // [npartials × npartials]
     double* __restrict__ d_total_integral,         // [1]
@@ -31,7 +31,7 @@ __global__ void computeBFKernel(
         int sltotal = 0;
         for (int p = 0; p < npartials; p++) {
             for (int s = 0; s < d_nSLvectors[p]; s++) {
-                cuComplex val = result_matrix[
+                ctComplex val = result_matrix[
                     event_idx * npolar * ngls +
                     polar_idx * ngls + (sltotal + s)];
                 partial_real[p] += val.x;
@@ -73,8 +73,8 @@ __global__ void computeBFKernel(
 }
 
 void computeBranchingFractions(
-    const cuComplex* d_matrix,
-    const cuComplex* d_vector,
+    const ctComplex* d_matrix,
+    const ctComplex* d_vector,
     double* d_partial_integral,
     double* d_scattering_matrix,
     double* d_total_integral,
@@ -84,22 +84,22 @@ void computeBranchingFractions(
     cublasHandle_t handle;
     cublasCreate(&handle);
 
-    const cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-    const cuComplex beta  = make_cuComplex(0.0f, 0.0f);
+    const ctComplex alpha = ctMake(1.0f, 0.0f);
+    const ctComplex beta  = ctMake(0.0f, 0.0f);
 
     // 1. cuBLAS gemv: 计算 S = A * v
-    cuComplex* d_complex_result = nullptr;
-    cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(cuComplex));
-    cublasCgemv(handle, CUBLAS_OP_T,
+    ctComplex* d_complex_result = nullptr;
+    cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(ctComplex));
+    CUBLAS_CGEMV(handle, CUBLAS_OP_T,
         ngls, nEvents * npolar,
         &alpha, d_matrix, ngls,
         d_vector, 1,
         &beta, d_complex_result, 1);
 
     // 2. cuBLAS dgmm: A * diag(v) → result_matrix
-    cuComplex* d_result_matrix = nullptr;
-    cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(cuComplex));
-    cublasCdgmm(handle, CUBLAS_SIDE_LEFT,
+    ctComplex* d_result_matrix = nullptr;
+    cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(ctComplex));
+    CUBLAS_CDGMM(handle, CUBLAS_SIDE_LEFT,
         ngls, nEvents * npolar,
         d_matrix, ngls,
         d_vector, 1,

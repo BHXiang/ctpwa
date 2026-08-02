@@ -93,7 +93,7 @@ torch::Tensor Parameters::extendVector(
         return free_vector.to(device);
     }
 
-    auto options = torch::TensorOptions().dtype(torch::kComplexFloat).device(device);
+    auto options = torch::TensorOptions().dtype(TORCH_COMPLEX).device(device);
     torch::Tensor ext = torch::zeros({ext_size}, options);
 
     torch::Tensor indices = torch::arange(0, original_size, torch::kLong).to(device);
@@ -124,7 +124,7 @@ torch::Tensor Parameters::collapseVectorGrad(
     int original_size) const
 {
     torch::Device device = extended_grad.device();
-    auto options = torch::TensorOptions().dtype(torch::kComplexFloat).device(device);
+    auto options = torch::TensorOptions().dtype(TORCH_COMPLEX).device(device);
     torch::Tensor grad = torch::zeros({original_size}, options);
 
     if (original_size > 0) {
@@ -148,17 +148,22 @@ torch::Tensor Parameters::collapseVectorGrad(
         if (ext_idx_vec.empty()) continue;
 
         torch::Tensor ext_idx_t = torch::tensor(ext_idx_vec, torch::kLong).to(device);
-        torch::Tensor rr_t = torch::tensor(rr_vec, torch::kFloat).to(device);
-        torch::Tensor ir_t = torch::tensor(ir_vec, torch::kFloat).to(device);
+        torch::Tensor rr_t = torch::tensor(rr_vec, TORCH_FLOAT).to(device);
+        torch::Tensor ir_t = torch::tensor(ir_vec, TORCH_FLOAT).to(device);
 
         torch::Tensor ext_grads = extended_grad.index_select(0, ext_idx_t);
 
+        // 全部用同 dtype 张量运算（torch 的 complex 标量运算符在 complex128 下缺失）
+        torch::Tensor one_i = torch::complex(
+            torch::tensor(0.0, torch::TensorOptions().dtype(TORCH_FLOAT)),
+            torch::tensor(1.0, torch::TensorOptions().dtype(TORCH_FLOAT)));
         torch::Tensor ext_re = (ext_grads + torch::conj(ext_grads)) / 2.0f;
-        torch::Tensor ext_im =
-            (ext_grads - torch::conj(ext_grads)) / (2.0f * c10::complex<float>(0, 1));
+        torch::Tensor ext_im = (ext_grads - torch::conj(ext_grads)) / (2.0f * one_i);
 
+        torch::Tensor rr_c = rr_t.to(TORCH_COMPLEX);
+        torch::Tensor ir_c = ir_t.to(TORCH_COMPLEX);
         torch::Tensor contrib =
-            (rr_t * ext_re + c10::complex<float>(0, 1) * ir_t * ext_im).sum();
+            (rr_c * ext_re + ir_c * ext_im * one_i).sum();
 
         grad[g.origin_id] = grad[g.origin_id] + contrib;
     }
@@ -181,7 +186,7 @@ std::pair<torch::Tensor, torch::Tensor> Parameters::splitParams(
     torch::Tensor real_part = params.slice(0, 0, nv);
     torch::Tensor imag_part = params.slice(0, nv, 2 * nv);
     torch::Tensor vector = torch::complex(
-        real_part.to(torch::kFloat), imag_part.to(torch::kFloat));
+        real_part.to(TORCH_FLOAT), imag_part.to(TORCH_FLOAT));
 
     torch::Tensor theta;
     if (nt > 0) {
@@ -307,7 +312,7 @@ void Parameters::extendCouplingParams(
     cudaDeviceSynchronize();
 }
 
-void Parameters::applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const
+void Parameters::applyCouplingMatrix(const double* d_params, ctComplex* d_v_out) const
 {
     if (!has_coupling_matrix_) return;
     const auto& cm = coupling_matrix_;
@@ -320,7 +325,7 @@ void Parameters::applyCouplingMatrix(const double* d_params, cuComplex* d_v_out)
 }
 
 void Parameters::transformCouplingGradient(
-    const cuComplex* d_grad_v, const cuComplex* d_v,
+    const ctComplex* d_grad_v, const ctComplex* d_v,
     const double* d_params, double* d_grad_p) const
 {
     if (!has_coupling_matrix_) return;
