@@ -124,6 +124,81 @@ def test_trans_folding_exact_count(make_analysis):
 
 
 # ============================================================
+# DeviceManager（L0 结构测试）
+# ============================================================
+
+def test_detect_has_devices():
+    """至少检测到 1 个可用 GPU。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    assert dm.numDevices() >= 1, "应有至少 1 个 CUDA GPU"
+    assert dm.hasDevices()
+
+
+def test_device_info_fields():
+    """设备属性（名称/算力/显存）应有效。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    for i in range(dm.numDevices()):
+        assert len(dm.deviceName(i)) > 0, f"GPU {i} 名称为空"
+        cc_major, cc_minor = dm.deviceComputeCapability(i)
+        assert cc_major >= 1, f"GPU {i} 算力异常"
+        assert dm.deviceMemoryTotal(i) > 0, f"GPU {i} 总显存为 0"
+        assert dm.deviceMemoryFree(i) > 0, f"GPU {i} 空闲显存为 0"
+
+
+def test_estimate_positive():
+    """内存估算应为正数，且事件数越多需求越大。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    gpu, other = dm.estimateMemory(1000, 4, 3, 1, 3, True)
+    assert gpu > 0 and other > 0, "内存估算应为正"
+    gpu2, _ = dm.estimateMemory(10000, 4, 3, 1, 3, True)
+    assert gpu2 > gpu, "事件数越多内存需求越大"
+
+
+def test_complex_precision():
+    """complex 精度模式：Float=8B，Double=16B（预留）。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    assert dm.complexPrecision() == 0, "默认应为 Float 精度"
+    assert dm.complexSize() == 8, "Float 精度 complex 应为 8B"
+    dm.setComplexPrecision(1)  # Double（预留）
+    assert dm.complexSize() == 16, "Double 精度 complex 应为 16B"
+    dm.setComplexPrecision(0)  # 恢复 Float
+
+
+def test_capacity_small_fits():
+    """小数据应通过容量预检。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    # (overall, device, buffer, required, available)
+    status, dev, buf, need, avail = dm.checkCapacity([1000], 4, 3, 1, 3, True)
+    assert status == 0, f"小数据应 OK, got status={status} buf={buf}"
+
+
+def test_capacity_large_fails():
+    """超大数据应 FAIL（任一 GPU 无法承载）。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    # 10 亿事件 × 28 振幅，远超任何消费级显存
+    status, dev, buf, need, avail = dm.checkCapacity([1000000000], 28, 3, 2, 3, True)
+    assert status == 2, f"超大数据应 FAIL, got status={status}"
+    assert buf, "FAIL 时应给出超限 buffer 名"
+
+
+# ============================================================
 # 共振态自由参数
 # ============================================================
 

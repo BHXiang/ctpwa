@@ -4,6 +4,8 @@
 
 #include "Amplitude.cu"
 
+#include "DeviceManager.cu"
+
 #include "ComputeHessian.cu"
 
 #include "AmpGen.cu"
@@ -34,6 +36,42 @@ PYBIND11_MODULE(ctpwa, m)
         .def("resonanceParamNames", &DecayInfo::resonanceParamNames)
         .def("hasCouplingMatrix", &DecayInfo::hasCouplingMatrix)
         .def("print", &DecayInfo::print);
+
+    pybind11::class_<DeviceManager>(m, "DeviceManager")
+        .def(pybind11::init<>())
+        .def("detect", &DeviceManager::detect)
+        .def("numDevices", &DeviceManager::numDevices)
+        .def("hasDevices", &DeviceManager::hasDevices)
+        .def("print", &DeviceManager::print)
+        .def("deviceName", [](const DeviceManager& dm, int i) {
+            return dm.device(i).name; })
+        .def("deviceMemoryTotal", [](const DeviceManager& dm, int i) {
+            return dm.device(i).total_memory; })
+        .def("deviceMemoryFree", [](const DeviceManager& dm, int i) {
+            return dm.device(i).free_memory; })
+        .def("deviceComputeCapability", [](const DeviceManager& dm, int i) {
+            const auto& d = dm.device(i);
+            return std::make_pair(d.cc_major, d.cc_minor); })
+        .def("estimateMemory", [](const DeviceManager& dm, int n_events,
+                                   int n_amps, int n_pol, int n_sl, int n_part,
+                                   bool has_bkg) {
+            auto m = dm.estimate(n_events, n_amps, n_pol, n_sl, n_part, has_bkg);
+            return std::make_pair(m.total_bytes_gpu, m.total_bytes_other); })
+        .def("checkCapacity", [](const DeviceManager& dm,
+                                  std::vector<int> events_per_gpu,
+                                  int n_amps, int n_pol, int n_sl, int n_part,
+                                  bool has_bkg) {
+            auto r = dm.checkCapacity(events_per_gpu, n_amps, n_pol, n_sl,
+                                      n_part, has_bkg);
+            return std::make_tuple((int)r.overall, r.failing_device,
+                                   r.failing_buffer, r.required_bytes,
+                                   r.available_bytes); })
+        .def("complexSize", &DeviceManager::complexSize)
+        .def("setComplexPrecision", [](DeviceManager& dm, int p) {
+            dm.setComplexPrecision(p == 0 ? ComplexPrecision::Float
+                                          : ComplexPrecision::Double); })
+        .def("complexPrecision", [](const DeviceManager& dm) {
+            return (int)dm.complexPrecision(); });
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
