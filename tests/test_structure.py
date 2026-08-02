@@ -164,15 +164,20 @@ def test_estimate_positive():
 
 
 def test_complex_precision():
-    """complex 精度模式：Float=8B，Double=16B（预留）。"""
+    """编译精度一致性：complexSize 与 compiledPrecision 匹配。
+
+    精度编译时确定（ctComplex = cuComplex 8B / cuDoubleComplex 16B），
+    运行时 setComplexPrecision 不改变实际内存布局。
+    """
     import ctpwa
 
     dm = ctpwa.DeviceManager()
-    assert dm.complexPrecision() == 0, "默认应为 Float 精度"
-    assert dm.complexSize() == 8, "Float 精度 complex 应为 8B"
-    dm.setComplexPrecision(1)  # Double（预留）
-    assert dm.complexSize() == 16, "Double 精度 complex 应为 16B"
-    dm.setComplexPrecision(0)  # 恢复 Float
+    precision = dm.compiledPrecision()
+    assert precision in ("float", "double"), f"未知精度: {precision}"
+    expected_size = 8 if precision == "float" else 16
+    assert dm.complexSize() == expected_size, (
+        f"compiledPrecision={precision} 但 complexSize={dm.complexSize()}"
+    )
 
 
 def test_capacity_small_fits():

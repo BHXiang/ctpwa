@@ -211,8 +211,13 @@ def test_golden_nll(make_analysis, device, base_params):
 
 
 def test_golden_gradient(make_analysis, device, base_params):
-    """固定参数 → 梯度必须等于 golden 记录值。"""
+    """固定参数 → 梯度必须等于 golden 记录值。
+
+    排除固定参考参数（v0=1+0i）：其梯度是数值噪声（应≈0），
+    float/double 编译精度不同时噪声值不同，不参与对比。
+    """
     ana = make_analysis("simple")
+    n_vec = ana.getNVector()
     nll = ana.getNLL(base_params.requires_grad_(True))
     grad = torch.autograd.grad(nll, base_params)[0].detach().cpu().double()
     p = Path(__file__).resolve().parent / "golden" / "grad_simple.txt"
@@ -222,6 +227,13 @@ def test_golden_gradient(make_analysis, device, base_params):
         [float(v) for v in p.read_text().split()], dtype=torch.float64
     )
     assert grad.shape == expected.shape, "golden 梯度维度不匹配"
-    scale = grad.abs().clamp_min(1e-6)
-    max_rel = ((grad - expected).abs() / scale).max().item()
+
+    mask = torch.ones_like(grad, dtype=torch.bool)
+    mask[0] = False      # v0 实部固定
+    mask[n_vec] = False  # v0 虚部固定
+    if not mask.any():
+        pytest.skip("无自由参数可比")
+
+    scale = grad[mask].abs().clamp_min(1e-6)
+    max_rel = ((grad[mask] - expected[mask]).abs() / scale).max().item()
     assert max_rel < GRAD_RTOL, f"梯度偏离 golden，max rel = {max_rel:.2e}"

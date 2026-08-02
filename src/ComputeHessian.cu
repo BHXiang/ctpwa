@@ -1,4 +1,4 @@
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -6,7 +6,7 @@
 #include <ComputeHessian.cuh>
 
 // 就地共轭kernel
-__global__ void conjKernel(cuComplex* data, int N) {
+__global__ void conjKernel(ctComplex* data, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < N) data[i].y = -data[i].y;
 }
@@ -14,8 +14,8 @@ __global__ void conjKernel(cuComplex* data, int N) {
 // 合并Step A+B: 加载B和v到共享内存，计算S和Bu（old convention [[R,C],[-C,R]]），
 // 然后计算per-event Hessian（无原子操作）
 __global__ void perEventHessianKernel(
-    const cuComplex* __restrict__ d_B,       // chunk × n²
-    const cuComplex* __restrict__ d_v,       // n
+    const ctComplex* __restrict__ d_B,       // chunk × n²
+    const ctComplex* __restrict__ d_v,       // n
     const double* __restrict__ d_weights,    // chunk
     double* __restrict__ d_hessian_chunk,    // chunk × 4n² (output, per-event slot)
     int nEvents, int n)
@@ -25,14 +25,17 @@ __global__ void perEventHessianKernel(
     const int evt = blockIdx.x;
     if (evt >= nEvents) return;
 
-    __shared__ cuComplex sB[64 * 64];       // B matrix
-    __shared__ double svr[64];              // real(v)
-    __shared__ double svi[64];              // imag(v)
-    __shared__ double sBu[128];             // Bu = tildeB @ u (2n, NOT divided by S)
-    __shared__ double sS;                   // S = u^T @ tildeB @ u
+    // 动态共享内存（double 版 n=64 时 64×64×16B=64KB > 48KB 默认上限，
+    // 调用方设置 cudaFuncAttributeMaxDynamicSharedMemorySize）
+    extern __shared__ ctFloat hsmem[];
+    ctComplex* sB  = reinterpret_cast<ctComplex*>(hsmem);          // n×n
+    double*   svr  = reinterpret_cast<double*>(hsmem + n * n * (sizeof(ctComplex) / sizeof(ctFloat)));  // n
+    double*   svi  = svr + n;                                      // n
+    double*   sBu  = svi + n;                                      // 2n
+    double*   sS   = sBu + 2 * n;                                  // 1
 
     // 协作加载 B_k → shared memory
-    const cuComplex* Bk = d_B + evt * n * n;
+    const ctComplex* Bk = d_B + evt * n * n;
     int nn = n * n;
     for (int idx = threadIdx.x; idx < nn; idx += blockDim.x)
         sB[idx] = Bk[idx];
@@ -68,11 +71,11 @@ __global__ void perEventHessianKernel(
         for (int i = 0; i < n; ++i)
             S += svr[i] * sBu[i] + svi[i] * sBu[n + i];
         if (S <= 0.0) S = 1e-30;
-        sS = S;
+        *sS = S;
     }
     __syncthreads();
 
-    double invS = 1.0 / sS;
+    double invS = 1.0 / *sS;
     double invS2 = invS * invS;
     double* hess_out = d_hessian_chunk + evt * hess_sz;
 
@@ -133,7 +136,7 @@ __global__ void reduceHessianKernel(
 }
 
 void computeDataHessianContrib(
-    const cuComplex* d_amp, const cuComplex* d_vector,
+    const ctComplex* d_amp, const ctComplex* d_vector,
     const double* d_weights,
     double* d_hessian,
     int nEvents, int n_polar, int n_amplitudes)
@@ -149,29 +152,29 @@ void computeDataHessianContrib(
     size_t free_mem, total_mem;
     cudaMemGetInfo(&free_mem, &total_mem);
     // per-event: B(n² complex) + localHess(4n² double)
-    size_t per_event = stride_B * sizeof(cuComplex) + hess_sz * sizeof(double);
+    size_t per_event = stride_B * sizeof(ctComplex) + hess_sz * sizeof(double);
     int max_chunk = (free_mem / 4) / per_event;
     if (max_chunk > nEvents) max_chunk = nEvents;
     if (max_chunk < 1) max_chunk = 1;
 
     // 一次性分配chunk缓冲区 (B + hessian_chunk)
-    cuComplex *d_B;
+    ctComplex *d_B;
     double *d_hessian_chunk;
-    cudaMalloc(&d_B, max_chunk * stride_B * sizeof(cuComplex));
+    cudaMalloc(&d_B, max_chunk * stride_B * sizeof(ctComplex));
     cudaMalloc(&d_hessian_chunk, max_chunk * hess_sz * sizeof(double));
 
     cublasHandle_t handle;
     cublasCreate(&handle);
-    cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-    cuComplex beta  = make_cuComplex(0.0f, 0.0f);
+    ctComplex alpha = ctMake(1.0f, 0.0f);
+    ctComplex beta  = ctMake(0.0f, 0.0f);
 
     for (int off = 0; off < nEvents; off += max_chunk) {
         int chunk = (off + max_chunk <= nEvents) ? max_chunk : (nEvents - off);
-        const cuComplex* A_chunk = d_amp + off * stride_amp;
+        const ctComplex* A_chunk = d_amp + off * stride_amp;
         const double* w_chunk = (d_weights != nullptr) ? d_weights + off : nullptr;
 
         // 1. B_k = A^H * A (cublas col-major → 读为row-major = A^H A)
-        cublasCgemmStridedBatched(handle,
+        CUBLAS_CGEMM_STRIDED_BATCHED(handle,
             CUBLAS_OP_N, CUBLAS_OP_C, n, n, n_polar,
             &alpha, A_chunk, n, stride_amp, A_chunk, n, stride_amp,
             &beta, d_B, n, stride_B, chunk);
@@ -179,8 +182,14 @@ void computeDataHessianContrib(
         conjKernel<<<grid, kBlockSize>>>(d_B, chunk * stride_B);
 
         // 2. Per-event Hessian (含S和Bu计算，old convention [[R,C],[-C,R]])
-        perEventHessianKernel<<<chunk, kBlockSize>>>(d_B, d_vector, w_chunk,
-            d_hessian_chunk, chunk, n);
+        {
+            size_t shm = (size_t)(n * n) * sizeof(ctComplex)
+                       + (size_t)(5 * n) * sizeof(double);
+            cudaFuncSetAttribute(perEventHessianKernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+            perEventHessianKernel<<<chunk, kBlockSize, shm>>>(d_B, d_vector, w_chunk,
+                d_hessian_chunk, chunk, n);
+        }
 
         // 3. 归约 per-event → 全局（每chunk仅 4n² 次atomicAdd）
         reduceHessianKernel<<<hess_sz, kBlockSize>>>(d_hessian_chunk, d_hessian,
@@ -198,15 +207,17 @@ void computeDataHessianContrib(
 //   Im(P*v) = R_true*vi - C_true*vr  = (tildeP_true @ u)_bot
 // tildeP贡献用 [[R,-C],[C,R]] 约定来补偿共轭存储: sP.y=-C_true → -sP.y=C_true
 __global__ void phspHessianKernel(
-    const cuComplex* __restrict__ P,      // n×n (共轭存储)
-    const cuComplex* __restrict__ v,      // n
+    const ctComplex* __restrict__ P,      // n×n (共轭存储)
+    const ctComplex* __restrict__ v,      // n
     double invT, double weight,
     double* __restrict__ d_hessian,
     int n)
 {
     const int n2 = 2 * n;
-    __shared__ cuComplex sP[64 * 64];
-    __shared__ double sPu_real[128];
+    // 动态共享内存（double 版 64×64×16B=64KB 超限）
+    extern __shared__ ctFloat hsmem[];
+    ctComplex* sP      = reinterpret_cast<ctComplex*>(hsmem);      // n×n
+    double*    sPu_real = reinterpret_cast<double*>(hsmem + n * n * (sizeof(ctComplex) / sizeof(ctFloat)));  // 2n
 
     int nn = n * n;
     for (int idx = threadIdx.x; idx < nn; idx += blockDim.x) sP[idx] = P[idx];
@@ -214,9 +225,9 @@ __global__ void phspHessianKernel(
 
     // Pu = P * v (复数乘法), 利用共轭存储得到正确的tildeP_true @ u
     for (int a = threadIdx.x; a < n; a += blockDim.x) {
-        cuComplex pu = make_cuComplex(0, 0);
+        ctComplex pu = ctMake(0, 0);
         for (int b = 0; b < n; ++b) {
-            cuComplex pb = sP[a * n + b], vb = v[b];
+            ctComplex pb = sP[a * n + b], vb = v[b];
             pu.x += pb.x * vb.x - pb.y * vb.y;
             pu.y += pb.x * vb.y + pb.y * vb.x;
         }
@@ -252,12 +263,18 @@ __global__ void phspHessianKernel(
 }
 
 void computePhspHessian(
-    const cuComplex* d_phsp_matrix, const cuComplex* d_vector,
+    const ctComplex* d_phsp_matrix, const ctComplex* d_vector,
     double phsp_factor, double weight,
     double* d_hessian, int n)
 {
     double invT = 1.0 / phsp_factor;
-    phspHessianKernel<<<1, 256>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+    {
+        size_t shm = (size_t)(n * n) * sizeof(ctComplex)
+                   + (size_t)(2 * n) * sizeof(double);
+        cudaFuncSetAttribute(phspHessianKernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+        phspHessianKernel<<<1, 256, shm>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+    }
 }
 
 // ========== Hessian约束投影: H_orig = J^T * H_ext * J ==========
@@ -382,8 +399,8 @@ void reduceHessianWithConstraints(
  // ============================================================
 __global__ void computeSfromAmpsKernel(
     double* d_S_re, double* d_S_im, double* d_I,
-    const cuComplex* d_amp,   // [nEv * nPol * n_amp]
-    const cuComplex* d_v,     // [n_amp]
+    const ctComplex* d_amp,   // [nEv * nPol * n_amp]
+    const ctComplex* d_v,     // [n_amp]
     int nEvents, int nPolar, int n_amp,
     double* d_phsp_t3_re = nullptr,   // [n_amp]
     double* d_phsp_t3_im = nullptr)   // [n_amp]
@@ -395,8 +412,8 @@ __global__ void computeSfromAmpsKernel(
     for (int p = 0; p < nPolar; ++p) {
         double sre = 0.0, sim = 0.0;
         for (int a = 0; a < n_amp; ++a) {
-            cuComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
-            cuComplex v_a = d_v[a];
+            ctComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
+            ctComplex v_a = d_v[a];
             sre += (double)v_a.x * (double)amp_ap.x - (double)v_a.y * (double)amp_ap.y;
             sim += (double)v_a.x * (double)amp_ap.y + (double)v_a.y * (double)amp_ap.x;
         }
@@ -414,7 +431,7 @@ __global__ void computeSfromAmpsKernel(
         for (int a = 0; a < n_amp; ++a) {
             double t3_re = 0.0, t3_im = 0.0;
             for (int p = 0; p < nPolar; ++p) {
-                cuComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
+                ctComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
                 double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
                 t3_re += Sr[p] * ar + Si[p] * ai;
                 t3_im += Sr[p] * ai - Si[p] * ar;
@@ -432,7 +449,7 @@ __global__ void computeSfromAmpsKernel(
 template<int Npr, int Nres>
 __global__ void hessianStage1Kernel(
     const thrust::complex<double>* d_slamps,
-    const cuComplex* d_v,
+    const ctComplex* d_v,
     const DeviceMomenta* d_momenta,
     const DecayNode* d_decayNodes, int decayChain_size,
     const SL* d_slComb,
@@ -501,7 +518,7 @@ __global__ void hessianStage1Kernel(
     for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
         int res = sl_idx / sl_per_res;
         if (res >= Nres) continue;
-        cuComplex vv = d_v[sl_idx];
+        ctComplex vv = d_v[sl_idx];
 
         using CV = ComplexVar<double, Npr, true>;
         CV R_ad(1.0, 0.0);
@@ -756,7 +773,7 @@ __global__ void hessianCrossBlockKernel(
 __global__ void hessianMixedBlockKernel(
     const double* d_S_re, const double* d_S_im,   // [nEv*nPolar]
     const double* d_I,                             // [nEv]
-    const cuComplex* d_amp,                        // [nEv_total*nPolar*n_amp_total]
+    const ctComplex* d_amp,                        // [nEv_total*nPolar*n_amp_total]
     const thrust::complex<double>* d_slamps,        // [nSLtotal * nTotal]
     const double* d_g,                             // [nEv*Npr]
     const double* d_dS_re, const double* d_dS_im,  // [nEv*Npr*nPolar]
@@ -800,7 +817,7 @@ __global__ void hessianMixedBlockKernel(
             double dF_re = dF_re_ptr[j], dF_im = dF_im_ptr[j];
 
             for (int p = 0; p < nPolar; ++p) {
-                cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + global_a];
+                ctComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + global_a];
                 double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
 
                 double sr = Sr_ptr[p], si = Si_ptr[p];
@@ -850,7 +867,7 @@ __global__ void hessianMixedBlockKernel(
 __global__ void hessianCrossMixedKernel(
     const double* d_S_re, const double* d_S_im,
     const double* d_I,
-    const cuComplex* d_amp,
+    const ctComplex* d_amp,
     const double* d_g_B, const double* d_dS_re_B, const double* d_dS_im_B,
     const int* d_gidx_B, int NTb,
     int nSL_A, int site_A,
@@ -879,7 +896,7 @@ __global__ void hessianCrossMixedKernel(
 
         double term3_re = 0.0, term3_im = 0.0;
         for (int p = 0; p < nPolar; ++p) {
-            cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
+            ctComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
             double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
             double sr = Sr_ptr[p], si = Si_ptr[p];
             term3_re += sr * ar + si * ai;
@@ -893,7 +910,7 @@ __global__ void hessianCrossMixedKernel(
 
             double term1_re = 0.0, term1_im = 0.0;
             for (int p = 0; p < nPolar; ++p) {
-                cuComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
+                ctComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + ga];
                 double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
                 int ds_idx = jb * nPolar + p;
                 double ds_re = dS_reB_ptr[ds_idx], ds_im = dS_imB_ptr[ds_idx];
@@ -925,10 +942,10 @@ __global__ void negateWeightsKernel(double* out, const double* in, int n) {
 }
 
 // Scale phsp amplitudes by per-event weight: amp[e,p,a] *= sqrt(weight[e] / W_total)
-// Applied to ALL nPol*nAmp entries for each event, so the subsequent cublasCgemm
+// Applied to ALL nPol*nAmp entries for each event, so the subsequent CUBLAS_CGEMM
 // computes A_weighted^H A_weighted = A^H diag(w) A / W_total.
 __global__ void scalePhspAmpsKernel(
-    cuComplex* d_amp, const double* d_weights,
+    ctComplex* d_amp, const double* d_weights,
     int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -940,7 +957,7 @@ __global__ void scalePhspAmpsKernel(
         ? sqrt(d_weights[evt] * inv_W_total)
         : sqrt(inv_W_total);  // uniform weight: 1/N
 
-    float s = (float)scale;
+    ctFloat s = ctCastFloat(scale);
     d_amp[idx].x *= s;
     d_amp[idx].y *= s;
 }

@@ -28,7 +28,7 @@ enum class DeviceType {
 
 // Complex 精度模式（预留 double 精度，当前仅 float）
 enum class ComplexPrecision {
-    Float = 0,   // cuComplex (float2), 8 bytes — 当前行为
+    Float = 0,   // ctComplex (float2), 8 bytes — 当前行为
     Double = 1   // cuDoubleComplex (double2), 16 bytes — 预留
 };
 

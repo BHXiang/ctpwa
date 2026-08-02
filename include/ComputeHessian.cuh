@@ -1,7 +1,7 @@
 #ifndef COMPUTEHESSIAN_CUH
 #define COMPUTEHESSIAN_CUH
 
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cuda_runtime.h>
 
 // 计算data/bkg事件的Hessian贡献（含权重）
@@ -10,7 +10,7 @@
 // d_weights: nEvents权重 (nullptr=全1)
 // d_hessian: 2n×2n double矩阵（就地累加，调用方先清零）
 void computeDataHessianContrib(
-    const cuComplex* d_amp, const cuComplex* d_vector,
+    const ctComplex* d_amp, const ctComplex* d_vector,
     const double* d_weights,
     double* d_hessian,
     int nEvents, int n_polar, int n_amplitudes);
@@ -22,7 +22,7 @@ void computeDataHessianContrib(
 // weight: N_data - W_bkg (phsp项权重)
 // d_hessian: 2n×2n（就地累加）
 void computePhspHessian(
-    const cuComplex* d_phsp_matrix, const cuComplex* d_vector,
+    const ctComplex* d_phsp_matrix, const ctComplex* d_vector,
     double phsp_factor, double weight,
     double* d_hessian, int n);
 

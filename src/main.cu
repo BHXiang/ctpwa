@@ -71,7 +71,9 @@ PYBIND11_MODULE(ctpwa, m)
             dm.setComplexPrecision(p == 0 ? ComplexPrecision::Float
                                           : ComplexPrecision::Double); })
         .def("complexPrecision", [](const DeviceManager& dm) {
-            return (int)dm.complexPrecision(); });
+            return (int)dm.complexPrecision(); })
+        .def("compiledPrecision", [](const DeviceManager&) {
+            return std::string(PRECISION_NAME); });
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")

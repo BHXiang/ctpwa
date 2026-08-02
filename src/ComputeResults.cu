@@ -1,4 +1,4 @@
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <vector>
@@ -19,7 +19,7 @@ __device__ __host__ int getInterferenceIndex(int i, int j, int npartials)
 
 // 核函数：计算复数模平方并按 npolar 分组求和，同时计算总和
 __global__ void
-computeModTotalWeight(const cuComplex* __restrict__ complex_result,
+computeModTotalWeight(const ctComplex* __restrict__ complex_result,
     double* __restrict__ final_result,
     double* __restrict__ total_sum, int nEvents, int npolar)
 {
@@ -33,7 +33,7 @@ computeModTotalWeight(const cuComplex* __restrict__ complex_result,
     // 每个线程处理一个 event，累加对应的 npolar 个元素的模平方
     for (int polar_idx = 0; polar_idx < npolar; polar_idx++) {
         int global_idx = event_idx * npolar + polar_idx;
-        cuComplex val = complex_result[global_idx];
+        ctComplex val = complex_result[global_idx];
         double mod_square = val.x * val.x + val.y * val.y;
         sum += mod_square;
     }
@@ -47,7 +47,7 @@ computeModTotalWeight(const cuComplex* __restrict__ complex_result,
 // 修改后的部分权重核函数，同时计算干涉矩阵
 template <int N_PARTIALS>
 __global__ void
-computeModWithInterference(const cuComplex* __restrict__ result_matrix,
+computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     double* __restrict__ final_result,
     double* __restrict__ interference_matrix,
     // double *__restrict__ event_interference,
@@ -99,7 +99,7 @@ computeModWithInterference(const cuComplex* __restrict__ result_matrix,
         // 计算每个部分的振幅
         for (int p = 0; p < npartials; p++) {
             for (int s = 0; s < d_nSLvectors[p]; s++) {
-                cuComplex val = result_matrix[event_idx * npolar * ngls +
+                ctComplex val = result_matrix[event_idx * npolar * ngls +
                     polar_idx * ngls + (sltotal + s)];
                 partial_real[p] += val.x;
                 partial_imag[p] += val.y;
@@ -156,7 +156,7 @@ computeModWithInterference(const cuComplex* __restrict__ result_matrix,
 }
 
 // 主计算函数
-void computeResults(const cuComplex* d_matrix, const cuComplex* d_vector,
+void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
     double* d_total_result, double* d_total_integral,
     double* d_partial_result,
     // double *d_partial_sums,
@@ -169,14 +169,14 @@ void computeResults(const cuComplex* d_matrix, const cuComplex* d_vector,
     cublasCreate(&handle);
 
     // 分配设备内存
-    cuComplex* d_complex_result = nullptr;
-    cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(cuComplex));
+    ctComplex* d_complex_result = nullptr;
+    cudaMalloc(&d_complex_result, nEvents * npolar * sizeof(ctComplex));
 
     // cuBLAS 矩阵向量乘法
-    const cuComplex alpha = make_cuComplex(1.0, 0.0);
-    const cuComplex beta = make_cuComplex(0.0, 0.0);
+    const ctComplex alpha = ctMake(1.0, 0.0);
+    const ctComplex beta = ctMake(0.0, 0.0);
 
-    cublasCgemv(handle, CUBLAS_OP_T, ngls, nEvents * npolar, &alpha, d_matrix,
+    CUBLAS_CGEMV(handle, CUBLAS_OP_T, ngls, nEvents * npolar, &alpha, d_matrix,
         ngls, d_vector, 1, &beta, d_complex_result, 1);
 
     // 检查 cuBLAS 调用
@@ -195,14 +195,14 @@ void computeResults(const cuComplex* d_matrix, const cuComplex* d_vector,
     // 清理中间结果
     cudaFree(d_complex_result);
 
-    cuComplex* d_result_matrix = nullptr;
-    cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(cuComplex));
+    ctComplex* d_result_matrix = nullptr;
+    cudaMalloc(&d_result_matrix, ngls * nEvents * npolar * sizeof(ctComplex));
 
     // 使用 cuBLAS 矩阵乘对角矩阵
     // d_matrix: (nEvents * npolar) × ngls (列主序)
     // d_vector: ngls 向量
     // 计算 d_result_matrix = d_matrix * diag(d_vector)，形状相同
-    cublasCdgmm(handle, CUBLAS_SIDE_LEFT, ngls, nEvents * npolar, d_matrix,
+    CUBLAS_CDGMM(handle, CUBLAS_SIDE_LEFT, ngls, nEvents * npolar, d_matrix,
         ngls, d_vector, 1, d_result_matrix,
         ngls);
 

@@ -127,9 +127,9 @@ public:
     // 拟合参数 → 旧格式: d_in[Re_p, Im_p, θ] → d_out[Re_v, Im_v, θ]
     void extendCouplingParams(const double* d_in, double* d_out, int ncf, int nt) const;
     // v_ext = coupling(p), d_v: [n_amps] complex
-    void applyCouplingMatrix(const double* d_params, cuComplex* d_v_out) const;
-    // ∂L/∂v → ∂L/∂p  (d_grad_v: cuComplex [n_amps], d_v: cuComplex [n_amps])
-    void transformCouplingGradient(const cuComplex* d_grad_v, const cuComplex* d_v,
+    void applyCouplingMatrix(const double* d_params, ctComplex* d_v_out) const;
+    // ∂L/∂v → ∂L/∂p  (d_grad_v: ctComplex [n_amps], d_v: ctComplex [n_amps])
+    void transformCouplingGradient(const ctComplex* d_grad_v, const ctComplex* d_v,
                                    const double* d_params, double* d_grad_p) const;
     void freeCouplingData();
 

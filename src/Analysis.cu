@@ -1,7 +1,7 @@
 // #include <pybind11/pybind11.h>
 #include <chrono>
 #include <cstdio>
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cublas_v2.h>
 #include <fstream>
 #include <iostream>
@@ -614,11 +614,11 @@ static void traceDouble(const char* tag, const double* d, int n, int show = 8) {
     double sum = 0; for (int i = 0; i < k; ++i) sum += std::abs(h[i]);
     printf(" |sum|=% .4f\n", sum);
 }
-static void traceComplex(const char* tag, const cuComplex* d, int n, int show = 5) {
+static void traceComplex(const char* tag, const ctComplex* d, int n, int show = 5) {
     if (n <= 0) return;
     int k = std::min(n, show);
-    std::vector<cuComplex> h(k);
-    cudaMemcpy(h.data(), d, k * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+    std::vector<ctComplex> h(k);
+    cudaMemcpy(h.data(), d, k * sizeof(ctComplex), cudaMemcpyDeviceToHost);
     printf("[TRACE] %s (%d total): ", tag, n);
     for (int i = 0; i < k; ++i) printf("(%.4f%+.4fj) ", h[i].x, h[i].y);
     if (n > k) printf("...");
@@ -681,9 +681,9 @@ public:
         torch::autograd::AutogradContext* ctx,
         torch::Tensor params_tensor,           // 统一参数 [2*nFreeVector + nFreeTheta] float64
         Parameters* params_mgr,                // 参数管理器（含约束 & 维度信息 & vspace flag）
-        std::vector<cuComplex*>& d_all_amplitudes_list,
+        std::vector<ctComplex*>& d_all_amplitudes_list,
         AmpCalc* amp_calc,                     // 共振态管理器
-        cuComplex* d_phsp_matrix_,
+        ctComplex* d_phsp_matrix_,
         const std::vector<std::vector<int>>& events_list,
         const std::vector<std::vector<int>>& events_offsets_list,
         const std::vector<std::vector<int>>& amp_offsets_list,
@@ -716,8 +716,8 @@ public:
             ctx->saved_data["original_params"] = params_tensor;
 
             vector = torch::complex(
-                ext.slice(0, 0, na).to(torch::kFloat),
-                ext.slice(0, na, 2 * na).to(torch::kFloat));
+                ext.slice(0, 0, na).to(TORCH_FLOAT),
+                ext.slice(0, na, 2 * na).to(TORCH_FLOAT));
             theta = (nt > 0) ? ext.slice(0, 2 * na, 2 * na + nt) : torch::Tensor();
         } else {
             std::tie(vector, theta) = params_mgr->splitParams(params_tensor);
@@ -766,7 +766,7 @@ public:
             // 预计算有效耦合 T（复用各 GPU 上的 extended_vector）
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 cudaSetDevice(gpu);
-                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(
+                const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
                     extended_vec_per_gpu[gpu].data_ptr());
                 amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
                 cudaDeviceSynchronize();
@@ -790,29 +790,29 @@ public:
             if (W_total <= 0.0) W_total = 1.0;
             cudaSetDevice(primary_dev);
 
-            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nPhsp = events_list[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
 
                 int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-                cuComplex* d_phsp_scaled;
-                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+                ctComplex* d_phsp_scaled;
+                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(ctComplex));
                 cudaMemcpy(d_phsp_scaled, d_all_amplitudes_list[gpu],
-                           nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                           nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
                 const double* d_w = (gpu < (int)d_phsp_weights_list.size()) ? d_phsp_weights_list[gpu] : nullptr;
                 int grid = (nPhsp_total + 255) / 256;
                 scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
                     nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
-                cuComplex* d_phsp_gpu;
-                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                ctComplex* d_phsp_gpu;
+                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cublasHandle_t h;
                 cublasCreate(&h);
-                cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-                cuComplex beta  = make_cuComplex(0.0f, 0.0f);
-                cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C,
+                ctComplex alpha = ctMake(1.0f, 0.0f);
+                ctComplex beta  = ctMake(0.0f, 0.0f);
+                CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C,
                     n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
                     &alpha, d_phsp_scaled, n_amplitudes_,
                     d_phsp_scaled, n_amplitudes_,
@@ -821,19 +821,19 @@ public:
                 cudaFree(d_phsp_scaled);
 
                 if (gpu == primary_dev) {
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    ctComplex one = ctMake(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                     cudaFree(d_phsp_gpu);
                 } else {
                     cudaSetDevice(primary_dev);
-                    cuComplex* d_temp;
-                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    ctComplex* d_temp;
+                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                     cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                        n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                     cudaSetDevice(gpu);
                     cudaFree(d_phsp_gpu);
                     cudaSetDevice(primary_dev);
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    ctComplex one = ctMake(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                     cudaFree(d_temp);
                 }
@@ -842,28 +842,28 @@ public:
 
         // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
         cudaSetDevice(primary_dev);
-        cuComplex* d_P_vec;
-        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(cuComplex));
-        float* d_phsp_r, * d_phsp_i;
-        cudaMalloc(&d_phsp_r, sizeof(float));
-        cudaMalloc(&d_phsp_i, sizeof(float));
+        ctComplex* d_P_vec;
+        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
+        ctPhspReal* d_phsp_r, * d_phsp_i;
+        cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
+        cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
         {
             torch::Tensor extended_vector_conj = extended_vector.conj();
-            const cuComplex* d_vec_conj = reinterpret_cast<const cuComplex*>(extended_vector_conj.data_ptr());
+            const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
             computeQuadraticForm(d_phsp_matrix_, d_vec_conj, d_P_vec,
                 d_phsp_r, d_phsp_i, n_amplitudes_);
         }
-        float phsp_r, phsp_i;
-        cudaMemcpy(&phsp_r, d_phsp_r, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&phsp_i, d_phsp_i, sizeof(float), cudaMemcpyDeviceToHost);
+        ctPhspReal phsp_r, phsp_i;
+        cudaMemcpy(&phsp_r, d_phsp_r, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&phsp_i, d_phsp_i, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
         cudaFree(d_phsp_r);
         cudaFree(d_phsp_i);
         double phsp_factor = static_cast<double>(phsp_r);
 
         // std::cout << "PHSP factor: " << phsp_factor << std::endl;
         // //输出 d_P_vec 检查
-        // std::vector<cuComplex> h_P_vec(n_amplitudes_);
-        // cudaMemcpy(h_P_vec.data(), d_P_vec, n_amplitudes_ * sizeof(cuComplex),
+        // std::vector<ctComplex> h_P_vec(n_amplitudes_);
+        // cudaMemcpy(h_P_vec.data(), d_P_vec, n_amplitudes_ * sizeof(ctComplex),
         //     cudaMemcpyDeviceToHost);
         // std::cout << "P_vec: ";
         // for (int i = 0; i < n_amplitudes_; ++i) {
@@ -879,11 +879,11 @@ public:
         double bkg_integral = bkg_integral_;
 
         // 预分配持久化buffer（首次分配，之后复用）
-        static cuComplex* s_d_grad_global = nullptr;
-        static cuComplex* s_d_grad_buf = nullptr;
-        static std::vector<cuComplex*> s_d_grad_per_gpu;
-        static std::vector<cuComplex*> s_d_w_bufs;       // per-GPU data w buffer
-        static std::vector<cuComplex*> s_d_w_bkg_bufs;   // per-GPU bkg  w buffer
+        static ctComplex* s_d_grad_global = nullptr;
+        static ctComplex* s_d_grad_buf = nullptr;
+        static std::vector<ctComplex*> s_d_grad_per_gpu;
+        static std::vector<ctComplex*> s_d_w_bufs;       // per-GPU data w buffer
+        static std::vector<ctComplex*> s_d_w_bkg_bufs;   // per-GPU bkg  w buffer
         static std::vector<int> s_w_buf_sizes;            // data
         static std::vector<int> s_w_bkg_buf_sizes;        // bkg
         static int s_alloc_n = 0;
@@ -898,8 +898,8 @@ public:
             for (auto& p : s_d_w_bkg_bufs) if (p) { cudaFree(p); p = nullptr; }
 
             cudaSetDevice(primary_dev);
-            cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(cuComplex));
-            cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(cuComplex));
+            cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(ctComplex));
+            cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(ctComplex));
             s_d_grad_per_gpu.resize(num_gpus, nullptr);
             s_d_w_bufs.resize(num_gpus, nullptr);
             s_d_w_bkg_bufs.resize(num_gpus, nullptr);
@@ -907,34 +907,34 @@ public:
             s_w_bkg_buf_sizes.assign(num_gpus, 0);
             for (int g = 0; g < num_gpus; ++g) {
                 cudaSetDevice(g);
-                cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(cuComplex));
+                cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(ctComplex));
             }
             s_alloc_n = extended_n_gls;
         }
 
-        cuComplex* d_grad_global = s_d_grad_global;
-        cuComplex* d_grad_buf = s_d_grad_buf;
+        ctComplex* d_grad_global = s_d_grad_global;
+        ctComplex* d_grad_buf = s_d_grad_buf;
         cudaSetDevice(primary_dev);
-        cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
+        cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(ctComplex));
 
         for (int gpu = 0; gpu < num_gpus; ++gpu) {
             cudaSetDevice(gpu);
-            const cuComplex* d_vec_gpu = reinterpret_cast<const cuComplex*>(
+            const ctComplex* d_vec_gpu = reinterpret_cast<const ctComplex*>(
                 extended_vec_per_gpu[gpu].data_ptr());
-            cuComplex* d_grad = s_d_grad_per_gpu[gpu];
+            ctComplex* d_grad = s_d_grad_per_gpu[gpu];
 
             // --- data ---
             int nData_gpu = events_list[gpu][1];
             if (nData_gpu > 0) {
-                cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][1];
+                ctComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][1];
 
                 // 分配/检查 w buffer（仅当有 theta 即做共振态拟合时）
-                cuComplex* d_w_out = nullptr;
+                ctComplex* d_w_out = nullptr;
                 if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
                     int nTotal = nData_gpu * n_polar_;
                     if (s_w_buf_sizes[gpu] < nTotal) {
                         if (s_d_w_bufs[gpu]) cudaFree(s_d_w_bufs[gpu]);
-                        cudaMalloc(&s_d_w_bufs[gpu], nTotal * sizeof(cuComplex));
+                        cudaMalloc(&s_d_w_bufs[gpu], nTotal * sizeof(ctComplex));
                         s_w_buf_sizes[gpu] = nTotal;
                     }
                     d_w_out = s_d_w_bufs[gpu];
@@ -947,12 +947,12 @@ public:
                 totalDataEvents += nData_gpu;
                 // P2P累加到global (正号)
                 if (gpu == primary_dev) {
-                    axpyComplex(d_grad_global, d_grad, make_cuComplex(1.0f, 0.0f), extended_n_gls);
+                    axpyComplex(d_grad_global, d_grad, ctMake(1.0f, 0.0f), extended_n_gls);
                 }
                 else {
-                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(ctComplex));
                     cudaSetDevice(primary_dev);
-                    axpyComplex(d_grad_global, d_grad_buf, make_cuComplex(1.0f, 0.0f), extended_n_gls);
+                    axpyComplex(d_grad_global, d_grad_buf, ctMake(1.0f, 0.0f), extended_n_gls);
                 }
             }
 
@@ -960,16 +960,16 @@ public:
             int nBkg_gpu = (events_list[gpu].size() > 2) ? events_list[gpu][2] : 0;
             if (nBkg_gpu > 0) {
                 cudaSetDevice(gpu);
-                cuComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
+                ctComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
                 const double* d_w = d_bkg_weights_list[gpu];
 
                 // 分配/检查 bkg  w buffer
-                cuComplex* d_w_bkg_out = nullptr;
+                ctComplex* d_w_bkg_out = nullptr;
                 if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
                     int nTotal = nBkg_gpu * n_polar_;
                     if (s_w_bkg_buf_sizes[gpu] < nTotal) {
                         if (s_d_w_bkg_bufs[gpu]) cudaFree(s_d_w_bkg_bufs[gpu]);
-                        cudaMalloc(&s_d_w_bkg_bufs[gpu], nTotal * sizeof(cuComplex));
+                        cudaMalloc(&s_d_w_bkg_bufs[gpu], nTotal * sizeof(ctComplex));
                         s_w_bkg_buf_sizes[gpu] = nTotal;
                     }
                     d_w_bkg_out = s_d_w_bkg_bufs[gpu];
@@ -981,12 +981,12 @@ public:
                 total_bkg_nll += nll;
                 totalBkgEvents += nBkg_gpu;
                 if (gpu == primary_dev) {
-                    axpyComplex(d_grad_global, d_grad, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
+                    axpyComplex(d_grad_global, d_grad, ctMake(-1.0f, 0.0f), extended_n_gls);
                 }
                 else {
-                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(cuComplex));
+                    cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(ctComplex));
                     cudaSetDevice(primary_dev);
-                    axpyComplex(d_grad_global, d_grad_buf, make_cuComplex(-1.0f, 0.0f), extended_n_gls);
+                    axpyComplex(d_grad_global, d_grad_buf, ctMake(-1.0f, 0.0f), extended_n_gls);
                 }
             }
         }
@@ -1003,12 +1003,12 @@ public:
             if (totalDataEvents > 0) {
                 std::vector<int> n_data_events(num_gpus);
                 std::vector<int> phsp_offsets(num_gpus);
-                std::vector<cuComplex*> d_v_ptrs(num_gpus);
+                std::vector<ctComplex*> d_v_ptrs(num_gpus);
                 for (int g = 0; g < num_gpus; ++g) {
                     n_data_events[g] = events_list[g][1];
                     phsp_offsets[g] = events_list[g][0];
-                    d_v_ptrs[g] = const_cast<cuComplex*>(
-                        reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
+                    d_v_ptrs[g] = const_cast<ctComplex*>(
+                        reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
                 amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res,
                     +1.0, phsp_offsets, d_v_ptrs);
@@ -1018,12 +1018,12 @@ public:
             if (totalBkgEvents > 0) {
                 std::vector<int> n_bkg_events(num_gpus);
                 std::vector<int> bkg_offsets(num_gpus);
-                std::vector<cuComplex*> d_v_ptrs(num_gpus);
+                std::vector<ctComplex*> d_v_ptrs(num_gpus);
                 for (int g = 0; g < num_gpus; ++g) {
                     n_bkg_events[g] = events_list[g][2];
                     bkg_offsets[g] = events_list[g][0] + events_list[g][1]; // phsp + data 偏移
-                    d_v_ptrs[g] = const_cast<cuComplex*>(
-                        reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
+                    d_v_ptrs[g] = const_cast<ctComplex*>(
+                        reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
                 amp_calc->computeResonanceGradient(s_d_w_bkg_bufs, n_bkg_events, d_grad_res,
                     -1.0, bkg_offsets, d_v_ptrs);
@@ -1037,7 +1037,7 @@ public:
                 if (total_phsp > 0 && phsp_factor > 1e-30) {
                     double phsp_sign = -effective_data / (phsp_factor * total_phsp);
 
-                    std::vector<cuComplex*> d_S_bufs(num_gpus, nullptr);
+                    std::vector<ctComplex*> d_S_bufs(num_gpus, nullptr);
                     std::vector<int> n_phsp_evts(num_gpus);
                     cublasHandle_t ch;
                     cublasCreate(&ch);
@@ -1047,22 +1047,22 @@ public:
                         n_phsp_evts[g] = nP;
                         if (nP == 0) continue;
                         int nTot = nP * n_polar_;
-                        cudaMalloc(&d_S_bufs[g], nTot * sizeof(cuComplex));
-                        cuComplex* d_amp = d_all_amplitudes_list[g];
-                        const cuComplex* d_vg = reinterpret_cast<const cuComplex*>(
+                        cudaMalloc(&d_S_bufs[g], nTot * sizeof(ctComplex));
+                        ctComplex* d_amp = d_all_amplitudes_list[g];
+                        const ctComplex* d_vg = reinterpret_cast<const ctComplex*>(
                             extended_vec_per_gpu[g].data_ptr());
-                        cuComplex a = make_cuComplex(1.0f, 0.0f);
-                        cuComplex b = make_cuComplex(0.0f, 0.0f);
-                        cublasCgemv(ch, CUBLAS_OP_T, n_amplitudes_, nTot,
+                        ctComplex a = ctMake(1.0f, 0.0f);
+                        ctComplex b = ctMake(0.0f, 0.0f);
+                        CUBLAS_CGEMV(ch, CUBLAS_OP_T, n_amplitudes_, nTot,
                             &a, d_amp, n_amplitudes_, d_vg, 1, &b, d_S_bufs[g], 1);
                     }
                     cublasDestroy(ch);
 
                     cudaSetDevice(primary_dev);  // d_grad_res is on primary_dev
-                    std::vector<cuComplex*> d_v_ptrs(num_gpus);
+                    std::vector<ctComplex*> d_v_ptrs(num_gpus);
                     for (int g = 0; g < num_gpus; ++g)
-                        d_v_ptrs[g] = const_cast<cuComplex*>(
-                            reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[g].data_ptr()));
+                        d_v_ptrs[g] = const_cast<ctComplex*>(
+                            reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
                     amp_calc->computeResonanceGradient(d_S_bufs, n_phsp_evts, d_grad_res,
                         phsp_sign, {}, d_v_ptrs);
 
@@ -1086,8 +1086,8 @@ public:
         }
 
         // // 输出d_grad_global检查
-        // std::vector<cuComplex> h_grad_global(extended_n_gls);
-        // cudaMemcpy(h_grad_global.data(), d_grad_global, extended_n_gls * sizeof(cuComplex),
+        // std::vector<ctComplex> h_grad_global(extended_n_gls);
+        // cudaMemcpy(h_grad_global.data(), d_grad_global, extended_n_gls * sizeof(ctComplex),
         //     cudaMemcpyDeviceToHost);
         // std::cout << "Global gradient: ";
         // for (int i = 0; i < extended_n_gls; ++i) {
@@ -1096,9 +1096,9 @@ public:
         // std::cout << std::endl;
 
         // // 输出d_vec_gpu检查
-        // std::vector<cuComplex> h_vec_gpu(extended_n_gls);
+        // std::vector<ctComplex> h_vec_gpu(extended_n_gls);
         // cudaMemcpy(h_vec_gpu.data(), extended_vec_per_gpu[0].data_ptr(),
-        //     extended_n_gls * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        //     extended_n_gls * sizeof(ctComplex), cudaMemcpyDeviceToHost);
         // std::cout << "Extended vector (GPU 0): ";
         // for (int i = 0; i < extended_n_gls; ++i) {
         //     std::cout << "(" << h_vec_gpu[i].x << ", " << h_vec_gpu[i].y << ") ";
@@ -1121,7 +1121,7 @@ public:
         if (isnan(loss) || isinf(loss)) {
             // std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf") << ", resetting to 1e30" << std::endl;
             loss = 1e30;
-            cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(cuComplex));
+            cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(ctComplex));
             // theta 梯度也要清零，否则 NaN 会传播到最终梯度
             if (n_free_res > 0)
                 cudaMemset(grad_theta.data_ptr<double>(), 0, n_free_res * sizeof(double));
@@ -1130,7 +1130,7 @@ public:
         // loss 重置时跳过 phsp 梯度累加——phsp_factor 已 clamp 到 1e-30，
         // scale_phsp ~ 1e33 会把 d_P_vec 中的任何 NaN/Inf 重新注入梯度
         if (!loss_reset) {
-            cuComplex scale_phsp = make_cuComplex(
+            ctComplex scale_phsp = ctMake(
                 static_cast<float>(totalDataEvents - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
             axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
         }
@@ -1139,9 +1139,9 @@ public:
         // 6. 保存梯度和loss到ctx
         cudaSetDevice(primary_dev);
         torch::Tensor global_extended_grad = torch::empty({ extended_n_gls },
-            torch::kComplexFloat).to(vector.device());
+            TORCH_COMPLEX).to(vector.device());
         cudaMemcpy(global_extended_grad.data_ptr(), d_grad_global,
-            extended_n_gls * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+            extended_n_gls * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
 
         ctx->save_for_backward({ params_tensor });
         ctx->saved_data["global_extended_grad"] = global_extended_grad;
@@ -1176,8 +1176,8 @@ public:
         //    printf("\n[TRACE] ===== BACKWARD: NLLFunction =====\n");
         //    printf("[TRACE] na=%d ncf=%d nt=%d\n", na, ncf, nt);
 
-        //     // [5] grad_v: Wirtinger ∂L/∂v* (cuComplex [na])
-        //    traceComplex("5.grad_v(∂L/∂v*)", reinterpret_cast<cuComplex*>(global_extended_grad.data_ptr()), na);
+        //     // [5] grad_v: Wirtinger ∂L/∂v* (ctComplex [na])
+        //    traceComplex("5.grad_v(∂L/∂v*)", reinterpret_cast<ctComplex*>(global_extended_grad.data_ptr()), na);
         //     // [5b] grad_theta
         //     if (nt > 0 && grad_theta.numel() > 0)
         //        traceDouble("5.grad_theta", grad_theta.data_ptr<double>(), nt, 4);
@@ -1191,8 +1191,8 @@ public:
 
             // Current v values for gradient transform
             auto v_buf = torch::empty({na}, torch::TensorOptions()
-                .dtype(torch::kComplexFloat).device(global_extended_grad.device()));
-            cuComplex* d_v = reinterpret_cast<cuComplex*>(v_buf.data_ptr());
+                .dtype(TORCH_COMPLEX).device(global_extended_grad.device()));
+            ctComplex* d_v = reinterpret_cast<ctComplex*>(v_buf.data_ptr());
             params_mgr->applyCouplingMatrix(d_p, d_v);
 //            traceComplex("7.v_ext(from p)", d_v, na);
 
@@ -1200,7 +1200,7 @@ public:
             auto grad_p = torch::empty({2 * ncf},
                 torch::TensorOptions().dtype(torch::kFloat64).device(global_extended_grad.device()));
             double* d_grad_p = grad_p.data_ptr<double>();
-            cuComplex* d_grad_v = reinterpret_cast<cuComplex*>(global_extended_grad.data_ptr());
+            ctComplex* d_grad_v = reinterpret_cast<ctComplex*>(global_extended_grad.data_ptr());
             params_mgr->transformCouplingGradient(d_grad_v, d_v, d_p, d_grad_p);
 
         //     // [8] gradient w.r.t p: [Re(∂L/∂p), Im(∂L/∂p)]
@@ -1365,8 +1365,8 @@ public:
 
             // Build complex vector from extended format
             extended_vector = torch::complex(
-                ext.slice(0, 0, na).to(torch::kFloat),
-                ext.slice(0, na, 2 * na).to(torch::kFloat));
+                ext.slice(0, 0, na).to(TORCH_FLOAT),
+                ext.slice(0, na, 2 * na).to(TORCH_FLOAT));
 
             // Recompute amplitudes if theta params present
             if (nt > 0) {
@@ -1376,7 +1376,7 @@ public:
                     n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
             }
         } else {
-            TORCH_CHECK(params.dtype() == torch::kComplexFloat, "params must be complex128 in legacy mode");
+            TORCH_CHECK(params.dtype() == TORCH_COMPLEX, "params must be complex128 in legacy mode");
             extended_vector = params_.extendVector(params, dev);
         }
 
@@ -1451,7 +1451,7 @@ public:
             /////////////////////////
             /////////////////////////
             computeResults(d_all_amplitudes_[gpu],
-                reinterpret_cast<const cuComplex*>(extended_vec_per_gpu[gpu].data_ptr()),
+                reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[gpu].data_ptr()),
                 d_final_result_vec[gpu], d_total_integral_gpu, d_partial_result_vec[gpu],
                 d_interference_matrix_gpu, d_nSLvectors, npartials, events_[gpu][0],
                 n_amplitudes_, n_polar_);
@@ -2268,28 +2268,28 @@ public:
         // 耦合参数 Hessian [2n × 2n]（被 getBranchFractions 调用）
 
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == torch::kComplexFloat, "vector must be complex128");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be complex128");
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
 
         const int n = vector.numel();
         torch::Device dev = vector.device();
         torch::Tensor extended_vector = params_.extendVector(vector, dev);
         torch::Tensor extended_vector_conj = extended_vector.conj();
-        const cuComplex* d_vec = reinterpret_cast<const cuComplex*>(extended_vector.data_ptr());
-        const cuComplex* d_vec_conj = reinterpret_cast<const cuComplex*>(extended_vector_conj.data_ptr());
+        const ctComplex* d_vec = reinterpret_cast<const ctComplex*>(extended_vector.data_ptr());
+        const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
 
         // 计算phsp量 (与forward pass一致)
         cudaSetDevice(dev.index());
-        cuComplex* d_P_vec;
-        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(cuComplex));
-        float* d_pr, * d_pi;
-        cudaMalloc(&d_pr, sizeof(float));
-        cudaMalloc(&d_pi, sizeof(float));
+        ctComplex* d_P_vec;
+        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
+        ctPhspReal* d_pr, * d_pi;
+        cudaMalloc(&d_pr, sizeof(ctPhspReal));
+        cudaMalloc(&d_pi, sizeof(ctPhspReal));
         // 用d_vec（非共轭）与phspHessianKernel的Pu/tildeP约定保持一致
         computeQuadraticForm(d_phsp_matrix_, d_vec, d_P_vec, d_pr, d_pi, n_amplitudes_);
-        float phr, phi;
-        cudaMemcpy(&phr, d_pr, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&phi, d_pi, sizeof(float), cudaMemcpyDeviceToHost);
+        ctPhspReal phr, phi;
+        cudaMemcpy(&phr, d_pr, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&phi, d_pi, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
         double phsp_factor = (double)phr;
         cudaFree(d_pr); cudaFree(d_pi);
 
@@ -2306,7 +2306,7 @@ public:
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
             torch::Tensor vec_gpu = extended_vector.to(torch::Device(torch::kCUDA, gpu));
-            const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(vec_gpu.data_ptr());
+            const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(vec_gpu.data_ptr());
 
             // 在当前GPU上分配临时hessian并清零
             double* d_hess_gpu;
@@ -2317,7 +2317,7 @@ public:
             int nData = events_[gpu][1];
             if (nData > 0) {
                 totalDataEvents += nData;
-                cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
                 computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
             }
 
@@ -2336,7 +2336,7 @@ public:
                     std::vector<double> h_w_neg(nBkg, -1.0);
                     cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
                 }
-                cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
+                ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
                 computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
                 cudaFree(d_w_bkg);
             }
@@ -2432,9 +2432,9 @@ public:
             nt  = params_.nFreeTheta();
             auto dev = params.device();
             auto v_ext = torch::empty({nv},
-                torch::TensorOptions().dtype(torch::kComplexFloat).device(dev));
+                torch::TensorOptions().dtype(TORCH_COMPLEX).device(dev));
             params_.applyCouplingMatrix(params.data_ptr<double>(),
-                reinterpret_cast<cuComplex*>(v_ext.data_ptr()));
+                reinterpret_cast<ctComplex*>(v_ext.data_ptr()));
             vector = v_ext;
             theta = (nt > 0) ? params.slice(0, 2*ncf, params.size(0))
                              : torch::Tensor();
@@ -2478,48 +2478,48 @@ public:
             if (W_total <= 0.0) W_total = 1.0;
 
             cudaSetDevice(primary_dev);
-            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
 
                 int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-                cuComplex* d_phsp_scaled;
-                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+                ctComplex* d_phsp_scaled;
+                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(ctComplex));
                 cudaMemcpy(d_phsp_scaled, d_all_amplitudes_[gpu],
-                           nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                           nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
                 const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
                 int grid = (nPhsp_total + 255) / 256;
                 scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
                     nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
-                cuComplex* d_phsp_gpu;
-                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                ctComplex* d_phsp_gpu;
+                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cublasHandle_t h;
                 cublasCreate(&h);
-                cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-                cuComplex beta  = make_cuComplex(0.0f, 0.0f);
-                cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
+                ctComplex alpha = ctMake(1.0f, 0.0f);
+                ctComplex beta  = ctMake(0.0f, 0.0f);
+                CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
                     &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
                     &beta, d_phsp_gpu, n_amplitudes_);
                 cublasDestroy(h);
                 cudaFree(d_phsp_scaled);
 
                 if (gpu == (size_t)primary_dev) {
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    ctComplex one = ctMake(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                     cudaFree(d_phsp_gpu);
                 } else {
                     cudaSetDevice(primary_dev);
-                    cuComplex* d_temp;
-                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    ctComplex* d_temp;
+                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                     cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                        n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                     cudaSetDevice(gpu);
                     cudaFree(d_phsp_gpu);
                     cudaSetDevice(primary_dev);
-                    cuComplex one = make_cuComplex(1.0f, 0.0f);
+                    ctComplex one = ctMake(1.0f, 0.0f);
                     axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                     cudaFree(d_temp);
                 }
@@ -2531,20 +2531,20 @@ public:
         // ---- 3. vv block [0:n2, 0:n2] ----
         if (n2 > 0) {
             torch::Tensor extended_vector = is_coupling ? vector : params_.extendVector(vector, dev);
-            const cuComplex* d_vec = reinterpret_cast<const cuComplex*>(extended_vector.data_ptr());
+            const ctComplex* d_vec = reinterpret_cast<const ctComplex*>(extended_vector.data_ptr());
             const int n_ext = extended_vector.numel();
 
             // phsp factor
             cudaSetDevice(dev.index());
-            cuComplex* d_P_vec;
-            cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(cuComplex));
-            float *d_pr, *d_pi;
-            cudaMalloc(&d_pr, sizeof(float));
-            cudaMalloc(&d_pi, sizeof(float));
+            ctComplex* d_P_vec;
+            cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
+            ctPhspReal *d_pr, *d_pi;
+            cudaMalloc(&d_pr, sizeof(ctPhspReal));
+            cudaMalloc(&d_pi, sizeof(ctPhspReal));
             computeQuadraticForm(d_phsp_matrix_, d_vec, d_P_vec, d_pr, d_pi, n_amplitudes_);
-            float phr, phi;
-            cudaMemcpy(&phr, d_pr, sizeof(float), cudaMemcpyDeviceToHost);
-            cudaMemcpy(&phi, d_pi, sizeof(float), cudaMemcpyDeviceToHost);
+            ctPhspReal phr, phi;
+            cudaMemcpy(&phr, d_pr, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
+            cudaMemcpy(&phi, d_pi, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
             double phsp_factor = (double)phr;
             cudaFree(d_pr); cudaFree(d_pi);
             cudaFree(d_P_vec);
@@ -2559,7 +2559,7 @@ public:
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
                 cudaSetDevice(gpu);
                 torch::Tensor vec_gpu = extended_vector.to(torch::Device(torch::kCUDA, gpu));
-                const cuComplex* d_v_gpu = reinterpret_cast<const cuComplex*>(vec_gpu.data_ptr());
+                const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(vec_gpu.data_ptr());
 
                 double* d_hess_gpu;
                 cudaMalloc(&d_hess_gpu, hess_sz * sizeof(double));
@@ -2568,7 +2568,7 @@ public:
                 int nData = events_[gpu][1];
                 if (nData > 0) {
                     totalDataEvents += nData;
-                    cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
+                    ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
                     computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
                 }
 
@@ -2585,7 +2585,7 @@ public:
                         std::vector<double> h_w_neg(nBkg, -1.0);
                         cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
                     }
-                    cuComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
+                    ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
                     computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
                     cudaFree(d_w_bkg);
                 }
@@ -2668,20 +2668,20 @@ public:
 
             // Build per-GPU interleaved v arrays (avoid cross-device access)
             std::vector<torch::Tensor> v_il_tensors;  // keep tensors alive
-            std::vector<cuComplex*> d_v_per_gpu(n_gpu, nullptr);
+            std::vector<ctComplex*> d_v_per_gpu(n_gpu, nullptr);
             for (int gpu = 0; gpu < n_gpu; ++gpu) {
                 cudaSetDevice(gpu);
                 torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
                 amp_calc_.computeEffectiveCoupling(
-                    reinterpret_cast<const cuComplex*>(v_gpu.data_ptr()), n_ext);
-                // Build interleaved per-GPU
-                torch::Tensor vr = torch::real(v_gpu).to(torch::kFloat32);
-                torch::Tensor vi = torch::imag(v_gpu).to(torch::kFloat32);
+                    reinterpret_cast<const ctComplex*>(v_gpu.data_ptr()), n_ext);
+                // Build interleaved per-GPU（dtype 跟随编译精度：float32/float64）
+                torch::Tensor vr = torch::real(v_gpu).to(TORCH_FLOAT);
+                torch::Tensor vi = torch::imag(v_gpu).to(TORCH_FLOAT);
                 torch::Tensor vil = torch::empty({n_ext * 2},
-                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::Device(torch::kCUDA, gpu)));
+                    torch::TensorOptions().dtype(TORCH_FLOAT).device(torch::Device(torch::kCUDA, gpu)));
                 vil.slice(0, 0, 2 * n_ext, 2).copy_(vr);
                 vil.slice(0, 1, 2 * n_ext, 2).copy_(vi);
-                d_v_per_gpu[gpu] = const_cast<cuComplex*>(reinterpret_cast<const cuComplex*>(vil.data_ptr()));
+                d_v_per_gpu[gpu] = const_cast<ctComplex*>(reinterpret_cast<const ctComplex*>(vil.data_ptr()));
                 v_il_tensors.push_back(vil);
             }
             cudaSetDevice(primary_dev);
@@ -2840,10 +2840,10 @@ public:
                 int na = cm.n_amps;
 
                 // Build extended vector v_ext
-                auto v_ext_tensor = torch::empty({na}, torch::TensorOptions().dtype(torch::kComplexFloat).device(dev));
+                auto v_ext_tensor = torch::empty({na}, torch::TensorOptions().dtype(TORCH_COMPLEX).device(dev));
                 params_.applyCouplingMatrix(params.data_ptr<double>(),
-                    reinterpret_cast<cuComplex*>(v_ext_tensor.data_ptr()));
-                const cuComplex* d_v_ext = reinterpret_cast<const cuComplex*>(v_ext_tensor.data_ptr());
+                    reinterpret_cast<ctComplex*>(v_ext_tensor.data_ptr()));
+                const ctComplex* d_v_ext = reinterpret_cast<const ctComplex*>(v_ext_tensor.data_ptr());
 
                 // Allocate g_v on primary GPU
                 cudaMalloc(&d_g_v, 2 * na * sizeof(double));
@@ -2854,13 +2854,13 @@ public:
                     int nEv = events_[gpu][1];
                     if (nEv == 0) continue;
                     cudaSetDevice(gpu);
-                    cuComplex* d_g_gpu;
-                    cudaMalloc(&d_g_gpu, na * sizeof(cuComplex));
+                    ctComplex* d_g_gpu;
+                    cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
                     computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][1],
                         d_v_ext, d_g_gpu, nEv, n_polar_, na, nullptr, nullptr);
-                    // Convert cuComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
-                    std::vector<cuComplex> h_g_tmp(na);
-                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                    // Convert ctComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
+                    std::vector<ctComplex> h_g_tmp(na);
+                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(ctComplex), cudaMemcpyDeviceToHost);
                     std::vector<double> h_g(2 * na);
                     for (int a = 0; a < na; ++a) {
                         h_g[a]      = (double)h_g_tmp[a].x;
@@ -2881,8 +2881,8 @@ public:
                     if (events_[gpu].size() <= 2 || events_[gpu][2] == 0) continue;
                     int nEv = events_[gpu][2];
                     cudaSetDevice(gpu);
-                    cuComplex* d_g_gpu;
-                    cudaMalloc(&d_g_gpu, na * sizeof(cuComplex));
+                    ctComplex* d_g_gpu;
+                    cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
                     // Negate bkg weights (same as in NLL forward)
                     const double* d_w = (gpu < (int)bkg_weights_.size() && bkg_weights_[gpu]) ? nullptr : nullptr;
                     // Use negated bkg weights
@@ -2895,9 +2895,9 @@ public:
                     computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][2],
                         d_v_ext, d_g_gpu, nEv, n_polar_, na, d_neg_w, nullptr);
                     if (d_neg_w) cudaFree(d_neg_w);
-                    // Convert cuComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
-                    std::vector<cuComplex> h_g_tmp(na);
-                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                    // Convert ctComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
+                    std::vector<ctComplex> h_g_tmp(na);
+                    cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(ctComplex), cudaMemcpyDeviceToHost);
                     std::vector<double> h_g(2 * na);
                     for (int a = 0; a < na; ++a) {
                         h_g[a]      = (double)h_g_tmp[a].x;
@@ -2918,30 +2918,30 @@ public:
                     cudaSetDevice(primary_dev);
 
                     // Compute phsp_factor and P_vec = M × v
-                    cuComplex* d_P_vec; cudaMalloc(&d_P_vec, na * sizeof(cuComplex));
+                    ctComplex* d_P_vec; cudaMalloc(&d_P_vec, na * sizeof(ctComplex));
                     {
                         cublasHandle_t h; cublasCreate(&h);
-                        cuComplex alpha = make_cuComplex(1,0), beta = make_cuComplex(0,0);
-                        cublasCgemv(h, CUBLAS_OP_N, na, na, &alpha, d_phsp_matrix_, na,
+                        ctComplex alpha = ctMake(1,0), beta = ctMake(0,0);
+                        CUBLAS_CGEMV(h, CUBLAS_OP_N, na, na, &alpha, d_phsp_matrix_, na,
                                     d_v_ext, 1, &beta, d_P_vec, 1);
                         cublasDestroy(h);
                     }
-                    float phr;
+                    ctPhspReal phr;
                     {
                         auto v_conj = v_ext_tensor.conj();
-                        const cuComplex* d_vc = reinterpret_cast<const cuComplex*>(v_conj.data_ptr());
-                        float *d_pr, *d_pi;
-                        cudaMalloc(&d_pr, sizeof(float)); cudaMalloc(&d_pi, sizeof(float));
+                        const ctComplex* d_vc = reinterpret_cast<const ctComplex*>(v_conj.data_ptr());
+                        ctPhspReal *d_pr, *d_pi;
+                        cudaMalloc(&d_pr, sizeof(ctPhspReal)); cudaMalloc(&d_pi, sizeof(ctPhspReal));
                         computeQuadraticForm(d_phsp_matrix_, d_vc, d_P_vec, d_pr, d_pi, na);
-                        cudaMemcpy(&phr, d_pr, sizeof(float), cudaMemcpyDeviceToHost);
+                        cudaMemcpy(&phr, d_pr, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
                         cudaFree(d_pr); cudaFree(d_pi);
                     }
                     double phsp_factor = (double)phr;
 
                     if (phsp_factor > 1e-30) {
                         double scale = N_eff / phsp_factor;
-                        std::vector<cuComplex> h_P(na);
-                        cudaMemcpy(h_P.data(), d_P_vec, na * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+                        std::vector<ctComplex> h_P(na);
+                        cudaMemcpy(h_P.data(), d_P_vec, na * sizeof(ctComplex), cudaMemcpyDeviceToHost);
                         std::vector<double> h_g(2 * na, 0.0);
                         for (int a = 0; a < na; ++a) {
                             h_g[a]      = scale * (double)h_P[a].x;
@@ -3008,7 +3008,7 @@ public:
 
             auto vg = extended_vector.to(torch::Device(torch::kCUDA, gpu));
             computeBranchingFractions(d_all_amplitudes_[gpu],
-                reinterpret_cast<const cuComplex*>(vg.data_ptr()),
+                reinterpret_cast<const ctComplex*>(vg.data_ptr()),
                 d_p, nullptr, d_t, d_nsl, npartials, nPhsp, n_amplitudes_, n_polar_);
 
             std::vector<double> hp(npartials); double ht;
@@ -3023,7 +3023,7 @@ public:
     // Accumulates into out_partial and out_scattering (caller must zero-initialize).
     void computeTruthIntegrals(
         const torch::Tensor& extended_vector,
-        const std::vector<cuComplex*>& d_amps,
+        const std::vector<ctComplex*>& d_amps,
         const std::vector<int>& ev_per_gpu,
         double* out_partial,
         double* out_scattering,
@@ -3046,7 +3046,7 @@ public:
 
             auto vg = extended_vector.to(torch::Device(torch::kCUDA, gpu));
             computeBranchingFractions(d_amps[gpu],
-                reinterpret_cast<const cuComplex*>(vg.data_ptr()),
+                reinterpret_cast<const ctComplex*>(vg.data_ptr()),
                 d_p, d_s, d_t, d_nsl, npartials, nt, n_amplitudes_, n_polar_);
 
             std::vector<double> hp(npartials), hs(npartials * npartials); double ht;
@@ -3068,7 +3068,7 @@ public:
         std::vector<double>& out_phsp,
         std::vector<double>& out_bf,
         int npartials,
-        const std::vector<cuComplex*>& d_truth_amps,
+        const std::vector<ctComplex*>& d_truth_amps,
         const std::vector<int>& truth_ev_per_gpu,
         double dataIntegral) const
     {
@@ -3096,7 +3096,7 @@ public:
     torch::Tensor getBranchFractions(torch::Tensor& vector)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == torch::kComplexFloat, "vector must be ComplexFloat");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
 
         const auto& data_files = config_parser_.getDataFiles();
         TORCH_CHECK(data_files.count("phsp_truth") > 0, "No phsp_truth in config");
@@ -3191,7 +3191,7 @@ public:
                 t_amp_off[g] = {0, nev * n_polar_ * n_amplitudes_};
             }
             events_offsets_ = t_ev_off; amp_offsets_ = t_amp_off;
-            std::vector<cuComplex*> d_batch_amps = calculateAmplitudes(Vp4_tpg);
+            std::vector<ctComplex*> d_batch_amps = calculateAmplitudes(Vp4_tpg);
 
             // Center
             computeTruthIntegrals(ev_center, d_batch_amps, batch_ev_per_gpu,
@@ -3261,10 +3261,10 @@ public:
     {
         // torch::Tensor output = torch::from_blob(data_fix_, {data_length *
         // n_gls_},
-        // torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
         torch::Tensor output = torch::from_blob(d_all_amplitudes_[0] + amp_offsets_[0][1],
             { events_[0][1] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
 
         return output;
     }
@@ -3273,10 +3273,10 @@ public:
     {
         // torch::Tensor output = torch::from_blob(phsp_fix_, {phsp_length *
         // n_gls_},
-        // torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
         torch::Tensor output = torch::from_blob(d_all_amplitudes_[0],
             { events_[0][0] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
 
         return output;
     }
@@ -3301,12 +3301,12 @@ public:
     //             << Vp4_truth.begin()->second.size() << std::endl;
     //         // std::cout << "Calculating phase space truth amplitudes..." <<
     //         // std::endl;
-    //         cuComplex* truth_fix = calculateAmplitudes(Vp4_truth, { 0 }, { 0 });
+    //         ctComplex* truth_fix = calculateAmplitudes(Vp4_truth, { 0 }, { 0 });
     //         int truth_length = Vp4_truth.begin()->second.size() * n_polar_;
 
     //         torch::Tensor output = torch::from_blob(truth_fix,
     //             { truth_length * n_gls_ },
-    //             torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+    //             torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
 
     //         cudaFree(truth_fix);
 
@@ -3317,20 +3317,20 @@ public:
     //         std::cerr
     //             << "No phsp_truth data file specified in the configuration."
     //             << std::endl;
-    //         return torch::empty({ 0 }, torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA));
+    //         return torch::empty({ 0 }, torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA));
     //     }
     // }
 
     torch::Tensor getBkgTensor() const
     {
         if (events_[0].size() <= 2 || events_[0][2] == 0)
-            return torch::empty({ 0 }, torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA));
+            return torch::empty({ 0 }, torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA));
         // torch::Tensor output = torch::from_blob(bkg_fix_, {bkg_length *
         // n_gls_},
-        // torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
         torch::Tensor output = torch::from_blob(d_all_amplitudes_[0] + amp_offsets_[0][2],
             { events_[0][2] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(torch::kComplexFloat).device(torch::kCUDA)).clone();
+            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
 
         return output;
     }
@@ -3463,8 +3463,8 @@ private:
     std::vector<int> nSLvectors_;
 
     // 振幅数据，设备端
-    std::vector<cuComplex*> d_all_amplitudes_;
-    cuComplex* d_phsp_matrix_ = nullptr;
+    std::vector<ctComplex*> d_all_amplitudes_;
+    ctComplex* d_phsp_matrix_ = nullptr;
     std::vector<double*> data_weights_;
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
@@ -3570,6 +3570,24 @@ private:
         // 设备检测：枚举 GPU 属性/显存，替换散落的 cudaGetDeviceCount
         device_mgr_.detect();
         n_gpus_ = device_mgr_.numDevices();
+
+        // 精度匹配检查：config.yml 显式请求的精度必须与 .so 编译精度一致
+        {
+            const std::string& req = config_parser_.getPrecision();
+            if (req == "auto") {
+                // 未显式声明精度：跟随 .so 编译精度，不检查
+            } else if (req != "float" && req != "double") {
+                std::cerr << "ERROR: 配置 precision=\"" << req
+                          << "\" 无效（仅支持 float | double）" << std::endl;
+                throw std::runtime_error("invalid precision in config");
+            } else if (req != PRECISION_NAME) {
+                std::cerr << "ERROR: 配置文件请求 precision=" << req
+                          << "，但当前安装的 ctpwa 编译为 " << PRECISION_NAME
+                          << "。请用 CTPWA_DOUBLE_COMPLEX=1 pip install -e . "
+                             "重新编译安装双精度版本。" << std::endl;
+                throw std::runtime_error("precision mismatch");
+            }
+        }
         if (n_gpus_ == 0) {
             std::cerr << "ERROR: 无可用 CUDA 设备。ctpwa 当前仅支持 GPU 计算"
                          "（CPU 后端尚未实现），无法继续。" << std::endl;
@@ -3642,8 +3660,8 @@ private:
         // {
         //     Ntotal += events_[0][j];
         // }
-        // cuComplex* h_amp = new cuComplex[Ntotal * n_polar_ * n_amplitudes_];
-        // cudaMemcpy(h_amp, d_all_amplitudes_[0], Ntotal * n_polar_ * n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        // ctComplex* h_amp = new ctComplex[Ntotal * n_polar_ * n_amplitudes_];
+        // cudaMemcpy(h_amp, d_all_amplitudes_[0], Ntotal * n_polar_ * n_amplitudes_ * sizeof(ctComplex), cudaMemcpyDeviceToHost);
         // for (int i = 0; i < Ntotal * n_polar_ * n_amplitudes_; ++i)
         // {
         //     std::cout << "Amplitude[" << i << "] = " << h_amp[i].x << " + " << h_amp[i].y << "i" << std::endl;
@@ -3708,8 +3726,8 @@ private:
         }
 
         // // 打印d_all_amplitudes_[0]的所有元素，验证数据正确加载
-        // cuComplex* h_amp = new cuComplex[n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1])];
-        // cudaMemcpy(h_amp, d_all_amplitudes_[0], n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1]) * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        // ctComplex* h_amp = new ctComplex[n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1])];
+        // cudaMemcpy(h_amp, d_all_amplitudes_[0], n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1]) * sizeof(ctComplex), cudaMemcpyDeviceToHost);
         // std::cout << "First amplitudes on GPU 0:" << std::endl;
         // for (int i = 0; i < n_amplitudes_ * n_polar_ * (init_events[0] + init_events[1]); ++i)
         // {
@@ -3734,8 +3752,8 @@ private:
         if (W_total <= 0.0) W_total = 1.0;
 
         cudaSetDevice(0);  // ensure d_phsp_matrix_ is allocated on GPU 0
-        cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
-        cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+        cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+        cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
         {
             int nPhsp = events_[gpu][0];
@@ -3743,49 +3761,49 @@ private:
             cudaSetDevice(gpu);
 
             int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-            cuComplex* d_phsp_scaled;
-            cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(cuComplex));
+            ctComplex* d_phsp_scaled;
+            cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(ctComplex));
             cudaMemcpy(d_phsp_scaled, d_all_amplitudes_[gpu],
-                       nPhsp_total * sizeof(cuComplex), cudaMemcpyDeviceToDevice);
+                       nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
             const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
             int grid = (nPhsp_total + 255) / 256;
             scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
                 nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
-            cuComplex* d_phsp_gpu;
-            cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+            ctComplex* d_phsp_gpu;
+            cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
             cublasHandle_t h;
             cublasCreate(&h);
-            cuComplex alpha = make_cuComplex(1.0f, 0.0f);
-            cuComplex beta  = make_cuComplex(0.0f, 0.0f);
-            cublasCgemm(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
+            ctComplex alpha = ctMake(1.0f, 0.0f);
+            ctComplex beta  = ctMake(0.0f, 0.0f);
+            CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
                 &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
                 &beta, d_phsp_gpu, n_amplitudes_);
             cublasDestroy(h);
             cudaFree(d_phsp_scaled);
 
             if (gpu == 0) {
-                cuComplex one = make_cuComplex(1.0f, 0.0f);
+                ctComplex one = ctMake(1.0f, 0.0f);
                 axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                 cudaFree(d_phsp_gpu);
             } else {
                 cudaSetDevice(0);
-                cuComplex* d_temp;
-                cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                ctComplex* d_temp;
+                cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cudaMemcpyPeer(d_temp, 0, d_phsp_gpu, gpu,
-                    n_amplitudes_ * n_amplitudes_ * sizeof(cuComplex));
+                    n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cudaSetDevice(gpu);
                 cudaFree(d_phsp_gpu);
                 cudaSetDevice(0);
-                cuComplex one = make_cuComplex(1.0f, 0.0f);
+                ctComplex one = ctMake(1.0f, 0.0f);
                 axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                 cudaFree(d_temp);
             }
         }
         // // cudaFree(d_phsp);
         // // 打印矩阵d_phsp
-        // cuComplex* h_phsp = new cuComplex[n_amplitudes_ * n_amplitudes_];
-        // cudaMemcpy(h_phsp, d_phsp_matrix_, n_amplitudes_* n_amplitudes_ * sizeof(cuComplex), cudaMemcpyDeviceToHost);
+        // ctComplex* h_phsp = new ctComplex[n_amplitudes_ * n_amplitudes_];
+        // cudaMemcpy(h_phsp, d_phsp_matrix_, n_amplitudes_* n_amplitudes_ * sizeof(ctComplex), cudaMemcpyDeviceToHost);
         // std::cout << "Phase space matrix (phsp*phsp^T):" << std::endl;
         // for (int i = 0; i < n_amplitudes_; ++i) {
         //     for (int j = 0; j < n_amplitudes_; ++j) {
@@ -4085,11 +4103,11 @@ private:
         }
     }
 
-    std::vector<cuComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
+    std::vector<ctComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
     {
         // 多GPU支持：为每个GPU分配振幅内存
         // int num_gpus = events_.size();
-        std::vector<cuComplex*> d_all_amplitudes_vec(n_gpus_, nullptr);
+        std::vector<ctComplex*> d_all_amplitudes_vec(n_gpus_, nullptr);
 
         // 计算每个GPU的总事件数
         // std::vector<int> nEvents_per_gpu(n_gpus_, 0);
@@ -4104,7 +4122,7 @@ private:
             if (amp_offsets_[gpu].back() > 0) {
                 cudaSetDevice(gpu);
                 // std::cout << "Allocating memory for GPU " << gpu << ": " << events_offsets_[gpu].back() * n_polar_ * n_amplitudes_ << " " << amp_offsets_[gpu].back() << " amplitudes." << std::endl;
-                cudaMalloc(&d_all_amplitudes_vec[gpu], amp_offsets_[gpu].back() * sizeof(cuComplex));
+                cudaMalloc(&d_all_amplitudes_vec[gpu], amp_offsets_[gpu].back() * sizeof(ctComplex));
             }
         }
         // cudaSetDevice(0);

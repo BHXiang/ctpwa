@@ -902,7 +902,7 @@ __global__ void computeSLAmpKernel(
     }
 }
 
-void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
+void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     const std::vector<Resonance>& resonances,
     const int site,
     const int n_amplitudes,
@@ -1037,7 +1037,7 @@ void AmpCasDecay::getAmps(std::vector<cuComplex*>& d_amplitudes,
 }
 
 __global__ void
-computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
+computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamps, // SL振幅
@@ -1075,7 +1075,7 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
     // amp_offsets = %d\n", event_idx, sl_idx, offset_idx,
     // event_offsets[offset_idx], amp_offsets[offset_idx]);
 
-    thrust::complex<float> resAmp(1.0, 0.0);
+    ctResAmp resAmp(1.0, 0.0);
 
     // 遍历衰变链中的每个节点
     for (int nodeIdx = 0; nodeIdx < decayChain_size; ++nodeIdx)
@@ -1194,8 +1194,8 @@ computeAmpsKernel(cuComplex* amplitudes,                 // 输出振幅
         // printf("Event %d, SL %d, Polarization %d: amp_idx = %d\n", event_idx,
         // sl_idx, k, amp_idx);
 
-        thrust::complex<float> temp = resAmp * slamps[idx]; // * 100.0f;
-        amplitudes[amp_idx] = make_cuComplex(temp.real(), temp.imag());
+        ctResAmp temp = resAmp * slamps[idx]; // * 100.0f;
+        amplitudes[amp_idx] = ctMake(temp.real(), temp.imag());
 
         // printf("Event %d, SL %d, Polarization %d: resAmp = (%f, %f), slamp = (%f, %f), Final Amp = (%f, %f)\n",
         //     event_idx, sl_idx, k,
@@ -1421,7 +1421,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     }
 }
 
-void AmpCalc::reComputeAmps(std::vector<cuComplex*>& d_amplitudes,
+void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             const double* d_params,
                             int n_amplitudes,
                             const std::vector<std::vector<int>>& event_offsets,
@@ -1600,7 +1600,7 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
 // ∂R_total/∂θ 通过 AutoDiff 自动传播所有依赖关系（包括 Bf 对 mass 的依赖）
 template <int Nfree>
 __global__ void resonanceGradientKernel(
-    const cuComplex* d_w, const cuComplex* d_T,
+    const ctComplex* d_w, const ctComplex* d_T,
     const DeviceMomenta* d_momenta, const DecayNode* d_decayNodes,
     const SL* d_slComb, const DeviceResonance* d_res,
     int res_idx_in_block, const double* d_all_params,
@@ -1608,7 +1608,7 @@ __global__ void resonanceGradientKernel(
     int nEvents, int nPolar, int decayChain_size, double bf_d, double sign,
     int t_evt_offset,
     const thrust::complex<double>* d_slamps,
-    const cuComplex* d_v, int site, int nSLComb)
+    const ctComplex* d_v, int site, int nSLComb)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
@@ -1705,11 +1705,11 @@ __global__ void resonanceGradientKernel(
         // 累加 sl 的贡献: 对 pol 求和 Σ_p conj(w_p) · v_sl · slamps[sl,e,p]
         // 然后乘以 ∂R_sl/∂θ 的 (实部, 虚部) 并提取实部
         // ----------------------------------------------------------------
-        cuComplex v_sl = d_v[site + sl_idx];
+        ctComplex v_sl = d_v[site + sl_idx];
 
         double s_re = 0.0, s_im = 0.0;
         for (int pol = 0; pol < nPolar; ++pol) {
-            cuComplex w_val = d_w[evt * nPolar + pol];
+            ctComplex w_val = d_w[evt * nPolar + pol];
             int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
             auto sl_amp = d_slamps[amp_idx];
             double sl_re = sl_amp.real();
@@ -1737,9 +1737,9 @@ __global__ void resonanceGradientKernel(
 // T 计算 kernel: T[e,p] = Σ_sl v[site+sl] * slamps[sl, e, p]
 // ---------------------------------------------------------------------------
 __global__ void computeEffectiveCouplingKernel(
-    cuComplex* d_T,
+    ctComplex* d_T,
     const thrust::complex<double>* d_slamps,
-    const cuComplex* d_v,
+    const ctComplex* d_v,
     int nSL, int nTotal,
     int sl_start, int sl_end)  // SL range: only sum over these SL channels
 {
@@ -1753,13 +1753,13 @@ __global__ void computeEffectiveCouplingKernel(
         re += (double)vv.x * sv.real() - (double)vv.y * sv.imag();
         im += (double)vv.x * sv.imag() + (double)vv.y * sv.real();
     }
-    d_T[idx] = make_cuComplex((float)re, (float)im);
+    d_T[idx] = ctMake(ctCastFloat(re), ctCastFloat(im));
 }
 
 // ---------------------------------------------------------------------------
 // AmpCalc::computeEffectiveCoupling
 // ---------------------------------------------------------------------------
-void AmpCalc::computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes)
+void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
 {
     if (cas_list_.empty() || blocks_.empty()) return;
     // 仅在当前设备上计算 T（调用者负责 per-GPU 循环）
@@ -1775,7 +1775,7 @@ void AmpCalc::computeEffectiveCoupling(const cuComplex* d_v, int n_amplitudes)
         int nTotal = nEv * nPol;
 
         if (block.d_T[gpu] == nullptr) {
-            cudaMalloc(&block.d_T[gpu], nTotal * sizeof(cuComplex));
+            cudaMalloc(&block.d_T[gpu], nTotal * sizeof(ctComplex));
         }
 
         int grid = (nTotal + kBlockSize - 1) / kBlockSize;
@@ -1794,35 +1794,35 @@ __global__ void daxpy_kernel(double* y, const double* x, double alpha, int n) {
 
 // 计算 w[e,p] = sign * S[e,p] / I[e]（用于梯度计算：g = A^H * w）
 __global__ void computeGradWeightKernel(
-    cuComplex* d_w, const cuComplex* d_S, double* d_I,
+    ctComplex* d_w, const ctComplex* d_S, double* d_I,
     int nEv, int nPol, double sign)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nEv) return;
     double I_val = 0.0;
     for (int p = 0; p < nPol; ++p) {
-        cuComplex s = d_S[e * nPol + p];
+        ctComplex s = d_S[e * nPol + p];
         I_val += (double)s.x * s.x + (double)s.y * s.y;
     }
     d_I[e] = I_val;
     double inv_I = I_val > 1e-30 ? sign / I_val : 0.0;
     for (int p = 0; p < nPol; ++p) {
-        cuComplex s = d_S[e * nPol + p];
-        d_w[e * nPol + p] = make_cuComplex((float)(inv_I * s.x), (float)(inv_I * s.y));  // sign * S/I
+        ctComplex s = d_S[e * nPol + p];
+        d_w[e * nPol + p] = ctMake((float)(inv_I * s.x), (float)(inv_I * s.y));  // sign * S/I
     }
 }
 
 // 对 bkg 事件乘上权重
 __global__ void applyBkgWeightsKernel(
-    cuComplex* d_w, const double* d_weights, int nEv, int nPol)
+    ctComplex* d_w, const double* d_weights, int nEv, int nPol)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nEv) return;
     double wgt = d_weights ? d_weights[e] : 1.0;
     for (int p = 0; p < nPol; ++p) {
         int idx = e * nPol + p;
-        d_w[idx].x *= (float)wgt;
-        d_w[idx].y *= (float)wgt;
+        d_w[idx].x *= ctCastFloat(wgt);
+        d_w[idx].y *= ctCastFloat(wgt);
     }
 }
 
@@ -1830,12 +1830,12 @@ __global__ void applyBkgWeightsKernel(
 // AmpCalc::computeResonanceGradient
 // ---------------------------------------------------------------------------
 void AmpCalc::computeResonanceGradient(
-    const std::vector<cuComplex*>& d_w,
+    const std::vector<ctComplex*>& d_w,
     const std::vector<int>& n_events,
     double* d_grad_res,
     double sign,
     const std::vector<int>& t_offset,
-    const std::vector<cuComplex*>& d_v_per_gpu)
+    const std::vector<ctComplex*>& d_v_per_gpu)
 {
     int n_gpu = static_cast<int>(d_w.size());
     int n_free = nFreeResParams();
@@ -1882,7 +1882,7 @@ void AmpCalc::computeResonanceGradient(
                 int nPol = static_cast<int>(cas->getNPolarizations());
                 int grid = (nEv + kBlockSize - 1) / kBlockSize;
                 int evt_off = has_offset ? t_offset[gpu] : 0;
-                const cuComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
+                const ctComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
                 switch (Nlocal) {
                 case 1:
                     resonanceGradientKernel<1><<<grid, kBlockSize>>>(
@@ -1963,7 +1963,7 @@ void AmpCalc::computeResonanceGradient(
             int nPol = static_cast<int>(cj_cas->getNPolarizations());
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
             int evt_off = has_offset ? t_offset[gpu] : 0;
-            const cuComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
+            const ctComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
             switch (Nlocal) {
             case 1:
                 resonanceGradientKernel<1><<<grid, kBlockSize>>>(
@@ -2046,8 +2046,8 @@ void AmpCalc::computeUnifiedHessian(
     double* d_hess, int hess_ld,
     const std::vector<int>& t_offset,
     double default_weight,
-    const std::vector<cuComplex*>& d_v_per_gpu,
-    const std::vector<cuComplex*>& d_amp_per_gpu,
+    const std::vector<ctComplex*>& d_v_per_gpu,
+    const std::vector<ctComplex*>& d_amp_per_gpu,
     int n_amp_total,
     const std::vector<double*>& d_event_weights,
     double* d_phsp_I,
@@ -2086,8 +2086,8 @@ void AmpCalc::computeUnifiedHessian(
         if (nEv <= 0) continue;
         int evt_off = has_offset ? t_offset[gpu] : 0;
         const double* d_w = (gpu < (int)d_event_weights.size()) ? d_event_weights[gpu] : nullptr;
-        const cuComplex* d_v = d_v_per_gpu[gpu];
-        const cuComplex* d_amp = d_amp_per_gpu[gpu];
+        const ctComplex* d_v = d_v_per_gpu[gpu];
+        const ctComplex* d_amp = d_amp_per_gpu[gpu];
 
         // --- For remote GPUs, allocate local copies of global output buffers ---
         bool is_remote = (gpu != primary_dev);
@@ -2223,7 +2223,7 @@ void AmpCalc::computeUnifiedHessian(
 
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
 
-            const cuComplex* d_v_blk = d_v + blk.site;
+            const ctComplex* d_v_blk = d_v + blk.site;
             // Conjugate 块：phsp 积分已由 owner 计算，跳过 d_pI_g。
             // phsp 梯度/Hessian（d_pg_g, d_phA_g）通过 owner slot 累加。
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
@@ -2454,7 +2454,7 @@ void AmpCalc::testBWRHessian(double m, double m0, double g0, int L, double q, do
 // ============================================================
 
 __global__ void multiplicativeCouplingKernel(
-    cuComplex* d_v, const double* d_params,
+    ctComplex* d_v, const double* d_params,
     const int* d_amp_chain,
     const int* d_step_offsets,
     const int* d_step_data,
@@ -2479,8 +2479,8 @@ __global__ void multiplicativeCouplingKernel(
         re = new_re; im = new_im;
     }
 
-    d_v[a].x = (float)re;
-    d_v[a].y = (float)im;
+    d_v[a].x = ctCastFloat(re);
+    d_v[a].y = ctCastFloat(im);
 }
 
 // Gradient transform: ∂L/∂p using Wirtinger calculus
@@ -2488,8 +2488,8 @@ __global__ void multiplicativeCouplingKernel(
 // d_params, d_grad_p: [Re_0..Re_{n-1}, Im_0..Im_{n-1}] (all Re, all Im)
 __global__ void multiplicativeGradientKernel(
     double* d_grad_p,           // output [2·n_free] — [Re, Im] format
-    const cuComplex* d_grad_v,  // ∂L/∂v [n_amps]
-    const cuComplex* d_v,       // current v [n_amps]
+    const ctComplex* d_grad_v,  // ∂L/∂v [n_amps]
+    const ctComplex* d_v,       // current v [n_amps]
     const double* d_params,     // [2·n_free] — [Re, Im] format
     const int* d_amp_chain,     // [n_amps]
     const int* d_step_offsets,  // [n_amps+1]

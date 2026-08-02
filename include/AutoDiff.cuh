@@ -2,7 +2,7 @@
 #define AUTODIFF_CUH
 
 #include <cuda_runtime.h>
-#include <cuComplex.h>
+#include "ComplexType.h"
 #include <cmath>
 #include <iostream>
 
@@ -494,34 +494,28 @@ ComplexVar<T, N, WithHess> make_complex_constant(T re, T im) {
 }
 
 // ============================================================================
-// 第三部分：cuDoubleComplex / cuComplex 支持
+// 第三部分：cuDoubleComplex / ctComplex 支持
 // ============================================================================
 
-// cuDoubleComplex 到 ComplexVar 的转换（常数，无梯度）
+// ctComplex 到 ComplexVar 的转换（常数，无梯度）
+// （ctComplex 在 float 版为 cuComplex，double 版为 cuDoubleComplex）
 template <typename T, int N, bool WithHess>
 __host__ __device__
-ComplexVar<T, N, WithHess> cucomplex_to_complexvar(const cuDoubleComplex& z) {
-    return make_complex_constant<T, N, WithHess>(z.x, z.y);
-}
-
-// cuComplex 到 ComplexVar 的转换 (float 版本)
-template <typename T, int N, bool WithHess>
-__host__ __device__
-ComplexVar<T, N, WithHess> cucomplex_to_complexvar(const cuComplex& z) {
+ComplexVar<T, N, WithHess> cucomplex_to_complexvar(const ctComplex& z) {
     return make_complex_constant<T, N, WithHess>(z.x, z.y);
 }
 
 
-// 核函数：在设备端将 cuComplex 数组转换为 ComplexVar 数组
+// 核函数：在设备端将 ctComplex 数组转换为 ComplexVar 数组
 template <typename T, int N, bool WithHess>
 __global__ void init_complex_vars_kernel(
-    const cuComplex* d_input,
+    const ctComplex* d_input,
     ComplexVar<T, N, WithHess>* d_output,
     int num_res
 ) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < num_res) {
-        cuComplex val = d_input[idx];
+        ctComplex val = d_input[idx];
         d_output[idx] = make_complex_variable<T, N, WithHess>(2 * idx, 2 * idx + 1, val.x, val.y);
     }
 }

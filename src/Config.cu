@@ -64,6 +64,10 @@ ConfigParser::ConfigParser(const std::string &config_file)
 
         if (config["Plot"])
             parsePlotConfig(config["Plot"]);
+
+        // 用户请求的精度（auto=不检查，显式 float/double 时与 .so 比对）
+        if (config["precision"])
+            precision_ = config["precision"].as<std::string>();
     } catch (const YAML::Exception &e) {
         std::cerr << "Warning: Failed to parse config file \"" << config_file
                   << "\": " << e.what() << std::endl;
