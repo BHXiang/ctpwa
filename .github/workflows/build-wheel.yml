@@ -25,12 +25,16 @@ on:
 
 jobs:
   build:
+    # 直接用 ubuntu-22.04 runner（glibc 2.35）编译，产物符号 <= 2.35，
+    # auditwheel 打 manylinux_2_35 标签（要求目标系统 glibc >= 2.35）。
+    # 之前尝试 manylinux_2_34 容器，但该镜像是 RHEL 系（无 apt/dpkg）。
     runs-on: ubuntu-22.04
-    container:
-      image: quay.io/pypa/manylinux_2_34_x86_64:latest
 
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       # ---- 1. CUDA 13.2 toolkit（nvcc + runtime headers）----
       - name: Install CUDA 13.2 toolkit
@@ -62,11 +66,11 @@ jobs:
           CUDA_HOME: /usr/local/cuda-13.2
           ROOTSYS: /usr
         run: |
-          # apt 装的 ROOT 头/库在 /usr/include/root 与 /usr/lib/x86_64-linux-gnu/root
+          pip install auditwheel
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
           auditwheel repair \
-            --plat manylinux_2_34_x86_64 \
+            --plat manylinux_2_35_x86_64 \
             --exclude "libCore.so*" --exclude "libRIO.so*" \
             --exclude "libHist.so*" --exclude "libTree.so*" \
             --exclude "libMatrix.so*" --exclude "libPhysics.so*" \
