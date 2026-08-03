@@ -35,19 +35,21 @@ jobs:
       # ---- 1. CUDA 13.2 toolkit（nvcc + runtime headers）----
       - name: Install CUDA 13.2 toolkit
         run: |
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-          dpkg -i cuda-keyring_1.1-1_all.deb
+          set -x
+          curl -sSL -o /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          ls -l /tmp/cuda-keyring.deb
+          dpkg -i /tmp/cuda-keyring.deb
           apt-get update -qq
-          apt-get install -y -qq cuda-toolkit-13-2 libyaml-cpp-dev
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            cuda-toolkit-13-2 libyaml-cpp-dev
+          /usr/local/cuda-13.2/bin/nvcc --version | tail -1
 
-      # ---- 2. ROOT（Ubuntu 22.04 apt 包，6.26+）----
+      # ---- 2. ROOT（Ubuntu 22.04 apt meta 包，6.26+）----
       - name: Install ROOT
         run: |
-          apt-get install -y -qq \
-            libroot-core-dev libroot-tree-dev libroot-hist-dev \
-            libroot-math-mathcore-dev libroot-graf2d-graf-dev \
-            libroot-graf2d-gpad-dev libroot-io-dev libroot-net-dev \
-            libroot-physics-dev libroot-misc-mathmore-dev
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libroot-dev
+          root-config --version
 
       # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配）----
       - name: Install torch
