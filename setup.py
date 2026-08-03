@@ -166,7 +166,9 @@ extension = CUDAExtension(
             "-D_GLIBCXX_USE_CXX11_ABI=1",  # 确保与 PyTorch ABI 兼容
         ],
         "nvcc": [
-            *cuda_gencode_flags,  # 动态检测到的 gencode 选项
+            # gencode 由 TORCH_CUDA_ARCH_LIST 环境变量控制（torch cpp_extension 生成）；
+            # 本机开发不设置时 torch 自动检测 GPU；CI 构建 wheel 时显式设置
+            # 多架构列表（无 GPU 的 runner 上 torch 检测不到架构会 IndexError）。
             #"-arch=sm_120",
             "--expt-relaxed-constexpr",
             # "--use_fast_math",
