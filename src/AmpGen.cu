@@ -2106,6 +2106,8 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
 
 // 梯度 kernel（纯读取 d_dF 版）：∂F/∂θ 由 computeAmpsKernelAD 预计算，
 // 本 kernel 只做: -2·sign·Re(conj(w)·v·slamp·∂F/∂θ) 累加
+// 优化：per-block shared 部分和 → 每 block 只做 Nfree 次全局 atomicAdd
+// （50 万事件时全局 atomicAdd 从 200 万次降到 ~8000 次，消除竞争）
 template <int Nfree>
 __global__ void resonanceGradientKernel(
     const ctComplex* d_w,
@@ -2117,38 +2119,50 @@ __global__ void resonanceGradientKernel(
     int nEvents, int nPolar, int nSLComb, double sign,
     int evt_off, int site, int n_events_total)
 {
+    __shared__ double shm[Nfree];
+    for (int j = 0; j < Nfree; ++j) shm[j] = 0.0;
+    __syncthreads();
+
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
-    if (evt >= nEvents) return;
-    int global_evt = evt + evt_off;
+    if (evt < nEvents) {
+        int global_evt = evt + evt_off;
+        double acc[Nfree];
+        for (int j = 0; j < Nfree; ++j) acc[j] = 0.0;
 
-    for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
-        ctComplex v_sl = d_v[site + sl_idx];
+        for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
+            ctComplex v_sl = d_v[site + sl_idx];
 
-        double s_re = 0.0, s_im = 0.0;
-        for (int pol = 0; pol < nPolar; ++pol) {
-            ctComplex w_val = d_w[evt * nPolar + pol];
-            int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
-            auto sl_amp = d_slamps[amp_idx];
-            double sl_re = sl_amp.real();
-            double sl_im = sl_amp.imag();
-            // T_sl = v_sl * slamps[sl,e,p]
-            double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
-            double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
-            // conj(w) * T
-            s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
-            s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
+            double s_re = 0.0, s_im = 0.0;
+            for (int pol = 0; pol < nPolar; ++pol) {
+                ctComplex w_val = d_w[evt * nPolar + pol];
+                int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
+                auto sl_amp = d_slamps[amp_idx];
+                double sl_re = sl_amp.real();
+                double sl_im = sl_amp.imag();
+                // T_sl = v_sl * slamps[sl,e,p]
+                double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
+                double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
+                // conj(w) * T
+                s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
+                s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
+            }
+
+            // d_dF 由 reComputeAmps 按全局事件索引写入（含 phsp/data/bkg 全段），
+            // 此处必须用 global_evt（段内 evt 会错位）
+            int dF_base = (global_evt * nSLComb + sl_idx) * Nfree;
+            for (int j = 0; j < Nfree; ++j) {
+                ctComplex dF = d_dF[dF_base + j];
+                // -2 Re((s_re + i s_im) * (dF_re + i dF_im)) = -2 (s_re*dF_re - s_im*dF_im)
+                acc[j] += -2.0 * sign * (s_re * (double)dF.x - s_im * (double)dF.y);
+            }
         }
-
-        // d_dF 由 reComputeAmps 按全局事件索引写入（含 phsp/data/bkg 全段），
-        // 此处必须用 global_evt（段内 evt 会错位）
-        int dF_base = (global_evt * nSLComb + sl_idx) * Nfree;
-        for (int j = 0; j < Nfree; ++j) {
-            ctComplex dF = d_dF[dF_base + j];
-            // -2 Re((s_re + i s_im) * (dF_re + i dF_im)) = -2 (s_re*dF_re - s_im*dF_im)
-            double contrib = -2.0 * sign * (s_re * (double)dF.x - s_im * (double)dF.y);
-            atomicAdd(&d_grad[d_global_idx[j]], contrib);
-        }
+        for (int j = 0; j < Nfree; ++j)
+            atomicAdd(&shm[j], acc[j]);
     }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int j = 0; j < Nfree; ++j)
+            atomicAdd(&d_grad[d_global_idx[j]], shm[j]);
 }
 
 // ---------------------------------------------------------------------------
