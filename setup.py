@@ -33,8 +33,8 @@ class ForceBuildExtension(BuildExtension):
 def get_cuda_gencode_flags():
     """检测当前 nvcc 支持的 SM 架构，只对存在的架构生成 -gencode 选项"""
     # 期望支持的目标架构（主版本号对应 compute capability）
-    # desired_sm = [70, 75, 80, 86, 89, 90, 100, 120]
-    desired_sm = [120]
+    desired_sm = [70, 75, 80, 86, 89, 90, 100, 120]
+    # desired_sm = [120]
 
     try:
         output = subprocess.check_output(
@@ -189,12 +189,20 @@ extension = CUDAExtension(
     ],
 )
 
+# long_description 读 README.md（PyPI 页面渲染用）
+try:
+    with open(os.path.join(project_dir, "README.md"), encoding="utf-8") as _f:
+        _long_desc = _f.read()
+except Exception:
+    _long_desc = "A CUDA-Torch partial wave analysis package for high-energy physics"
+
 setup(
     name="ctpwa",
-    version="0.2.0",
+    version="0.3.0",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
-    long_description="A CUDA-Torch partial wave analysis package for high-energy physics",
+    long_description=_long_desc,
+    long_description_content_type="text/markdown",
     packages=find_packages(exclude=["example"]),
     ext_modules=[extension],
     cmdclass={
