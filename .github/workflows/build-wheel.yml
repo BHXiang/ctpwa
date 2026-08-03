@@ -43,16 +43,16 @@ jobs:
           curl -sSL -o /tmp/cuda-keyring.deb \
             https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           ls -l /tmp/cuda-keyring.deb
-          dpkg -i /tmp/cuda-keyring.deb
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq \
             cuda-toolkit-13-2 libyaml-cpp-dev
           /usr/local/cuda-13.2/bin/nvcc --version | tail -1
 
       # ---- 2. ROOT（Ubuntu 22.04 apt meta 包，6.26+）----
       - name: Install ROOT
         run: |
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libroot-dev
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq libroot-dev
           root-config --version
 
       # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配）----
