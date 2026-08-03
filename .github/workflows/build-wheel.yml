@@ -32,9 +32,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Ubuntu 22.04 apt 无 ROOT 包（jammy universe 移除了 ROOT）→ conda-forge 安装
+      - uses: conda-incubator/setup-miniconda@v3
         with:
           python-version: "3.12"
+          auto-update-conda: false
 
       # ---- 1. CUDA 13.2 toolkit（nvcc + runtime headers）----
       - name: Install CUDA 13.2 toolkit
@@ -49,22 +51,25 @@ jobs:
             cuda-toolkit-13-2 libyaml-cpp-dev
           /usr/local/cuda-13.2/bin/nvcc --version | tail -1
 
-      # ---- 2. ROOT（Ubuntu 22.04 apt meta 包，6.26+）----
+      # ---- 2. ROOT（conda-forge root 6.28+）----
       - name: Install ROOT
+        shell: bash -l {0}
         run: |
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq libroot-dev
+          conda install -y -q -c conda-forge root
           root-config --version
 
-      # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配）----
+      # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配；conda env 内 pip 安装）----
       - name: Install torch
+        shell: bash -l {0}
         run: |
           pip install "torch==2.12.0+cu132" --index-url https://download.pytorch.org/whl/cu132
 
       # ---- 4. 构建 wheel（镜像内 glibc 2.34 → manylinux_2_34 合法）----
       - name: Build wheel
+        shell: bash -l {0}
         env:
           CUDA_HOME: /usr/local/cuda-13.2
-          ROOTSYS: /usr
+          ROOTSYS: $CONDA_PREFIX
         run: |
           pip install auditwheel
           python setup.py bdist_wheel
