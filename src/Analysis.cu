@@ -695,6 +695,16 @@ public:
         int n_polar_)
     {
         TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
+        bool tprof = getenv("CTPWA_PROF") != nullptr;
+        auto tF0 = std::chrono::high_resolution_clock::now();
+        // phsp 矩阵/梯度段的持久化缓冲（懒分配，避免每次 forward 的 cublasCreate/cudaMalloc）
+        static std::vector<ctComplex*> s_d_phsp_scaled;
+        static std::vector<ctComplex*> s_d_phsp_gpu;
+        static std::vector<cublasHandle_t> s_phsp_handle;
+        static std::vector<int> s_phsp_alloc_sz;   // 每 GPU 已分配的 nPhsp_total
+        static std::vector<int> s_phsp_mat_sz;     // 已分配的矩阵大小（nA*nA）
+        static std::vector<ctComplex*> s_d_S_bufs;
+        static std::vector<int> s_dS_alloc_sz;
 
         // 0. 拆分 params → vector + theta
         torch::Tensor vector, theta;
@@ -753,6 +763,10 @@ public:
                 extended_vector.to(torch::Device(torch::kCUDA, i)));
         }
 
+        auto tF1 = std::chrono::high_resolution_clock::now();  // extend+分发完成
+        auto t2_reamp = tF1, t6_nll = tF1, t7_rg = tF1;
+        auto tF2 = tF1, tF3 = tF1, tF4 = tF1;
+
         // === 新增：Step 2.5: 更新振幅 & 预计算有效耦合 ===
         int n_free_res = 0;
         if (amp_calc) n_free_res = amp_calc->nFreeResParams();
@@ -773,7 +787,7 @@ public:
                 amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
                 cudaDeviceSynchronize();
             }
-            auto t2_reamp = std::chrono::high_resolution_clock::now();
+            t2_reamp = std::chrono::high_resolution_clock::now();
             if (getenv("CTPWA_PROF")) printf("[PROF] reComputeAmps: %.2f ms, +T: %.2f ms\n",
                 std::chrono::duration<double, std::milli>(t1_reamp - t0_reamp).count(),
                 std::chrono::duration<double, std::milli>(t2_reamp - t1_reamp).count());
@@ -795,16 +809,35 @@ public:
             }
             if (W_total <= 0.0) W_total = 1.0;
             cudaSetDevice(primary_dev);
+            tF2 = std::chrono::high_resolution_clock::now();  // W_total reduce 完成
 
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+            if ((int)s_phsp_handle.size() < num_gpus) {
+                s_d_phsp_scaled.resize(num_gpus, nullptr);
+                s_d_phsp_gpu.resize(num_gpus, nullptr);
+                s_phsp_handle.resize(num_gpus, nullptr);
+                s_phsp_alloc_sz.assign(num_gpus, 0);
+                s_phsp_mat_sz.assign(num_gpus, 0);
+            }
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nPhsp = events_list[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
+                if (!s_phsp_handle[gpu]) cublasCreate(&s_phsp_handle[gpu]);
 
                 int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-                ctComplex* d_phsp_scaled;
-                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(ctComplex));
+                int nMat = n_amplitudes_ * n_amplitudes_;
+                if (s_phsp_alloc_sz[gpu] < nPhsp_total) {
+                    if (s_d_phsp_scaled[gpu]) cudaFree(s_d_phsp_scaled[gpu]);
+                    cudaMalloc(&s_d_phsp_scaled[gpu], nPhsp_total * sizeof(ctComplex));
+                    s_phsp_alloc_sz[gpu] = nPhsp_total;
+                }
+                if (s_phsp_mat_sz[gpu] < nMat) {
+                    if (s_d_phsp_gpu[gpu]) cudaFree(s_d_phsp_gpu[gpu]);
+                    cudaMalloc(&s_d_phsp_gpu[gpu], nMat * sizeof(ctComplex));
+                    s_phsp_mat_sz[gpu] = nMat;
+                }
+                ctComplex* d_phsp_scaled = s_d_phsp_scaled[gpu];
                 cudaMemcpy(d_phsp_scaled, d_all_amplitudes_list[gpu],
                            nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
                 const double* d_w = (gpu < (int)d_phsp_weights_list.size()) ? d_phsp_weights_list[gpu] : nullptr;
@@ -812,39 +845,34 @@ public:
                 scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
                     nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
 
-                ctComplex* d_phsp_gpu;
-                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                cublasHandle_t h;
-                cublasCreate(&h);
+                ctComplex* d_phsp_gpu = s_d_phsp_gpu[gpu];
                 ctComplex alpha = ctMake(1.0f, 0.0f);
                 ctComplex beta  = ctMake(0.0f, 0.0f);
-                CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C,
+                CUBLAS_CGEMM(s_phsp_handle[gpu], CUBLAS_OP_N, CUBLAS_OP_C,
                     n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
                     &alpha, d_phsp_scaled, n_amplitudes_,
                     d_phsp_scaled, n_amplitudes_,
                     &beta, d_phsp_gpu, n_amplitudes_);
-                cublasDestroy(h);
-                cudaFree(d_phsp_scaled);
 
                 if (gpu == primary_dev) {
                     ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
-                    cudaFree(d_phsp_gpu);
+                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, nMat);
                 } else {
                     cudaSetDevice(primary_dev);
                     ctComplex* d_temp;
-                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                    cudaMalloc(&d_temp, nMat * sizeof(ctComplex));
                     cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                        nMat * sizeof(ctComplex));
                     cudaSetDevice(gpu);
-                    cudaFree(d_phsp_gpu);
                     cudaSetDevice(primary_dev);
                     ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                    axpyComplex(d_phsp_matrix_, d_temp, one, nMat);
                     cudaFree(d_temp);
                 }
             }
         }
+
+        tF3 = std::chrono::high_resolution_clock::now();  // phsp 矩阵 CGEMM 完成
 
         // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
         cudaSetDevice(primary_dev);
@@ -865,6 +893,7 @@ public:
         cudaFree(d_phsp_r);
         cudaFree(d_phsp_i);
         double phsp_factor = static_cast<double>(phsp_r);
+        tF4 = std::chrono::high_resolution_clock::now();  // phsp_factor D2H 完成
 
         // std::cout << "PHSP factor: " << phsp_factor << std::endl;
         // //输出 d_P_vec 检查
@@ -1005,12 +1034,23 @@ public:
             }
         }
 
+        t6_nll = std::chrono::high_resolution_clock::now();  // computeFactorNLL data+bkg 完成
+
         // === 新增：计算共振态参数梯度 ===
         torch::Tensor grad_theta;
         if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
             cudaSetDevice(primary_dev);
-            double* d_grad_res;
-            cudaMalloc(&d_grad_res, n_free_res * sizeof(double));
+            // 持久化懒分配（n_free_res 固定，避免每次 forward 的 malloc/free）
+            static double* s_d_grad_res = nullptr;
+            static int s_grad_res_sz = 0;
+            if (s_grad_res_sz < n_free_res) {
+                if (s_d_grad_res) cudaFree(s_d_grad_res);
+                cudaSetDevice(primary_dev);
+                cudaMalloc(&s_d_grad_res, n_free_res * sizeof(double));
+                s_grad_res_sz = n_free_res;
+            }
+            double* d_grad_res = s_d_grad_res;
+            cudaSetDevice(primary_dev);
             cudaMemset(d_grad_res, 0, n_free_res * sizeof(double));
 
             // data 贡献 (sign=+1, d_T/d_momenta 需加 phsp 偏移)
@@ -1061,24 +1101,30 @@ public:
 
                     std::vector<ctComplex*> d_S_bufs(num_gpus, nullptr);
                     std::vector<int> n_phsp_evts(num_gpus);
-                    cublasHandle_t ch;
-                    cublasCreate(&ch);
+                    if ((int)s_d_S_bufs.size() < num_gpus) {
+                        s_d_S_bufs.resize(num_gpus, nullptr);
+                        s_dS_alloc_sz.assign(num_gpus, 0);
+                    }
                     for (int g = 0; g < num_gpus; ++g) {
                         cudaSetDevice(g);
                         int nP = events_list[g][0];
                         n_phsp_evts[g] = nP;
                         if (nP == 0) continue;
                         int nTot = nP * n_polar_;
-                        cudaMalloc(&d_S_bufs[g], nTot * sizeof(ctComplex));
+                        if (s_dS_alloc_sz[g] < nTot) {
+                            if (s_d_S_bufs[g]) cudaFree(s_d_S_bufs[g]);
+                            cudaMalloc(&s_d_S_bufs[g], nTot * sizeof(ctComplex));
+                            s_dS_alloc_sz[g] = nTot;
+                        }
+                        d_S_bufs[g] = s_d_S_bufs[g];
                         ctComplex* d_amp = d_all_amplitudes_list[g];
                         const ctComplex* d_vg = reinterpret_cast<const ctComplex*>(
                             extended_vec_per_gpu[g].data_ptr());
                         ctComplex a = ctMake(1.0f, 0.0f);
                         ctComplex b = ctMake(0.0f, 0.0f);
-                        CUBLAS_CGEMV(ch, CUBLAS_OP_T, n_amplitudes_, nTot,
+                        CUBLAS_CGEMV(s_phsp_handle[g], CUBLAS_OP_T, n_amplitudes_, nTot,
                             &a, d_amp, n_amplitudes_, d_vg, 1, &b, d_S_bufs[g], 1);
                     }
-                    cublasDestroy(ch);
 
                     cudaSetDevice(primary_dev);  // d_grad_res is on primary_dev
                     std::vector<ctComplex*> d_v_ptrs(num_gpus);
@@ -1092,19 +1138,16 @@ public:
                     if (getenv("CTPWA_PROF")) printf("[PROF] resonanceGradient(phsp): %.2f ms\n",
                         std::chrono::duration<double, std::milli>(t1_rgp - t0_rgp).count());
 
-                    for (int g = 0; g < num_gpus; ++g)
-                        if (d_S_bufs[g]) { cudaSetDevice(g); cudaFree(d_S_bufs[g]); }
                     cudaSetDevice(primary_dev);
                 }
             }
+            t7_rg = std::chrono::high_resolution_clock::now();  // resonanceGradient 各段完成
 
             cudaSetDevice(primary_dev);
             grad_theta = torch::empty({ n_free_res },
                 torch::TensorOptions().dtype(torch::kFloat64).device(torch::Device(torch::kCUDA, primary_dev)));
             cudaMemcpy(grad_theta.data_ptr(), d_grad_res,
                 n_free_res * sizeof(double), cudaMemcpyDeviceToDevice);
-
-            cudaFree(d_grad_res);
         }
         else {
             grad_theta = torch::empty({ 0 },
@@ -1175,6 +1218,14 @@ public:
         ctx->saved_data["params_ptr"] = reinterpret_cast<int64_t>(params_mgr);
 
         // std::cout << "Total data NLL: " << loss << std::endl;
+        if (tprof) {
+            auto tFend = std::chrono::high_resolution_clock::now();
+            auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count(); };
+            printf("[PROF] f.extend: %.2f | f.reAmp+T: %.2f | f.Wred: %.2f | f.phspM: %.2f | f.quad+D2H: %.2f | f.nll: %.2f | f.gradRes: %.2f | f.tail: %.2f\n",
+                ms(tF0, tF1), ms(tF1, t2_reamp), ms(t2_reamp, tF2), ms(tF2, tF3),
+                ms(tF3, tF4), ms(tF4, t6_nll), ms(t6_nll, t7_rg), ms(t7_rg, tFend));
+        }
         return torch::tensor(loss, torch::kDouble).to(vector.device());
     }
 
@@ -1182,6 +1233,8 @@ public:
         torch::autograd::AutogradContext* ctx,
         const torch::autograd::tensor_list& grad_outputs)
     {
+        bool tprof = getenv("CTPWA_PROF") != nullptr;
+        auto tB0 = std::chrono::high_resolution_clock::now();
         const auto saved = ctx->get_saved_variables();
         const auto& params_tensor = saved[0];
         const auto& global_extended_grad = ctx->saved_data["global_extended_grad"].toTensor();
@@ -1256,6 +1309,9 @@ public:
             }
         }
 
+        auto tB1 = std::chrono::high_resolution_clock::now();
+        if (tprof) printf("[PROF] backward: %.2f ms\n",
+            std::chrono::duration<double, std::milli>(tB1 - tB0).count());
         return { grad_params * grad_outputs[0],
                 torch::Tensor(),   // params_mgr
                 torch::Tensor(), torch::Tensor(), torch::Tensor(),
