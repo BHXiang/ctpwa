@@ -20,3 +20,6 @@ tests/outputs/
 tests/__pycache__/
 tests/data/real_*
 tests/.pytest_cache/
+!.github/
+!.github/**
+!MANIFEST.in
