@@ -1,0 +1,87 @@
+# GitHub Actions: manylinux_2_34 wheel 构建 + 发布
+#
+# 触发方式:
+#   1. 打 tag:  git tag v0.3.0 && git push origin v0.3.0
+#   2. 手动:   Actions 页面 → build-wheel → Run workflow
+#
+# 产物:
+#   - manylinux_2_34_x86_64 wheel（含 sm_70~sm_120 共 7 个 SASS 变体）
+#   - 上传到 PyPI（需配置 secret: PYPI_API_TOKEN）
+#
+# 安装（目标机器）:
+#   # 系统依赖: CUDA 13.2 runtime、ROOT(6.26+)、yaml-cpp
+#   pip install torch==2.12.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+#   pip install ctpwa
+#
+# 注意: manylinux_2_34 要求目标系统 glibc >= 2.34（Ubuntu 22.04+ / Debian 12+）。
+#       ROOT 库不打包，目标机器需 source thisroot.sh 且 ROOT >= 6.26（SONAME 兼容）。
+
+name: build-wheel
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/pypa/manylinux_2_34_x86_64:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 1. CUDA 13.2 toolkit（nvcc + runtime headers）----
+      - name: Install CUDA 13.2 toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          dpkg -i cuda-keyring_1.1-1_all.deb
+          apt-get update -qq
+          apt-get install -y -qq cuda-toolkit-13-2 libyaml-cpp-dev
+
+      # ---- 2. ROOT（Ubuntu 22.04 apt 包，6.26+）----
+      - name: Install ROOT
+        run: |
+          apt-get install -y -qq \
+            libroot-core-dev libroot-tree-dev libroot-hist-dev \
+            libroot-math-mathcore-dev libroot-graf2d-graf-dev \
+            libroot-graf2d-gpad-dev libroot-io-dev libroot-net-dev \
+            libroot-physics-dev libroot-misc-mathmore-dev
+
+      # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配）----
+      - name: Install torch
+        run: |
+          pip install "torch==2.12.0+cu132" --index-url https://download.pytorch.org/whl/cu132
+
+      # ---- 4. 构建 wheel（镜像内 glibc 2.34 → manylinux_2_34 合法）----
+      - name: Build wheel
+        env:
+          CUDA_HOME: /usr/local/cuda-13.2
+          ROOTSYS: /usr
+        run: |
+          # apt 装的 ROOT 头/库在 /usr/include/root 与 /usr/lib/x86_64-linux-gnu/root
+          python setup.py bdist_wheel
+          WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
+          auditwheel repair \
+            --plat manylinux_2_34_x86_64 \
+            --exclude "libCore.so*" --exclude "libRIO.so*" \
+            --exclude "libHist.so*" --exclude "libTree.so*" \
+            --exclude "libMatrix.so*" --exclude "libPhysics.so*" \
+            --exclude "libMathCore.so*" --exclude "libThread.so*" \
+            --exclude "libNet.so*" --exclude "libGraf.so*" \
+            --exclude "libGraf3d.so*" --exclude "libGpad.so*" \
+            --exclude "libImt.so*" --exclude "libMultiProc.so*" \
+            --exclude "libcudart.so*" --exclude "libcublas.so*" --exclude "libcublasLt.so*" \
+            --exclude "libc10.so*" --exclude "libtorch.so*" --exclude "libtorch_cpu.so*" \
+            --exclude "libtorch_cuda.so*" --exclude "libtorch_python.so*" --exclude "libc10_cuda.so*" \
+            --exclude "libcudnn.so*" --exclude "libGL.so*" --exclude "libEGL.so*" \
+            --wheel-dir wheelhouse "$WHEEL"
+          ls -lh wheelhouse/
+
+      # ---- 5. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: wheelhouse/
