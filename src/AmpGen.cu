@@ -1208,6 +1208,252 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
 
 
 // ============================================================================
+// 合并非 AD kernel：一次启动处理多个无自由参数的 block
+// （与 computeAmpsMergedKernel 共用 ADBlockDesc，忽略 AD 字段）
+// ============================================================================
+__global__ void computeAmpsMergedPlainKernel(
+    ctComplex* amplitudes,
+    const ADBlockDesc* desc, int nblocks, int nSL_total,
+    const int* amp_offsets, const int* event_offsets, int num_offsets,
+    int n_amplitudes, double bf_d)
+{
+    int slg = blockIdx.x;
+    int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
+
+    int bi = 0;
+    while (bi + 1 < nblocks && desc[bi + 1].sl_start <= slg) ++bi;
+    const ADBlockDesc& B = desc[bi];
+    int sl_idx = slg - B.sl_start;
+    if (sl_idx >= B.nSL || event_idx >= B.nEvents) return;
+
+    int offset_idx = 0;
+    for (size_t i = 0; i < (size_t)num_offsets - 1; ++i) {
+        if (event_idx < event_offsets[i + 1]) { offset_idx = i; break; }
+    }
+
+    ctResAmp resAmp(1.0, 0.0);
+
+    // 遍历衰变链中的每个节点（逻辑与 computeAmpsKernel 相同）
+    for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx)
+    {
+        const DecayNode& node = B.d_decayNodes[nodeIdx];
+        const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+
+        LorentzVector pMother = B.d_momenta->getMomentum(event_idx, node.mother_idx);
+        LorentzVector pDaug1 = B.d_momenta->getMomentum(event_idx, node.daug1_idx);
+        LorentzVector pDaug2 = B.d_momenta->getMomentum(event_idx, node.daug2_idx);
+
+        double mm = pMother.M();
+        double qq = std::sqrt((mm * mm - std::pow(pDaug1.M() + pDaug2.M(), 2)) *
+                (mm * mm - std::pow(pDaug1.M() - pDaug2.M(), 2))) / 2 / mm;
+
+        double mass_mother = node.mass[0];
+        double mass_daug1 = node.mass[1];
+        double mass_daug2 = node.mass[2];
+
+        bool is_resonance_node = false;
+        DeviceResonance current_res;
+        for (int i = 0; i < B.resonance_count; ++i)
+        {
+            if (node.mother_idx == B.d_res[i].particle_idx)
+            {
+                is_resonance_node = true;
+                current_res = B.d_res[i];
+                break;
+            }
+        }
+
+        if (mass_mother == -1 && is_resonance_node)
+            mass_mother = B.d_all_params[current_res.param_offset];
+        if (mass_daug1 == -1)
+        {
+            for (int i = 0; i < B.resonance_count; ++i)
+            {
+                if (node.daug1_idx == B.d_res[i].particle_idx)
+                {
+                    mass_daug1 = B.d_all_params[B.d_res[i].param_offset];
+                    break;
+                }
+            }
+        }
+        if (mass_daug2 == -1)
+        {
+            for (int i = 0; i < B.resonance_count; ++i)
+            {
+                if (node.daug2_idx == B.d_res[i].particle_idx)
+                {
+                    mass_daug2 = B.d_all_params[B.d_res[i].param_offset];
+                    break;
+                }
+            }
+        }
+
+        double q0 = std::sqrt((mass_mother * mass_mother - std::pow(mass_daug1 + mass_daug2, 2)) *
+                (mass_mother * mass_mother - std::pow(mass_daug1 - mass_daug2, 2))) / 2 / mass_mother;
+
+        if (nodeIdx == 0)
+        {
+            resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
+            continue;
+        }
+
+        if (is_resonance_node)
+        {
+            const double* p = B.d_all_params + current_res.param_offset;
+            const double* ch = (current_res.type == ResModelType::Flatte)
+                ? B.d_all_channels + current_res.channel_offset : nullptr;
+            resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
+                p, current_res.param_count, current_res.type,
+                ch, current_res.n_channels, bf_d);
+        }
+    }
+
+    for (int k = 0; k < B.nPolar; ++k)
+    {
+        int idx = sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+        int amp_idx = 0;
+        if (offset_idx < num_offsets)
+        {
+            int nEv_seg = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
+            amp_idx = amp_offsets[offset_idx]
+                    + (event_idx - event_offsets[offset_idx]) * n_amplitudes * B.nPolar
+                    + k * n_amplitudes + sl_idx + B.site;
+        }
+        else
+        {
+            return;
+        }
+        ctResAmp temp = resAmp * B.d_slamps[idx];
+        amplitudes[amp_idx] = ctMake(temp.real(), temp.imag());
+    }
+}
+
+// ============================================================================
+// 合并 AD kernel：一次启动处理多个同 Nfree 的 block（减少启动开销，
+// 提升 GPU 占用——多个小 grid 合并成一个大 grid）
+// ============================================================================
+template <int Nfree>
+__global__ void computeAmpsMergedKernel(
+    ctComplex* amplitudes,
+    const ADBlockDesc* desc, int nblocks, int nSL_total,
+    const int* amp_offsets, const int* event_offsets, int num_offsets,
+    int n_amplitudes, double bf_d)
+{
+    int slg = blockIdx.x;
+    int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
+
+    // 定位 block（顺序扫描，nblocks 通常 1-3）
+    int bi = 0;
+    while (bi + 1 < nblocks && desc[bi + 1].sl_start <= slg) ++bi;
+    const ADBlockDesc& B = desc[bi];
+    int sl_idx = slg - B.sl_start;
+    if (sl_idx >= B.nSL || event_idx >= B.nEvents) return;
+
+    int offset_idx = 0;
+    for (size_t i = 0; i < (size_t)num_offsets - 1; ++i) {
+        if (event_idx < event_offsets[i + 1]) { offset_idx = i; break; }
+    }
+
+    using AD = Var<double, Nfree, false>;
+    using CV = ComplexVar<double, Nfree, false>;
+
+    // 目标共振态 = block 的第一个共振态（架构保证每 block 一个）
+    const DeviceResonance& target_res = B.d_res[0];
+    const double* target_rp = B.d_all_params + target_res.param_offset;
+
+    int ftg[8] = {-1,-1,-1,-1,-1,-1,-1,-1};
+    for (int j = 0; j < Nfree; ++j) {
+        int pi = B.d_param_map[j];
+        if (pi >= 0 && pi < 8) ftg[pi] = j;
+    }
+
+    AD m0_ad(target_rp[0]);
+    if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
+    AD gamma_ad;
+    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
+        gamma_ad = AD(target_rp[1]);
+        if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
+    }
+    AD other_g[4];
+    if (target_res.type == ResModelType::Flatte) {
+        for (int k = 0; k < target_res.param_count - 1 && k < 4; ++k) {
+            other_g[k] = AD(target_rp[1 + k]);
+            if (ftg[1 + k] >= 0) other_g[k].grad[ftg[1 + k]] = 1.0;
+        }
+    }
+
+    // ---- 节点循环：q0 质量回退规则与 computeAmpsKernelAD 一致 ----
+    CV R_ad(1.0, 0.0);
+    for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
+        const DecayNode& node = B.d_decayNodes[nodeIdx];
+        const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+        int L = sl.L;
+
+        LorentzVector pM  = B.d_momenta->getMomentum(event_idx, node.mother_idx);
+        LorentzVector pD1 = B.d_momenta->getMomentum(event_idx, node.daug1_idx);
+        LorentzVector pD2 = B.d_momenta->getMomentum(event_idx, node.daug2_idx);
+        double mm = pM.M();
+        double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+        AD q_ad(qq);
+        double md1 = pD1.M();
+        double md2 = pD2.M();
+
+        AD m0_q0, md1_q0, md2_q0;
+        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0)
+            m0_q0 = m0_ad;
+        else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
+        else m0_q0 = AD(1.0);
+        if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
+            md1_q0 = m0_ad;
+        else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+        if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
+            md2_q0 = m0_ad;
+        else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+
+        AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
+        bool is_res = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
+
+        CV nf;
+        if (is_res) {
+            AD params_arr[2] = {m0_ad, gamma_ad};
+            nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
+                                      params_arr, 2, target_res.type, nullptr, 0, bf_d);
+        } else {
+            AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
+            nf.real = bf_val; nf.imag = AD(0.0);
+        }
+        CV new_R;
+        new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
+        new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
+        R_ad = new_R;
+    }
+
+    // ---- 输出振幅（布局与 computeAmpsKernel 相同）----
+    for (int k = 0; k < B.nPolar; ++k) {
+        int idx = sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+        int amp_idx = 0;
+        if (offset_idx < num_offsets) {
+            int nEv_seg = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
+            amp_idx = amp_offsets[offset_idx]
+                    + (event_idx - event_offsets[offset_idx]) * n_amplitudes * B.nPolar
+                    + k * n_amplitudes + sl_idx + B.site;
+        } else {
+            return;
+        }
+        auto sl_amp = B.d_slamps[idx];
+        CV sl_cv(sl_amp.real(), sl_amp.imag());
+        CV temp = R_ad * sl_cv;
+        amplitudes[amp_idx] = ctMake(temp.real.val, temp.imag.val);
+    }
+
+    // ---- 输出导数 ∂F/∂θ_j（复数）----
+    int base = (event_idx * B.nSL + sl_idx) * Nfree;
+    for (int j = 0; j < Nfree; ++j) {
+        B.d_dF[base + j] = ctMake(R_ad.real.grad[j], R_ad.imag.grad[j]);
+    }
+}
+
+// ============================================================================
 // AD 版振幅 kernel：一次计算同时输出振幅 A 和共振态因子导数 ∂F/∂θ
 // （reComputeAmps 对含自由参数的 block 使用；resonanceGradientKernel 读取 d_dF）
 // 架构保证每个 block 恰有一个共振态（resonance_combinations 笛卡尔积展开）。
@@ -1404,6 +1650,7 @@ AmpCalc::~AmpCalc()
         if (d_grad_per_gpu_[gpu]) cudaFree(d_grad_per_gpu_[gpu]);
         if (d_ev_off_cache_[gpu]) cudaFree(d_ev_off_cache_[gpu]);
         if (d_amp_off_cache_[gpu]) cudaFree(d_amp_off_cache_[gpu]);
+        if (d_ad_desc_[gpu]) cudaFree(d_ad_desc_[gpu]);
     }
     // cas_list_ 由 shared_ptr 自动释放
 }
@@ -1723,105 +1970,171 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cj.free_param_idx = ow.free_param_idx;
         }
 
-        // 重跑 computeAmpsKernel（有自由参数的 block 用 AD 版，同时输出 ∂F/∂θ）
-        for (auto& block : blocks_) {
-            auto& cas = cas_list_[block.cas_idx];
+        // 重跑 computeAmpsKernel：AD block 按 nFree 分组，每组一次合并启动
+        // （同 stream 隐式顺序依赖，无需 per-block sync）
+        int* d_amp_offsets = d_amp_off_cache_[gpu];
+        int* d_event_offsets = d_ev_off_cache_[gpu];
+        int num_offsets = static_cast<int>(amp_offsets[gpu].size());
 
-            auto& d_slamps = cas->getSLAmps();
-            auto& d_momenta = cas->getMomenta();
-            auto& d_decayNodes = cas->getDecayNodes();
-            auto& d_slComb = cas->getDeviceSLCombs();
-            auto& nEvents = cas->getNEventsVec();
+        // 分组：nFree → block 列表（host；块结构固定，开销可忽略）
+        std::map<int, std::vector<int>> ad_groups;
+        for (size_t bi = 0; bi < blocks_.size(); ++bi)
+            if (blocks_[bi].nFree > 0) ad_groups[blocks_[bi].nFree].push_back(static_cast<int>(bi));
 
-            int* d_amp_offsets = d_amp_off_cache_[gpu];
-            int* d_event_offsets = d_ev_off_cache_[gpu];
-            int num_offsets = static_cast<int>(amp_offsets[gpu].size());
-
-            dim3 gridDim(static_cast<unsigned int>(cas->getNSLCombs()),
-                         (static_cast<unsigned int>(nEvents[gpu]) + 255) / 256);
-
-            if (block.nFree > 0) {
-                // AD 版：一次输出振幅 + ∂F/∂θ（d_dF 持久化，懒分配）
+        // 确保所有 AD block 的 d_dF / d_param_map 已分配（懒分配持久化）
+        for (const auto& [nfree, blist] : ad_groups) {
+            (void)nfree;
+            for (int bi : blist) {
+                auto& block = blocks_[bi];
+                auto& cas = cas_list_[block.cas_idx];
                 int nSL = static_cast<int>(cas->getNSLCombs());
-                size_t dF_size = (size_t)nEvents[gpu] * nSL * block.nFree;
+                int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
+                size_t dF_size = (size_t)nEv * nSL * block.nFree;
                 if (!block.d_dF[gpu])
                     cudaMalloc(&block.d_dF[gpu], dF_size * sizeof(ctComplex));
-
-                // free_param_idx 固定 → 持久化懒分配
                 if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
                 if (!block.d_param_map_[gpu]) {
                     cudaMalloc(&block.d_param_map_[gpu], block.nFree * sizeof(int));
                     cudaMemcpy(block.d_param_map_[gpu], block.free_param_idx.data(),
                                block.nFree * sizeof(int), cudaMemcpyHostToDevice);
                 }
-                int* d_param_map = block.d_param_map_[gpu];
+            }
+        }
 
-                switch (block.nFree) {
-                case 1:
-                    computeAmpsKernelAD<1><<<gridDim, blockSize>>>(
-                        d_amplitudes[gpu], block.d_dF[gpu],
-                        d_momenta[gpu], d_slComb[gpu], d_slamps[gpu],
-                        block.d_resonances[gpu], block.resonance_count,
-                        block.d_all_params[gpu], block.d_all_channels[gpu],
-                        d_decayNodes[gpu], cas->getDecayChainSize(),
-                        static_cast<int>(nEvents[gpu]), nSL,
-                        static_cast<int>(n_polar),
-                        d_amp_offsets, d_event_offsets, num_offsets,
-                        n_amplitudes, block.site, d_param_map, bf_d);
-                    break;
-                case 2:
-                    computeAmpsKernelAD<2><<<gridDim, blockSize>>>(
-                        d_amplitudes[gpu], block.d_dF[gpu],
-                        d_momenta[gpu], d_slComb[gpu], d_slamps[gpu],
-                        block.d_resonances[gpu], block.resonance_count,
-                        block.d_all_params[gpu], block.d_all_channels[gpu],
-                        d_decayNodes[gpu], cas->getDecayChainSize(),
-                        static_cast<int>(nEvents[gpu]), nSL,
-                        static_cast<int>(n_polar),
-                        d_amp_offsets, d_event_offsets, num_offsets,
-                        n_amplitudes, block.site, d_param_map, bf_d);
-                    break;
-                case 3:
-                    computeAmpsKernelAD<3><<<gridDim, blockSize>>>(
-                        d_amplitudes[gpu], block.d_dF[gpu],
-                        d_momenta[gpu], d_slComb[gpu], d_slamps[gpu],
-                        block.d_resonances[gpu], block.resonance_count,
-                        block.d_all_params[gpu], block.d_all_channels[gpu],
-                        d_decayNodes[gpu], cas->getDecayChainSize(),
-                        static_cast<int>(nEvents[gpu]), nSL,
-                        static_cast<int>(n_polar),
-                        d_amp_offsets, d_event_offsets, num_offsets,
-                        n_amplitudes, block.site, d_param_map, bf_d);
-                    break;
-                default:
-                    // 4+ 自由参数（Flatte 多通道）暂不支持 AD 融合，回退非 AD
-                    computeAmpsKernel<<<gridDim, blockSize>>>(
-                        d_amplitudes[gpu], d_momenta[gpu], d_slComb[gpu],
-                        d_slamps[gpu], block.d_resonances[gpu],
+        // 按 nFree 分组构建 desc 并启动（每组一次 kernel）
+        int n_ad_blocks = 0;
+        for (const auto& [nfree, blist] : ad_groups) n_ad_blocks += (int)blist.size();
+        if (d_ad_desc_.size() != (size_t)n_gpu) d_ad_desc_.assign(n_gpu, nullptr);
+        if (n_ad_blocks > d_ad_desc_cap_) {
+            for (int g = 0; g < n_gpu; ++g) {
+                cudaSetDevice(g);
+                if (d_ad_desc_[g]) cudaFree(d_ad_desc_[g]);
+                cudaMalloc(&d_ad_desc_[g], n_ad_blocks * sizeof(ADBlockDesc));
+            }
+            d_ad_desc_cap_ = n_ad_blocks;
+        }
+        std::vector<ADBlockDesc> h_desc;
+        for (const auto& [nfree, blist] : ad_groups) {
+            h_desc.clear();
+            int sl_start = 0, max_evt = 0;
+            for (int bi : blist) {
+                auto& block = blocks_[bi];
+                auto& cas = cas_list_[block.cas_idx];
+                ADBlockDesc d;
+                d.d_momenta = cas->getMomenta()[gpu];
+                d.d_slComb = cas->getDeviceSLCombs()[gpu];
+                d.d_slamps = cas->getSLAmps()[gpu];
+                d.d_res = block.d_resonances[gpu];
+                d.d_all_params = block.d_all_params[gpu];
+                d.d_all_channels = block.d_all_channels[gpu];
+                d.d_decayNodes = cas->getDecayNodes()[gpu];
+                d.d_param_map = block.d_param_map_[gpu];
+                d.d_dF = block.d_dF[gpu];
+                d.resonance_count = block.resonance_count;
+                d.decayChain_size = cas->getDecayChainSize();
+                d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
+                d.nSL = static_cast<int>(cas->getNSLCombs());
+                d.nPolar = static_cast<int>(n_polar);
+                d.sl_start = sl_start;
+                d.site = block.site;
+                h_desc.push_back(d);
+                sl_start += d.nSL;
+                max_evt = std::max(max_evt, d.nEvents);
+            }
+            int nblocks = static_cast<int>(h_desc.size());
+            cudaMemcpy(d_ad_desc_[gpu], h_desc.data(), nblocks * sizeof(ADBlockDesc),
+                       cudaMemcpyHostToDevice);
+            dim3 gridM(static_cast<unsigned int>(sl_start),
+                       (static_cast<unsigned int>(max_evt) + 255) / 256);
+            switch (nfree) {
+            case 1:
+                computeAmpsMergedKernel<1><<<gridM, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+                break;
+            case 2:
+                computeAmpsMergedKernel<2><<<gridM, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+                break;
+            case 3:
+                computeAmpsMergedKernel<3><<<gridM, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+                break;
+            default:
+                // 4+ 自由参数（Flatte 多通道）暂不支持 AD 融合，回退逐个非 AD
+                for (int bi : blist) {
+                    auto& block = blocks_[bi];
+                    auto& cas = cas_list_[block.cas_idx];
+                    dim3 gd(static_cast<unsigned int>(cas->getNSLCombs()),
+                            (static_cast<unsigned int>(cas->getNEventsVec()[gpu]) + 255) / 256);
+                    computeAmpsKernel<<<gd, blockSize>>>(
+                        d_amplitudes[gpu], cas->getMomenta()[gpu], cas->getDeviceSLCombs()[gpu],
+                        cas->getSLAmps()[gpu], block.d_resonances[gpu],
                         block.resonance_count, block.d_all_params[gpu],
-                        block.d_all_channels[gpu], d_decayNodes[gpu],
+                        block.d_all_channels[gpu], cas->getDecayNodes()[gpu],
                         cas->getDecayChainSize(),
-                        static_cast<int>(nEvents[gpu]),
+                        static_cast<int>(cas->getNEventsVec()[gpu]),
                         static_cast<int>(cas->getNSLCombs()),
                         static_cast<int>(n_polar),
                         d_amp_offsets, d_event_offsets, num_offsets,
                         n_amplitudes, block.site, bf_d);
-                    break;
                 }
-            } else {
-                computeAmpsKernel<<<gridDim, blockSize>>>(
-                    d_amplitudes[gpu], d_momenta[gpu], d_slComb[gpu],
-                    d_slamps[gpu], block.d_resonances[gpu],
-                    block.resonance_count, block.d_all_params[gpu],
-                    block.d_all_channels[gpu], d_decayNodes[gpu],
-                    cas->getDecayChainSize(),
-                    static_cast<int>(nEvents[gpu]),
-                    static_cast<int>(cas->getNSLCombs()),
-                    static_cast<int>(n_polar),
-                    d_amp_offsets, d_event_offsets, num_offsets,
-                    n_amplitudes, block.site, bf_d);
+                break;
             }
-            // 持久化缓冲：不再 per-block sync/free（同 stream 隐式顺序依赖）
+        }
+
+        // 非 AD block（无自由参数）：一次合并启动
+        {
+            h_desc.clear();
+            int sl_start = 0, max_evt = 0;
+            for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+                auto& block = blocks_[bi];
+                if (block.nFree > 0) continue;
+                auto& cas = cas_list_[block.cas_idx];
+                ADBlockDesc d;
+                d.d_momenta = cas->getMomenta()[gpu];
+                d.d_slComb = cas->getDeviceSLCombs()[gpu];
+                d.d_slamps = cas->getSLAmps()[gpu];
+                d.d_res = block.d_resonances[gpu];
+                d.d_all_params = block.d_all_params[gpu];
+                d.d_all_channels = block.d_all_channels[gpu];
+                d.d_decayNodes = cas->getDecayNodes()[gpu];
+                d.d_param_map = nullptr;
+                d.d_dF = nullptr;
+                d.resonance_count = block.resonance_count;
+                d.decayChain_size = cas->getDecayChainSize();
+                d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
+                d.nSL = static_cast<int>(cas->getNSLCombs());
+                d.nPolar = static_cast<int>(n_polar);
+                d.sl_start = sl_start;
+                d.site = block.site;
+                h_desc.push_back(d);
+                sl_start += d.nSL;
+                max_evt = std::max(max_evt, d.nEvents);
+            }
+            int nplain = static_cast<int>(h_desc.size());
+            if (nplain > 0) {
+                int need = n_ad_blocks + nplain;
+                if (need > d_ad_desc_cap_) {
+                    for (int g = 0; g < n_gpu; ++g) {
+                        cudaSetDevice(g);
+                        if (d_ad_desc_[g]) cudaFree(d_ad_desc_[g]);
+                        cudaMalloc(&d_ad_desc_[g], need * sizeof(ADBlockDesc));
+                    }
+                    d_ad_desc_cap_ = need;
+                }
+                // 复用 d_ad_desc_[gpu] 的后半段
+                ADBlockDesc* d_desc_plain = d_ad_desc_[gpu] + n_ad_blocks;
+                cudaMemcpy(d_desc_plain, h_desc.data(), nplain * sizeof(ADBlockDesc),
+                           cudaMemcpyHostToDevice);
+                dim3 gridP(static_cast<unsigned int>(sl_start),
+                           (static_cast<unsigned int>(max_evt) + 255) / 256);
+                computeAmpsMergedPlainKernel<<<gridP, blockSize>>>(
+                    d_amplitudes[gpu], d_desc_plain, nplain, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+            }
         }
     }
 

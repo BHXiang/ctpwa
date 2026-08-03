@@ -183,6 +183,26 @@ public:
     }
 };
 
+// 合并 AD 振幅 kernel 的每 block 描述（设备端；一次启动处理多个 block）
+struct ADBlockDesc {
+    const DeviceMomenta* d_momenta;
+    const SL* d_slComb;
+    const thrust::complex<double>* d_slamps;
+    const DeviceResonance* d_res;
+    const double* d_all_params;
+    const double* d_all_channels;
+    const DecayNode* d_decayNodes;
+    const int* d_param_map;      // [Nfree]: 自由参数下标
+    ctComplex* d_dF;             // 输出 ∂F/∂θ [nEvents*nSL*Nfree]
+    int resonance_count;
+    int decayChain_size;
+    int nEvents;                 // 本 GPU 上该 block 的事件数
+    int nSL;                     // 本 block 的 SL 组合数
+    int nPolar;
+    int sl_start;                // grid.x 累积偏移（组内）
+    int site;                    // 振幅列偏移
+};
+
 // ============================================================
 // AmpCalc: 管理共振态参数扫描
 // ============================================================
@@ -311,6 +331,9 @@ private:
     std::vector<std::vector<int>> cached_amp_off_;    // 每 GPU 上次上传的 amp_offsets 副本
     std::vector<int*> d_ev_off_cache_;                // 每 GPU 设备端 event_offsets（懒分配）
     std::vector<int*> d_amp_off_cache_;               // 每 GPU 设备端 amp_offsets（懒分配）
+    // 合并 AD kernel 的 block 描述缓冲（每 GPU 一份，懒分配）
+    std::vector<ADBlockDesc*> d_ad_desc_;             // 每 GPU：desc 数组
+    int d_ad_desc_cap_ = 0;                           // 每 GPU 已分配容量（block 数）
 };
 
 // 核函数声明
@@ -342,6 +365,14 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const int* amp_offsets, const int* event_offsets,
     int num_amp_offsets, int n_amplitudes, int site,
     double bf_d);
+
+// 合并 AD kernel：一次启动处理多个同 Nfree 的 block
+template <int Nfree>
+__global__ void computeAmpsMergedKernel(
+    ctComplex* amplitudes,
+    const ADBlockDesc* desc, int nblocks, int nSL_total,
+    const int* amp_offsets, const int* event_offsets, int num_offsets,
+    int n_amplitudes, double bf_d);
 
 // 共振态参数梯度 kernel：对单个共振态的 Nfree 个自由参数计算 ∂NLL/∂θ
 template <int Nfree>
