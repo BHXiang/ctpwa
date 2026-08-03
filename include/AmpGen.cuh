@@ -195,8 +195,12 @@ public:
         std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
         std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
+        std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（AD kernel 输出）
         int resonance_count;
         int site;                                     // gls_index，对应 d_all_amplitudes 的列偏移
+        int nFree = 0;                                // 该块自由参数数（conjugate 块=owner 的）
+        std::vector<int> free_global_idx;             // d_dF[j] → slots_[j] 全局索引（host）
+        std::vector<int> free_param_idx;              // d_dF[j] → 参数下标（host，d_param_map）
     };
 
     // 参数槽：一个自由参数 → 对应哪个 block 的哪个共振态的哪个 params 下标

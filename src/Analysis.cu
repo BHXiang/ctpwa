@@ -758,10 +758,12 @@ public:
         if (amp_calc) n_free_res = amp_calc->nFreeResParams();
         if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
             // 重新计算 d_all_amplitudes（用新的共振态参数）
+            auto t0_reamp = std::chrono::high_resolution_clock::now();
             amp_calc->reComputeAmps(d_all_amplitudes_list,
                 reinterpret_cast<const double*>(theta.data_ptr()),
                 n_amplitudes_, events_offsets_list, amp_offsets_list, n_polar_);
             cudaDeviceSynchronize();
+            auto t1_reamp = std::chrono::high_resolution_clock::now();
 
             // 预计算有效耦合 T（复用各 GPU 上的 extended_vector）
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -771,6 +773,10 @@ public:
                 amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
                 cudaDeviceSynchronize();
             }
+            auto t2_reamp = std::chrono::high_resolution_clock::now();
+            if (getenv("CTPWA_PROF")) printf("[PROF] reComputeAmps: %.2f ms, +T: %.2f ms\n",
+                std::chrono::duration<double, std::milli>(t1_reamp - t0_reamp).count(),
+                std::chrono::duration<double, std::milli>(t2_reamp - t1_reamp).count());
 
             // 更新 d_phsp_matrix_（振幅已变，phsp 矩阵需同步）
             cudaSetDevice(primary_dev);
@@ -940,11 +946,15 @@ public:
                     d_w_out = s_d_w_bufs[gpu];
                 }
 
+                auto t0_nll = std::chrono::high_resolution_clock::now();
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
                     d_grad, nData_gpu, n_polar_, n_amplitudes_, nullptr, d_w_out);
 
                 total_data_nll += nll;
                 totalDataEvents += nData_gpu;
+                auto t1_nll = std::chrono::high_resolution_clock::now();
+                if (getenv("CTPWA_PROF")) printf("[PROF] computeFactorNLL(data): %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1_nll - t0_nll).count());
                 // P2P累加到global (正号)
                 if (gpu == primary_dev) {
                     axpyComplex(d_grad_global, d_grad, ctMake(1.0f, 0.0f), extended_n_gls);
@@ -975,11 +985,15 @@ public:
                     d_w_bkg_out = s_d_w_bkg_bufs[gpu];
                 }
 
+                auto t0_nllb = std::chrono::high_resolution_clock::now();
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
                     d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w, d_w_bkg_out);
 
                 total_bkg_nll += nll;
                 totalBkgEvents += nBkg_gpu;
+                auto t1_nllb = std::chrono::high_resolution_clock::now();
+                if (getenv("CTPWA_PROF")) printf("[PROF] computeFactorNLL(bkg): %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1_nllb - t0_nllb).count());
                 if (gpu == primary_dev) {
                     axpyComplex(d_grad_global, d_grad, ctMake(-1.0f, 0.0f), extended_n_gls);
                 }
@@ -1010,8 +1024,12 @@ public:
                     d_v_ptrs[g] = const_cast<ctComplex*>(
                         reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
+                auto t0_rg = std::chrono::high_resolution_clock::now();
                 amp_calc->computeResonanceGradient(s_d_w_bufs, n_data_events, d_grad_res,
                     +1.0, phsp_offsets, d_v_ptrs);
+                auto t1_rg = std::chrono::high_resolution_clock::now();
+                if (getenv("CTPWA_PROF")) printf("[PROF] resonanceGradient(data): %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1_rg - t0_rg).count());
             }
 
             // bkg 贡献 (sign=-1, loss = data_nll - bkg_nll)
@@ -1025,8 +1043,12 @@ public:
                     d_v_ptrs[g] = const_cast<ctComplex*>(
                         reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
                 }
+                auto t0_rgb = std::chrono::high_resolution_clock::now();
                 amp_calc->computeResonanceGradient(s_d_w_bkg_bufs, n_bkg_events, d_grad_res,
                     -1.0, bkg_offsets, d_v_ptrs);
+                auto t1_rgb = std::chrono::high_resolution_clock::now();
+                if (getenv("CTPWA_PROF")) printf("[PROF] resonanceGradient(bkg): %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1_rgb - t0_rgb).count());
             }
 
             // phsp 贡献: ∂((N_data-W_bkg)*log(phsp))/∂θ
@@ -1063,8 +1085,12 @@ public:
                     for (int g = 0; g < num_gpus; ++g)
                         d_v_ptrs[g] = const_cast<ctComplex*>(
                             reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[g].data_ptr()));
+                    auto t0_rgp = std::chrono::high_resolution_clock::now();
                     amp_calc->computeResonanceGradient(d_S_bufs, n_phsp_evts, d_grad_res,
                         phsp_sign, {}, d_v_ptrs);
+                    auto t1_rgp = std::chrono::high_resolution_clock::now();
+                    if (getenv("CTPWA_PROF")) printf("[PROF] resonanceGradient(phsp): %.2f ms\n",
+                        std::chrono::duration<double, std::milli>(t1_rgp - t0_rgp).count());
 
                     for (int g = 0; g < num_gpus; ++g)
                         if (d_S_bufs[g]) { cudaSetDevice(g); cudaFree(d_S_bufs[g]); }
