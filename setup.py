@@ -2,6 +2,7 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
+import shutil
 import subprocess
 
 # 获取环境变量中的路径
@@ -9,6 +10,23 @@ conda_prefix = os.environ.get("CONDA_PREFIX")
 root_dir = os.environ.get("ROOTSYS")  # 默认使用 /usr
 cuda_dir = os.environ.get("CUDA_HOME")
 project_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+class ForceBuildExtension(BuildExtension):
+    """强制全量重编（build_ext 子类）。
+
+    main.cu #include 全部 .cu 的单文件架构下，增量编译不可靠：
+    setuptools（use_ninja=False）不跟踪 include 依赖，改 .cu 不触发重编；
+    ninja 在编辑与 install 同秒（mtime 精度 1s）时判定依赖未变而跳过。
+    两者都会链接新旧混合的 .so（实测 Hessian 慢 27×）。
+    清 build_temp 保证每次全量重编，产物一致（单文件架构下本来每次
+    都重编整个 main.cu，无额外成本）。
+    """
+    def run(self):
+        bt = self.build_temp
+        if bt and os.path.isdir(bt):
+            shutil.rmtree(bt, ignore_errors=True)
+        super().run()
 
 
 # 获取当前 CUDA 环境支持的 SM 架构，生成 gencode 编译选项
@@ -180,8 +198,12 @@ setup(
     packages=find_packages(exclude=["example"]),
     ext_modules=[extension],
     cmdclass={
-        "build_ext": BuildExtension.with_options(
-            use_ninja=False,  # 如果系统没有 ninja
+        # ForceBuildExtension: 清 build_temp 强制全量重编 + ninja 依赖跟踪。
+        # 单文件架构（main.cu #include 全部 .cu）下 setuptools 增量编译不跟踪
+        # include 依赖（use_ninja=False 时改 .cu 不触发重编），会链接新旧混合
+        # 的 .so（实测 Hessian 慢 27×）。清空后每次全量编译，保证产物一致。
+        "build_ext": ForceBuildExtension.with_options(
+            use_ninja=True,
             no_python_abi_suffix=True,  # 不添加 Python ABI 后缀
         )
     },
