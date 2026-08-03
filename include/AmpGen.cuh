@@ -201,6 +201,12 @@ public:
         int nFree = 0;                                // 该块自由参数数（conjugate 块=owner 的）
         std::vector<int> free_global_idx;             // d_dF[j] → slots_[j] 全局索引（host）
         std::vector<int> free_param_idx;              // d_dF[j] → 参数下标（host，d_param_map）
+        // ---- 持久化映射缓冲（懒分配；内容在 addBlock 后固定，避免每次调用 cudaMalloc/cudaFree）----
+        std::vector<int*> d_res_idx_;                 // 每 GPU：本块 slot → 共振态索引（updateResonanceParams 用）
+        std::vector<int*> d_param_idx_;               // 每 GPU：本块 slot → params[] 下标
+        std::vector<int*> d_global_offset_;           // 每 GPU：本块 slot → 全局 slot 下标
+        std::vector<int*> d_param_map_;               // 每 GPU：free_param_idx 设备副本（AD kernel 用）
+        std::vector<int*> d_global_idx_;              // 每 GPU：free_global_idx 设备副本（梯度累加用）
     };
 
     // 参数槽：一个自由参数 → 对应哪个 block 的哪个共振态的哪个 params 下标
@@ -297,6 +303,14 @@ private:
     std::map<std::pair<int,int>, std::pair<int,int>> conjugate_broadcast_;
     // Track which (block_idx, res_idx) first registered each resonance name
     std::map<std::string, std::pair<int,int>> resonance_owners_;
+    // ---- 持久化跨调用缓冲（懒分配；避免每次调用 cudaMalloc/cudaFree + 隐含同步）----
+    std::vector<double*> d_params_per_gpu_;           // 每 GPU：d_params 广播副本（n_free 固定）
+    std::vector<double*> d_grad_per_gpu_;             // computeResonanceGradient 的每 GPU 临时梯度
+    // amp/event offsets 内容缓存（fit 循环中内容不变，内容变化时自动重传）
+    std::vector<std::vector<int>> cached_ev_off_;     // 每 GPU 上次上传的 event_offsets 副本
+    std::vector<std::vector<int>> cached_amp_off_;    // 每 GPU 上次上传的 amp_offsets 副本
+    std::vector<int*> d_ev_off_cache_;                // 每 GPU 设备端 event_offsets（懒分配）
+    std::vector<int*> d_amp_off_cache_;               // 每 GPU 设备端 amp_offsets（懒分配）
 };
 
 // 核函数声明

@@ -1389,7 +1389,21 @@ AmpCalc::~AmpCalc()
             if (block.d_all_channels[gpu]) cudaFree(block.d_all_channels[gpu]);
             if (block.d_T.size() > gpu && block.d_T[gpu]) cudaFree(block.d_T[gpu]);
             if (block.d_dF.size() > gpu && block.d_dF[gpu]) cudaFree(block.d_dF[gpu]);
+            if (block.d_res_idx_.size() > gpu && block.d_res_idx_[gpu]) cudaFree(block.d_res_idx_[gpu]);
+            if (block.d_param_idx_.size() > gpu && block.d_param_idx_[gpu]) cudaFree(block.d_param_idx_[gpu]);
+            if (block.d_global_offset_.size() > gpu && block.d_global_offset_[gpu]) cudaFree(block.d_global_offset_[gpu]);
+            if (block.d_param_map_.size() > gpu && block.d_param_map_[gpu]) cudaFree(block.d_param_map_[gpu]);
+            if (block.d_global_idx_.size() > gpu && block.d_global_idx_[gpu]) cudaFree(block.d_global_idx_[gpu]);
         }
+    }
+    // 跨块持久化缓冲（每 GPU 一份）
+    size_t n_gpu_persist = d_params_per_gpu_.size();
+    for (size_t gpu = 0; gpu < n_gpu_persist; ++gpu) {
+        cudaSetDevice(static_cast<int>(gpu));
+        if (d_params_per_gpu_[gpu]) cudaFree(d_params_per_gpu_[gpu]);
+        if (d_grad_per_gpu_[gpu]) cudaFree(d_grad_per_gpu_[gpu]);
+        if (d_ev_off_cache_[gpu]) cudaFree(d_ev_off_cache_[gpu]);
+        if (d_amp_off_cache_[gpu]) cudaFree(d_amp_off_cache_[gpu]);
     }
     // cas_list_ 由 shared_ptr 自动释放
 }
@@ -1581,33 +1595,54 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
 
-    // 1. 把 d_params 广播到所有 GPU
-    std::vector<double*> d_params_per_gpu(n_gpu, nullptr);
+    // 1. 把 d_params 广播到所有 GPU（缓冲持久化，仅首次分配）
+    if (d_params_per_gpu_.size() != (size_t)n_gpu) {
+        d_params_per_gpu_.assign(n_gpu, nullptr);
+        for (int gpu = 0; gpu < n_gpu; ++gpu) {
+            cudaSetDevice(gpu);
+            cudaMalloc(&d_params_per_gpu_[gpu], n_free * sizeof(double));
+        }
+    }
     int primary_dev = 0;
     cudaGetDevice(&primary_dev);
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
-        cudaMalloc(&d_params_per_gpu[gpu], n_free * sizeof(double));
-    }
-    // 从 primary GPU 拷贝到各 GPU
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == primary_dev) {
             cudaSetDevice(primary_dev);
-            cudaMemcpy(d_params_per_gpu[primary_dev], d_params,
+            cudaMemcpy(d_params_per_gpu_[primary_dev], d_params,
                        n_free * sizeof(double), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemcpyPeer(d_params_per_gpu[gpu], gpu,
+            cudaMemcpyPeer(d_params_per_gpu_[gpu], gpu,
                            d_params, primary_dev,
                            n_free * sizeof(double));
         }
     }
 
-    // 2. 构建设备端的 slots 映射数组
-    std::vector<int> h_slot_block(n_free), h_slot_res(n_free), h_slot_param(n_free);
-    for (int i = 0; i < n_free; ++i) {
-        h_slot_block[i] = slots_[i].block_idx;
-        h_slot_res[i] = slots_[i].res_idx;
-        h_slot_param[i] = slots_[i].param_idx;
+    // 2. amp/event offsets 设备缓冲：内容不变则复用（fit 循环中内容固定）
+    if (cached_ev_off_.size() != (size_t)n_gpu) {
+        cached_ev_off_.resize(n_gpu);
+        cached_amp_off_.resize(n_gpu);
+        d_ev_off_cache_.assign(n_gpu, nullptr);
+        d_amp_off_cache_.assign(n_gpu, nullptr);
+    }
+    for (int gpu = 0; gpu < n_gpu; ++gpu) {
+        if (cached_ev_off_[gpu] != event_offsets[gpu]) {
+            cudaSetDevice(gpu);
+            if (!d_ev_off_cache_[gpu])
+                cudaMalloc(&d_ev_off_cache_[gpu],
+                           std::max((size_t)1, event_offsets[gpu].size()) * sizeof(int));
+            cudaMemcpy(d_ev_off_cache_[gpu], event_offsets[gpu].data(),
+                       event_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
+            cached_ev_off_[gpu] = event_offsets[gpu];
+        }
+        if (cached_amp_off_[gpu] != amp_offsets[gpu]) {
+            cudaSetDevice(gpu);
+            if (!d_amp_off_cache_[gpu])
+                cudaMalloc(&d_amp_off_cache_[gpu],
+                           std::max((size_t)1, amp_offsets[gpu].size()) * sizeof(int));
+            cudaMemcpy(d_amp_off_cache_[gpu], amp_offsets[gpu].data(),
+                       amp_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
+            cached_amp_off_[gpu] = amp_offsets[gpu];
+        }
     }
 
     // 3. 每个 GPU: 更新 DeviceResonance 参数 + 重跑 computeAmpsKernel
@@ -1616,8 +1651,16 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
         int blockSize = 256;
 
         // 为每个 block 更新 DeviceResonance 中的自由参数
+        // （slot → (res_idx, param_idx, global_idx) 映射在 addBlock 后固定，持久化懒分配）
         for (size_t bi = 0; bi < blocks_.size(); ++bi) {
             auto& block = blocks_[bi];
+
+            if (!block.d_res_idx_.size()) {
+                block.d_res_idx_.assign(n_gpu, nullptr);
+                block.d_param_idx_.assign(n_gpu, nullptr);
+                block.d_global_offset_.assign(n_gpu, nullptr);
+            }
+            if (block.d_res_idx_[gpu]) continue;  // 映射已上传过（内容固定）
 
             // 收集本 block 涉及的 slots（按原始 slots_ 顺序的子集）
             std::vector<int> local_res_idx, local_param_idx, local_global_offset;
@@ -1631,24 +1674,25 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             int n_local = static_cast<int>(local_res_idx.size());
             if (n_local == 0) continue;
 
-            int* d_res_idx, * d_param_idx, * d_global_offset;
-            cudaMalloc(&d_res_idx, n_local * sizeof(int));
-            cudaMalloc(&d_param_idx, n_local * sizeof(int));
-            cudaMalloc(&d_global_offset, n_local * sizeof(int));
-            cudaMemcpy(d_res_idx, local_res_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_param_idx, local_param_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_global_offset, local_global_offset.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMalloc(&block.d_res_idx_[gpu], std::max(1, n_local) * sizeof(int));
+            cudaMalloc(&block.d_param_idx_[gpu], std::max(1, n_local) * sizeof(int));
+            cudaMalloc(&block.d_global_offset_[gpu], std::max(1, n_local) * sizeof(int));
+            cudaMemcpy(block.d_res_idx_[gpu], local_res_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(block.d_param_idx_[gpu], local_param_idx.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(block.d_global_offset_[gpu], local_global_offset.data(), n_local * sizeof(int), cudaMemcpyHostToDevice);
+        }
 
+        // 启动 updateResonanceParams（每个 GPU 只需更新一次全局 slot 映射——见下方统一 kernel）
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            auto& block = blocks_[bi];
+            int n_local = static_cast<int>(block.free_global_idx.size());
+            if (n_local == 0 || !block.d_res_idx_[gpu]) continue;
             int grid = (n_local + blockSize - 1) / blockSize;
             updateResonanceParamsKernel<<<grid, blockSize>>>(
                 block.d_all_params[gpu], block.d_resonances[gpu],
                 block.resonance_count,
-                d_params_per_gpu[gpu], d_res_idx, d_param_idx, d_global_offset, n_local);
-
-            cudaDeviceSynchronize();
-            cudaFree(d_res_idx);
-            cudaFree(d_param_idx);
-            cudaFree(d_global_offset);
+                d_params_per_gpu_[gpu], block.d_res_idx_[gpu],
+                block.d_param_idx_[gpu], block.d_global_offset_[gpu], n_local);
         }
 
         // Broadcast theta params to conjugate blocks (cross-chain shared resonances)
@@ -1669,7 +1713,6 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaMemcpy(d_cj_params, d_ow_params,
                        ow_count * sizeof(double), cudaMemcpyDeviceToDevice);
         }
-        cudaDeviceSynchronize();
 
         // 为 conjugate 块填充自由参数信息（从 owner 复制；参数值已广播）
         for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
@@ -1690,15 +1733,8 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             auto& d_slComb = cas->getDeviceSLCombs();
             auto& nEvents = cas->getNEventsVec();
 
-            // 准备 amp_offsets 和 event_offsets 的设备端数据
-            int* d_amp_offsets;
-            cudaMalloc(&d_amp_offsets, amp_offsets[gpu].size() * sizeof(int));
-            cudaMemcpy(d_amp_offsets, amp_offsets[gpu].data(),
-                       amp_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
-            int* d_event_offsets;
-            cudaMalloc(&d_event_offsets, event_offsets[gpu].size() * sizeof(int));
-            cudaMemcpy(d_event_offsets, event_offsets[gpu].data(),
-                       event_offsets[gpu].size() * sizeof(int), cudaMemcpyHostToDevice);
+            int* d_amp_offsets = d_amp_off_cache_[gpu];
+            int* d_event_offsets = d_ev_off_cache_[gpu];
             int num_offsets = static_cast<int>(amp_offsets[gpu].size());
 
             dim3 gridDim(static_cast<unsigned int>(cas->getNSLCombs()),
@@ -1711,10 +1747,14 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (!block.d_dF[gpu])
                     cudaMalloc(&block.d_dF[gpu], dF_size * sizeof(ctComplex));
 
-                int* d_param_map;
-                cudaMalloc(&d_param_map, block.nFree * sizeof(int));
-                cudaMemcpy(d_param_map, block.free_param_idx.data(),
-                           block.nFree * sizeof(int), cudaMemcpyHostToDevice);
+                // free_param_idx 固定 → 持久化懒分配
+                if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
+                if (!block.d_param_map_[gpu]) {
+                    cudaMalloc(&block.d_param_map_[gpu], block.nFree * sizeof(int));
+                    cudaMemcpy(block.d_param_map_[gpu], block.free_param_idx.data(),
+                               block.nFree * sizeof(int), cudaMemcpyHostToDevice);
+                }
+                int* d_param_map = block.d_param_map_[gpu];
 
                 switch (block.nFree) {
                 case 1:
@@ -1768,7 +1808,6 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                         n_amplitudes, block.site, bf_d);
                     break;
                 }
-                cudaFree(d_param_map);
             } else {
                 computeAmpsKernel<<<gridDim, blockSize>>>(
                     d_amplitudes[gpu], d_momenta[gpu], d_slComb[gpu],
@@ -1782,20 +1821,11 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, block.site, bf_d);
             }
-
-            cudaDeviceSynchronize();
-            cudaFree(d_amp_offsets);
-            cudaFree(d_event_offsets);
+            // 持久化缓冲：不再 per-block sync/free（同 stream 隐式顺序依赖）
         }
     }
 
-    // 4. 释放临时的 d_params 副本
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        if (d_params_per_gpu[gpu]) {
-            cudaSetDevice(gpu);
-            cudaFree(d_params_per_gpu[gpu]);
-        }
-    }
+    // 恢复 primary device
     cudaSetDevice(primary_dev);
 }
 
@@ -1906,7 +1936,7 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
         computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
             block.d_T[gpu], cas->getSLAmps()[gpu],
             d_v + block.site, nSL, nTotal, 0, nSL);
-        cudaDeviceSynchronize();
+        // 无 sync：同 stream 隐式顺序；调用方负责最终同步
     }
 }
 
@@ -1970,12 +2000,17 @@ void AmpCalc::computeResonanceGradient(
 
     constexpr int kBlockSize = 256;
 
-    // 为每 GPU 分配临时梯度 buffer
-    std::vector<double*> d_grad_per_gpu(n_gpu, nullptr);
+    // 每 GPU 的临时梯度 buffer：持久化懒分配，每次清零（避免每次 malloc/free 隐含同步）
+    if (d_grad_per_gpu_.size() != (size_t)n_gpu) {
+        d_grad_per_gpu_.assign(n_gpu, nullptr);
+        for (int gpu = 0; gpu < n_gpu; ++gpu) {
+            cudaSetDevice(gpu);
+            cudaMalloc(&d_grad_per_gpu_[gpu], n_free * sizeof(double));
+        }
+    }
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         cudaSetDevice(gpu);
-        cudaMalloc(&d_grad_per_gpu[gpu], n_free * sizeof(double));
-        cudaMemset(d_grad_per_gpu[gpu], 0, n_free * sizeof(double));
+        cudaMemset(d_grad_per_gpu_[gpu], 0, n_free * sizeof(double));
     }
 
     // 启动梯度 kernel 的公共 lambda（每 block 一份）
@@ -1995,34 +2030,43 @@ void AmpCalc::computeResonanceGradient(
             int n_events_total = static_cast<int>(cas->getNEventsVec()[gpu]);
             const ctComplex* d_v_gpu = has_dv ? d_v_per_gpu[gpu] : nullptr;
 
-            int* d_global_idx;
-            cudaMalloc(&d_global_idx, Nlocal * sizeof(int));
-            cudaMemcpy(d_global_idx, global_idx.data(), Nlocal * sizeof(int),
-                       cudaMemcpyHostToDevice);
+            // free_global_idx 固定 → 持久化懒分配（conjugate 复用 owner 的指针）
+            if (!block.d_global_idx_.size()) {
+                // 从 owner 复制（reComputeAmps 已填充 host 侧 free_global_idx）
+                if (block.free_global_idx.empty() && !global_idx.empty()) {
+                    const_cast<ResBlock&>(block).free_global_idx = global_idx;
+                }
+                const_cast<ResBlock&>(block).d_global_idx_.assign(n_gpu, nullptr);
+            }
+            int* d_global_idx = block.d_global_idx_[gpu];
+            if (!d_global_idx) {
+                cudaMalloc(&d_global_idx, std::max(1, Nlocal) * sizeof(int));
+                cudaMemcpy(d_global_idx, block.free_global_idx.data(),
+                           Nlocal * sizeof(int), cudaMemcpyHostToDevice);
+                const_cast<ResBlock&>(block).d_global_idx_[gpu] = d_global_idx;
+            }
 
             switch (Nlocal) {
             case 1:
                 resonanceGradientKernel<1><<<grid, kBlockSize>>>(
                     d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu[gpu],
+                    d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
                 break;
             case 2:
                 resonanceGradientKernel<2><<<grid, kBlockSize>>>(
                     d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu[gpu],
+                    d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
                 break;
             case 3:
                 resonanceGradientKernel<3><<<grid, kBlockSize>>>(
                     d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu[gpu],
+                    d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
                 break;
             default: break;
             }
-            cudaDeviceSynchronize();
-            cudaFree(d_global_idx);
         }
     };
 
@@ -2053,12 +2097,12 @@ void AmpCalc::computeResonanceGradient(
         if (gpu == primary_dev) {
             cudaSetDevice(primary_dev);
             int grid = (n_free + 255) / 256;
-            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_grad_per_gpu[primary_dev], 1.0, n_free);
+            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_grad_per_gpu_[primary_dev], 1.0, n_free);
             cudaDeviceSynchronize();
         } else {
             std::vector<double> h_temp(n_free);
             cudaSetDevice(gpu);
-            cudaMemcpy(h_temp.data(), d_grad_per_gpu[gpu],
+            cudaMemcpy(h_temp.data(), d_grad_per_gpu_[gpu],
                        n_free * sizeof(double), cudaMemcpyDeviceToHost);
             cudaSetDevice(primary_dev);
             double* d_temp;
@@ -2071,10 +2115,6 @@ void AmpCalc::computeResonanceGradient(
         }
     }
 
-    for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
-        cudaFree(d_grad_per_gpu[gpu]);
-    }
     cudaSetDevice(primary_dev);
 }
 
