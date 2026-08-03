@@ -6,6 +6,8 @@ set -euo pipefail
 # ---------- config ----------
 PLAT=${MANYLINUX_PLAT:-manylinux_2_34_x86_64}
 OUTPUT_DIR="dist"
+# 多架构 gencode（torch cpp_extension 生成；可被环境变量覆盖）
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5 8.0 8.6 8.9 9.0 10.0 12.0}"
 # ---------------------------
 
 # clean previous builds
