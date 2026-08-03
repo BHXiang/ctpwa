@@ -2541,6 +2541,10 @@ public:
                 n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
         }
 
+        bool hprof = getenv("CTPWA_PROF") != nullptr;
+        auto hT0 = std::chrono::high_resolution_clock::now();  // reComputeAmps 完成
+        auto hT1 = hT0, hT2 = hT0, hT3 = hT0, hT4 = hT0, hT5 = hT0;
+
         // Update d_phsp_matrix_ to reflect current amplitudes
         {
             int primary_dev = dev.index();
@@ -2609,6 +2613,8 @@ public:
         }
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
+
+        hT1 = std::chrono::high_resolution_clock::now();  // phsp 矩阵重建完成
 
         // ---- 3. vv block [0:n2, 0:n2] ----
         if (n2 > 0) {
@@ -2738,6 +2744,8 @@ public:
         // reorderVVBlockInterleavedToGrouped(hessian.data_ptr<double>(), nv, total);
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
+
+        hT2 = std::chrono::high_resolution_clock::now();  // vv block 完成
 
         // ---- 4. vθ/θθ block [n2:total, n2:total] ----
         if (nt > 0 && theta.numel() > 0) {
@@ -2901,6 +2909,7 @@ public:
             cudaFree(d_hess);
             hessian.slice(0,n2,total).slice(1,n2,total).copy_(res_hess);
         }
+        hT3 = std::chrono::high_resolution_clock::now();  // vθ/θθ 段完成
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
@@ -3060,11 +3069,25 @@ public:
                 nv, ncf, nt);
             cudaFree(d_g_v);
 
+            if (hprof) {
+                auto hTend = std::chrono::high_resolution_clock::now();
+                auto hms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                printf("[PROF] H.reAmp: %.2f | H.phspM: %.2f | H.vv: %.2f | H.vth+thth+cpl: %.2f | H.total: %.2f\n",
+                    hms(hT0, hT1), hms(hT1, hT2), hms(hT2, hT3), hms(hT3, hTend), hms(hT0, hTend));
+                fflush(stdout);
+            }
             return hess_fit;
         }
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
+        if (hprof) {
+            auto hTend = std::chrono::high_resolution_clock::now();
+            auto hms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            printf("[PROF] H.reAmp: %.2f | H.phspM: %.2f | H.vv: %.2f | H.vth+thth+cpl: %.2f | H.total: %.2f\n",
+                hms(hT0, hT1), hms(hT1, hT2), hms(hT2, hT3), hms(hT3, hTend), hms(hT0, hTend));
+            fflush(stdout);
+        }
         return hessian;
     }
 
