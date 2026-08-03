@@ -2085,57 +2085,8 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             }
         }
 
-        // 非 AD block（无自由参数）：一次合并启动
-        {
-            h_desc.clear();
-            int sl_start = 0, max_evt = 0;
-            for (size_t bi = 0; bi < blocks_.size(); ++bi) {
-                auto& block = blocks_[bi];
-                if (block.nFree > 0) continue;
-                auto& cas = cas_list_[block.cas_idx];
-                ADBlockDesc d;
-                d.d_momenta = cas->getMomenta()[gpu];
-                d.d_slComb = cas->getDeviceSLCombs()[gpu];
-                d.d_slamps = cas->getSLAmps()[gpu];
-                d.d_res = block.d_resonances[gpu];
-                d.d_all_params = block.d_all_params[gpu];
-                d.d_all_channels = block.d_all_channels[gpu];
-                d.d_decayNodes = cas->getDecayNodes()[gpu];
-                d.d_param_map = nullptr;
-                d.d_dF = nullptr;
-                d.resonance_count = block.resonance_count;
-                d.decayChain_size = cas->getDecayChainSize();
-                d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
-                d.nSL = static_cast<int>(cas->getNSLCombs());
-                d.nPolar = static_cast<int>(n_polar);
-                d.sl_start = sl_start;
-                d.site = block.site;
-                h_desc.push_back(d);
-                sl_start += d.nSL;
-                max_evt = std::max(max_evt, d.nEvents);
-            }
-            int nplain = static_cast<int>(h_desc.size());
-            if (nplain > 0) {
-                int need = n_ad_blocks + nplain;
-                if (need > d_ad_desc_cap_) {
-                    for (int g = 0; g < n_gpu; ++g) {
-                        cudaSetDevice(g);
-                        if (d_ad_desc_[g]) cudaFree(d_ad_desc_[g]);
-                        cudaMalloc(&d_ad_desc_[g], need * sizeof(ADBlockDesc));
-                    }
-                    d_ad_desc_cap_ = need;
-                }
-                // 复用 d_ad_desc_[gpu] 的后半段
-                ADBlockDesc* d_desc_plain = d_ad_desc_[gpu] + n_ad_blocks;
-                cudaMemcpy(d_desc_plain, h_desc.data(), nplain * sizeof(ADBlockDesc),
-                           cudaMemcpyHostToDevice);
-                dim3 gridP(static_cast<unsigned int>(sl_start),
-                           (static_cast<unsigned int>(max_evt) + 255) / 256);
-                computeAmpsMergedPlainKernel<<<gridP, blockSize>>>(
-                    d_amplitudes[gpu], d_desc_plain, nplain, sl_start,
-                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
-            }
-        }
+        // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，
+        // 初始化时 getAmps 已计算，fit 循环中跳过重算（纯浪费）
     }
 
     // 恢复 primary device
