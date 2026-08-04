@@ -80,17 +80,17 @@ jobs:
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
           python - <<'PYEOF'
-import zipfile, os
-src = "$WHEEL"
-dst = src.replace("linux_x86_64", "manylinux_2_35_x86_64")
-with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        if item.filename.endswith("WHEEL"):
-            data = data.replace(b"linux_x86_64", b"manylinux_2_35_x86_64")
-        zout.writestr(item, data)
-os.remove(src)
-PYEOF
+          import zipfile, os
+          src = "$WHEEL"
+          dst = src.replace("linux_x86_64", "manylinux_2_35_x86_64")
+          with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+              for item in zin.infolist():
+                  data = zin.read(item.filename)
+                  if item.filename.endswith("WHEEL"):
+                      data = data.replace(b"linux_x86_64", b"manylinux_2_35_x86_64")
+                  zout.writestr(item, data)
+          os.remove(src)
+          PYEOF
           mkdir -p wheelhouse && mv "$WHEEL" wheelhouse/
           ls -lh wheelhouse/
 
