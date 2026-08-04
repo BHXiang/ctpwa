@@ -79,7 +79,7 @@ jobs:
           # （只改 WHEEL 元数据和文件名，不碰 ELF）。
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
-          python - <<'PYEOF'
+          python - <<PYEOF
           import zipfile, os
           src = "$WHEEL"
           dst = src.replace("linux_x86_64", "manylinux_2_35_x86_64")
