@@ -448,7 +448,7 @@ __global__ void computeSfromAmpsKernel(
 // ============================================================
 template<int Npr, int Nres>
 __global__ void hessianStage1Kernel(
-    const thrust::complex<double>* d_slamps,
+    const thrust::complex<double>* d_slamp_tab,  // [nSigma × nSL×nPol×nEv_total]
     const ctComplex* d_v,
     const DeviceMomenta* d_momenta,
     const DecayNode* d_decayNodes, int decayChain_size,
@@ -466,13 +466,17 @@ __global__ void hessianStage1Kernel(
     double* d_g_out,       // [nEv * NT]
     double* d_dS_re_out,   // [nEv * NT * nPolar]
     double* d_dS_im_out,   // [nEv * NT * nPolar]
-    double* d_dF_re_out = nullptr,  // [nEv * nSL * Npr] ∂F/∂θ for mixed Hessian
+    double* d_dF_re_out = nullptr,  // [nSigma × nEv * nSL * Npr] ∂F/∂θ for mixed Hessian
     double* d_dF_im_out = nullptr,
     // Phsp accumulators
     double* d_phsp_I = nullptr,
     double* d_phsp_grad = nullptr,
     double* d_phsp_hessA = nullptr,
-    int evt_offset = 0)
+    int evt_offset = 0,
+    // 全同粒子置换拓扑（σ=0 恒等 +1）
+    int nSigma = 1,
+    const DeviceMomenta* d_mom_tab = nullptr,
+    const double* d_sign_tab = nullptr)
 {
     static_assert(Npr >= 1 && Npr <= 3, "Npr must be 1-3");
     static_assert(Nres >= 1 && Nres <= 4, "Nres must be 1-4");
@@ -515,88 +519,100 @@ __global__ void hessianStage1Kernel(
     double dS_re[NT][32] = { {0} }, dS_im[NT][32] = { {0} };
     double d2S_re[NT][NT][32] = { {{0}} }, d2S_im[NT][NT][32] = { {{0}} };
 
+    size_t dF_row = (size_t)nEvents * nSL * Npr;         // per-σ dF 行距
+    size_t slamp_row = (size_t)nSL * nTotal;             // per-σ slamp 行距（nTotal = nEv_total×nPol）
+
     for (int sl_idx = 0; sl_idx < nSL; ++sl_idx) {
         int res = sl_idx / sl_per_res;
         if (res >= Nres) continue;
         ctComplex vv = d_v[sl_idx];
 
-        using CV = ComplexVar<double, Npr, true>;
-        CV R_ad(1.0, 0.0);
-        {
-            const DeviceResonance& target = d_resonances[res];
-            AD* m0p = &m0_ad[res];
-            AD* gp = &g_ad[res];
+        // 全同粒子：S、∂S/∂θ、∂²S/∂θ² = Σ_σ sgn(σ)·v·slamp(σ)·{R(σ), ∂R(σ)/∂θ, ∂²R(σ)/∂θ²}
+        for (int s = 0; s < nSigma; ++s) {
+            const DeviceMomenta* dm = (s == 0 || !d_mom_tab) ? d_momenta : &d_mom_tab[s];
+            double sg = (s == 0) ? 1.0 : d_sign_tab[s];
+            const thrust::complex<double>* slam = d_slamp_tab + (size_t)s * slamp_row;
+            const double* dF_re_s = d_dF_re_out ? d_dF_re_out + (size_t)s * dF_row : nullptr;
+            const double* dF_im_s = d_dF_im_out ? d_dF_im_out + (size_t)s * dF_row : nullptr;
 
-            for (int ni = 0; ni < decayChain_size; ++ni) {
-                const DecayNode& node = d_decayNodes[ni];
-                const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
-                int L = sl.L;
-                LorentzVector pM = d_momenta->getMomentum(evt_abs, node.mother_idx);
-                LorentzVector pD1 = d_momenta->getMomentum(evt_abs, node.daug1_idx);
-                LorentzVector pD2 = d_momenta->getMomentum(evt_abs, node.daug2_idx);
-                double mm = pM.M();
-                double md1 = pD1.M();
-                double md2 = pD2.M();
-                double qq = breakup_momentum(mm, md1, md2);
+            using CV = ComplexVar<double, Npr, true>;
+            CV R_ad(1.0, 0.0);
+            {
+                const DeviceResonance& target = d_resonances[res];
+                AD* m0p = &m0_ad[res];
+                AD* gp = &g_ad[res];
 
-                AD m0_q0, md1_q0, md2_q0;
-                if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
-                    m0_q0 = *m0p;
-                else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
-                else m0_q0 = AD(1.0);
-                if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
-                    md1_q0 = *m0p;
-                else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
-                if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
-                    md2_q0 = *m0p;
-                else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+                for (int ni = 0; ni < decayChain_size; ++ni) {
+                    const DecayNode& node = d_decayNodes[ni];
+                    const SL& sl = d_slComb[sl_idx * decayChain_size + ni];
+                    int L = sl.L;
+                    LorentzVector pM = dm->getMomentum(evt_abs, node.mother_idx);
+                    LorentzVector pD1 = dm->getMomentum(evt_abs, node.daug1_idx);
+                    LorentzVector pD2 = dm->getMomentum(evt_abs, node.daug2_idx);
+                    double mm = pM.M();
+                    double md1 = pD1.M();
+                    double md2 = pD2.M();
+                    double qq = breakup_momentum(mm, md1, md2);
 
-                AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
-                AD q_ad(qq);
-                bool is_res = (node.mother_idx == target.particle_idx && node.mass[0] <= 0);
+                    AD m0_q0, md1_q0, md2_q0;
+                    if (node.mother_idx == target.particle_idx && node.mass[0] <= 0)
+                        m0_q0 = *m0p;
+                    else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
+                    else m0_q0 = AD(1.0);
+                    if (node.mass[1] <= 0 && node.daug1_idx == target.particle_idx)
+                        md1_q0 = *m0p;
+                    else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+                    if (node.mass[2] <= 0 && node.daug2_idx == target.particle_idx)
+                        md2_q0 = *m0p;
+                    else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
 
-                CV nf;
-                if (is_res) {
-                    AD params_arr[2] = {*m0p, *gp};
-                    nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                              params_arr, 2, target.type, nullptr, 0, bf_d);
-                } else {
-                    auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
-                    nf.real = bf; nf.imag = AD(0.0);
+                    AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
+                    AD q_ad(qq);
+                    bool is_res = (node.mother_idx == target.particle_idx && node.mass[0] <= 0);
+
+                    CV nf;
+                    if (is_res) {
+                        AD params_arr[2] = {*m0p, *gp};
+                        nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
+                                                  params_arr, 2, target.type, nullptr, 0, bf_d);
+                    } else {
+                        auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                        nf.real = bf; nf.imag = AD(0.0);
+                    }
+                    CV new_R;
+                    new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
+                    new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
+                    R_ad = new_R;
                 }
-                CV new_R;
-                new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
-                new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
-                R_ad = new_R;
             }
-        }
 
-        // Output ∂F/∂θ for mixed Hessian
-        if (d_dF_re_out) {
-            for (int j = 0; j < Npr; ++j) {
-                int fidx = evt * nSL * Npr + sl_idx * Npr + j;
-                d_dF_re_out[fidx] = R_ad.real.grad[j];
-                d_dF_im_out[fidx] = R_ad.imag.grad[j];
+            // Output ∂F(σ)/∂θ for mixed Hessian（per-σ 行）
+            if (d_dF_re_out) {
+                for (int j = 0; j < Npr; ++j) {
+                    int fidx = (int)((size_t)s * dF_row) + evt * nSL * Npr + sl_idx * Npr + j;
+                    d_dF_re_out[fidx] = R_ad.real.grad[j];
+                    d_dF_im_out[fidx] = R_ad.imag.grad[j];
+                }
             }
-        }
 
-        int j0 = res * Npr;
-        for (int p = 0; p < nPolar; ++p) {
-            auto sl_amp = d_slamps[sl_idx * nTotal + evt_abs * nPolar + p];
-            double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
-            double t_re = (double)vv.x * sl_re - (double)vv.y * sl_im;
-            double t_im = (double)vv.x * sl_im + (double)vv.y * sl_re;
+            int j0 = res * Npr;
+            for (int p = 0; p < nPolar; ++p) {
+                auto sl_amp = slam[sl_idx * nTotal + evt_abs * nPolar + p];
+                double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
+                double t_re = (double)vv.x * sl_re - (double)vv.y * sl_im;
+                double t_im = (double)vv.x * sl_im + (double)vv.y * sl_re;
 
-            for (int j = 0; j < Npr; ++j) {
-                double dFr = R_ad.real.grad[j], dFi = R_ad.imag.grad[j];
-                dS_re[j0 + j][p] += dFr * t_re - dFi * t_im;
-                dS_im[j0 + j][p] += dFr * t_im + dFi * t_re;
-            }
-            for (int j = 0; j < Npr; ++j) {
-                for (int k = j; k < Npr; ++k) {
-                    double d2Fr = R_ad.real.hess[j][k], d2Fi = R_ad.imag.hess[j][k];
-                    d2S_re[j0 + j][j0 + k][p] += d2Fr * t_re - d2Fi * t_im;
-                    d2S_im[j0 + j][j0 + k][p] += d2Fr * t_im + d2Fi * t_re;
+                for (int j = 0; j < Npr; ++j) {
+                    double dFr = R_ad.real.grad[j], dFi = R_ad.imag.grad[j];
+                    dS_re[j0 + j][p] += sg * (dFr * t_re - dFi * t_im);
+                    dS_im[j0 + j][p] += sg * (dFr * t_im + dFi * t_re);
+                }
+                for (int j = 0; j < Npr; ++j) {
+                    for (int k = j; k < Npr; ++k) {
+                        double d2Fr = R_ad.real.hess[j][k], d2Fi = R_ad.imag.hess[j][k];
+                        d2S_re[j0 + j][j0 + k][p] += sg * (d2Fr * t_re - d2Fi * t_im);
+                        d2S_im[j0 + j][j0 + k][p] += sg * (d2Fr * t_im + d2Fi * t_re);
+                    }
                 }
             }
         }
@@ -774,17 +790,18 @@ __global__ void hessianMixedBlockKernel(
     const double* d_S_re, const double* d_S_im,   // [nEv*nPolar]
     const double* d_I,                             // [nEv]
     const ctComplex* d_amp,                        // [nEv_total*nPolar*n_amp_total]
-    const thrust::complex<double>* d_slamps,        // [nSLtotal * nTotal]
+    const thrust::complex<double>* d_slamp_tab,    // [nSigma × nSLtotal * nTotal]
     const double* d_g,                             // [nEv*Npr]
     const double* d_dS_re, const double* d_dS_im,  // [nEv*Npr*nPolar]
-    const double* d_dF_re, const double* d_dF_im,  // [nEv*nSL*Npr]
+    const double* d_dF_re, const double* d_dF_im,  // [nSigma × nEv*nSL*Npr]
     const int* d_global_idx,                       // [Npr]
     double* d_mixed, int mixed_ld,                 // [2*n_amp_total × P]
     int nEvents, int nSL, int Npr, int nPolar, int n_amp_total, int site,
     int nTotal_slamp,
     double default_weight, const double* d_event_weights,
     double* d_phsp_sum = nullptr,
-    int evt_offset = 0)
+    int evt_offset = 0,
+    int nSigma = 1, const double* d_sign_tab = nullptr)
 {
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
@@ -814,8 +831,6 @@ __global__ void hessianMixedBlockKernel(
             double term2_re = 0.0, term2_im = 0.0;
             double term3_re = 0.0, term3_im = 0.0;
 
-            double dF_re = dF_re_ptr[j], dF_im = dF_im_ptr[j];
-
             for (int p = 0; p < nPolar; ++p) {
                 ctComplex amp_ap = d_amp[evt * nPolar * n_amp_total + p * n_amp_total + global_a];
                 double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
@@ -825,18 +840,24 @@ __global__ void hessianMixedBlockKernel(
                 int ds_idx = j * nPolar + p;
                 double ds_re = dS_re_ptr[ds_idx], ds_im = dS_im_ptr[ds_idx];
 
-                auto sl_amp = d_slamps[a * nTotal_slamp + evt_abs * nPolar + p];
-                double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
-
                 // Term 1: Re/Im(conj(dS_j) · amp_a)
                 term1_re += ds_re * ar + ds_im * ai;
                 term1_im += ds_re * ai - ds_im * ar;
 
-                // Term 2: Re/Im(conj(S) · slamp_a · dF_j)
-                double sl_dF_re = sl_re * dF_re - sl_im * dF_im;
-                double sl_dF_im = sl_re * dF_im + sl_im * dF_re;
-                term2_re += sr * sl_dF_re + si * sl_dF_im;
-                term2_im += sr * sl_dF_im - si * sl_dF_re;
+                // Term 2: Σ_σ sgn(σ)·Re/Im(conj(S) · slamp_σ(a) · dF_σ(j))
+                //（全同粒子：slamp 与 ∂F/∂θ 都随 σ 变化，必须在求和内）
+                for (int s = 0; s < nSigma; ++s) {
+                    double sg = (s == 0) ? 1.0 : d_sign_tab[s];
+                    auto sl_amp = d_slamp_tab[(size_t)s * ((size_t)nSL * nTotal_slamp)
+                                            + (size_t)a * nTotal_slamp + evt_abs * nPolar + p];
+                    double sl_re = sl_amp.real(), sl_im = sl_amp.imag();
+                    double dFr = dF_re_ptr[(size_t)s * ((size_t)nEvents * nSL * Npr) + j];
+                    double dFi = dF_im_ptr[(size_t)s * ((size_t)nEvents * nSL * Npr) + j];
+                    double sl_dF_re = sl_re * dFr - sl_im * dFi;
+                    double sl_dF_im = sl_re * dFi + sl_im * dFr;
+                    term2_re += sg * (sr * sl_dF_re + si * sl_dF_im);
+                    term2_im += sg * (sr * sl_dF_im - si * sl_dF_re);
+                }
 
                 // Term 3 coef: Re/Im(conj(S) · amp_a)
                 term3_re += sr * ar + si * ai;

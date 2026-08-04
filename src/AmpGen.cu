@@ -122,15 +122,15 @@ AmpCasDecay::AmpCasDecay(const std::vector<Particle>& particles)
 
 AmpCasDecay::~AmpCasDecay()
 {
-    // cudaFree(d_slamps_);
-    // cudaFree(d_momenta_);
-    // cudaFree(d_decayNodes_);
-    // cudaFree(d_slCombination_);
-    for (size_t i = 0; i < d_slamps_.size(); ++i)
+    for (size_t i = 0; i < d_slamp_tab_.size(); ++i)
     {
         cudaSetDevice(static_cast<int>(i));
-        if (d_slamps_[i])
-            cudaFree(d_slamps_[i]);
+        if (d_slamp_tab_[i])
+            cudaFree(d_slamp_tab_[i]);
+        if (d_sign_tab_[i])
+            cudaFree(d_sign_tab_[i]);
+        if (d_mom_tab_[i])
+            cudaFree(d_mom_tab_[i]);
         if (d_momenta_[i])
             cudaFree(d_momenta_[i]);
         if (d_decayNodes_[i])
@@ -143,6 +143,22 @@ AmpCasDecay::~AmpCasDecay()
         cudaSetDevice(static_cast<int>(i));
         if (d_polarization_map_[i])
             cudaFree(d_polarization_map_[i]);
+    }
+    // σ≥1 的重建动量（σ=0 即 d_momenta_，上面已释放）
+    for (size_t m = 1; m < d_mom_sigma_.size(); ++m)
+    {
+        for (size_t i = 0; i < d_mom_sigma_[m].size(); ++i)
+        {
+            cudaSetDevice(static_cast<int>(i));
+            if (d_mom_sigma_[m][i])
+            {
+                DeviceMomenta h;
+                cudaMemcpy(&h, d_mom_sigma_[m][i], sizeof(DeviceMomenta),
+                           cudaMemcpyDeviceToHost);
+                cudaFree(h.momenta);
+                cudaFree(d_mom_sigma_[m][i]);
+            }
+        }
     }
 }
 
@@ -164,10 +180,221 @@ void AmpCasDecay::setPolarizationMap(const std::vector<int>& map)
     h_polarization_map_ = map; // stored on host, uploaded to GPU in computeSLAmps
 }
 
-void AmpCasDecay::setPermutedMappings(const std::vector<std::map<std::string, int>>& maps, bool is_boson)
+void AmpCasDecay::setIdenticalGroups(const std::vector<std::pair<std::vector<std::string>, bool>>& groups)
 {
-    permuted_mappings_ = maps;
-    identical_boson_ = is_boson;
+    identical_groups_ = groups;
+}
+
+// ============================================================================
+// 全同粒子置换拓扑生成（coset of S_n / 稳定子）
+//
+// 对应文章中 "permutation amplitudes" PA = Σ_σ sgn(σ) A(σ)：
+//   - σ 作用于链中同组全同粒子的槽位；同一子衰变内的交换由选择定则
+//     (-1)^{L+S}=±1 自动满足（稳定子），不进求和；
+//   - 若成员是中间态（有子衰变），置换必须整棵子树一起换（子结构相同）；
+//   - 费米子带 sgn(σ)（换位乘积奇偶性），玻色子恒 +1；
+//   - 多组 = 各组 coset 的笛卡尔积（槽位不相交，直接叠加）。
+// ============================================================================
+void AmpCasDecay::buildPermTopologies()
+{
+    h_perm_maps_.clear();
+    h_signs_.clear();
+    h_signs_.push_back(1.0);  // σ=0：恒等
+
+    if (identical_groups_.empty()) return;
+
+    std::string root = decayChain_[0].mother;
+
+    // 链中粒子集合（校验用）
+    std::set<std::string> in_chain;
+    for (const auto& node : decayChain_) {
+        in_chain.insert(node.mother);
+        in_chain.insert(node.daug1);
+        in_chain.insert(node.daug2);
+    }
+
+    // 一个成员的子树：path（相对该成员的"左/右"走向序列）→ 粒子名 + 逆映射
+    struct Subtree {
+        std::string name;
+        std::map<std::vector<int>, std::string> paths;      // path → name
+        std::map<std::string, std::vector<int>> name_path;  // name → path
+    };
+
+    // 每组生成 coset（每个成员 i 的槽位接收成员 σ(i) 的内容）
+    for (const auto& [members, is_boson] : identical_groups_) {
+        std::vector<Subtree> subs;
+        for (const auto& m : members) {
+            if (m == root || in_chain.find(m) == in_chain.end()) continue;
+            Subtree s;
+            s.name = m;
+            subs.push_back(s);
+        }
+        if (subs.size() < 2) continue;  // 单成员组无置换
+
+        // 子树路径传播（父→子，循环直至不动点）
+        for (auto& s : subs) {
+            std::vector<int> empty;
+            s.paths[empty] = s.name;
+            s.name_path[s.name] = empty;
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (const auto& node : decayChain_) {
+                    auto it = s.name_path.find(node.mother);
+                    if (it == s.name_path.end()) continue;
+                    std::vector<int> p1 = it->second, p2 = it->second;
+                    p1.push_back(1);
+                    p2.push_back(2);
+                    if (s.paths.find(p1) == s.paths.end()) {
+                        s.paths[p1] = node.daug1;
+                        s.name_path[node.daug1] = p1;
+                        changed = true;
+                    }
+                    if (s.paths.find(p2) == s.paths.end()) {
+                        s.paths[p2] = node.daug2;
+                        s.name_path[node.daug2] = p2;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // 一致性：所有成员子树结构必须相同（全同粒子必须有相同的衰变结构）
+        const auto& ref_paths = subs[0].paths;
+        for (const auto& s : subs) {
+            if (s.paths.size() != ref_paths.size()) {
+                std::cerr << "Error: identical group members have different decay structures ("
+                          << subs[0].name << " vs " << s.name << ")" << std::endl;
+                return;  // 安全失败：不做对称化
+            }
+            for (const auto& [p, n] : ref_paths)
+                if (s.paths.find(p) == s.paths.end()) {
+                    std::cerr << "Error: identical group members have different decay structures ("
+                              << subs[0].name << " vs " << s.name << ")" << std::endl;
+                    return;
+                }
+        }
+
+        // 嵌套检查：一个成员的子树内不能有同组另一成员
+        for (size_t i = 0; i < subs.size(); ++i)
+            for (size_t j = 0; j < subs.size(); ++j)
+                if (i != j && subs[i].name_path.count(subs[j].name)) {
+                    std::cerr << "Error: identical group members nested inside each other ("
+                              << subs[i].name << " contains " << subs[j].name << ")" << std::endl;
+                    return;
+                }
+
+        // 稳定子：同一步的两个子粒子互为同组成员 → 该换位是稳定子
+        std::vector<std::pair<int, int>> stab_pairs;
+        for (const auto& node : decayChain_) {
+            int i1 = -1, i2 = -1;
+            for (size_t i = 0; i < subs.size(); ++i) {
+                if (subs[i].name == node.daug1) i1 = static_cast<int>(i);
+                if (subs[i].name == node.daug2) i2 = static_cast<int>(i);
+            }
+            if (i1 >= 0 && i2 >= 0) stab_pairs.emplace_back(i1, i2);
+        }
+        // 稳定子元素 = 各换位的任意乘积（不相交 → 直接枚举子集）
+        int n = static_cast<int>(subs.size());
+        std::vector<int> id_perm(n);
+        for (int i = 0; i < n; ++i) id_perm[i] = i;
+        std::vector<std::vector<int>> stab_elts = { id_perm };
+        for (const auto& [a, b] : stab_pairs) {
+            size_t cur = stab_elts.size();
+            for (size_t k = 0; k < cur; ++k) {
+                std::vector<int> t = stab_elts[k];
+                std::swap(t[a], t[b]);
+                stab_elts.push_back(t);
+            }
+        }
+
+        // 枚举 S_n 全部置换，按稳定子取陪集代表元（canonical = 轨道内字典序最小）
+        auto canonical = [&](const std::vector<int>& p) {
+            std::vector<int> best = p;
+            for (const auto& t : stab_elts) {
+                std::vector<int> q(n);
+                for (int i = 0; i < n; ++i) q[i] = p[t[i]];
+                if (q < best) best = q;
+            }
+            return best;
+        };
+
+        std::vector<std::vector<int>> reps;
+        std::set<std::vector<int>> seen;
+        std::vector<int> perm = id_perm;
+        do {
+            auto c = canonical(perm);
+            if (seen.insert(c).second) reps.push_back(c);
+        } while (std::next_permutation(perm.begin(), perm.end()));
+        for (const auto& sb : subs) std::cerr << " " << sb.name;
+        std::cerr << "  stab_pairs=" << stab_pairs.size() << "  reps:";
+        for (const auto& r : reps) {
+            std::cerr << " [";
+            for (int x : r) std::cerr << x;
+            std::cerr << "]";
+        }
+        std::cerr << std::endl;
+
+        // 每组生成自己的 σ≥1 重建动量映射 + 符号
+        std::vector<std::map<std::string, int>> group_maps;
+        std::vector<double> group_signs;
+        for (const auto& rep : reps) {
+            if (rep == id_perm) continue;  // 恒等（含纯稳定子项）
+            // 符号：费米子 sgn(rep)（逆序数奇偶），玻色子 +1
+            double sg = 1.0;
+            if (!is_boson) {
+                int inv = 0;
+                for (int i = 0; i < n; ++i)
+                    for (int j = i + 1; j < n; ++j)
+                        if (rep[i] > rep[j]) ++inv;
+                sg = (inv % 2 == 0) ? 1.0 : -1.0;
+            }
+            // 重建动量映射：位置 i 的子树内容换成成员 rep[i] 的子树（路径对应）。
+            // 映射语义（与 convertToDeviceMomenta 一致）：mapping[name] = 动量新槽位。
+            // 必须覆盖全部粒子（恒等底 + 组内交换）——convertToDeviceMomenta 用 map 尺寸分配数组
+            std::map<std::string, int> pmap = particleToIndex_;
+            for (int i = 0; i < n; ++i) {
+                int j = rep[i];  // 成员 subs[j] 的内容移到位置 i
+                for (const auto& [path, name] : subs[i].paths) {
+                    auto it = subs[j].paths.find(path);
+                    if (it == subs[j].paths.end()) continue;  // 已校验一致，不会发生
+                    pmap[it->second] = particleToIndex_[name];
+                }
+            }
+            group_maps.push_back(pmap);
+            group_signs.push_back(sg);
+        }
+
+        // 与已有组叠加（多组笛卡尔积；槽位不相交）
+        if (group_maps.empty()) continue;
+        if (h_perm_maps_.empty()) {
+            h_perm_maps_ = group_maps;
+            h_signs_ = { 1.0 };
+            for (auto sg : group_signs) h_signs_.push_back(sg);
+        } else {
+            std::vector<std::map<std::string, int>> new_maps;
+            std::vector<double> new_signs;
+            for (size_t a = 0; a < h_perm_maps_.size(); ++a)
+                for (size_t b = 0; b < group_maps.size(); ++b) {
+                    std::map<std::string, int> merged = group_maps[b];
+                    for (const auto& [k, v] : h_perm_maps_[a]) merged[k] = v;
+                    new_maps.push_back(merged);
+                    new_signs.push_back(h_signs_[a + 1] * group_signs[b]);
+                }
+            h_perm_maps_ = std::move(new_maps);
+            h_signs_.clear();
+            h_signs_.push_back(1.0);
+            for (auto sg : new_signs) h_signs_.push_back(sg);
+        }
+
+        std::cout << "  Identical group (" << (is_boson ? "boson" : "fermion")
+                  << "): " << n << " members (" << group_maps.size()
+                  << " permutation topologies)" << std::endl;
+    }
+
+    if (h_signs_.size() > 33)
+        std::cerr << "Warning: " << h_signs_.size() - 1
+                  << " permutation topologies — memory usage scales with this!" << std::endl;
 }
 
 // AmpCasDecay 私有方法实现
@@ -270,6 +497,9 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
         }
 
         // 第二步：根据衰变链逐级计算中间态和初态粒子的四动量
+        // 注意：重建索引必须用【原始】索引空间（成员 particleToIndex_）——
+        // σ 拓扑时传入的 mapping 是"动量→槽位"的放置映射，而 kernel 按节点
+        // 原始索引读动量；中间态动量 = 其子树内（已按 σ 放置的）末态动量之和。
         bool changed = true;
         int max_iterations = decayChain.size() + 1;
         int iteration = 0;
@@ -284,9 +514,9 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
                 const std::string& daug1 = decay_node.daug1;
                 const std::string& daug2 = decay_node.daug2;
 
-                auto mother_it = particleToIndex.find(mother);
-                auto daug1_it = particleToIndex.find(daug1);
-                auto daug2_it = particleToIndex.find(daug2);
+                auto mother_it = particleToIndex_.find(mother);
+                auto daug1_it = particleToIndex_.find(daug1);
+                auto daug2_it = particleToIndex_.find(daug2);
 
                 if (mother_it == particleToIndex.end() ||
                     daug1_it == particleToIndex.end() ||
@@ -345,7 +575,9 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
 
 void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta)
 {
-    d_slamps_.resize(finalMomenta.size(), nullptr);
+    d_slamp_tab_.resize(finalMomenta.size(), nullptr);
+    d_mom_tab_.resize(finalMomenta.size(), nullptr);
+    d_sign_tab_.resize(finalMomenta.size(), nullptr);
     d_decayNodes_.resize(finalMomenta.size(), nullptr);
     d_slCombination_.resize(finalMomenta.size(), nullptr);
     d_polarization_map_.resize(finalMomenta.size(), nullptr);
@@ -367,8 +599,25 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
     {
         particleToIndex_[name] = index++;
     }
+    {
+        const auto& f0 = finalMomenta[0];
+        auto it1 = f0.find("pi01");
+        if (it1 != f0.end() && it1->second.size() > 8000) {
+            const auto& p = it1->second[8000];
+        }
+    }
+    // 全同粒子置换拓扑（在权威 index 空间内生成）
+    buildPermTopologies();
+    int nSigma = static_cast<int>(h_signs_.size());
     // 所有四动量都入设备端
     d_momenta_ = convertToDeviceMomenta(finalMomenta, particleToIndex_, decayChain_);
+    // 每 σ 拓扑的重建四动量（σ=0 复用 d_momenta_；σ≥1 用交换映射重建——
+    // 中间态动量随末态交换重新求和，这是置换正确性的关键）
+    d_mom_sigma_.clear();
+    d_mom_sigma_.push_back(d_momenta_);
+    for (size_t m = 0; m < h_perm_maps_.size(); ++m)
+        d_mom_sigma_.push_back(
+            convertToDeviceMomenta(finalMomenta, h_perm_maps_[m], decayChain_));
 
     for (size_t i = 0; i < finalMomenta.size(); ++i)
     {
@@ -407,8 +656,23 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             host_dj2.push_back(std::get<2>(jvals)); // dj2
         }
 
-        // 分配设备内存
-        cudaMalloc(&d_slamps_[i], nEvents_[i] * nPolarizations_ * nSLCombs_ * sizeof(thrust::complex<double>));
+        // 分配 SL 振幅 tab（nSigma 行：σ=0 恒等 + 置换拓扑）
+        size_t slamp_row = (size_t)nEvents_[i] * nPolarizations_ * nSLCombs_;
+        cudaMalloc(&d_slamp_tab_[i], (size_t)nSigma * slamp_row * sizeof(thrust::complex<double>));
+        if (nSigma > 1) {
+            cudaMalloc(&d_sign_tab_[i], (size_t)nSigma * sizeof(double));
+            cudaMemcpy(d_sign_tab_[i], h_signs_.data(),
+                       (size_t)nSigma * sizeof(double), cudaMemcpyHostToDevice);
+            // σ 动量数组（DeviceMomenta 值拷贝，每项含各自的 momenta 指针）
+            // σ 动量数组：DeviceMomenta 结构体在设备端，须 D2H 拷贝取值
+            std::vector<DeviceMomenta> h_mom_arr(nSigma);
+            for (int s = 0; s < nSigma; ++s)
+                cudaMemcpy(&h_mom_arr[s], d_mom_sigma_[s][i],
+                           sizeof(DeviceMomenta), cudaMemcpyDeviceToHost);
+            cudaMalloc(&d_mom_tab_[i], (size_t)nSigma * sizeof(DeviceMomenta));
+            cudaMemcpy(d_mom_tab_[i], h_mom_arr.data(),
+                       (size_t)nSigma * sizeof(DeviceMomenta), cudaMemcpyHostToDevice);
+        }
 
         // 准备设备端的衰变链信息
         int* d_dimj, * d_dimj1, * d_dimj2;
@@ -468,93 +732,44 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         int blockSize = 256;
         int numBlocks = (nEvents_[i] + blockSize - 1) / blockSize;
 
-        for (int start = 0; start < nEvents_[i]; start += batch_size)
+        // 逐 σ 计算 SL 振幅（σ=0 恒等；σ≥1 用重建动量）
+        for (int s = 0; s < nSigma; ++s)
         {
-            int n_events = 0;
-            if (start + batch_size <= nEvents_[i])
+            thrust::complex<double>* target = d_slamp_tab_[i] + (size_t)s * slamp_row;
+            const DeviceMomenta* dm = d_mom_sigma_[s][i];
+            for (int start = 0; start < nEvents_[i]; start += batch_size)
             {
-                n_events = batch_size;
-            }
-            else
-            {
-                n_events = nEvents_[i] - start;
-            }
+                int n_events = 0;
+                if (start + batch_size <= nEvents_[i])
+                {
+                    n_events = batch_size;
+                }
+                else
+                {
+                    n_events = nEvents_[i] - start;
+                }
 
-            thrust::complex<double>* d_amp_buffer;
-            cudaMalloc(&d_amp_buffer, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
-            // cudaMalloc(&d_amp_buffer, 1 * sizeof(thrust::complex<double>));
-            // computeSLAmpKernel<<<gridDim, blockDim, sharedMemSize>>>(
-            // computeSLAmpKernel<<<gridDim, blockDim>>>(
-            computeSLAmpKernel << <numBlocks, blockSize, sharedMemSize >> > (
-                d_slamps_[i], d_amp_buffer, d_momenta_[i], d_decayNodes_[i], d_dimj, d_dimj1,
-                d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
-                decayChain_.size(), amp_size* nSLCombs_, n_events, start,
-                d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
-                nPolarizations_total_);
-
-            cudaDeviceSynchronize();
-
-            // 检查CUDA错误
-            cudaError_t err = cudaGetLastError();
-            if (err != cudaSuccess)
-            {
-                std::cerr << "CUDA error in computeSLAmp: "
-                    << cudaGetErrorString(err) << std::endl;
-            }
-
-            cudaFree(d_amp_buffer);
-        }
-
-        // 跨链全同粒子: 对每个交换拓扑计算 SL 振幅并就地累加
-        for (size_t p = 0; p < permuted_mappings_.size(); ++p) {
-            // 用交换后的映射重建 DeviceMomenta（动量位置被交换）
-            auto d_mom_perm = convertToDeviceMomenta(
-                finalMomenta, permuted_mappings_[p], decayChain_);
-            cudaSetDevice(i);  // restore device after convertToDeviceMomenta
-
-            double sign = identical_boson_ ? 1.0 : -1.0;
-
-            // 分配全尺寸临时 buffer（kernel 按绝对事件索引写入）
-            size_t full_size = nEvents_[i] * nPolarizations_ * nSLCombs_;
-            thrust::complex<double>* d_temp;
-            cudaMalloc(&d_temp, full_size * sizeof(thrust::complex<double>));
-
-            for (int start = 0; start < nEvents_[i]; start += batch_size) {
-                int n_events = (start + batch_size <= nEvents_[i])
-                    ? batch_size : (nEvents_[i] - start);
-
-                // scratch buffer 按 batch 分配
-                thrust::complex<double>* d_scratch;
-                cudaMalloc(&d_scratch, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
-
-                // 用交换后的动量计算 SL 振幅到临时 buffer
+                thrust::complex<double>* d_amp_buffer;
+                cudaMalloc(&d_amp_buffer, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
                 computeSLAmpKernel << <numBlocks, blockSize, sharedMemSize >> > (
-                    d_temp, d_scratch, d_mom_perm[i], d_decayNodes_[i],
-                    d_dimj, d_dimj1, d_dimj2, d_slCombination_[i],
-                    nSLCombs_, nEvents_[i], nPolarizations_,
+                    target, d_amp_buffer, dm, d_decayNodes_[i], d_dimj, d_dimj1,
+                    d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
                     decayChain_.size(), amp_size* nSLCombs_, n_events, start,
                     d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
                     nPolarizations_total_);
+
                 cudaDeviceSynchronize();
 
-                cudaFree(d_scratch);
+                // 检查CUDA错误
+                cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    std::cerr << "CUDA error in computeSLAmp: "
+                        << cudaGetErrorString(err) << std::endl;
+                }
+
+                cudaFree(d_amp_buffer);
             }
-
-            // 一次性累加: d_slamps_[i] += sign * d_temp
-            int blk = 256;
-            int grd = (full_size + blk - 1) / blk;
-            addSLAmpsKernel << <grd, blk >> > (d_slamps_[i], d_temp, full_size, sign);
-            cudaDeviceSynchronize();
-
-            cudaFree(d_temp);
-
-            // 释放所有GPU的交换链 DeviceMomenta
-            for (size_t g = 0; g < d_mom_perm.size(); ++g) {
-                cudaSetDevice(static_cast<int>(g));
-                cudaFree(d_mom_perm[g]->momenta);
-                cudaFree(d_mom_perm[g]);
-            }
-            cudaSetDevice(i);  // restore device
         }
 
         // 清理临时设备内存
@@ -735,7 +950,7 @@ __global__ void computeSLAmpKernel(
             int dim_j1 = d_dimj1[nodeIdx];
             int dim_j2 = d_dimj2[nodeIdx];
 
-            // 直接从设备内存获取四动量
+            // 直接从设备内存获取四动量（σ 拓扑传入已重建的 d_momenta）
             LorentzVector pDaug1 = d_momenta->getMomentum(start_events + eventIdx, node.daug1_idx);
             LorentzVector pDaug2 = d_momenta->getMomentum(start_events + eventIdx, node.daug2_idx);
 
@@ -999,7 +1214,10 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
             (d_amplitudes[i],       // 输出振幅
                 d_momenta_[i],         // 四动量数据
                 d_slCombination_[i],   // SL组合
-                d_slamps_[i],          // SL振幅
+                d_slamp_tab_[i],       // SL振幅 tab（σ=0 行=恒等）
+                getNSigma(),           // 置换拓扑数
+                d_mom_tab_[i],         // σ 动量数组
+                d_sign_tab_[i],        // 符号
                 d_resonances,       // 共振态数组
                 resonance_count,    // 共振态数量
                 d_all_params,       // flat 自由参数
@@ -1040,7 +1258,10 @@ __global__ void
 computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
-    const thrust::complex<double>* slamps, // SL振幅
+    const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
+    int nSigma,                            // 置换拓扑数（含恒等）
+    const DeviceMomenta* d_mom_tab,        // [nSigma] 重建动量数组
+    const double* d_sign_tab,              // [nSigma]
     const DeviceResonance* resonances,     // 共振态数组
     int resonance_count,                   // 共振态数量
     const double* d_all_params,            // 所有共振态的自由参数（flat）
@@ -1075,7 +1296,21 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     // amp_offsets = %d\n", event_idx, sl_idx, offset_idx,
     // event_offsets[offset_idx], amp_offsets[offset_idx]);
 
-    ctResAmp resAmp(1.0, 0.0);
+    // 全同粒子置换求和：A = Σ_σ sgn(σ) · resAmp(σ) · slamp(σ)
+    // （resAmp 随 σ 变化：置换改变了中间态不变质量 → F 因子必须参与求和）
+    size_t slamp_row = (size_t)nSLComb * nPolar * nEvents;
+    const int MAX_POL = 32;
+    if (nPolar > MAX_POL) { printf("computeAmpsKernel: nPolar=%d > %d\n", nPolar, MAX_POL); return; }
+    ctResAmp A_tot[MAX_POL];
+    for (int k = 0; k < nPolar; ++k) A_tot[k] = ctResAmp(0.0, 0.0);
+
+    for (int s = 0; s < nSigma; ++s)
+    {
+        const DeviceMomenta* dm = (s == 0 || !d_mom_tab) ? d_momenta : &d_mom_tab[s];
+        double sg = (s == 0) ? 1.0 : d_sign_tab[s];
+        const thrust::complex<double>* slamps = slamp_tab + (size_t)s * slamp_row;
+
+        ctResAmp resAmp(1.0, 0.0);
 
     // 遍历衰变链中的每个节点
     for (int nodeIdx = 0; nodeIdx < decayChain_size; ++nodeIdx)
@@ -1083,13 +1318,10 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         const DecayNode& node = decayChain[nodeIdx];
         const SL& sl = slCombinations[nodeIdx + sl_idx * decayChain_size];
 
-        // 获取母粒子四动量
-        LorentzVector pMother =
-            d_momenta->getMomentum(event_idx, node.mother_idx);
-        LorentzVector pDaug1 =
-            d_momenta->getMomentum(event_idx, node.daug1_idx);
-        LorentzVector pDaug2 =
-            d_momenta->getMomentum(event_idx, node.daug2_idx);
+        // 获取母粒子四动量（σ 拓扑用重建动量）
+        LorentzVector pMother = dm->getMomentum(event_idx, node.mother_idx);
+        LorentzVector pDaug1 = dm->getMomentum(event_idx, node.daug1_idx);
+        LorentzVector pDaug2 = dm->getMomentum(event_idx, node.daug2_idx);
 
         double mm = pMother.M();
         double qq = std::sqrt((mm * mm - std::pow(pDaug1.M() + pDaug2.M(), 2)) *
@@ -1172,37 +1404,30 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         }
     }
 
-    // 计算极化相关的振幅
+    // 计算极化相关的振幅（σ 内累加；amp_idx 在循环外统一计算）
     for (int k = 0; k < nPolar; ++k)
     {
         int idx = sl_idx * nPolar * nEvents + event_idx * nPolar + k;
-        // int idx = event_idx * nPolar * n_amplitudes + k * n_amplitudes + sl_idx;
-        // int amp_idx = site * nEvents * nPolar + idx;
+
+        ctResAmp temp = resAmp * slamps[idx];
+        A_tot[k] += sg * temp;
+    }
+    }  // σ 循环结束
+
+    // 输出对称化振幅
+    for (int k = 0; k < nPolar; ++k)
+    {
+        int idx = sl_idx * nPolar * nEvents + event_idx * nPolar + k;
         int amp_idx = 0;
         if (offset_idx < num_offsets)
         {
-            int nEvents = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
-            // int nEvents = event_offsets[offset_idx + 1];
-            // amp_idx = amp_offsets[offset_idx] + site * nEvents * nPolar + sl_idx * nPolar * nEvents + (event_idx - event_offsets[offset_idx]) * nPolar + k;
             amp_idx = amp_offsets[offset_idx] + (event_idx - event_offsets[offset_idx]) * n_amplitudes * nPolar + k * n_amplitudes + sl_idx + site;
         }
         else
         {
             return;
         }
-
-        // printf("Event %d, SL %d, Polarization %d: amp_idx = %d\n", event_idx,
-        // sl_idx, k, amp_idx);
-
-        ctResAmp temp = resAmp * slamps[idx]; // * 100.0f;
-        amplitudes[amp_idx] = ctMake(temp.real(), temp.imag());
-
-        // printf("Event %d, SL %d, Polarization %d: resAmp = (%f, %f), slamp = (%f, %f), Final Amp = (%f, %f)\n",
-        //     event_idx, sl_idx, k,
-        //     resAmp.real(), resAmp.imag(),
-        //     slamps[idx].real(), slamps[idx].imag(),
-        //     temp.real(), temp.imag());
-
+        amplitudes[amp_idx] = ctMake(A_tot[k].real(), A_tot[k].imag());
     }
 }
 
@@ -1323,7 +1548,7 @@ __global__ void computeAmpsMergedPlainKernel(
         {
             return;
         }
-        ctResAmp temp = resAmp * B.d_slamps[idx];
+        ctResAmp temp = resAmp * B.d_slamp_tab[idx];  // σ=0 行（恒等；本 kernel 未启用置换求和）
         amplitudes[amp_idx] = ctMake(temp.real(), temp.imag());
     }
 }
@@ -1382,50 +1607,82 @@ __global__ void computeAmpsMergedKernel(
         }
     }
 
-    // ---- 节点循环：q0 质量回退规则与 computeAmpsKernelAD 一致 ----
-    CV R_ad(1.0, 0.0);
-    for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
-        const DecayNode& node = B.d_decayNodes[nodeIdx];
-        const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
-        int L = sl.L;
+    // ---- 全同粒子置换求和：A = Σ_σ sgn(σ)·R(σ)·slamp(σ) ----
+    // R(σ) 为 σ 拓扑的节点因子链（AD，θ 相关）；slamp(σ) 为预缓存的 SL 振幅（θ 无关）。
+    // per-σ 输出 ∂F(σ)/∂θ 到 d_dF_tab 供梯度/Hessian 使用。
+    size_t slamp_row = (size_t)B.nSL * B.nPolar * B.nEvents;
+    size_t dF_row = (size_t)B.nEvents * B.nSL * Nfree;
+    // 每个极化独立累加（k 之间不能共享——各极化 slamp 不同）
+    const int MAX_POL = 32;
+    if (B.nPolar > MAX_POL) { printf("computeAmpsMergedKernel: nPolar=%d > %d\n", B.nPolar, MAX_POL); return; }
+    CV R_tot_pol[MAX_POL];
+    for (int k = 0; k < B.nPolar; ++k) R_tot_pol[k] = CV(0.0, 0.0);
 
-        LorentzVector pM  = B.d_momenta->getMomentum(event_idx, node.mother_idx);
-        LorentzVector pD1 = B.d_momenta->getMomentum(event_idx, node.daug1_idx);
-        LorentzVector pD2 = B.d_momenta->getMomentum(event_idx, node.daug2_idx);
-        double mm = pM.M();
-        double qq = breakup_momentum(mm, pD1.M(), pD2.M());
-        AD q_ad(qq);
-        double md1 = pD1.M();
-        double md2 = pD2.M();
+    for (int s = 0; s < B.nSigma; ++s) {
+        const DeviceMomenta* dm = (s == 0 || !B.d_mom_tab) ? B.d_momenta : &B.d_mom_tab[s];
+        double sg = (s == 0) ? 1.0 : B.d_sign_tab[s];
+        const thrust::complex<double>* slam = B.d_slamp_tab + (size_t)s * slamp_row;
 
-        AD m0_q0, md1_q0, md2_q0;
-        if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0)
-            m0_q0 = m0_ad;
-        else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
-        else m0_q0 = AD(1.0);
-        if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
-            md1_q0 = m0_ad;
-        else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
-        if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
-            md2_q0 = m0_ad;
-        else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+        // ---- 节点循环：q0 质量回退规则与 computeAmpsKernelAD 一致 ----
+        CV R_ad(1.0, 0.0);
+        for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
+            const DecayNode& node = B.d_decayNodes[nodeIdx];
+            const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+            int L = sl.L;
 
-        AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
-        bool is_res = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
+            // σ 拓扑用重建动量（中间态动量已随交换重新求和）
+            LorentzVector pM  = dm->getMomentum(event_idx, node.mother_idx);
+            LorentzVector pD1 = dm->getMomentum(event_idx, node.daug1_idx);
+            LorentzVector pD2 = dm->getMomentum(event_idx, node.daug2_idx);
+            double mm = pM.M();
+            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+            AD q_ad(qq);
+            double md1 = pD1.M();
+            double md2 = pD2.M();
 
-        CV nf;
-        if (is_res) {
-            AD params_arr[2] = {m0_ad, gamma_ad};
-            nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                      params_arr, 2, target_res.type, nullptr, 0, bf_d);
-        } else {
-            AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
-            nf.real = bf_val; nf.imag = AD(0.0);
+            AD m0_q0, md1_q0, md2_q0;
+            if (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0)
+                m0_q0 = m0_ad;
+            else if (node.mass[0] > 0) m0_q0 = AD(node.mass[0]);
+            else m0_q0 = AD(1.0);
+            if (node.mass[1] <= 0 && node.daug1_idx == target_res.particle_idx)
+                md1_q0 = m0_ad;
+            else md1_q0 = AD(node.mass[1] > 0 ? node.mass[1] : md1);
+            if (node.mass[2] <= 0 && node.daug2_idx == target_res.particle_idx)
+                md2_q0 = m0_ad;
+            else md2_q0 = AD(node.mass[2] > 0 ? node.mass[2] : md2);
+
+            AD q0_ad = computeQ0AD(m0_q0, md1_q0, md2_q0);
+            bool is_res = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
+
+            CV nf;
+            if (is_res) {
+                AD params_arr[2] = {m0_ad, gamma_ad};
+                nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
+                                          params_arr, 2, target_res.type, nullptr, 0, bf_d);
+            } else {
+                AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
+                nf.real = bf_val; nf.imag = AD(0.0);
+            }
+            CV new_R;
+            new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
+            new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
+            R_ad = new_R;
         }
-        CV new_R;
-        new_R.real = R_ad.real * nf.real - R_ad.imag * nf.imag;
-        new_R.imag = R_ad.real * nf.imag + R_ad.imag * nf.real;
-        R_ad = new_R;
+
+        // ---- per-σ 输出导数 ∂F(σ)/∂θ_j（复数）----
+        int base = (event_idx * B.nSL + sl_idx) * Nfree + (int)((size_t)s * dF_row);
+        for (int j = 0; j < Nfree; ++j) {
+            B.d_dF_tab[base + j] = ctMake(R_ad.real.grad[j], R_ad.imag.grad[j]);
+        }
+
+        // ---- 振幅累加（val only，省 AD 标量传播）----
+        for (int k = 0; k < B.nPolar; ++k) {
+            size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+            auto sl_amp = slam[idx];
+            R_tot_pol[k].real.val += sg * (R_ad.real.val * sl_amp.real() - R_ad.imag.val * sl_amp.imag());
+            R_tot_pol[k].imag.val += sg * (R_ad.real.val * sl_amp.imag() + R_ad.imag.val * sl_amp.real());
+        }
     }
 
     // ---- 输出振幅（布局与 computeAmpsKernel 相同）----
@@ -1440,18 +1697,11 @@ __global__ void computeAmpsMergedKernel(
         } else {
             return;
         }
-        auto sl_amp = B.d_slamps[idx];
-        CV sl_cv(sl_amp.real(), sl_amp.imag());
-        CV temp = R_ad * sl_cv;
-        amplitudes[amp_idx] = ctMake(temp.real.val, temp.imag.val);
-    }
-
-    // ---- 输出导数 ∂F/∂θ_j（复数）----
-    int base = (event_idx * B.nSL + sl_idx) * Nfree;
-    for (int j = 0; j < Nfree; ++j) {
-        B.d_dF[base + j] = ctMake(R_ad.real.grad[j], R_ad.imag.grad[j]);
+        (void)idx;
+        amplitudes[amp_idx] = ctMake(R_tot_pol[k].real.val, R_tot_pol[k].imag.val);
     }
 }
+
 
 // ============================================================================
 // AD 版振幅 kernel：一次计算同时输出振幅 A 和共振态因子导数 ∂F/∂θ
@@ -1989,7 +2239,8 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 auto& cas = cas_list_[block.cas_idx];
                 int nSL = static_cast<int>(cas->getNSLCombs());
                 int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
-                size_t dF_size = (size_t)nEv * nSL * block.nFree;
+                int nSigma = cas->getNSigma();   // 全同粒子置换拓扑数
+                size_t dF_size = (size_t)nEv * nSL * block.nFree * nSigma;
                 if (!block.d_dF[gpu])
                     cudaMalloc(&block.d_dF[gpu], dF_size * sizeof(ctComplex));
                 if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
@@ -2023,13 +2274,16 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 ADBlockDesc d;
                 d.d_momenta = cas->getMomenta()[gpu];
                 d.d_slComb = cas->getDeviceSLCombs()[gpu];
-                d.d_slamps = cas->getSLAmps()[gpu];
+                d.d_slamp_tab = cas->getSLAmpsTab()[gpu];
                 d.d_res = block.d_resonances[gpu];
                 d.d_all_params = block.d_all_params[gpu];
                 d.d_all_channels = block.d_all_channels[gpu];
                 d.d_decayNodes = cas->getDecayNodes()[gpu];
                 d.d_param_map = block.d_param_map_[gpu];
-                d.d_dF = block.d_dF[gpu];
+                d.d_dF_tab = block.d_dF[gpu];
+                d.nSigma = cas->getNSigma();
+                d.d_mom_tab = cas->getMomentaTab()[gpu];
+                d.d_sign_tab = cas->getSignsTab()[gpu];
                 d.resonance_count = block.resonance_count;
                 d.decayChain_size = cas->getDecayChainSize();
                 d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
@@ -2071,7 +2325,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             (static_cast<unsigned int>(cas->getNEventsVec()[gpu]) + 255) / 256);
                     computeAmpsKernel<<<gd, blockSize>>>(
                         d_amplitudes[gpu], cas->getMomenta()[gpu], cas->getDeviceSLCombs()[gpu],
-                        cas->getSLAmps()[gpu], block.d_resonances[gpu],
+                        cas->getSLAmpsTab()[gpu], cas->getNSigma(),
+                        cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu],
+                        block.d_resonances[gpu],
                         block.resonance_count, block.d_all_params[gpu],
                         block.d_all_channels[gpu], cas->getDecayNodes()[gpu],
                         cas->getDecayChainSize(),
@@ -2111,13 +2367,14 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
 template <int Nfree>
 __global__ void resonanceGradientKernel(
     const ctComplex* d_w,
-    const thrust::complex<double>* d_slamps,
+    const thrust::complex<double>* d_slamp_tab,  // [nSigma × nSL×nPol×nEv_total]
     const ctComplex* d_v,
-    const ctComplex* d_dF,           // [nEvents*nSLComb*Nfree] 复数导数
+    const ctComplex* d_dF_tab,       // [nSigma × nEv_total×nSL×Nfree] 复数导数
     const int* d_global_idx,         // [Nfree]
     double* d_grad,
     int nEvents, int nPolar, int nSLComb, double sign,
-    int evt_off, int site, int n_events_total)
+    int evt_off, int site, int n_events_total,
+    int nSigma, const double* d_sign_tab)
 {
     __shared__ double shm[Nfree];
     for (int j = 0; j < Nfree; ++j) shm[j] = 0.0;
@@ -2129,31 +2386,41 @@ __global__ void resonanceGradientKernel(
         double acc[Nfree];
         for (int j = 0; j < Nfree; ++j) acc[j] = 0.0;
 
+        size_t slamp_row = (size_t)nSLComb * nPolar * n_events_total;
+        size_t dF_row = (size_t)n_events_total * nSLComb * Nfree;
+
         for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
             ctComplex v_sl = d_v[site + sl_idx];
 
-            double s_re = 0.0, s_im = 0.0;
-            for (int pol = 0; pol < nPolar; ++pol) {
-                ctComplex w_val = d_w[evt * nPolar + pol];
-                int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
-                auto sl_amp = d_slamps[amp_idx];
-                double sl_re = sl_amp.real();
-                double sl_im = sl_amp.imag();
-                // T_sl = v_sl * slamps[sl,e,p]
-                double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
-                double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
-                // conj(w) * T
-                s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
-                s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
-            }
+            // 全同粒子：∂A/∂θ_j = Σ_σ sgn(σ)·v·slamp(σ)·∂F(σ)/∂θ_j
+            for (int s = 0; s < nSigma; ++s) {
+                double sg = (s == 0) ? 1.0 : d_sign_tab[s];
+                const thrust::complex<double>* slam = d_slamp_tab + (size_t)s * slamp_row;
+                const ctComplex* dF_s = d_dF_tab + (size_t)s * dF_row;
 
-            // d_dF 由 reComputeAmps 按全局事件索引写入（含 phsp/data/bkg 全段），
-            // 此处必须用 global_evt（段内 evt 会错位）
-            int dF_base = (global_evt * nSLComb + sl_idx) * Nfree;
-            for (int j = 0; j < Nfree; ++j) {
-                ctComplex dF = d_dF[dF_base + j];
-                // -2 Re((s_re + i s_im) * (dF_re + i dF_im)) = -2 (s_re*dF_re - s_im*dF_im)
-                acc[j] += -2.0 * sign * (s_re * (double)dF.x - s_im * (double)dF.y);
+                double s_re = 0.0, s_im = 0.0;
+                for (int pol = 0; pol < nPolar; ++pol) {
+                    ctComplex w_val = d_w[evt * nPolar + pol];
+                    int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
+                    auto sl_amp = slam[amp_idx];
+                    double sl_re = sl_amp.real();
+                    double sl_im = sl_amp.imag();
+                    // T_sl = v_sl * slamps[sl,e,p]
+                    double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
+                    double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
+                    // conj(w) * T
+                    s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
+                    s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
+                }
+
+                // d_dF 由 reComputeAmps 按全局事件索引写入（含 phsp/data/bkg 全段），
+                // 此处必须用 global_evt（段内 evt 会错位）
+                int dF_base = (global_evt * nSLComb + sl_idx) * Nfree;
+                for (int j = 0; j < Nfree; ++j) {
+                    ctComplex dF = dF_s[dF_base + j];
+                    // -2 Re((s_re + i s_im) * (dF_re + i dF_im)) = -2 (s_re*dF_re - s_im*dF_im)
+                    acc[j] += -2.0 * sign * sg * (s_re * (double)dF.x - s_im * (double)dF.y);
+                }
             }
         }
         for (int j = 0; j < Nfree; ++j)
@@ -2324,24 +2591,29 @@ void AmpCalc::computeResonanceGradient(
                 const_cast<ResBlock&>(block).d_global_idx_[gpu] = d_global_idx;
             }
 
+            int nSigma = cas->getNSigma();
+            const double* d_sign_tab = cas->getSignsTab()[gpu];
             switch (Nlocal) {
             case 1:
                 resonanceGradientKernel<1><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
+                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
+                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
+                    nSigma, d_sign_tab);
                 break;
             case 2:
                 resonanceGradientKernel<2><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
+                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
+                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
+                    nSigma, d_sign_tab);
                 break;
             case 3:
                 resonanceGradientKernel<3><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmps()[gpu], d_v_gpu, block.d_dF[gpu],
+                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total);
+                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
+                    nSigma, d_sign_tab);
                 break;
             default: break;
             }
@@ -2571,8 +2843,10 @@ void AmpCalc::computeUnifiedHessian(
             cudaMalloc(&bt.d_g, nEv * NT * sizeof(double));
             cudaMalloc(&bt.d_dS_re, nEv * NT * nPol * sizeof(double));
             cudaMalloc(&bt.d_dS_im, nEv * NT * nPol * sizeof(double));
-            cudaMalloc(&bt.d_dF_re, nEv * nSL * Npr * sizeof(double));
-            cudaMalloc(&bt.d_dF_im, nEv * nSL * Npr * sizeof(double));
+            // dF 按 σ 行存储（全同粒子置换拓扑；σ=0 恒等）
+            int nSigma = cas->getNSigma();
+            cudaMalloc(&bt.d_dF_re, (size_t)nEv * nSL * Npr * nSigma * sizeof(double));
+            cudaMalloc(&bt.d_dF_im, (size_t)nEv * nSL * Npr * nSigma * sizeof(double));
             cudaMalloc(&bt.d_gidx, NT * sizeof(int));
             cudaMemcpy(bt.d_gidx, global_idx.data(), NT * sizeof(int), cudaMemcpyHostToDevice);
 
@@ -2584,40 +2858,44 @@ void AmpCalc::computeUnifiedHessian(
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
             if (Npr == 2 && Nres == 2) {
                 hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
-                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
             } else if (Npr == 1 && Nres == 1) {
                 hessianStage1Kernel<1,1><<<grid, kBlockSize>>>(
-                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
             } else if (Npr == 2 && Nres == 1) {
                 hessianStage1Kernel<2,1><<<grid, kBlockSize>>>(
-                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
             } else if (Npr == 1 && Nres == 2) {
                 hessianStage1Kernel<1,2><<<grid, kBlockSize>>>(
-                    cas->getSLAmps()[gpu], d_v_blk,
+                    cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
-                    d_pI_ptr, d_pg_g, d_phA_g, evt_off);
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
             } else {
                 printf("computeUnifiedHessian: unsupported Npr=%d Nres=%d\n", Npr, Nres);
             }
@@ -2675,12 +2953,14 @@ void AmpCalc::computeUnifiedHessian(
                 hessianMixedBlockKernel<<<grid, kBlockSize>>>(
                     d_S_re, d_S_im, d_I_full,
                     d_amp + evt_off * nPol * n_amp_total,
-                    cas_list_[blk.cas_idx]->getSLAmps()[gpu],
+                    cas_list_[blk.cas_idx]->getSLAmpsTab()[gpu],
                     bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mix_g, nFreeResParams(),
                     nEv, nSL, Npr, nPol, n_amp_total, blk.site,
-                    nTotal_slamp, default_weight, d_w, d_msum_g, evt_off);
+                    nTotal_slamp, default_weight, d_w, d_msum_g, evt_off,
+                    cas_list_[blk.cas_idx]->getNSigma(),
+                    cas_list_[blk.cas_idx]->getSignsTab()[gpu]);
                 cudaDeviceSynchronize();
             }
 

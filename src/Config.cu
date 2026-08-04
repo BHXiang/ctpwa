@@ -751,7 +751,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             // 解析共振态链
             for (const auto &res_node : chain_data) {
                 std::string key = res_node.first.as<std::string>();
-                if (key != "decay" && key != "legend") {
+                if (key != "decay" && key != "legend" && key != "symmetrize") {
                     ResonanceChainConfig res_chain;
                     res_chain.intermediate = key;
 

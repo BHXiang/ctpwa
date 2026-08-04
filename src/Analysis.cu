@@ -4279,65 +4279,28 @@ private:
             auto intermediate_resonance_map = chain_info.intermediate_resonance_map;
             auto intermediate_combs = chain_info.intermediate_combs;
 
-            // 跨链全同粒子: 生成交换拓扑的 permuted particleToIndex mappings
-            std::vector<std::map<std::string, int>> permuted_mappings;
-            bool identical_boson = true;
+            // 跨链全同粒子: 收集链中出现的全同组（≥2 成员）→ cas 生成置换拓扑。
+            // coset 生成（子树感知、稳定子、费米子 sgn）在 computeSLAmps 内部完成，
+            // 这里只需把 (成员名, is_boson) 传给 cas。
+            std::vector<std::pair<std::vector<std::string>, bool>> identical_groups;
             if (chain.symmetrize) {
-                // 构建参考 name→idx 映射（与 computeSLAmps 中一致）
-                std::set<std::string> all_particles;
+                std::set<std::string> chain_particles;
                 for (const auto& step : chain.decay_steps) {
-                    all_particles.insert(step.mother);
-                    for (const auto& d : step.daughters) all_particles.insert(d);
+                    chain_particles.insert(step.mother);
+                    for (const auto& d : step.daughters) chain_particles.insert(d);
                 }
-                for (const auto& name : config_parser_.getDataOrder())
-                    all_particles.insert(name);
-                std::map<std::string, int> ref_map;
-                int idx = 0;
-                for (const auto& name : all_particles) ref_map[name] = idx++;
-
-                // 找第一步的旁观者（非中间共振态的那个 daughter）
-                std::string spectator;
-                std::set<std::string> intermediates;
-                for (size_t s = 0; s < chain.decay_steps.size(); ++s)
-                    intermediates.insert(chain.decay_steps[s].mother);
-                for (const auto& d : chain.decay_steps[0].daughters) {
-                    if (intermediates.find(d) == intermediates.end()) {
-                        spectator = d;
-                        break;
-                    }
-                }
-
-                // 找旁观者所属的全同组
-                std::string group;
+                std::map<std::string, std::vector<std::string>> groups_by_name;
+                std::map<std::string, bool> group_boson;
                 for (const auto& p : particles_) {
-                    if (p.name == spectator && !p.identical_group.empty()) {
-                        group = p.identical_group;
-                        identical_boson = !p.is_fermion();
-                        break;
-                    }
+                    if (p.identical_group.empty() ||
+                        chain_particles.find(p.name) == chain_particles.end())
+                        continue;
+                    groups_by_name[p.identical_group].push_back(p.name);
+                    group_boson[p.identical_group] = !p.is_fermion();
                 }
-
-                // 对该组中所有在链中但非旁观者的粒子生成交换映射
-                if (!group.empty()) {
-                    for (const auto& step : chain.decay_steps) {
-                        for (const auto& d : step.daughters) {
-                            if (d == spectator) continue;
-                            for (const auto& p : particles_) {
-                                if (p.name == d && p.identical_group == group) {
-                                    auto perm_map = ref_map;
-                                    std::swap(perm_map[spectator], perm_map[d]);
-                                    permuted_mappings.push_back(perm_map);
-                                    break; // 每个 daughter 只加一次
-                                }
-                            }
-                        }
-                    }
-                    if (!permuted_mappings.empty()) {
-                        std::cout << "  Cross-chain identical: spectator=" << spectator
-                                  << " (" << (identical_boson ? "boson" : "fermion")
-                                  << "), " << permuted_mappings.size()
-                                  << " exchanged topologies" << std::endl;
-                    }
+                for (const auto& [gname, members] : groups_by_name) {
+                    if (members.size() >= 2)
+                        identical_groups.push_back({ members, group_boson[gname] });
                 }
             }
 
@@ -4347,7 +4310,7 @@ private:
                 cas->setNPolarizations(n_polar_);
                 cas->setNPolarizationsTotal(n_polar_total_);
                 cas->setPolarizationMap(polarization_map_);
-                cas->setPermutedMappings(permuted_mappings, identical_boson);
+                cas->setIdenticalGroups(identical_groups);
                 for (const auto& step : chain.decay_steps)
                 {
                     std::array<int, 3> spins = { 0 };
