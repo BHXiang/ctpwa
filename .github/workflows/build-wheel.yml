@@ -91,7 +91,7 @@ jobs:
                   zout.writestr(item, data)
           os.remove(src)
           PYEOF
-          mkdir -p wheelhouse && mv "$WHEEL" wheelhouse/
+          mkdir -p wheelhouse && mv dist/ctpwa-*.whl wheelhouse/
           ls -lh wheelhouse/
 
       # ---- 5. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
