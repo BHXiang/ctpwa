@@ -23,3 +23,5 @@ tests/.pytest_cache/
 !.github/
 !.github/**
 !MANIFEST.in
+!doc/
+!doc/**
