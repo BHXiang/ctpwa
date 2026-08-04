@@ -30,7 +30,7 @@
 
 ```bash
 # 系统依赖
-sudo apt install libyaml-cpp-dev      # yaml-cpp
+conda install yaml-cpp 
 # ROOT：下载/编译后 source thisroot.sh
 # CUDA：安装与 GPU 匹配的驱动 + CUDA 13.2 runtime
 
@@ -151,7 +151,7 @@ covariant-tensor formalism, computed in parallel on GPUs with CUDA.
 
 ```bash
 # system deps
-sudo apt install libyaml-cpp-dev
+conda install yaml-cpp
 # ROOT: install and `source thisroot.sh`
 # CUDA: driver + CUDA 13.2 runtime
 
