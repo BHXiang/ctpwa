@@ -73,23 +73,25 @@ jobs:
           # 无 GPU runner 上 torch 检测不到架构 → 显式指定（空格分隔）
           TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
         run: |
-          pip install auditwheel
+          # 不用 auditwheel repair：它用 patchelf 重写 ELF 会破坏 .nv_fatbin 的
+          # 加载（内容完好、cuobjdump 可读，但 driver 报 device kernel image is
+          # invalid——A100 上实测确认）。改为 bdist_wheel 后手动改 manylinux 标签
+          # （只改 WHEEL 元数据和文件名，不碰 ELF）。
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
-          auditwheel repair \
-            --plat manylinux_2_35_x86_64 \
-            --exclude "libCore.so*" --exclude "libRIO.so*" \
-            --exclude "libHist.so*" --exclude "libTree.so*" \
-            --exclude "libMatrix.so*" --exclude "libPhysics.so*" \
-            --exclude "libMathCore.so*" --exclude "libThread.so*" \
-            --exclude "libNet.so*" --exclude "libGraf.so*" \
-            --exclude "libGraf3d.so*" --exclude "libGpad.so*" \
-            --exclude "libImt.so*" --exclude "libMultiProc.so*" \
-            --exclude "libcudart.so*" --exclude "libcublas.so*" --exclude "libcublasLt.so*" \
-            --exclude "libc10.so*" --exclude "libtorch.so*" --exclude "libtorch_cpu.so*" \
-            --exclude "libtorch_cuda.so*" --exclude "libtorch_python.so*" --exclude "libc10_cuda.so*" \
-            --exclude "libcudnn.so*" --exclude "libGL.so*" --exclude "libEGL.so*" \
-            --wheel-dir wheelhouse "$WHEEL"
+          python - <<'PYEOF'
+import zipfile, os
+src = "$WHEEL"
+dst = src.replace("linux_x86_64", "manylinux_2_35_x86_64")
+with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+    for item in zin.infolist():
+        data = zin.read(item.filename)
+        if item.filename.endswith("WHEEL"):
+            data = data.replace(b"linux_x86_64", b"manylinux_2_35_x86_64")
+        zout.writestr(item, data)
+os.remove(src)
+PYEOF
+          mkdir -p wheelhouse && mv "$WHEEL" wheelhouse/
           ls -lh wheelhouse/
 
       # ---- 5. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
