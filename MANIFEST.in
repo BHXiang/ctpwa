@@ -3,7 +3,7 @@
 # 否则其他机器 pip install 编译失败。
 recursive-include include *.cuh *.h
 recursive-include src *.cu *.cuh *.h
-recursive-include tests *.py *.yml *.txt *.dat *.sh
 recursive-include doc *
 recursive-include example *.py *.yml *.md
 include README.md LICENSE
+prune tests

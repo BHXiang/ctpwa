@@ -205,7 +205,7 @@ setup(
     description="CUDA-Torch Partial Wave Analysis",
     long_description=_long_desc,
     long_description_content_type="text/markdown",
-    packages=find_packages(exclude=["example"]),
+    packages=find_packages(exclude=["example", "tests"]),
     ext_modules=[extension],
     cmdclass={
         # ForceBuildExtension: 清 build_temp 强制全量重编 + ninja 依赖跟踪。
