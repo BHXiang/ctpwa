@@ -104,20 +104,22 @@ private:
         double mass;
     };
 
-    // thrust::complex<double> *d_slamps_ = nullptr;
-    // DeviceMomenta *d_momenta_ = nullptr;
-    // DecayNode *d_decayNodes_ = nullptr;
-    // SL *d_slCombination_ = nullptr;
-    std::vector<thrust::complex<double>*> d_slamps_;// = nullptr;
+    // 全同粒子置换拓扑（coset）：
+    // d_slamp_tab_[gpu] = [nSigma × nEv×nSL×nPol]，σ=0 行 = 恒等 SL 振幅
+    std::vector<thrust::complex<double>*> d_slamp_tab_;  // [gpu]
+    std::vector<std::vector<DeviceMomenta*>> d_mom_sigma_; // [σ][gpu]：σ 拓扑的重建四动量（σ=0 复用 d_momenta_）
+    std::vector<DeviceMomenta*> d_mom_tab_;  // [gpu]：[nSigma] DeviceMomenta 值数组（kernel 用）
+    std::vector<double*> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
     std::vector<DeviceMomenta*> d_momenta_;// = nullptr;
     std::vector<DecayNode*> d_decayNodes_;// = nullptr;
     std::vector<SL*> d_slCombination_;// = nullptr;
     std::vector<int*> d_polarization_map_;  // GPU polarization mask: output_idx -> tensor_idx
     std::vector<int> h_polarization_map_;   // host copy, used to upload to GPU in computeSLAmps
     size_t nPolarizations_total_;           // total tensor polarizations (before masking)
-    // 跨链全同粒子交换拓扑
-    std::vector<std::map<std::string, int>> permuted_mappings_; // exchanged name→idx maps
-    bool identical_boson_ = true;           // Bose(symmetric sum) / Fermi(alternating)
+    // 跨链全同粒子组：(成员名列表, is_boson)；computeSLAmps 中生成子树感知的置换拓扑
+    std::vector<std::pair<std::vector<std::string>, bool>> identical_groups_;
+    std::vector<std::map<std::string, int>> h_perm_maps_;  // host: [σ≥1] name→idx（重建动量用）
+    std::vector<double> h_signs_;                // host: [nSigma]（σ=0 恒等 +1）
     // // 每批数据大小
     // int* batchSizes_;
 
@@ -131,16 +133,12 @@ private:
     size_t nPolarizations_;
 
     void addParticleIfNotExists(const std::string& name, int spin, int parity, double mass);
-    // void computeNPolarizations_(const std::map<std::string,
-    // std::vector<LorentzVector>> &finalMomenta); DeviceMomenta
-    // *convertToDeviceMomenta(const std::map<std::string,
-    // std::vector<LorentzVector>> &finalMomenta, const std::map<std::string,
-    // int> &particleToIndex, const std::vector<DecayNodeHost> &decayChain, int
-    // start_event, int batch_size);
     std::vector<DeviceMomenta*> convertToDeviceMomenta(
         const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta,
         const std::map<std::string, int>& particleToIndex,
         const std::vector<DecayNodeHost>& decayChain);
+    // 生成全同粒子置换拓扑（coset）；computeSLAmps 内调用
+    void buildPermTopologies();
 
 public:
     AmpCasDecay(const std::vector<Particle>& particles);
@@ -152,7 +150,8 @@ public:
     void setNPolarizations(const int nPolarizations) { nPolarizations_ = nPolarizations; }
     void setNPolarizationsTotal(const int nTotal) { nPolarizations_total_ = nTotal; }
     void setPolarizationMap(const std::vector<int>& map);
-    void setPermutedMappings(const std::vector<std::map<std::string, int>>& maps, bool is_boson);
+    // 全同粒子组：(成员名, is_boson)；computeSLAmps 时生成置换拓扑（coset）
+    void setIdenticalGroups(const std::vector<std::pair<std::vector<std::string>, bool>>& groups);
     void setBatchSizes(const std::vector<int>& batchSizes);
 
     void computeSLAmps(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta);
@@ -172,7 +171,15 @@ public:
     size_t getNPolarizationsTotal() const { return nPolarizations_total_; }
     int getDecayChainSize() const { return static_cast<int>(decayChain_.size()); }
     const std::vector<size_t>& getNEventsVec() const { return nEvents_; }
-    const std::vector<thrust::complex<double>*>& getSLAmps() const { return d_slamps_; }
+    // σ=0 行（恒等 SL 振幅）——tab 的起始指针
+    const std::vector<thrust::complex<double>*>& getSLAmps() const { return d_slamp_tab_; }
+    // 全同粒子置换拓扑（coset）访问
+    int getNSigma() const { return static_cast<int>(h_signs_.size()); }
+    const std::vector<thrust::complex<double>*>& getSLAmpsTab() const { return d_slamp_tab_; }
+    const std::vector<std::vector<DeviceMomenta*>>& getMomentaSigma() const { return d_mom_sigma_; }
+    const std::vector<DeviceMomenta*>& getMomentaTab() const { return d_mom_tab_; }
+    const std::vector<double*>& getSignsTab() const { return d_sign_tab_; }
+    const std::vector<double>& getSignsHost() const { return h_signs_; }
     const std::vector<DeviceMomenta*>& getMomenta() const { return d_momenta_; }
     const std::vector<DecayNode*>& getDecayNodes() const { return d_decayNodes_; }
     const std::vector<SL*>& getDeviceSLCombs() const { return d_slCombination_; }
@@ -187,13 +194,17 @@ public:
 struct ADBlockDesc {
     const DeviceMomenta* d_momenta;
     const SL* d_slComb;
-    const thrust::complex<double>* d_slamps;
+    const thrust::complex<double>* d_slamp_tab;  // [nSigma × nEv×nSL×nPol]（σ=0 行=恒等）
     const DeviceResonance* d_res;
     const double* d_all_params;
     const double* d_all_channels;
     const DecayNode* d_decayNodes;
     const int* d_param_map;      // [Nfree]: 自由参数下标
-    ctComplex* d_dF;             // 输出 ∂F/∂θ [nEvents*nSL*Nfree]
+    ctComplex* d_dF_tab;         // 输出 ∂F/∂θ [nSigma × nEvents*nSL*Nfree]（σ=0 行=恒等）
+    // 全同粒子置换拓扑（coset）
+    int nSigma;                  // 置换项数（含恒等）
+    const DeviceMomenta* d_mom_tab;  // [nSigma] DeviceMomenta 数组（σ 拓扑的重建动量）
+    const double* d_sign_tab;    // [nSigma]（sign[0]=+1）
     int resonance_count;
     int decayChain_size;
     int nEvents;                 // 本 GPU 上该 block 的事件数
@@ -355,7 +366,10 @@ __global__ void
 computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
-    const thrust::complex<double>* slamps, // SL振幅
+    const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
+    int nSigma,                            // 置换项数（含恒等）
+    const DeviceMomenta* d_mom_tab,        // [nSigma] 重建动量数组
+    const double* d_sign_tab,              // [nSigma]
     const DeviceResonance* resonances,     // 共振态数组
     int resonance_count,                   // 共振态数量
     const double* d_all_params,            // 所有共振态的自由参数（flat）
@@ -374,27 +388,18 @@ __global__ void computeAmpsMergedKernel(
     const int* amp_offsets, const int* event_offsets, int num_offsets,
     int n_amplitudes, double bf_d);
 
-// 共振态参数梯度 kernel：对单个共振态的 Nfree 个自由参数计算 ∂NLL/∂θ
+// 共振态参数梯度 kernel：对 block 的 Nfree 个自由参数计算 ∂NLL/∂θ
+// （d_dF 由 reComputeAmps 的 AD kernel 预计算；本 kernel 纯读取）
 template <int Nfree>
 __global__ void resonanceGradientKernel(
-    const ctComplex* d_w,              // [nEvents × nPolar] w = S/I
-    const ctComplex* d_T,              // [nEvents × nPolar] 有效耦合
-    const DeviceMomenta* d_momenta,    // 四动量
-    const DecayNode* d_decayNodes,     // 衰变链
-    const SL* d_slComb,                // SL 组合
-    const DeviceResonance* d_res,      // 共振态数组
-    int res_idx_in_block,              // 目标共振态在 d_res 中的下标
-    const double* d_all_params,        // flat 自由参数数组
-    const int* d_param_map,            // [Nfree]：每个自由参数 → params[] 下标
-    double* d_grad,                    // 输出 [nFreeResParams]（累加到此数组）
-    const int* d_global_idx,           // [Nfree]：每个自由参数在全局 slots_ 中的下标
-    int nEvents, int nPolar,
-    int decayChain_size,
-    double bf_d,
-    double sign = 1.0,
-    int t_evt_offset = 0,
-    const thrust::complex<double>* d_slamps = nullptr,
-    const ctComplex* d_v = nullptr,
-    int site = 0);
+    const ctComplex* d_w,                  // [nEvents × nPolar] w = S/I
+    const thrust::complex<double>* d_slamp_tab,  // [nSigma × nSL×nPol×nEv_total]
+    const ctComplex* d_v,                  // 耦合向量（site 偏移）
+    const ctComplex* d_dF_tab,             // [nSigma × nEv_total×nSL×Nfree]
+    const int* d_global_idx,               // [Nfree]：全局 slots_ 下标
+    double* d_grad,                        // 输出（累加）
+    int nEvents, int nPolar, int nSLComb, double sign,
+    int evt_off, int site, int n_events_total,
+    int nSigma, const double* d_sign_tab); // 置换拓扑（σ=0 恒等 +1）
 
 #endif // AMPGEN_CUH
