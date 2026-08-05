@@ -8,8 +8,6 @@
 !setup.py
 !example/
 !example/**
-!scripts/
-!scripts/**
 !pyproject.toml
 !.gitignore
 !README.md
