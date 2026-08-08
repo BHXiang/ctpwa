@@ -83,6 +83,7 @@ __device__ auto computeNodeFactor(
     const T* params, int param_count,
     ResModelType model_type,
     const double* channels, int n_channels,
+    const double* aux, int aux_offset,   // Hist 形状表（与 channels 同辅助段；非 Hist 传 nullptr/0）
     double bf_d
 ) -> typename ResResult<T>::type;
 

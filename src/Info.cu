@@ -67,7 +67,8 @@ void DecayInfo::buildDecayChains(
                         for (const auto& c : it->second.channels)
                             if (c.size() >= 2) ch.emplace_back(c[0], c[1]);
                         rlist.emplace_back(rname, rc.intermediate, ip.spin, ip.parity,
-                                           it->second.type, it->second.parameters, ch);
+                                           it->second.type, it->second.parameters, ch,
+                                           it->second.options);
                         // Free theta params with readable names
                         if (!it->second.free.empty()) {
                             const auto& pnames = rlist.back().getOrderedParamNames();

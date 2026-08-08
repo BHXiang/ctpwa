@@ -465,6 +465,7 @@ __global__ void hessianStage1Kernel(
     const SL* d_slComb,
     const DeviceResonance* d_resonances,
     const double* d_all_params,
+    const double* d_all_channels,       // flat 辅助段（Flatte channels + Hist 表）
     const int* d_global_idx,
     double* d_hess, int hess_ld,
     int nEvents, int nSL, int nPolar, double bf_d, double default_weight,
@@ -506,9 +507,9 @@ __global__ void hessianStage1Kernel(
     int ftg[Nres][Npr];
     for (int r = 0; r < Nres; ++r) {
         int po = d_resonances[r].param_offset;
-        m0_ad[r] = AD(d_all_params[po]);
+        m0_ad[r] = AD((d_resonances[r].param_count > 0) ? d_all_params[po] : 1.0);
         m0_ad[r].grad[0] = 1.0;
-        g_ad[r] = AD(d_all_params[po + 1]);
+        g_ad[r] = AD((d_resonances[r].param_count > 1) ? d_all_params[po + 1] : 1.0);
         g_ad[r].grad[1] = 1.0;
         for (int j = 0; j < Npr; ++j)
             ftg[r][j] = d_global_idx[r * Npr + j];
@@ -584,7 +585,9 @@ __global__ void hessianStage1Kernel(
                     if (is_res) {
                         AD params_arr[2] = {*m0p, *gp};
                         nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                                  params_arr, 2, target.type, nullptr, 0, bf_d);
+                                                  params_arr, 2, target.type,
+                                                  d_all_channels, target.n_channels,
+                                                  d_all_channels, target.aux_offset, bf_d);
                     } else {
                         auto bf = Bf<AD>(L, q_ad, q0_ad, bf_d);
                         nf.real = bf; nf.imag = AD(0.0);

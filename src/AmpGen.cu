@@ -1163,6 +1163,12 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                 h_all_channels.push_back(ch.second);
             }
 
+            // 模型辅助数据（Hist 形状表）→ 同一辅助段
+            const auto& aux = resonance.getAuxData();
+            devRes.aux_offset = static_cast<int>(h_all_channels.size());
+            devRes.aux_size = static_cast<int>(aux.size());
+            h_all_channels.insert(h_all_channels.end(), aux.begin(), aux.end());
+
             host_resonances.push_back(devRes);
         }
 
@@ -1208,7 +1214,6 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaFree(d_event_offsets);
             continue;
         }
-
         // 调用核函数计算振幅
         computeAmpsKernel << <gridDim, blockDim >> >
             (d_amplitudes[i],       // 输出振幅
@@ -1348,7 +1353,9 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         // 更新质量参数
         if (mass_mother == -1 && is_resonance_node)
         {
-            mass_mother = d_all_params[current_res.param_offset];
+            // 无参数模型（Hist）用默认质量，避免读空的 d_all_params
+            mass_mother = (current_res.param_count > 0)
+                ? d_all_params[current_res.param_offset] : 1.0;
         }
         if (mass_daug1 == -1)
         {
@@ -1356,7 +1363,8 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
             {
                 if (decayChain[nodeIdx].daug1_idx == resonances[i].particle_idx)
                 {
-                    mass_daug1 = d_all_params[resonances[i].param_offset];
+                    mass_daug1 = (resonances[i].param_count > 0)
+                        ? d_all_params[resonances[i].param_offset] : 1.0;
                     break;
                 }
             }
@@ -1367,7 +1375,8 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
             {
                 if (decayChain[nodeIdx].daug2_idx == resonances[i].particle_idx)
                 {
-                    mass_daug2 = d_all_params[resonances[i].param_offset];
+                    mass_daug2 = (resonances[i].param_count > 0)
+                        ? d_all_params[resonances[i].param_offset] : 1.0;
                     break;
                 }
             }
@@ -1400,7 +1409,8 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
                 ? d_all_channels + current_res.channel_offset : nullptr;
             resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
                 p, current_res.param_count, current_res.type,
-                ch, current_res.n_channels, bf_d);
+                ch, current_res.n_channels,
+                d_all_channels, current_res.aux_offset, bf_d);
         }
     }
 
@@ -1430,7 +1440,6 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         amplitudes[amp_idx] = ctMake(A_tot[k].real(), A_tot[k].imag());
     }
 }
-
 
 // ============================================================================
 // 合并非 AD kernel：一次启动处理多个无自由参数的 block
@@ -1489,14 +1498,16 @@ __global__ void computeAmpsMergedPlainKernel(
         }
 
         if (mass_mother == -1 && is_resonance_node)
-            mass_mother = B.d_all_params[current_res.param_offset];
+            mass_mother = (current_res.param_count > 0)
+                ? B.d_all_params[current_res.param_offset] : 1.0;
         if (mass_daug1 == -1)
         {
             for (int i = 0; i < B.resonance_count; ++i)
             {
                 if (node.daug1_idx == B.d_res[i].particle_idx)
                 {
-                    mass_daug1 = B.d_all_params[B.d_res[i].param_offset];
+                    mass_daug1 = (B.d_res[i].param_count > 0)
+                        ? B.d_all_params[B.d_res[i].param_offset] : 1.0;
                     break;
                 }
             }
@@ -1507,7 +1518,8 @@ __global__ void computeAmpsMergedPlainKernel(
             {
                 if (node.daug2_idx == B.d_res[i].particle_idx)
                 {
-                    mass_daug2 = B.d_all_params[B.d_res[i].param_offset];
+                    mass_daug2 = (B.d_res[i].param_count > 0)
+                        ? B.d_all_params[B.d_res[i].param_offset] : 1.0;
                     break;
                 }
             }
@@ -1529,7 +1541,8 @@ __global__ void computeAmpsMergedPlainKernel(
                 ? B.d_all_channels + current_res.channel_offset : nullptr;
             resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
                 p, current_res.param_count, current_res.type,
-                ch, current_res.n_channels, bf_d);
+                ch, current_res.n_channels,
+                B.d_all_channels, current_res.aux_offset, bf_d);
         }
     }
 
@@ -1592,17 +1605,17 @@ __global__ void computeAmpsMergedKernel(
         if (pi >= 0 && pi < 8) ftg[pi] = j;
     }
 
-    AD m0_ad(target_rp[0]);
+    AD m0_ad((target_res.param_count > 0) ? target_rp[0] : 1.0);
     if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
     AD gamma_ad;
     if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
-        gamma_ad = AD(target_rp[1]);
+        gamma_ad = AD((target_res.param_count > 1) ? target_rp[1] : 1.0);
         if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
     }
     AD other_g[4];
     if (target_res.type == ResModelType::Flatte) {
         for (int k = 0; k < target_res.param_count - 1 && k < 4; ++k) {
-            other_g[k] = AD(target_rp[1 + k]);
+            other_g[k] = AD((target_res.param_count > 1 + k) ? target_rp[1 + k] : 1.0);
             if (ftg[1 + k] >= 0) other_g[k].grad[ftg[1 + k]] = 1.0;
         }
     }
@@ -1659,7 +1672,9 @@ __global__ void computeAmpsMergedKernel(
             if (is_res) {
                 AD params_arr[2] = {m0_ad, gamma_ad};
                 nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                          params_arr, 2, target_res.type, nullptr, 0, bf_d);
+                                          params_arr, 2, target_res.type,
+                                          B.d_all_channels, target_res.n_channels,
+                                          B.d_all_channels, target_res.aux_offset, bf_d);
             } else {
                 AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
                 nf.real = bf_val; nf.imag = AD(0.0);
@@ -1701,7 +1716,6 @@ __global__ void computeAmpsMergedKernel(
         amplitudes[amp_idx] = ctMake(R_tot_pol[k].real.val, R_tot_pol[k].imag.val);
     }
 }
-
 
 // ============================================================================
 // AD 版振幅 kernel：一次计算同时输出振幅 A 和共振态因子导数 ∂F/∂θ
@@ -1748,17 +1762,17 @@ __global__ void computeAmpsKernelAD(
         if (pi >= 0 && pi < 8) ftg[pi] = j;
     }
 
-    AD m0_ad(target_rp[0]);
+    AD m0_ad((target_res.param_count > 0) ? target_rp[0] : 1.0);
     if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
     AD gamma_ad;
     if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
-        gamma_ad = AD(target_rp[1]);
+        gamma_ad = AD((target_res.param_count > 1) ? target_rp[1] : 1.0);
         if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
     }
     AD other_g[4];
     if (target_res.type == ResModelType::Flatte) {
         for (int k = 0; k < target_res.param_count - 1 && k < 4; ++k) {
-            other_g[k] = AD(target_rp[1 + k]);
+            other_g[k] = AD((target_res.param_count > 1 + k) ? target_rp[1 + k] : 1.0);
             if (ftg[1 + k] >= 0) other_g[k].grad[ftg[1 + k]] = 1.0;
         }
     }
@@ -1798,7 +1812,9 @@ __global__ void computeAmpsKernelAD(
         if (is_res) {
             AD params_arr[2] = {m0_ad, gamma_ad};
             nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                      params_arr, 2, target_res.type, nullptr, 0, bf_d);
+                                      params_arr, 2, target_res.type,
+                                      d_all_channels, target_res.n_channels,
+                                      d_all_channels, target_res.aux_offset, bf_d);
         } else {
             AD bf_val = Bf<AD>(L, q_ad, q0_ad, bf_d);
             nf.real = bf_val; nf.imag = AD(0.0);
@@ -1986,6 +2002,12 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             h_all_channels.push_back(ch.first);
             h_all_channels.push_back(ch.second);
         }
+
+        // 模型辅助数据（Hist 形状表）→ 同一辅助段
+        const auto& aux = res.getAuxData();
+        dr.aux_offset = static_cast<int>(h_all_channels.size());
+        dr.aux_size = static_cast<int>(aux.size());
+        h_all_channels.insert(h_all_channels.end(), aux.begin(), aux.end());
 
         h_res.push_back(dr);
     }
@@ -2599,21 +2621,21 @@ void AmpCalc::computeResonanceGradient(
                     d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    nSigma, d_sign_tab);
+                    cas->getNSigma(), d_sign_tab);
                 break;
             case 2:
                 resonanceGradientKernel<2><<<grid, kBlockSize>>>(
                     d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    nSigma, d_sign_tab);
+                    cas->getNSigma(), d_sign_tab);
                 break;
             case 3:
                 resonanceGradientKernel<3><<<grid, kBlockSize>>>(
                     d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    nSigma, d_sign_tab);
+                    cas->getNSigma(), d_sign_tab);
                 break;
             default: break;
             }
@@ -2861,7 +2883,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
+                    blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,
@@ -2871,7 +2893,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
+                    blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,
@@ -2881,7 +2903,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
+                    blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,
@@ -2891,7 +2913,7 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
-                    blk.d_all_params[gpu], bt.d_gidx, d_hess_g, hess_ld,
+                    blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx, d_hess_g, hess_ld,
                     nEv, nSL, nPol, 3.0, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im, bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,
@@ -3065,7 +3087,6 @@ void AmpCalc::computeUnifiedHessian(
     }
     cudaSetDevice(primary_dev);
 }
-
 
 void AmpCalc::testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d, double* out)
 {

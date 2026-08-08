@@ -20,12 +20,16 @@ __device__ T computeQ0AD(T m0, T md1, T md2)
     }
 }
 
+// Hist 形状表查表（定义在文件下方）
+__device__ inline double lookupHistTable(double m, const double* aux, int off);
+
 template <typename T>
 __device__ auto computeNodeFactor(
     int L, T mm, T q_ad, T q0_ad,
     const T* params, int param_count,
     ResModelType model_type,
     const double* channels, int n_channels,
+    const double* aux, int aux_offset,
     double bf_d
 ) -> typename ResResult<T>::type
 {
@@ -64,9 +68,43 @@ __device__ auto computeNodeFactor(
                 return ResResult<T>::make(fl.real * bf, fl.imag * bf);
             }
         }
+        case ResModelType::Hist: {
+            // 直方图形状查表（无自由参数 → AD 梯度为 0）
+            // aux[offset+0] = m_min, [offset+1] = m_max, [offset+2] = n_bins, 之后为 bin 值
+            double mval;
+            if constexpr (std::is_arithmetic_v<T>) mval = (double)mm;
+            else mval = (double)mm.val;
+            double f = lookupHistTable(mval, aux, aux_offset);
+            return ResResult<T>::make(T(f), T(0.0));
+        }
         default:
             return ResResult<T>::make(T(1.0), T(0.0));
     }
+}
+
+// ============================================================================
+// Hist 形状表线性插值查表
+// aux[off+0] = m_min, [off+1] = m_max, [off+2] = n_bins, [off+3..] = bin 值
+// 边界外: 默认 clip 到端点值
+// ============================================================================
+__device__ inline double lookupHistTable(double m, const double* aux, int off)
+{
+    if (aux == nullptr || off < 0) return 0.0;
+    if (!(m >= 0.0)) return 0.0;   // NaN/负数 → 0（!(m>=0) 同时拦截 NaN 和负值）
+    double m_min = aux[off];
+    double m_max = aux[off + 1];
+    int n = (int)aux[off + 2];
+    const double* vals = aux + off + 3;
+    if (n < 2 || m_max <= m_min) return 0.0;
+    if (m <= m_min) return vals[0];
+    if (m >= m_max) return vals[n - 1];
+    double x = (m - m_min) / (m_max - m_min) * n;
+    // 防御: clamp 索引（浮点误差/异常值下也不越界）
+    if (x < 0.0) x = 0.0;
+    if (x >= (double)(n - 1)) x = (double)(n - 2);
+    int i = (int)x;
+    double frac = x - i;
+    return vals[i] * (1.0 - frac) + vals[i + 1] * frac;
 }
 
 // 模板化BlattWeisskopf函数，支持double和AutoDiff类型
