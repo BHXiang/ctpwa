@@ -15,6 +15,26 @@ void computeDataHessianContrib(
     double* d_hessian,
     int nEvents, int n_polar, int n_amplitudes);
 
+// 完整 Hessian 快速路径（与 computeDataHessianContrib 数学完全一致，~4× 快）：
+//   H = Σ_e 4w·Bu·Bu^T/I² − 2·tildeB(A^H diag(w/I) A)
+// 不逐事件 CGEMM：tildeB 项聚合为一次加权 Gram 矩阵（两个普通 CGEMM），
+// 外积项用 block-reduce kernel（共享内存累加 + 单次 atomicAdd）。
+// 负权重（bkg）自动做 ± 拆分。n_polar ∈ [2,10] 走模板 kernel，其余回退到原路径。
+void computeDataHessianContribFast(
+    const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_weights,
+    double* d_hessian,
+    int nEvents, int n_polar, int n_amplitudes);
+
+// Gauss-Newton 近似（丢弃 -2w·tildeB/I 项）：
+//   H_GN = Σ_e 4w·Bu·Bu^T/I²   (~4.5× 快)
+// 适合迭代式二阶优化器（Fisher-like 曲率）；需要精确协方差时用 Fast 版本。
+void computeDataHessianContribGN(
+    const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_weights,
+    double* d_hessian,
+    int nEvents, int n_polar, int n_amplitudes);
+
 // 计算phsp项的Hessian贡献: weight * [2*tildeP/T - 4*(tildeP*u)*(tildeP*u)^T/T²]
 // d_phsp_matrix: n×n Hermitian (A_phsp^H * A_phsp, 未除N_phsp)
 // d_vector: n 复数参数

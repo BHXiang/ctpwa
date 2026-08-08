@@ -97,7 +97,12 @@ PYBIND11_MODULE(ctpwa, m)
              pybind11::arg("m"), pybind11::arg("m0"), pybind11::arg("g0"),
              pybind11::arg("L"), pybind11::arg("q"), pybind11::arg("q0"), pybind11::arg("d") = 3.0,
              "Test AutoDiff BWR Hessian. Returns [R_re,R_im, dRe_dm0,dRe_dg0,dIm_dm0,dIm_dg0, d2Re_dm02,d2Re_dm0dg0,d2Re_dg02, d2Im_dm02,d2Im_dm0dg0,d2Im_dg02]")
-        .def("getBranchFractions", &analysis::getBranchFractions)
+        .def("getFitFractions", &analysis::getFitFractions,
+             "Fit fractions: FF_i = ∫|A_i|² / ∫|ΣA|² (pure shape, no efficiency). "
+             "Returns [npartials, 2] = [center, error]. BF_i = BF_total × FF_i.")
+        .def("getBranchFractions", &analysis::getBranchFractions,
+             "Branch fractions: BF_i = D_i·N_data / (ε_i·N_truth) with per-wave "
+             "efficiency ε_i = phsp/truth. Returns [npartials, 2] = [center, error].")
         .def("getBkgTensor", &analysis::getBkgTensor)
         .def("getBkgWeightsTensor", &analysis::getBkgWeightsTensor)
         .def("saveSLAmps", &analysis::saveSLAmps)

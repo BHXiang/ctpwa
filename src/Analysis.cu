@@ -669,6 +669,14 @@ static void traceTensor(const char* tag, const torch::Tensor& t, int show = 8) {
     }
 }
 
+
+//////////////////////////////////////////////////////////////
+/// Hessian fast-path switch: CTPWA_HESS_FAST=0 → legacy CGEMM path
+///////////////////////////////////////////////////////////////
+static inline bool hessianFastPathEnabled() {
+    const char* e = getenv("CTPWA_HESS_FAST");
+    return (e == nullptr) || (atoi(e) != 0);
+}
 //////////////////////////////////////////////////////////////
 /// NLLFunction 类定义
 ///////////////////////////////////////////////////////////////
@@ -911,6 +919,7 @@ public:
         double total_bkg_nll = 0.0;
         int totalDataEvents = 0;
         int totalBkgEvents = 0;
+        double totalDataWeight = 0.0;   // Σ data 权重（无权重时 = 事件数）
         double bkg_integral = bkg_integral_;
 
         // 预分配持久化buffer（首次分配，之后复用）
@@ -962,6 +971,8 @@ public:
             int nData_gpu = events_list[gpu][1];
             if (nData_gpu > 0) {
                 ctComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][1];
+                const double* d_w_data = (gpu < (int)d_data_weights_list.size())
+                    ? d_data_weights_list[gpu] : nullptr;
 
                 // 分配/检查 w buffer（仅当有 theta 即做共振态拟合时）
                 ctComplex* d_w_out = nullptr;
@@ -977,10 +988,19 @@ public:
 
                 auto t0_nll = std::chrono::high_resolution_clock::now();
                 double nll = computeFactorNLL(d_amp, d_vec_gpu,
-                    d_grad, nData_gpu, n_polar_, n_amplitudes_, nullptr, d_w_out);
+                    d_grad, nData_gpu, n_polar_, n_amplitudes_, d_w_data, d_w_out);
 
                 total_data_nll += nll;
                 totalDataEvents += nData_gpu;
+                // data 总权重（phsp 归一化 N_eff 用；无权重时 = 事件数）
+                if (d_w_data != nullptr) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<const double> dp(d_w_data);
+                    totalDataWeight += thrust::reduce(dp, dp + nData_gpu);
+                }
+                else {
+                    totalDataWeight += nData_gpu;
+                }
                 auto t1_nll = std::chrono::high_resolution_clock::now();
                 if (getenv("CTPWA_PROF")) printf("[PROF] computeFactorNLL(data): %.2f ms\n",
                     std::chrono::duration<double, std::milli>(t1_nll - t0_nll).count());
@@ -1095,7 +1115,7 @@ public:
             {
                 int total_phsp = 0;
                 for (int g = 0; g < num_gpus; ++g) total_phsp += events_list[g][0];
-                double effective_data = totalDataEvents - bkg_integral_;
+                double effective_data = totalDataWeight - bkg_integral_;
                 if (total_phsp > 0 && phsp_factor > 1e-30) {
                     double phsp_sign = -effective_data / (phsp_factor * total_phsp);
 
@@ -1182,7 +1202,7 @@ public:
         // printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
         //     total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
 
-        double loss = total_data_nll - total_bkg_nll  + (totalDataEvents - bkg_integral_) * log(phsp_factor);
+        double loss = total_data_nll - total_bkg_nll + (totalDataWeight - bkg_integral_) * log(phsp_factor);
         // std::cout << "Data NLL: " << total_data_nll << ", Bkg NLL: " << total_bkg_nll
         //           << ", PHSP factor: " << phsp_factor
         //           << ", Total loss: " << loss << std::endl;
@@ -1200,7 +1220,7 @@ public:
         // scale_phsp ~ 1e33 会把 d_P_vec 中的任何 NaN/Inf 重新注入梯度
         if (!loss_reset) {
             ctComplex scale_phsp = ctMake(
-                static_cast<float>(totalDataEvents - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
+                static_cast<float>(totalDataWeight - bkg_integral_) / static_cast<float>(phsp_factor), 0.0f);
             axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
         }
         cudaFree(d_P_vec);
@@ -1587,7 +1607,8 @@ public:
 
         // int dataIntegral = data_length / n_polar_;
         // if (bkg_fix_ != nullptr && bkg_length > 0)
-        int dataIntegral = N_data;
+        // data 加权时用总权重（无权重时 = 事件数），与 NLL 的 N_eff 一致
+        double dataIntegral = data_total_weight_;
         if (N_bkg > 0)
         {
             if (h_bkg_integral > 0)
@@ -2400,7 +2421,10 @@ public:
             if (nData > 0) {
                 totalDataEvents += nData;
                 ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
+                const double* d_w_data = (gpu < data_weights_.size()) ? data_weights_[gpu] : nullptr;
+                (hessianFastPathEnabled()
+                    ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext)
+                    : computeDataHessianContrib(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext));
             }
 
             // --- bkg ---
@@ -2419,7 +2443,9 @@ public:
                     cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
                 }
                 ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
+                (hessianFastPathEnabled()
+                    ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext)
+                    : computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext));
                 cudaFree(d_w_bkg);
             }
 
@@ -2445,7 +2471,7 @@ public:
         cudaSetDevice(dev.index());
 
         // phsp Hessian贡献
-        double phsp_weight = (double)totalDataEvents - bkg_integral_;
+        double phsp_weight = data_total_weight_ - bkg_integral_;
         cudaSetDevice(dev.index());
         computePhspHessian(d_phsp_matrix_, d_vec, phsp_factor, phsp_weight, d_hessian, n_ext);
 
@@ -2657,7 +2683,10 @@ public:
                 if (nData > 0) {
                     totalDataEvents += nData;
                     ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                    computeDataHessianContrib(d_amp, d_v_gpu, nullptr, d_hess_gpu, nData, n_polar_, n_ext);
+                    const double* d_w_data = (gpu < data_weights_.size()) ? data_weights_[gpu] : nullptr;
+                    (hessianFastPathEnabled()
+                        ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext)
+                        : computeDataHessianContrib(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext));
                 }
 
                 int nBkg = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
@@ -2674,7 +2703,9 @@ public:
                         cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
                     }
                     ctComplex* d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                    computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext);
+                    (hessianFastPathEnabled()
+                        ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext)
+                        : computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext));
                     cudaFree(d_w_bkg);
                 }
 
@@ -2699,7 +2730,7 @@ public:
             cudaSetDevice(dev.index());
 
             // phsp Hessian contribution
-            double phsp_weight = (double)totalDataEvents - bkg_integral_;
+            double phsp_weight = data_total_weight_ - bkg_integral_;
             computePhspHessian(d_phsp_matrix_, d_vec, phsp_factor, phsp_weight, d_hess_ext, n_ext);
 
             // Constraint projection (identity in coupling mode since nv=na=n_ext)
@@ -2842,8 +2873,7 @@ public:
                 cudaMemcpy(h_ph.data(), d_phA, P*P*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_dh.data(), d_hess, P*P*sizeof(double), cudaMemcpyDeviceToHost);
                 cudaFree(d_pI); cudaFree(d_pg); cudaFree(d_phA);
-                int totD=0; for(int g=0;g<n_gpu;++g) totD+=events_[g][1];
-                double A = (double)totD - bkg_integral_;
+                double A = data_total_weight_ - bkg_integral_;
                 int npt=0; for(int g=0;g<n_gpu;++g) npt+=events_[g][0];
                 double pf=h_pI/npt, c1=A/(pf*npt), c2=-A/(pf*pf*npt*npt);
                 for(int j=0;j<P;++j) for(int k=0;k<P;++k) h_dh[j*P+k] += c1*h_ph[j*P+k] + c2*phsp_h_pg[j]*phsp_h_pg[k];
@@ -2947,8 +2977,9 @@ public:
                     cudaSetDevice(gpu);
                     ctComplex* d_g_gpu;
                     cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
+                    const double* d_w_data = (gpu < (int)data_weights_.size()) ? data_weights_[gpu] : nullptr;
                     computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][1],
-                        d_v_ext, d_g_gpu, nEv, n_polar_, na, nullptr, nullptr);
+                        d_v_ext, d_g_gpu, nEv, n_polar_, na, d_w_data, nullptr);
                     // Convert ctComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
                     std::vector<ctComplex> h_g_tmp(na);
                     cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(ctComplex), cudaMemcpyDeviceToHost);
@@ -3004,8 +3035,7 @@ public:
 
                 // --- Phsp gradient: g_phsp = N_eff / phsp_factor * (M × v) ---
                 {
-                    int totD = 0; for (int g = 0; g < n_gpu; ++g) totD += events_[g][1];
-                    double N_eff = (double)totD - bkg_integral_;
+                    double N_eff = data_total_weight_ - bkg_integral_;
                     cudaSetDevice(primary_dev);
 
                     // Compute phsp_factor and P_vec = M × v
@@ -3198,47 +3228,33 @@ public:
         return out;
     }
 
-    torch::Tensor getBranchFractions(torch::Tensor& vector)
+    // =====================================================================
+    // 公共: phsp_truth（无效率 MC）批处理积分 + Jacobian 扰动积分
+    // 输出（调用方清零后传入）:
+    //   truth_c_partial [npartials]          Σ|A_i|²（中心）
+    //   truth_c_scattering [npartials²]      2Re(A_i A_j*)（中心）
+    //   truth_p/m_partial [n2×npartials]     ±ε 扰动后的 Σ|A_i|²
+    //   truth_p/m_scattering [n2×npartials²] ±ε 扰动后的散射矩阵
+    // =====================================================================
+    void computeTruthBatchIntegrals(
+        const torch::Tensor& ev_center,
+        const std::vector<torch::Tensor>& ev_perturbed_p,
+        const std::vector<torch::Tensor>& ev_perturbed_m,
+        std::vector<double>& truth_c_partial,
+        std::vector<double>& truth_c_scattering,
+        std::vector<double>& truth_p_partial,
+        std::vector<double>& truth_p_scattering,
+        std::vector<double>& truth_m_partial,
+        std::vector<double>& truth_m_scattering,
+        int npartials)
     {
-        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
-
         const auto& data_files = config_parser_.getDataFiles();
         TORCH_CHECK(data_files.count("phsp_truth") > 0, "No phsp_truth in config");
 
-        const int n = vector.numel();
-        const int n2 = 2 * n;
-        const int npartials = nSLvectors_.size();
-        torch::Device dev = vector.device();
-
-        // dataIntegral
-        int totalDataEvents = 0;
-        for (size_t gpu = 0; gpu < events_.size(); ++gpu)
-            totalDataEvents += events_[gpu][1];
-        double dataIntegral = static_cast<double>(totalDataEvents) - bkg_integral_;
-
-        // ===== Phsp integrals + perturbed vectors (once) =====
         std::vector<std::string> particles_names;
         for (const auto& p : particles_) particles_names.push_back(p.name);
 
-        torch::Tensor ev_center = params_.extendVector(vector, dev);
-        std::vector<double> phsp_partial(npartials);
-        computePhspIntegrals(ev_center, phsp_partial, npartials);
-
-        // Pre-compute all perturbed vectors for Jacobian
-        torch::Tensor v_real = torch::view_as_real(vector).flatten().clone();
-        const double eps = 5e-6;
-        std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
-        for (int j = 0; j < n2; ++j) {
-            auto vp = v_real.clone(); vp[j] += eps;
-            auto vm = v_real.clone(); vm[j] -= eps;
-            auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
-            auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
-            ev_perturbed_p[j] = params_.extendVector(cvp, dev);
-            ev_perturbed_m[j] = params_.extendVector(cvm, dev);
-        }
-
-        // ===== Count total truth events =====
+        // Count total truth events
         std::string truth_file = data_files.at("phsp_truth")[1];
         int total_truth = 0;
         {
@@ -3250,16 +3266,8 @@ public:
         }
         std::cout << "Phase space truth events: " << total_truth << std::endl;
 
-        // ===== Batched truth accumulation =====
+        // Batched truth accumulation
         const int batch_size = 100000;
-        std::vector<double> truth_c_partial(npartials, 0.0);
-        std::vector<double> truth_c_scattering(npartials * npartials, 0.0);
-
-        std::vector<double> truth_p_partial(n2 * npartials, 0.0);
-        std::vector<double> truth_p_scattering(n2 * npartials * npartials, 0.0);
-        std::vector<double> truth_m_partial(n2 * npartials, 0.0);
-        std::vector<double> truth_m_scattering(n2 * npartials * npartials, 0.0);
-
         const auto& data_order = config_parser_.getDataOrder();
         auto saved_ev = events_offsets_, saved_amp = amp_offsets_;
         int n_batches = (total_truth + batch_size - 1) / batch_size;
@@ -3303,7 +3311,7 @@ public:
                 truth_c_partial.data(), truth_c_scattering.data(), npartials);
 
             // Jacobian perturbations (reuse same batch amplitudes)
-            for (int j = 0; j < n2; ++j) {
+            for (int j = 0; j < (int)ev_perturbed_p.size(); ++j) {
                 computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps, batch_ev_per_gpu,
                     truth_p_partial.data() + j * npartials,
                     truth_p_scattering.data() + j * npartials * npartials, npartials);
@@ -3317,6 +3325,59 @@ public:
                 if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
         }
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
+    }
+
+    // =====================================================================
+    // 分支分数: BF_i = D_i · N_data / (ε_i · N_truth)
+    //   D_i = ∫2|A_i|²（truth 散射对角元）, ε_i = phsp_partial/truth_partial（分波效率）
+    // 需要: phsp（带效率）+ phsp_truth（无效率）两个 MC 样本 + data 归一化。
+    // 返回 [npartials, 2]: [center, error]
+    // =====================================================================
+    torch::Tensor getBranchFractions(torch::Tensor& vector)
+    {
+        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+
+        const auto& data_files = config_parser_.getDataFiles();
+        TORCH_CHECK(data_files.count("phsp_truth") > 0, "No phsp_truth in config");
+
+        const int n = vector.numel();
+        const int n2 = 2 * n;
+        const int npartials = nSLvectors_.size();
+        torch::Device dev = vector.device();
+
+        // dataIntegral（data 加权时用总权重）
+        double dataIntegral = data_total_weight_ - bkg_integral_;
+
+        // ===== Phsp integrals + perturbed vectors (once) =====
+        torch::Tensor ev_center = params_.extendVector(vector, dev);
+        std::vector<double> phsp_partial(npartials);
+        computePhspIntegrals(ev_center, phsp_partial, npartials);
+
+        // Pre-compute all perturbed vectors for Jacobian
+        torch::Tensor v_real = torch::view_as_real(vector).flatten().clone();
+        const double eps = 5e-6;
+        std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
+        for (int j = 0; j < n2; ++j) {
+            auto vp = v_real.clone(); vp[j] += eps;
+            auto vm = v_real.clone(); vm[j] -= eps;
+            auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
+            auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
+            ev_perturbed_p[j] = params_.extendVector(cvp, dev);
+            ev_perturbed_m[j] = params_.extendVector(cvm, dev);
+        }
+
+        // ===== Truth integrals (center + Jacobian perturbations) =====
+        std::vector<double> truth_c_partial(npartials, 0.0);
+        std::vector<double> truth_c_scattering(npartials * npartials, 0.0);
+        std::vector<double> truth_p_partial(n2 * npartials, 0.0);
+        std::vector<double> truth_p_scattering(n2 * npartials * npartials, 0.0);
+        std::vector<double> truth_m_partial(n2 * npartials, 0.0);
+        std::vector<double> truth_m_scattering(n2 * npartials * npartials, 0.0);
+        computeTruthBatchIntegrals(ev_center, ev_perturbed_p, ev_perturbed_m,
+            truth_c_partial, truth_c_scattering,
+            truth_p_partial, truth_p_scattering,
+            truth_m_partial, truth_m_scattering, npartials);
 
         // ===== Compute BF center from accumulated integrals =====
         std::vector<double> bf_center(npartials);
@@ -3357,6 +3418,97 @@ public:
         for (int i = 0; i < npartials; ++i) {
             result[i][0] = bf_center[i];
             result[i][1] = bf_errors[i];
+        }
+        return result;
+    }
+
+    // =====================================================================
+    // 拟合分数: FF_i = ∫|A_i|² / ∫|ΣA|² = truth_partial[i] / Σ_j truth_partial[j]
+    // 只用 phsp_truth（无效率 MC）→ 纯产生形状占比（与 tfpwa 的 fit fraction 一致）。
+    // 总分支比已知时: BF_i = BF_total × FF_i。
+    // 返回 [npartials, 2]: [center, error]
+    // =====================================================================
+    torch::Tensor getFitFractions(torch::Tensor& vector)
+    {
+        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+
+        const int n = vector.numel();
+        const int n2 = 2 * n;
+        const int npartials = nSLvectors_.size();
+        torch::Device dev = vector.device();
+
+        // Perturbed vectors for Jacobian
+        torch::Tensor ev_center = params_.extendVector(vector, dev);
+        torch::Tensor v_real = torch::view_as_real(vector).flatten().clone();
+        const double eps = 5e-6;
+        std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
+        for (int j = 0; j < n2; ++j) {
+            auto vp = v_real.clone(); vp[j] += eps;
+            auto vm = v_real.clone(); vm[j] -= eps;
+            auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
+            auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
+            ev_perturbed_p[j] = params_.extendVector(cvp, dev);
+            ev_perturbed_m[j] = params_.extendVector(cvm, dev);
+        }
+
+        // Truth integrals (center + Jacobian); only partial integrals needed
+        std::vector<double> truth_c_partial(npartials, 0.0);
+        std::vector<double> truth_c_scattering(npartials * npartials, 0.0);
+        std::vector<double> truth_p_partial(n2 * npartials, 0.0);
+        std::vector<double> truth_p_scattering(n2 * npartials * npartials, 0.0);
+        std::vector<double> truth_m_partial(n2 * npartials, 0.0);
+        std::vector<double> truth_m_scattering(n2 * npartials * npartials, 0.0);
+        computeTruthBatchIntegrals(ev_center, ev_perturbed_p, ev_perturbed_m,
+            truth_c_partial, truth_c_scattering,
+            truth_p_partial, truth_p_scattering,
+            truth_m_partial, truth_m_scattering, npartials);
+
+        // FF_i = truth_partial[i] / Σ_j truth_partial[j]
+        double truth_total = 0.0;
+        for (int i = 0; i < npartials; ++i) truth_total += truth_c_partial[i];
+        if (truth_total <= 0.0) truth_total = 1e-30;
+
+        std::vector<double> ff_center(npartials);
+        for (int i = 0; i < npartials; ++i)
+            ff_center[i] = truth_c_partial[i] / truth_total;
+
+        // ===== Errors: FF_error = sqrt(diag(J_FF @ H^{-1} @ J_FF^T)) =====
+        // J_FF[i][j] = (FF_p[i] - FF_m[i]) / (2·eps)
+        std::vector<double> ff_errors(npartials, 0.0);
+        torch::Tensor hessian = computeCouplingHessian(vector);
+        if (hessian.numel() > 0 && hessian.size(0) == n2) {
+            auto eig = torch::linalg_eigvalsh(hessian);
+            if (eig[0].item<double>() > 1e-8) {
+                torch::Tensor cov = torch::linalg_inv(hessian).cpu();
+                std::vector<double> h_cov(n2 * n2);
+                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n2 * n2 * sizeof(double));
+
+                std::vector<double> J(npartials * n2, 0.0);
+                for (int j = 0; j < n2; ++j) {
+                    double tot_p = 0.0, tot_m = 0.0;
+                    for (int i = 0; i < npartials; ++i) {
+                        tot_p += truth_p_partial[j * npartials + i];
+                        tot_m += truth_m_partial[j * npartials + i];
+                    }
+                    if (tot_p <= 0.0) tot_p = 1e-30;
+                    if (tot_m <= 0.0) tot_m = 1e-30;
+                    for (int i = 0; i < npartials; ++i) {
+                        double ff_p = truth_p_partial[j * npartials + i] / tot_p;
+                        double ff_m = truth_m_partial[j * npartials + i] / tot_m;
+                        J[i * n2 + j] = (ff_p - ff_m) / (2.0 * eps);
+                    }
+                }
+
+                computeBFErrors(J.data(), h_cov.data(), ff_errors.data(), npartials, n2);
+            }
+        }
+        // 返回 n×2: [center, error]
+        auto opts = torch::TensorOptions().dtype(torch::kFloat64);
+        torch::Tensor result = torch::empty({ npartials, 2 }, opts);
+        for (int i = 0; i < npartials; ++i) {
+            result[i][0] = ff_center[i];
+            result[i][1] = ff_errors[i];
         }
         return result;
     }
@@ -3574,6 +3726,7 @@ private:
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
     double bkg_integral_ = 0.0;
+    double data_total_weight_ = 0.0;   // Σ data 权重（无权重时 = data 事件数）
 
     // 设备管理（GPU 枚举、内存预检；预留 CPU/双精度扩展）
     DeviceManager device_mgr_;
@@ -3774,17 +3927,32 @@ private:
         // delete[] h_amp;
 
         // data_weights_
+        data_total_weight_ = 0.0;
         if (data_files.count("data_weights") > 0)
         {
             std::vector<int> data_events_per_gpu;
             for (size_t i = 0; i < events_.size(); ++i)
                 data_events_per_gpu.push_back(events_[i][1]);
             data_weights_ = readWeightsFromFile(data_files.at("data_weights"), data_events_per_gpu);
+            // Σ data 权重（phsp 归一化 N_eff 用；无权重 GPU 按事件数计）
+            for (size_t gpu = 0; gpu < data_weights_.size(); ++gpu) {
+                if (data_weights_[gpu] != nullptr && events_[gpu].size() > 1 && events_[gpu][1] > 0) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<double> dp(data_weights_[gpu]);
+                    data_total_weight_ += thrust::reduce(dp, dp + events_[gpu][1]);
+                }
+                else if (events_[gpu].size() > 1) {
+                    data_total_weight_ += events_[gpu][1];
+                }
+            }
         }
         else
         {
-            for (size_t i = 0; i < events_.size(); ++i)
+            for (size_t i = 0; i < events_.size(); ++i) {
                 data_weights_.push_back(nullptr);
+                if (events_[i].size() > 1)
+                    data_total_weight_ += events_[i][1];
+            }
         }
 
         // phsp_weights_
