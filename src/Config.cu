@@ -815,7 +815,22 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
         res.P = props["P"].as<int>();
         res.type = props["model"].as<std::string>();
-        res.parameters = props["parameters"].as<std::vector<double>>();
+        if (props["parameters"])
+            res.parameters = props["parameters"].as<std::vector<double>>();
+
+        // 模型选项（Hist: file/bins/range/extrapolate）
+        if (props["file"])        res.options["file"] = props["file"].as<std::string>();
+        if (props["bins"])        res.options["bins"] = props["bins"].as<std::string>();
+        if (props["range"]) {
+            auto r = props["range"].as<std::vector<double>>();
+            std::string s;
+            for (size_t i = 0; i < r.size(); ++i) {
+                if (i) s += ",";
+                s += std::to_string(r[i]);
+            }
+            res.options["range"] = s;
+        }
+        if (props["extrapolate"]) res.options["extrapolate"] = props["extrapolate"].as<std::string>();
 
         // 解析 channels 字段（仅 Flatte 使用）
         if (props["channels"]) {
@@ -824,15 +839,19 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             }
         }
 
-        // 处理tex字段，可能是字符串或字符串数组
-        if (props["tex"].IsSequence()) {
-            // tex是数组
-            for (const auto &tex_part : props["tex"]) {
-                res.tex.push_back(tex_part.as<std::string>());
+        // 处理tex字段，可能是字符串或字符串数组；缺失时默认用共振态名字
+        if (props["tex"]) {
+            if (props["tex"].IsSequence()) {
+                // tex是数组
+                for (const auto &tex_part : props["tex"]) {
+                    res.tex.push_back(tex_part.as<std::string>());
+                }
+            } else {
+                // 单个字符串，放入向量中
+                res.tex.push_back(props["tex"].as<std::string>());
             }
         } else {
-            // 单个字符串，放入向量中
-            res.tex.push_back(props["tex"].as<std::string>());
+            res.tex.push_back(name);   // 默认: 用共振态名字显示
         }
 
         // 解析free字段: [0,1] 扫params[0]和params[1]; [-1] 全扫

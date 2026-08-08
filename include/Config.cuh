@@ -29,6 +29,7 @@ struct ResonanceConfig {
   std::vector<std::string> tex;
   std::vector<int> free; // 需要拟合的参数下标; {-1}=全部; 空=不拟合
   std::vector<std::vector<double>> free_range; // 每个free参数的 [lower, upper]; 空=使用默认
+  std::map<std::string, std::string> options; // 模型选项 (Hist: file/bins/range/extrapolate)
 };
 
 struct SpinChainConfig {
