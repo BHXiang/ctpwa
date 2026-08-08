@@ -2,6 +2,7 @@
 #define RESONANCE_CUH
 
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -35,9 +36,9 @@ struct DeviceResonance
 };
 
 // ============================================================================
-// 模型注册表（Model Registry）
-// 统一描述共振模型的参数元数据；新增模型只需注册一条 ModelSpec，
-// 不再需要改 Resonance 类的 switch。
+// 模型注册表（Model Registry）— 类驱动
+// 每个模型一个 ResonanceModel 子类，负责参数元数据 + 模型专属逻辑
+// （aux 数据构建等）。新增模型 = 写一个类 + registerModel。
 // ============================================================================
 
 // 单个参数描述
@@ -48,34 +49,38 @@ struct ParamSpec
     bool optional = false; // true 时允许 config 不提供（如 BWR 的 r）
 };
 
-// 模型规范（注册表条目）
-struct ModelSpec
+// 模型接口：每个模型一个实现类
+class ResonanceModel
 {
-    ResModelType type;                     // 设备分派用枚举
-    std::string name;                      // 配置字符串（"BWR"/"BW"/"ONE"/"Flatte"）
-    std::vector<ParamSpec> params;         // 固定参数（按此顺序进入 d_all_params）
-    std::string extra_prefix = "";         // 固定参数之后的附加参数前缀（Flatte: "g" → g1,g2,...）
-    std::map<std::string, std::string> options;  // 模型专属选项（预留: Hist 的 file/bins/range, Custom 的 expr）
+  public:
+    virtual ~ResonanceModel() = default;
+
+    virtual std::string name() const = 0;                 // 配置字符串（"BWR"/"Hist"）
+    virtual ResModelType type() const = 0;                // 设备分派枚举
+    virtual std::vector<ParamSpec> paramSpecs() const = 0; // 固定参数（按此顺序进 d_all_params）
+    virtual std::string extraPrefix() const { return ""; } // 附加参数前缀（Flatte: "g" → g1,g2,...）
+
+    // 构建模型专属辅助数据（Hist: 读直方图文件 → [m_min,m_max,n_bins,values...]；非 aux 模型返回空）
+    virtual std::vector<double> buildAuxData(
+        const std::map<std::string, std::string>& options) const { return {}; }
 };
 
-// 注册表：按名字/类型查询模型规范；支持运行时动态注册（Hist/Custom 阶段使用）
+// 注册表：按名字/类型查询模型；模型实例为注册表所有（单例），调用方只持有指针
 class ModelRegistry
 {
   public:
-    // 按名字查询（找不到返回 nullptr）
-    static const ModelSpec* find(const std::string& name);
+    // 按名字查询（大小写不敏感；找不到返回 nullptr）
+    static const ResonanceModel* find(const std::string& name);
     // 按类型查询（必须存在）
-    static const ModelSpec& get(ResModelType type);
-    // 按名字查询（必须存在）
-    static const ModelSpec& get(const std::string& name);
+    static const ResonanceModel& get(ResModelType type);
     // 运行时注册（Hist/Custom 等动态模型使用）；覆盖同名条目
-    static void registerModel(const ModelSpec& spec);
+    static void registerModel(std::unique_ptr<ResonanceModel> model);
     // 全部已注册模型
-    static const std::map<std::string, ModelSpec>& all();
+    static const std::map<std::string, std::unique_ptr<ResonanceModel>>& all();
 
   private:
-    static std::map<std::string, ModelSpec>& table();
-    static std::map<ResModelType, std::string>& typeNameMap();
+    static std::map<std::string, std::unique_ptr<ResonanceModel>>& table();
+    static std::map<ResModelType, const ResonanceModel*>& typeMap();
 };
 
 // 共振态类
@@ -98,7 +103,7 @@ class Resonance
     int getJ() const { return J_; }
     int getP() const { return P_; }
     ResModelType getModelType() const { return modelType_; }
-    const ModelSpec& getModelSpec() const { return spec_; }
+    const ResonanceModel& getModel() const { return *model_; }
 
     void setConjugatePartner(const std::string& partnerName)
     {
@@ -111,7 +116,7 @@ class Resonance
     std::vector<double> getOrderedParams() const;
     // 返回 channel masses（仅 Flatte 有效）
     const std::vector<std::pair<double, double>>& getChannels() const { return channels_; }
-    // 返回模型辅助数据（Hist: [m_min, m_max, n_bins, values...]；非 Hist 为空）
+    // 返回模型辅助数据（Hist: [m_min, m_max, n_bins, values...]；非 aux 模型为空）
     // 与 channels 一起进入 d_all_channels 辅助段，aux_offset 指向段内偏移
     const std::vector<double>& getAuxData() const { return aux_data_; }
     // 返回规范顺序的参数名列表
@@ -120,15 +125,15 @@ class Resonance
     static int paramIndexForType(ResModelType type, const std::string& paramName);
 
   private:
-    void setParamsFromSpec(const ModelSpec& spec, const std::vector<double>& params);
-    void loadHistAuxData();   // Hist: 读取直方图文件 → aux_data_
+    void setParamsFromModel(const std::vector<double>& params);
 
     std::string name_;
     std::string tag_;
     int J_; // 自旋
     int P_; // 宇称
     ResModelType modelType_;
-    ModelSpec spec_;                       // 注册表拷贝（含类型元数据）
+    const ResonanceModel* model_ = nullptr;    // 注册表单例指针（不拥有）
+    std::map<std::string, std::string> options_; // 模型选项（Hist: file/bins/range）
     std::string conjugate_partner_;
     std::map<std::string, double> params_;
     std::vector<std::string> param_names_;          // insertion order for iteration
