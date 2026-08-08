@@ -363,6 +363,14 @@ void ConfigParser::parseData(const YAML::Node &node)
     if (node["bkg_weights"])
         data_files_["bkg_weights"] =
             node["bkg_weights"].as<std::vector<std::string>>();
+
+    if (node["data_weights"])
+        data_files_["data_weights"] =
+            node["data_weights"].as<std::vector<std::string>>();
+
+    if (node["phsp_weights"])
+        data_files_["phsp_weights"] =
+            node["phsp_weights"].as<std::vector<std::string>>();
 }
 
 void ConfigParser::parseDecayChains(const YAML::Node &node)

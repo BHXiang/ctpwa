@@ -2,7 +2,7 @@
 
 **CUDA + PyTorch 协变张量分波分析（Partial Wave Analysis）工具包**
 
-用于高能物分波分析：基于协变张量理论构建衰变振幅，
+用于高能物理分波分析：基于协变张量理论构建衰变振幅，
 用 CUDA 在 GPU 上并行计算。
 
 ---
@@ -115,7 +115,7 @@ Constraints:
 ## 性能（RTX 5060, 50 万事件）
 
 - fwd+bwd（NLL+梯度）：约 18 ms
-- 共振态参数 Hessian：约 0.5 s
+- Hessian：约 0.5 s
 
 
 ---
@@ -233,7 +233,7 @@ Constraints:
 ## Performance (RTX 5060, 500k events)
 
 - fwd+bwd (NLL+gradient): ~18 ms
-- resonance Hessian: ~0.5 s
+- Hessian: ~0.5 s
 
 ## License
 

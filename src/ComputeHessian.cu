@@ -11,8 +11,12 @@ __global__ void conjKernel(ctComplex* data, int N) {
     if (i < N) data[i].y = -data[i].y;
 }
 
-// 合并Step A+B: 加载B和v到共享内存，计算S和Bu（old convention [[R,C],[-C,R]]），
-// 然后计算per-event Hessian（无原子操作）
+// 合并Step A+B: 加载B和v到共享内存，计算S和Bu，然后计算per-event Hessian（无原子操作）
+// 注意：d_B 已经过 conjKernel 共轭（sB = conj(A^H A) = R - iC），因此实际公式是
+// 标准约定 tildeB = [[R,-C],[C,R]]：
+//   Bu[0:n]  = R*vr - C*vi  = Re(B·v)
+//   Bu[n:2n] = C*vr + R*vi  = Im(B·v)
+// H = 4w·Bu·Bu^T/S² - 2w·tildeB/S（S = u^T·Bu = |Av|²）
 __global__ void perEventHessianKernel(
     const ctComplex* __restrict__ d_B,       // chunk × n²
     const ctComplex* __restrict__ d_v,       // n
@@ -48,9 +52,12 @@ __global__ void perEventHessianKernel(
 
     double weight = (d_weights != nullptr) ? d_weights[evt] : 1.0;
 
-    // --- 计算 Bu = tildeB @ u，old convention tildeB = [[R, C], [-C, R]] ---
-    // Bu[0:n]   = R*vr + C*vi
-    // Bu[n:2n]  = -C*vr + R*vi
+    // --- 计算 Bu = tildeB @ u ---
+    // sB = conj(A^H A)（已共轭），设 B = A^H A = R + iC，则 sB.x = R, sB.y = -C。
+    // 实际等价于标准约定 tildeB = [[R, -C], [C, R]]：
+    //   Bu[0:n]   = R*vr - C*vi  = Re(B·v)
+    //   Bu[n:2n]  = C*vr + R*vi  = Im(B·v)
+    //（以下代码利用 sB.y = -C 直接写出，勿按字面 [[R,C],[-C,R]] 解读）
     for (int i = threadIdx.x; i < n2; i += blockDim.x) {
         double sum = 0.0;
         if (i < n) {
@@ -65,7 +72,7 @@ __global__ void perEventHessianKernel(
     }
     __syncthreads();
 
-    // --- 计算 S = u^T @ Bu = Σ_i (vr[i]*Bu[i] + vi[i]*Bu[n+i]) ---
+    // --- 计算 S = u^T @ Bu = Σ_i (vr[i]*Bu[i] + vi[i]*Bu[n+i]) = |Av|² ---
     if (threadIdx.x == 0) {
         double S = 0.0;
         for (int i = 0; i < n; ++i)
@@ -80,7 +87,9 @@ __global__ void perEventHessianKernel(
     double* hess_out = d_hessian_chunk + evt * hess_sz;
 
     // --- per-event Hessian: H = 4*w*Bu*Bu^T/S² - 2*w*tildeB/S ---
-    // tildeB = [[R, C], [-C, R]] (old convention)
+    // 同样基于共轭存储 sB（sB.x=R, sB.y=-C）：
+    //   H_00 = -2wR/S, H_01 = +2wC/S, H_10 = -2wC/S, H_11 = -2wR/S
+    //（即标准约定 [[R,-C],[C,R]] 的 tildeB 项）
     for (int idx = threadIdx.x; idx < hess_sz; idx += blockDim.x) {
         int i = idx / n2, j = idx % n2;
         double val = 4.0 * weight * sBu[i] * sBu[j] * invS2;
@@ -181,7 +190,7 @@ void computeDataHessianContrib(
         int grid = (chunk * stride_B + kBlockSize - 1) / kBlockSize;
         conjKernel<<<grid, kBlockSize>>>(d_B, chunk * stride_B);
 
-        // 2. Per-event Hessian (含S和Bu计算，old convention [[R,C],[-C,R]])
+        // 2. Per-event Hessian (含S和Bu计算；B 已共轭 → 标准约定 [[R,-C],[C,R]])
         {
             size_t shm = (size_t)(n * n) * sizeof(ctComplex)
                        + (size_t)(5 * n) * sizeof(double);
@@ -201,11 +210,12 @@ void computeDataHessianContrib(
 }
 
 // ========== phsp Hessian ==========
-// 关键：phsp_matrix_未经conjKernel修复（与data部分不同），存储为共轭: sP.y = -C_true
-// 因此 Pu = P_stored * v (复数乘法) 恰好得到 tildeP_true @ u:
-//   Re(P*v) = R_true*vr + C_true*vi  = (tildeP_true @ u)_top
-//   Im(P*v) = R_true*vi - C_true*vr  = (tildeP_true @ u)_bot
-// tildeP贡献用 [[R,-C],[C,R]] 约定来补偿共轭存储: sP.y=-C_true → -sP.y=C_true
+// 关键：phsp_matrix_未经conjKernel修复（与data部分不同），存储为共轭: sP = conj(M), sP.y = -C_true
+// 因此 Pu = P_stored * v (复数乘法) 恰好得到 tildeB_old @ u（old convention [[R,C],[-C,R]]）:
+//   Re(P*v) = R_true*vr + C_true*vi  = (tildeB_old @ u)_top
+//   Im(P*v) = R_true*vi - C_true*vr  = (tildeB_old @ u)_bot
+// tildeP贡献同理用 [[R,C],[-C,R]] 约定（与Pu一致，公式自洽）:
+//   H_00,H_11 += 2wR/T, H_01 += +2wC/T, H_10 += -2wC/T
 __global__ void phspHessianKernel(
     const ctComplex* __restrict__ P,      // n×n (共轭存储)
     const ctComplex* __restrict__ v,      // n
@@ -244,7 +254,7 @@ __global__ void phspHessianKernel(
         // -4*w*Pu*Pu^T/T²
         val += -4.0 * weight * sPu_real[i] * sPu_real[j] * invT2;
 
-        // +2*w*tildeP/T, 用 [[R,-C],[C,R]] 约定补偿共轭存储
+        // +2*w*tildeP/T, [[R,C],[-C,R]] 约定（sP.x=R, sP.y=-C）
         if (i < n && j < n)
             val += 2.0 * weight * sP[i * n + j].x * invT;
         else if (i < n && j >= n)
@@ -1011,4 +1021,389 @@ void reorderVVBlockInterleavedToGrouped(double* H, int nv, int stride)
     reorderVVBlockKernel<<<grid, block>>>(d_tmp, H, nv, stride, stride);
     cudaDeviceSynchronize();
     cudaFree(d_tmp);
+}
+
+// ===========================================================================
+// Fast Hessian paths (benchmarked in ~/pwa/hessian/morefast/bench_hess.cu)
+// ===========================================================================
+//
+// Key idea 1 (Gauss-Newton block-reduce): Bu = A^H·S needs no per-event CGEMM.
+//   H_GN = Σ_e 4w_e·Bu_e·Bu_e^T/I_e²   (drops the -2w·tildeB/I term)
+//   Each block processes BLK_EVENTS events, accumulates H in shared memory
+//   (tiled), then one atomicAdd pass to global.
+//
+// Key idea 2 (FULL fast path): the dropped term aggregates into ONE weighted
+//   Gram matrix: Σ_e (w_e/I_e)·tildeB_e = tilde(A^H diag(w_e/I_e) A),
+//   computed by scaling A and a single plain CGEMM. So the FULL Hessian
+//   (same math as computeDataHessianContrib) costs ~4× less.
+//
+// Conventions: Bu_std = [Re(A^H S), Im(A^H S)] (standard convention), which
+// matches the conj'ed-B convention of the per-event baseline above.
+// ===========================================================================
+
+constexpr int kFastBlock = 256;
+
+// I[e] = Σ_p |S[e,p]|² (S pre-computed by CUBLAS_CGEMV)
+__global__ void computeIntensityKernel(
+    const ctComplex* __restrict__ dS, ctFloat* __restrict__ dI,
+    int nEvents, int nPolar)
+{
+    int evt = blockIdx.x * kFastBlock + threadIdx.x;
+    if (evt >= nEvents) return;
+    ctFloat sum = CTF(0.0);
+    const ctComplex* Se = dS + evt * nPolar;
+    for (int p = 0; p < nPolar; ++p)
+        sum += Se[p].x * Se[p].x + Se[p].y * Se[p].y;
+    dI[evt] = sum;
+}
+
+// Scale A for the weighted Gram matrix. Negative weights (bkg contribution)
+// can't be absorbed by a real sqrt, so split into positive/negative parts:
+//   Σ_e (w_e/I_e)·B_e = A+^H A+ − A−^H A−,  A± = A·sqrt(|w_e|/I_e) for ±w_e > 0
+__global__ void scaleAmpsForGramKernel(
+    ctComplex* __restrict__ dA_pos, ctComplex* __restrict__ dA_neg,
+    const ctComplex* __restrict__ dA_src, const ctFloat* __restrict__ dI,
+    const double* __restrict__ dW,
+    int nEvents, int nPolar, int nAmp)
+{
+    // NOTE: dA_src/dI/dW all point into the current chunk (event 0..nEvents-1)
+    int idx = blockIdx.x * kFastBlock + threadIdx.x;
+    int total = nEvents * nPolar * nAmp;
+    if (idx >= total) return;
+    int evt = (idx / nAmp) / nPolar;
+    ctFloat Ival = dI[evt];
+    double w = (dW != nullptr) ? dW[evt] : 1.0;
+    ctComplex z = ctMake(0.0f, 0.0f);
+    dA_pos[idx] = z;
+    dA_neg[idx] = z;
+    if (Ival <= CTF(0.0) || w == 0.0) return;
+    ctFloat s = ctCastFloat(sqrt(fabs(w) / (double)Ival));
+    ctComplex a = dA_src[idx];
+    a.x *= s; a.y *= s;
+    if (w > 0) dA_pos[idx] = a;
+    else       dA_neg[idx] = a;
+}
+
+// a[i] -= b[i]
+__global__ void subComplexKernel(ctComplex* a, const ctComplex* b, int n) {
+    int i = blockIdx.x * kFastBlock + threadIdx.x;
+    if (i < n) { a[i].x -= b[i].x; a[i].y -= b[i].y; }
+}
+
+// Block-reduce Gauss-Newton outer product:
+//   H += Σ_events 4w·Bu_std·Bu_std^T/I²,  Bu_std = [Re(A^H S), Im(A^H S)]
+// Each block: BLK_EVENTS events → Bu in shared → tile-accumulate H in shared →
+// one atomicAdd pass to global.
+template<int NP, int BLK_EVENTS, int TILE>
+__global__ void gnBlockReduceKernel(
+    const ctComplex* __restrict__ dA, const ctComplex* __restrict__ dS,
+    const ctFloat* __restrict__ dI, const double* __restrict__ dW,
+    double* __restrict__ dH, int nEv, int nA)
+{
+    const int n2 = 2 * nA;
+    const int hess_sz = n2 * n2;
+    const int blk = blockIdx.x;
+    int evt0 = blk * BLK_EVENTS;
+    if (evt0 >= nEv) return;
+
+    // Bu/s4 用 double 计算与存储（与 legacy per-event kernel 的 double 精度一致；
+    // 避免 float 在 I 极小事件上放大误差）
+    extern __shared__ double hs_fast[];
+    double* sBu_all = hs_fast;                               // BLK_EVENTS × n2
+    double* s4_all = sBu_all + BLK_EVENTS * n2;              // BLK_EVENTS
+    double* sH = s4_all + BLK_EVENTS;                        // TILE
+
+    // Compute Bu for all valid events in this block
+    int n_ok = 0;
+    #pragma unroll 1
+    for (int le = 0; le < BLK_EVENTS; ++le) {
+        int evt = evt0 + le;
+        if (evt >= nEv) break;
+        double* sBu = sBu_all + n_ok * n2;
+        const ctComplex* A_evt = dA + evt * NP * nA;
+
+        ctFloat Ival = dI[evt];
+        double w = (dW != nullptr) ? dW[evt] : 1.0;
+        if (Ival <= CTF(0.0)) continue;
+
+        // S per polarization (registers, double 精度)
+        double Sp_re[10], Sp_im[10];
+        #pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            Sp_re[p] = (double)dS[evt * NP + p].x;
+            Sp_im[p] = (double)dS[evt * NP + p].y;
+        }
+
+        // Bu_std[i]   = Σ_p Re(conj(A[p,i])·S[p])
+        // Bu_std[n+i] = Σ_p Im(conj(A[p,i])·S[p])
+        for (int i = threadIdx.x; i < n2; i += kFastBlock) {
+            double acc = 0.0;
+            if (i < nA) {
+                #pragma unroll
+                for (int p = 0; p < NP; ++p) {
+                    ctComplex a = A_evt[p * nA + i];
+                    acc += (double)a.x * Sp_re[p] + (double)a.y * Sp_im[p];
+                }
+            } else {
+                int ii = i - nA;
+                #pragma unroll
+                for (int p = 0; p < NP; ++p) {
+                    ctComplex a = A_evt[p * nA + ii];
+                    acc += (double)a.x * Sp_im[p] - (double)a.y * Sp_re[p];
+                }
+            }
+            sBu[i] = acc;
+        }
+        if (threadIdx.x == 0) s4_all[n_ok] = 4.0 * w / ((double)Ival * (double)Ival);
+        __syncthreads();
+        ++n_ok;
+    }
+    if (n_ok == 0) return;
+
+    // Tile-by-tile accumulation
+    for (int t0 = 0; t0 < hess_sz; t0 += TILE) {
+        int tile = min(TILE, hess_sz - t0);
+        for (int idx = threadIdx.x; idx < tile; idx += kFastBlock) sH[idx] = 0.0;
+        __syncthreads();
+
+        #pragma unroll 1
+        for (int le = 0; le < n_ok; ++le) {
+            const double* sBu = sBu_all + le * n2;
+            double s4 = s4_all[le];
+            for (int idx = threadIdx.x; idx < tile; idx += kFastBlock) {
+                int gi = t0 + idx;
+                int i = gi / n2, j = gi % n2;
+                sH[idx] += s4 * sBu[i] * sBu[j];
+            }
+        }
+        __syncthreads();
+
+        for (int idx = threadIdx.x; idx < tile; idx += kFastBlock) {
+            if (sH[idx] == 0.0) continue;
+            unsigned long long* p = (unsigned long long*)(dH + t0 + idx);
+            unsigned long long old = *p, nv;
+            do {
+                nv = __double_as_longlong(__longlong_as_double(old) + sH[idx]);
+                unsigned long long prev = atomicCAS(p, old, nv);
+                if (prev == old) break;
+                old = prev;
+            } while (true);
+        }
+        __syncthreads();
+    }
+}
+
+// Add -2·tildeB(B_total) to H. Standard convention [[R,-C],[C,R]] (matches
+// the conj'ed-B baseline):
+//   H_00,H_11 += -2·R ; H_01 += +2·C ; H_10 += -2·C
+__global__ void addTildeBStdKernel(
+    const ctComplex* __restrict__ dB, double* __restrict__ dH, int n)
+{
+    const int n2 = 2 * n;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n2 || j >= n2) return;
+    double val = 0.0;
+    if (i < n && j < n)       val = -2.0 * (double)dB[i * n + j].x;         // R
+    else if (i < n && j >= n) val = +2.0 * (double)dB[i * n + (j - n)].y;   // +C
+    else if (i >= n && j < n) val = -2.0 * (double)dB[(i - n) * n + j].y;   // -C
+    else                      val = -2.0 * (double)dB[(i - n) * n + (j - n)].x;  // R
+    unsigned long long* p = (unsigned long long*)(dH + i * n2 + j);
+    unsigned long long old = *p, nv;
+    do {
+        nv = __double_as_longlong(__longlong_as_double(old) + val);
+        unsigned long long prev = atomicCAS(p, old, nv);
+        if (prev == old) break;
+        old = prev;
+    } while (true);
+}
+
+// Template dispatch for gnBlockReduceKernel by n_polar and BLK_EVENTS
+template<int NP>
+static void launchGNBlockReduce(int blkEvt, int shm, int nBlk,
+    const ctComplex* dA, const ctComplex* dS, const ctFloat* dI,
+    const double* dW, double* dH, int nEv, int nA)
+{
+    auto L = [&](auto* k) {
+        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
+        k<<<nBlk, kFastBlock, shm>>>(dA, dS, dI, dW, dH, nEv, nA);
+    };
+    switch (blkEvt) {
+        case 8:  L(&gnBlockReduceKernel<NP,8,4096>);  break;
+        case 4:  L(&gnBlockReduceKernel<NP,4,4096>);  break;
+        case 2:  L(&gnBlockReduceKernel<NP,2,4096>);  break;
+        default: L(&gnBlockReduceKernel<NP,1,4096>);  break;
+    }
+}
+
+static void launchGNBlockReduceDispatch(int nP, int blkEvt, int shm, int nBlk,
+    const ctComplex* dA, const ctComplex* dS, const ctFloat* dI,
+    const double* dW, double* dH, int nEv, int nA)
+{
+    switch (nP) {
+        case 2:  launchGNBlockReduce<2>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 3:  launchGNBlockReduce<3>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 4:  launchGNBlockReduce<4>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 5:  launchGNBlockReduce<5>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 6:  launchGNBlockReduce<6>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 7:  launchGNBlockReduce<7>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 8:  launchGNBlockReduce<8>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 9:  launchGNBlockReduce<9>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        case 10: launchGNBlockReduce<10>(blkEvt, shm, nBlk, dA, dS, dI, dW, dH, nEv, nA); break;
+        default: break;  // unsupported → caller falls back
+    }
+}
+
+// FULL Hessian fast path — same math as computeDataHessianContrib:
+//   H = Σ_e 4w·Bu·Bu^T/I²  −  2·tildeB(A^H diag(w/I) A)
+// d_weights: nullptr = 1.0 (data), negative values = bkg contribution.
+// d_hessian: 2n×2n accumulator (caller zeroes first), in-place additive.
+void computeDataHessianContribFast(
+    const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_weights,
+    double* d_hessian,
+    int nEvents, int n_polar, int n_amplitudes)
+{
+    // Fall back to the per-event CGEMM path for unsupported n_polar
+    if (n_polar < 2 || n_polar > 10) {
+        computeDataHessianContrib(d_amp, d_vector, d_weights,
+            d_hessian, nEvents, n_polar, n_amplitudes);
+        return;
+    }
+    if (nEvents <= 0) return;
+
+    const int n = n_amplitudes;
+    const int n2 = 2 * n;
+    const int hess_sz = n2 * n2;
+
+    // Per-GPU temporary buffers (allocated on the current device)
+    const int max_chunk = 50000;  // events per chunk (bounds memory)
+    int chunk_evt = min(max_chunk, nEvents);
+    int chunk_total = chunk_evt * n_polar * n;
+
+    ctComplex* dA_pos; cudaMalloc(&dA_pos, chunk_total * sizeof(ctComplex));
+    ctComplex* dA_neg; cudaMalloc(&dA_neg, chunk_total * sizeof(ctComplex));
+    ctComplex* dS;     cudaMalloc(&dS, chunk_evt * n_polar * sizeof(ctComplex));
+    ctFloat*   dI;     cudaMalloc(&dI, chunk_evt * sizeof(ctFloat));
+    ctComplex* dB_total; cudaMalloc(&dB_total, n * n * sizeof(ctComplex));
+    ctComplex* dB_neg;   cudaMalloc(&dB_neg, n * n * sizeof(ctComplex));
+
+    cublasHandle_t handle; cublasCreate(&handle);
+    ctComplex alpha = ctMake(1.0, 0.0);
+    ctComplex beta0 = ctMake(0.0, 0.0);
+
+    // Block-reduce config (auto-fit shared memory)
+    int blkEvt = 8;
+    size_t bu_shm = (size_t)blkEvt * n2 * sizeof(double) + blkEvt * sizeof(double);
+    size_t shm = bu_shm + 4096 * sizeof(double);
+    const size_t kMaxShm = 48000;
+    while (shm > kMaxShm && blkEvt > 1) {
+        blkEvt /= 2;
+        bu_shm = (size_t)blkEvt * n2 * sizeof(double) + blkEvt * sizeof(double);
+        shm = bu_shm + 4096 * sizeof(double);
+    }
+
+    for (int off = 0; off < nEvents; off += max_chunk) {
+        int chunk = min(max_chunk, nEvents - off);
+        const ctComplex* Achunk = d_amp + off * n_polar * n;
+        const double* Wchunk = (d_weights != nullptr) ? d_weights + off : nullptr;
+
+        // 1. S = A^T·v (CUBLAS_CGEMV), I = |S|²
+        CUBLAS_CGEMV(handle, CUBLAS_OP_T, n, chunk * n_polar,
+            &alpha, Achunk, n, d_vector, 1, &beta0, dS, 1);
+        computeIntensityKernel<<<(chunk + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+            dS, dI, chunk, n_polar);
+
+        // 2. scale A into +/− buffers
+        scaleAmpsForGramKernel<<<(chunk * n_polar * n + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+            dA_pos, dA_neg, Achunk, dI, Wchunk, chunk, n_polar, n);
+        cudaDeviceSynchronize();
+
+        // 3. B_total = A+^H A+ − A−^H A−  (two plain CGEMMs, K = chunk·n_polar)
+        CUBLAS_CGEMM(handle, CUBLAS_OP_N, CUBLAS_OP_C, n, n, chunk * n_polar,
+            &alpha, dA_pos, n, dA_pos, n, &beta0, dB_total, n);
+        CUBLAS_CGEMM(handle, CUBLAS_OP_N, CUBLAS_OP_C, n, n, chunk * n_polar,
+            &alpha, dA_neg, n, dA_neg, n, &beta0, dB_neg, n);
+        cudaDeviceSynchronize();
+        subComplexKernel<<<(n * n + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+            dB_total, dB_neg, n * n);
+
+        // 4. outer product 4w·Bu·Bu^T/I² (block-reduce)
+        {
+            int nBlk = (chunk + blkEvt - 1) / blkEvt;
+            launchGNBlockReduceDispatch(n_polar, blkEvt, (int)shm, nBlk,
+                Achunk, dS, dI, Wchunk, d_hessian, chunk, n);
+        }
+
+        // 5. −2·tildeB(B_total)
+        {
+            dim3 blk2(16, 16), grd2((n2 + 15) / 16, (n2 + 15) / 16);
+            addTildeBStdKernel<<<grd2, blk2>>>(dB_total, d_hessian, n);
+        }
+    }
+
+    cublasDestroy(handle);
+    cudaFree(dA_pos); cudaFree(dA_neg); cudaFree(dS); cudaFree(dI);
+    cudaFree(dB_total); cudaFree(dB_neg);
+}
+
+// Gauss-Newton approximation (drops the -2w·tildeB/I term):
+//   H_GN = Σ_e 4w·Bu·Bu^T/I²
+// ~4.5× faster than the full CGEMM path; useful for iterative second-order
+// optimizers (Fisher-like curvature). Falls back to the full fast path when
+// n_polar is unsupported by the templates.
+void computeDataHessianContribGN(
+    const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_weights,
+    double* d_hessian,
+    int nEvents, int n_polar, int n_amplitudes)
+{
+    // Fall back to the per-event CGEMM path for unsupported n_polar
+    if (n_polar < 2 || n_polar > 10) {
+        computeDataHessianContrib(d_amp, d_vector, d_weights,
+            d_hessian, nEvents, n_polar, n_amplitudes);
+        return;
+    }
+    if (nEvents <= 0) return;
+
+    const int n = n_amplitudes;
+    const int n2 = 2 * n;
+
+    const int max_chunk = 50000;
+    int chunk_evt = min(max_chunk, nEvents);
+
+    ctComplex* dS; cudaMalloc(&dS, chunk_evt * n_polar * sizeof(ctComplex));
+    ctFloat*   dI; cudaMalloc(&dI, chunk_evt * sizeof(ctFloat));
+
+    cublasHandle_t handle; cublasCreate(&handle);
+    ctComplex alpha = ctMake(1.0, 0.0);
+    ctComplex beta0 = ctMake(0.0, 0.0);
+
+    int blkEvt = 8;
+    size_t bu_shm = (size_t)blkEvt * n2 * sizeof(double) + blkEvt * sizeof(double);
+    size_t shm = bu_shm + 4096 * sizeof(double);
+    const size_t kMaxShm = 48000;
+    while (shm > kMaxShm && blkEvt > 1) {
+        blkEvt /= 2;
+        bu_shm = (size_t)blkEvt * n2 * sizeof(double) + blkEvt * sizeof(double);
+        shm = bu_shm + 4096 * sizeof(double);
+    }
+
+    for (int off = 0; off < nEvents; off += max_chunk) {
+        int chunk = min(max_chunk, nEvents - off);
+        const ctComplex* Achunk = d_amp + off * n_polar * n;
+        const double* Wchunk = (d_weights != nullptr) ? d_weights + off : nullptr;
+
+        CUBLAS_CGEMV(handle, CUBLAS_OP_T, n, chunk * n_polar,
+            &alpha, Achunk, n, d_vector, 1, &beta0, dS, 1);
+        computeIntensityKernel<<<(chunk + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+            dS, dI, chunk, n_polar);
+
+        int nBlk = (chunk + blkEvt - 1) / blkEvt;
+        launchGNBlockReduceDispatch(n_polar, blkEvt, (int)shm, nBlk,
+            Achunk, dS, dI, Wchunk, d_hessian, chunk, n);
+    }
+
+    cublasDestroy(handle);
+    cudaFree(dS); cudaFree(dI);
 }

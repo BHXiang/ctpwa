@@ -45,8 +45,8 @@ void DeviceManager::detect()
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess || count <= 0) {
         std::fprintf(stderr,
-            "DeviceManager: 未检测到 CUDA 设备 (%s)。"
-            "CPU 后端尚未实现，无法继续。\n",
+            "DeviceManager: no CUDA devices detected (%s). "
+            "CPU backend is not implemented yet.\n",
             cudaGetErrorString(err));
         return;  // devices_ 为空
     }
@@ -115,13 +115,13 @@ const DeviceInfo& DeviceManager::primary() const
 bool DeviceManager::setDevice(int i) const
 {
     if (i < 0 || i >= (int)devices_.size()) {
-        std::fprintf(stderr, "DeviceManager: 设备索引 %d 越界 (共 %d 个)\n",
+        std::fprintf(stderr, "DeviceManager: device index %d out of range (%d devices)\n",
                      i, (int)devices_.size());
         return false;
     }
     cudaError_t err = cudaSetDevice(i);
     if (err != cudaSuccess) {
-        std::fprintf(stderr, "DeviceManager: cudaSetDevice(%d) 失败: %s\n",
+        std::fprintf(stderr, "DeviceManager: cudaSetDevice(%d) failed: %s\n",
                      i, cudaGetErrorString(err));
         return false;
     }
@@ -152,15 +152,15 @@ size_t DeviceManager::complexSize() const
 
 void DeviceManager::print() const
 {
-    std::printf("DeviceManager: %d 个设备\n", (int)devices_.size());
+    std::printf("DeviceManager: %d device(s)\n", (int)devices_.size());
     for (const auto& d : devices_) {
-        std::printf("  [%d] %s (sm_%d%d), 显存 %s / %s%s\n",
+        std::printf("  [%d] %s (sm_%d%d), memory %s / %s%s\n",
                     d.index, d.name.c_str(), d.cc_major, d.cc_minor,
                     formatBytes((double)d.free_memory).c_str(),
                     formatBytes((double)d.total_memory).c_str(),
-                    d.available ? "" : " [不可用]");
+                    d.available ? "" : " [unavailable]");
     }
-    std::printf("  complex 精度: %s (%zu B/值)\n",
+    std::printf("  complex precision: %s (%zu B/value)\n",
                 (complex_precision_ == ComplexPrecision::Double) ? "double" : "float",
                 complexSize());
 }
