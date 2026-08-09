@@ -70,7 +70,12 @@ void DecayInfo::buildDecayChains(
                                            it->second.type, it->second.parameters, ch,
                                            it->second.options);
                         // Free theta params with readable names
-                        if (!it->second.free.empty()) {
+                        // Custom 模型: 参数默认全部自由（params 列表即声明自由参数）
+                        if (it->second.type == "custom" || it->second.type == "Custom") {
+                            const auto& pnames = rlist.back().getOrderedParamNames();
+                            for (size_t pi = 0; pi < pnames.size(); ++pi)
+                                resonance_param_names_.push_back(rname + "_" + pnames[pi]);
+                        } else if (!it->second.free.empty()) {
                             const auto& pnames = rlist.back().getOrderedParamNames();
                             bool all_free = (it->second.free.size() == 1 && it->second.free[0] == -1);
                             for (size_t pi = 0; pi < pnames.size(); ++pi) {

@@ -1,4 +1,5 @@
 #include <Resonance.cuh>
+#include <CustomExpr.cuh>
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -111,6 +112,58 @@ class HistModel : public ResonanceModel
     }
 };
 
+// Custom：用户自定义表达式模型（DSL）
+// options: expr(表达式), params(逗号分隔的参数名列表)
+// aux 数据 = 编译后的字节码段（compileCustomExpr 输出）
+class CustomModel : public ResonanceModel
+{
+  public:
+    std::string name() const override { return "Custom"; }
+    ResModelType type() const override { return ResModelType::Custom; }
+
+    std::vector<ParamSpec> paramSpecs() const override {
+        // 参数名在构造时由 options["params"] 决定；这里返回空（setParamsFromModel 特殊处理）
+        return {};
+    }
+
+    // 参数名列表（由 options["params"] 解析）
+    static std::vector<std::string> paramNamesFromOptions(
+        const std::map<std::string, std::string>& options)
+    {
+        std::vector<std::string> names;
+        auto it = options.find("params");
+        if (it != options.end()) {
+            std::string s = it->second;
+            size_t pos = 0;
+            while (pos < s.size()) {
+                size_t comma = s.find(',', pos);
+                std::string name = (comma == std::string::npos)
+                    ? s.substr(pos) : s.substr(pos, comma - pos);
+                // 去空白
+                size_t b = name.find_first_not_of(" \t");
+                size_t e = name.find_last_not_of(" \t");
+                if (b != std::string::npos)
+                    names.push_back(name.substr(b, e - b + 1));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        return names;
+    }
+
+    std::vector<double> buildAuxData(
+        const std::map<std::string, std::string>& options) const override
+    {
+        auto expr_it = options.find("expr");
+        if (expr_it == options.end())
+            throw std::runtime_error("Custom model requires expr option");
+        auto names = paramNamesFromOptions(options);
+        if (names.size() > 3)
+            throw std::runtime_error("Custom model supports at most 3 free params");
+        return compileCustomExpr(expr_it->second, names);
+    }
+};
+
 }  // namespace
 
 // ============================================================================
@@ -127,6 +180,7 @@ std::map<std::string, std::unique_ptr<ResonanceModel>>& ModelRegistry::table()
         m.emplace("ONE", std::make_unique<ONEModel>());
         m.emplace("Flatte", std::make_unique<FlatteModel>());
         m.emplace("Hist", std::make_unique<HistModel>());
+        m.emplace("Custom", std::make_unique<CustomModel>());
         return m;
     }();
     return t;
@@ -228,7 +282,14 @@ void Resonance::setParamsFromModel(const std::vector<double>& params)
     params_.clear();
     param_names_.clear();
 
-    const auto& specs = model_->paramSpecs();
+    // Custom 模型: 参数名来自 options["params"]（paramSpecs 为空）
+    std::vector<ParamSpec> specs;
+    if (modelType_ == ResModelType::Custom) {
+        for (const auto& n : CustomModel::paramNamesFromOptions(options_))
+            specs.push_back({n, 0.0, false});
+    } else {
+        specs = model_->paramSpecs();
+    }
 
     // 必需参数数量校验
     size_t required = 0;

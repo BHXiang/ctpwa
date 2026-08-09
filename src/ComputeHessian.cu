@@ -583,9 +583,13 @@ __global__ void hessianStage1Kernel(
 
                     CV nf;
                     if (is_res) {
-                        AD params_arr[2] = {*m0p, *gp};
+                        AD params_arr[4] = {*m0p, *gp, AD(0.0), AD(0.0)};
+                        if (target.type == ResModelType::Custom && target.param_count > 2) {
+                            params_arr[2] = AD(d_all_params[target.param_offset + 2]);
+                            if (d_global_idx[2] >= 0) params_arr[2].grad[d_global_idx[2]] = 1.0;
+                        }
                         nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                                  params_arr, 2, target.type,
+                                                  params_arr, target.param_count, target.type,
                                                   d_all_channels, target.n_channels,
                                                   d_all_channels, target.aux_offset, bf_d);
                     } else {

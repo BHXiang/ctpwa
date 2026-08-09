@@ -46,6 +46,11 @@ __host__ __device__ bool val_gt_zero(const T& x) {
     else return x.val > 0.0;
 }
 
+// Var 的模板参数 N 萃取（Custom DSL 组装 ComplexVar 用）
+template <typename V> struct VarN;
+template <typename T, int N, bool WH>
+struct VarN<Var<T, N, WH>> { static constexpr int value = N; };
+
 // ============================================================================
 // 模板化传播子函数声明
 // ============================================================================

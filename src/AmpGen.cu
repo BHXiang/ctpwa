@@ -1608,7 +1608,8 @@ __global__ void computeAmpsMergedKernel(
     AD m0_ad((target_res.param_count > 0) ? target_rp[0] : 1.0);
     if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
     AD gamma_ad;
-    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
+    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW ||
+        target_res.type == ResModelType::Custom) {
         gamma_ad = AD((target_res.param_count > 1) ? target_rp[1] : 1.0);
         if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
     }
@@ -1670,9 +1671,13 @@ __global__ void computeAmpsMergedKernel(
 
             CV nf;
             if (is_res) {
-                AD params_arr[2] = {m0_ad, gamma_ad};
+                AD params_arr[4] = {m0_ad, gamma_ad, AD(0.0), AD(0.0)};
+                if (target_res.type == ResModelType::Custom && target_res.param_count > 2) {
+                    params_arr[2] = AD(target_rp[2]);
+                    if (ftg[2] >= 0) params_arr[2].grad[ftg[2]] = 1.0;
+                }
                 nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                          params_arr, 2, target_res.type,
+                                          params_arr, target_res.param_count, target_res.type,
                                           B.d_all_channels, target_res.n_channels,
                                           B.d_all_channels, target_res.aux_offset, bf_d);
             } else {
@@ -1765,7 +1770,8 @@ __global__ void computeAmpsKernelAD(
     AD m0_ad((target_res.param_count > 0) ? target_rp[0] : 1.0);
     if (ftg[0] >= 0) m0_ad.grad[ftg[0]] = 1.0;
     AD gamma_ad;
-    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW) {
+    if (target_res.type == ResModelType::BWR || target_res.type == ResModelType::BW ||
+        target_res.type == ResModelType::Custom) {
         gamma_ad = AD((target_res.param_count > 1) ? target_rp[1] : 1.0);
         if (ftg[1] >= 0) gamma_ad.grad[ftg[1]] = 1.0;
     }
@@ -1810,9 +1816,13 @@ __global__ void computeAmpsKernelAD(
 
         CV nf;
         if (is_res) {
-            AD params_arr[2] = {m0_ad, gamma_ad};
+            AD params_arr[4] = {m0_ad, gamma_ad, AD(0.0), AD(0.0)};
+            if (target_res.type == ResModelType::Custom && target_res.param_count > 2) {
+                params_arr[2] = AD(target_rp[2]);
+                if (ftg[2] >= 0) params_arr[2].grad[ftg[2]] = 1.0;
+            }
             nf = computeNodeFactor<AD>(L, AD(mm), q_ad, q0_ad,
-                                      params_arr, 2, target_res.type,
+                                      params_arr, target_res.param_count, target_res.type,
                                       d_all_channels, target_res.n_channels,
                                       d_all_channels, target_res.aux_offset, bf_d);
         } else {
