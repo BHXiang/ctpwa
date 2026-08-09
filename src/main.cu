@@ -19,6 +19,7 @@
 #include "Info.cu"
 #include "Parameters.cu"
 #include "ResModel.cu"
+#include "CustomExpr.cu"
 #include "Resonance.cu"
 
 PYBIND11_MODULE(ctpwa, m)

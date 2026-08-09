@@ -831,6 +831,17 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             res.options["range"] = s;
         }
         if (props["extrapolate"]) res.options["extrapolate"] = props["extrapolate"].as<std::string>();
+        // Custom 模型: params(参数名列表) 和 expr(表达式)
+        if (props["params"]) {
+            auto pl = props["params"].as<std::vector<std::string>>();
+            std::string s;
+            for (size_t i = 0; i < pl.size(); ++i) {
+                if (i) s += ",";
+                s += pl[i];
+            }
+            res.options["params"] = s;
+        }
+        if (props["expr"]) res.options["expr"] = props["expr"].as<std::string>();
 
         // 解析 channels 字段（仅 Flatte 使用）
         if (props["channels"]) {

@@ -4588,10 +4588,21 @@ private:
                         for (size_t ri = 0; ri < resonance.size(); ++ri) {
                             const auto& res = resonance[ri];
                             auto it = config_res.find(res.getName());
-                            if (it != config_res.end() && !it->second.free.empty())
+                            // Custom 模型: 参数默认全部自由（params 列表即声明自由参数）
+                            bool is_custom = (it != config_res.end()) &&
+                                (it->second.type == "custom" || it->second.type == "Custom");
+                            if (it != config_res.end() && (is_custom || !it->second.free.empty()))
                             {
-                                all_free.push_back(it->second.free);
-                                all_free_ranges.push_back(it->second.free_range);
+                                if (is_custom) {
+                                    std::vector<int> all_idx;
+                                    for (int pi = 0; pi < (int)res.getOrderedParamNames().size(); ++pi)
+                                        all_idx.push_back(pi);
+                                    all_free.push_back(all_idx);
+                                    all_free_ranges.push_back({});
+                                } else {
+                                    all_free.push_back(it->second.free);
+                                    all_free_ranges.push_back(it->second.free_range);
+                                }
                             }
                             else
                             {

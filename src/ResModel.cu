@@ -1,4 +1,5 @@
 #include <ResModel.cuh>
+#include <CustomExpr.cuh>
 
 // ============================================================================
 // 统一共振态因子计算
@@ -76,6 +77,70 @@ __device__ auto computeNodeFactor(
             else mval = (double)mm.val;
             double f = lookupHistTable(mval, aux, aux_offset);
             return ResResult<T>::make(T(f), T(0.0));
+        }
+        case ResModelType::Custom: {
+            // DSL 字节码解释: aux = [P, n_seg, seg...]
+            // 段 0 = F, 段 1..P = ∂F/∂θ_j, 段 P+1.. = ∂²F/∂θ_j∂θ_k
+            // 输出 (re, im); 对 Var 类型组装成 ComplexVar（与现有 AD 一致）
+            double mval, qval, q0val;
+            if constexpr (std::is_arithmetic_v<T>) {
+                mval = (double)mm; qval = (double)q_ad; q0val = (double)q0_ad;
+            } else {
+                mval = mm.val; qval = q_ad.val; q0val = q0_ad.val;
+            }
+            int P = (int)aux[aux_offset];
+            int n_seg = (int)aux[aux_offset + 1];
+            int seg_off = aux_offset + 2;
+            // 参数值转 double（Var 类型取 .val）
+            double pvals[3];
+            for (int i = 0; i < param_count && i < 3; ++i) {
+                if constexpr (std::is_arithmetic_v<T>) pvals[i] = (double)params[i];
+                else pvals[i] = params[i].val;
+            }
+            double F_re = 0, F_im = 0;
+            // 逐段执行: 段 0 = F
+            {
+                int n_instr = (int)aux[seg_off];
+                double out[2];
+                evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
+                    pvals, out);
+                F_re = out[0]; F_im = out[1];
+                seg_off += 1 + 3 * n_instr;
+            }
+            if constexpr (std::is_arithmetic_v<T>) {
+                return ResResult<T>::make(T(F_re), T(F_im));
+            } else {
+                // 组装 ComplexVar<double,N>: grad/hess 数组
+                using VarT = T;   // Var<double, N, WH>
+                constexpr int N = VarN<T>::value;
+                VarT re_v(F_re), im_v(F_im);
+                // 一阶段 (段 1..P)
+                for (int j = 0; j < P && j < N; ++j) {
+                    int n_instr = (int)aux[seg_off];
+                    double out[2];
+                    evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
+                        pvals, out);
+                    re_v.grad[j] = out[0];
+                    im_v.grad[j] = out[1];
+                    seg_off += 1 + 3 * n_instr;
+                }
+                // 二阶段 (段 P+1.., j ≤ k)
+                for (int j = 0; j < P && j < N; ++j)
+                    for (int k = j; k < P && k < N; ++k) {
+                        int n_instr = (int)aux[seg_off];
+                        double out[2];
+                        evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
+                            pvals, out);
+                        re_v.hess[j][k] = out[0];
+                        im_v.hess[j][k] = out[1];
+                        if (j != k) {
+                            re_v.hess[k][j] = out[0];
+                            im_v.hess[k][j] = out[1];
+                        }
+                        seg_off += 1 + 3 * n_instr;
+                    }
+                return ResResult<T>::make(re_v, im_v);
+            }
         }
         default:
             return ResResult<T>::make(T(1.0), T(0.0));
