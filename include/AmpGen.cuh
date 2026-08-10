@@ -6,6 +6,7 @@
 #include <Config.cuh>
 #include <ResModel.cuh>
 #include <Resonance.cuh>
+#include <SymbolicDiff.cuh>  // Q0MassDep（getDaughterMassDep 签名）
 
 #include <array>
 #include "ComplexType.h"
@@ -188,6 +189,15 @@ public:
         auto it = particleToIndex_.find(tag);
         return (it != particleToIndex_.end()) ? it->second : -1;
     }
+
+    // 查询粒子 mother_idx 的衰变节点子粒子质量依赖（host）。
+    // 规则与 AD 版 kernel 的 q0 回退一致:
+    //   固定质量(config) → FixedMass; 子粒子=target(共振态,无固定质量) → M0Param;
+    //   否则(事件质量) → EventMass。
+    // 返回 false 若该粒子无衰变节点。
+    bool getDaughterMassDep(int mother_idx, int target_idx,
+        Q0MassDep& md1_dep, double& md1_fixed,
+        Q0MassDep& md2_dep, double& md2_fixed) const;
 };
 
 // 合并 AD 振幅 kernel 的每 block 描述（设备端；一次启动处理多个 block）

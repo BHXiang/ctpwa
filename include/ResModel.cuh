@@ -203,7 +203,7 @@ __device__ auto computeNodeFactor(
                 int n_instr = (int)aux[seg_off];
                 double out[2];
                 evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
-                    pvals, out);
+                    0.0, 0.0, pvals, out);  // Custom DSL 无 CVAR_MD1/2
                 F_re = out[0]; F_im = out[1];
                 seg_off += 1 + 3 * n_instr;
             }
@@ -217,7 +217,7 @@ __device__ auto computeNodeFactor(
                     int n_instr = (int)aux[seg_off];
                     double out[2];
                     evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
-                        pvals, out);
+                        0.0, 0.0, pvals, out);
                     re_v.grad[j] = out[0];
                     im_v.grad[j] = out[1];
                     seg_off += 1 + 3 * n_instr;
@@ -227,7 +227,7 @@ __device__ auto computeNodeFactor(
                         int n_instr = (int)aux[seg_off];
                         double out[2];
                         evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
-                            pvals, out);
+                            0.0, 0.0, pvals, out);
                         re_v.hess[j][k] = out[0];
                         im_v.hess[j][k] = out[1];
                         if (j != k) {

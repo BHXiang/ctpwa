@@ -115,13 +115,26 @@ Node modelDeriv(int composite_id, const Node& n, int p);
 
 #include <Resonance.cuh>  // ResModelType
 
+// q0 = breakup(m0, md1, md2) 中 m0/md1/md2 的依赖描述：
+//   FixedMass  → makeNum(质量)（config 固定质量，无导数）
+//   M0Param    → makeParam(0)（目标共振态质量参数，带导数；m0 或子粒子=目标时）
+//   EventMass  → makeVar(CVAR_MD1/2)（事件质量，运行时值，导数 0）
+enum class Q0MassDep : int {
+    FixedMass = 0,
+    M0Param = 1,
+    EventMass = 2,
+};
+
 // 程序化构建模型 AST → deriv → simplify → compileNode → aux[]
 // 返回标准 aux 布局 [P, n_seg, 段...]（与 compileCustomExpr/evalCustomAll 一致）
 // P: 自由参数数; L/d: 块级势垒参数; channels: Flatte 道质量列表
+// md1_dep/md2_dep: q0 链中两个子粒子质量的依赖（与 AD 版 kernel 的回退规则一致）
 std::vector<double> buildModelAST(
     ResModelType model_type,
     int L, double d,
     int P, int n_channels,
-    const std::vector<double>& channel_masses);
+    const std::vector<double>& channel_masses,
+    Q0MassDep md1_dep, double md1_fixed,
+    Q0MassDep md2_dep, double md2_fixed);
 
 #endif // SYMBOLIC_DIFF_CUH
