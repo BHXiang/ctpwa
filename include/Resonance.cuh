@@ -61,9 +61,10 @@ class ResonanceModel
     virtual std::vector<ParamSpec> paramSpecs() const = 0; // 固定参数（按此顺序进 d_all_params）
     virtual std::string extraPrefix() const { return ""; } // 附加参数前缀（Flatte: "g" → g1,g2,...）
 
-    // 构建模型专属辅助数据（Hist: 读直方图文件 → [m_min,m_max,n_bins,values...]；非 aux 模型返回空）
+    // 构建模型专属辅助数据
     virtual std::vector<double> buildAuxData(
-        const std::map<std::string, std::string>& options) const { return {}; }
+        const std::map<std::string, std::string>& options,
+        const std::vector<std::pair<double, double>>& channels = {}) const { return {}; }
 };
 
 // 注册表：按名字/类型查询模型；模型实例为注册表所有（单例），调用方只持有指针

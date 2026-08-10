@@ -1,4 +1,7 @@
 #include <AmpGen.cuh>
+#include <ComputeHessian.cuh>
+#include <HessianStage1Kernel.cuh>
+#include <CustomExpr.cuh>
 #include <ComputeNLL.cuh>
 #include <Parameters.cuh>
 #include <thrust/device_vector.h>
@@ -1862,6 +1865,124 @@ __global__ void computeAmpsKernelAD(
     }
 }
 
+__global__ void computeCustomAmpsKernel(
+    ctComplex* amplitudes,
+    const ADBlockDesc* desc, int nblocks, int nSL_total,
+    const int* amp_offsets, const int* event_offsets, int num_offsets,
+    int n_amplitudes, double bf_d)
+{
+    int slg = blockIdx.x;
+    int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
+
+    int bi = 0;
+    while (bi + 1 < nblocks && desc[bi + 1].sl_start <= slg) ++bi;
+    const ADBlockDesc& B = desc[bi];
+    int sl_idx = slg - B.sl_start;
+    if (sl_idx >= B.nSL || event_idx >= B.nEvents) return;
+
+    int offset_idx = 0;
+    for (size_t i = 0; i < (size_t)num_offsets - 1; ++i)
+        if (event_idx < event_offsets[i + 1]) { offset_idx = i; break; }
+
+    const DeviceResonance& target_res = B.d_res[0];
+    int P = target_res.param_count;
+    if (P < 1) P = 1;
+    if (P > 16) P = 16;   // 上限保护（实际 K-matrix 等 < 16）
+    const double* target_rp = B.d_all_params + target_res.param_offset;
+    const double* aux = B.d_all_channels;
+    int aux_offset = target_res.aux_offset;
+
+    double dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
+
+    size_t slamp_row = (size_t)B.nSL * B.nPolar * B.nEvents;
+    const int MAX_POL = 32;
+    double R_re[MAX_POL], R_im[MAX_POL];
+    for (int k = 0; k < B.nPolar; ++k) { R_re[k] = 0.0; R_im[k] = 0.0; }
+
+    for (int s = 0; s < B.nSigma; ++s) {
+        const DeviceMomenta* dm = (s == 0 || !B.d_mom_tab) ? B.d_momenta : &B.d_mom_tab[s];
+        double sg = (s == 0) ? 1.0 : B.d_sign_tab[s];
+        const thrust::complex<double>* slam = B.d_slamp_tab + (size_t)s * slamp_row;
+
+        // 节点循环（标量）：非目标节点 × Bf；目标节点 = Custom 标量求值
+        double Or = 1.0, Oi = 0.0;   // 非目标节点因子积
+        double Fr = 1.0, Fi = 0.0;   // 目标 Custom F
+        bool custom_eval = false;
+        for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
+            const DecayNode& node = B.d_decayNodes[nodeIdx];
+            const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+            int L = sl.L;
+
+            LorentzVector pM  = dm->getMomentum(event_idx, node.mother_idx);
+            LorentzVector pD1 = dm->getMomentum(event_idx, node.daug1_idx);
+            LorentzVector pD2 = dm->getMomentum(event_idx, node.daug2_idx);
+            double mm = pM.M();
+            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+            double md1 = pD1.M(), md2 = pD2.M();
+            bool is_target = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
+            // q0 质量回退（与 computeAmpsMergedKernel 一致）:
+            //   目标节点 → 参数 m0；固定质量 → node.mass；其它 → 1.0
+            double m0_q0 = is_target
+                ? ((target_res.param_count > 0) ? target_rp[0] : 1.0)
+                : ((node.mass[0] > 0) ? node.mass[0] : 1.0);
+            // 子粒子是目标共振态（无固定质量）→ 用其 m0 参数
+            // （与 computeAmpsMergedKernel 一致；否则回退到事件质量）
+            double md1_q0 = (node.mass[1] > 0) ? node.mass[1]
+                : ((node.daug1_idx == target_res.particle_idx && target_res.param_count > 0)
+                       ? target_rp[0] : md1);
+            double md2_q0 = (node.mass[2] > 0) ? node.mass[2]
+                : ((node.daug2_idx == target_res.particle_idx && target_res.param_count > 0)
+                       ? target_rp[0] : md2);
+            double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
+
+            if (is_target) {
+                if (!custom_eval) {
+                    evalCustomAll(aux, aux_offset, mm, qq, q0, L, bf_d,
+                        target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                    custom_eval = true;
+                }
+            } else {
+                double bf = Bf<double>(L, qq, q0, bf_d);
+                Or *= bf; Oi *= bf;
+            }
+        }
+
+        // F_total = O × F_custom; dF_total[j] = O × dF_custom[j]
+        double Ftr = Or * Fr - Oi * Fi, Fti = Or * Fi + Oi * Fr;
+
+        if (B.d_dF_tab) {
+            int base = (event_idx * B.nSL + sl_idx) * P
+                     + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * P));
+            for (int j = 0; j < P; ++j) {
+                double dtr = Or * dFr[j] - Oi * dFi[j];
+                double dti = Or * dFi[j] + Oi * dFr[j];
+                B.d_dF_tab[base + j] = ctMake(dtr, dti);
+            }
+        }
+
+        for (int k = 0; k < B.nPolar; ++k) {
+            size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+            auto sl_amp = slam[idx];
+            R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
+            R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+        }
+    }
+
+    // 输出振幅
+    for (int k = 0; k < B.nPolar; ++k) {
+        int idx = sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+        if (offset_idx < num_offsets) {
+            int nEv_seg = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
+            int amp_idx = amp_offsets[offset_idx]
+                        + (event_idx - event_offsets[offset_idx]) * n_amplitudes * B.nPolar
+                        + k * n_amplitudes + sl_idx + B.site;
+            amplitudes[amp_idx] = ctMake(R_re[k], R_im[k]);
+        }
+        (void)idx;
+    }
+}
+
+
 // 跨链全同粒子: 将交换拓扑的 SL 振幅就地累加到原始振幅
 // d_amp += sign * d_add,  sign = +1 (Bose) or -1 (Fermi)
 __global__ void addSLAmpsKernel(
@@ -2259,34 +2380,46 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
         int num_offsets = static_cast<int>(amp_offsets[gpu].size());
 
         // 分组：nFree → block 列表（host；块结构固定，开销可忽略）
+        // Custom 模型走独立标量 kernel（参数数 P 运行时，不经过 Var 模板）
         std::map<int, std::vector<int>> ad_groups;
-        for (size_t bi = 0; bi < blocks_.size(); ++bi)
-            if (blocks_[bi].nFree > 0) ad_groups[blocks_[bi].nFree].push_back(static_cast<int>(bi));
+        std::vector<int> custom_blocks;
+        for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+            if (blocks_[bi].nFree <= 0) continue;
+            // 用 h_templates_ 判断类型（host 端）
+            const auto& tmpl = h_templates_[bi];
+            bool is_custom = !tmpl.empty() && tmpl[0].type == ResModelType::Custom;
+            if (is_custom) custom_blocks.push_back(static_cast<int>(bi));
+            else ad_groups[blocks_[bi].nFree].push_back(static_cast<int>(bi));
+        }
 
         // 确保所有 AD block 的 d_dF / d_param_map 已分配（懒分配持久化）
+        // （custom_blocks 的 d_dF 同样需要）
+        auto ensure_ddF = [&](int bi) {
+            auto& block = blocks_[bi];
+            auto& cas = cas_list_[block.cas_idx];
+            int nSL = static_cast<int>(cas->getNSLCombs());
+            int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
+            int nSigma = cas->getNSigma();
+            size_t dF_size = (size_t)nEv * nSL * block.nFree * nSigma;
+            if (!block.d_dF[gpu])
+                cudaMalloc(&block.d_dF[gpu], dF_size * sizeof(ctComplex));
+            if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
+            if (!block.d_param_map_[gpu]) {
+                cudaMalloc(&block.d_param_map_[gpu], block.nFree * sizeof(int));
+                cudaMemcpy(block.d_param_map_[gpu], block.free_param_idx.data(),
+                           block.nFree * sizeof(int), cudaMemcpyHostToDevice);
+            }
+        };
+        for (int bi : custom_blocks) ensure_ddF(bi);
         for (const auto& [nfree, blist] : ad_groups) {
             (void)nfree;
-            for (int bi : blist) {
-                auto& block = blocks_[bi];
-                auto& cas = cas_list_[block.cas_idx];
-                int nSL = static_cast<int>(cas->getNSLCombs());
-                int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
-                int nSigma = cas->getNSigma();   // 全同粒子置换拓扑数
-                size_t dF_size = (size_t)nEv * nSL * block.nFree * nSigma;
-                if (!block.d_dF[gpu])
-                    cudaMalloc(&block.d_dF[gpu], dF_size * sizeof(ctComplex));
-                if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
-                if (!block.d_param_map_[gpu]) {
-                    cudaMalloc(&block.d_param_map_[gpu], block.nFree * sizeof(int));
-                    cudaMemcpy(block.d_param_map_[gpu], block.free_param_idx.data(),
-                               block.nFree * sizeof(int), cudaMemcpyHostToDevice);
-                }
-            }
+            for (int bi : blist) ensure_ddF(bi);
         }
 
         // 按 nFree 分组构建 desc 并启动（每组一次 kernel）
         int n_ad_blocks = 0;
         for (const auto& [nfree, blist] : ad_groups) n_ad_blocks += (int)blist.size();
+        n_ad_blocks += (int)custom_blocks.size();   // Custom block 复用同一 desc 缓冲
         if (d_ad_desc_.size() != (size_t)n_gpu) d_ad_desc_.assign(n_gpu, nullptr);
         if (n_ad_blocks > d_ad_desc_cap_) {
             for (int g = 0; g < n_gpu; ++g) {
@@ -2373,6 +2506,47 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             }
         }
 
+        // Custom block：独立标量 kernel（参数数 P 运行时，dF 直接输出）
+        if (!custom_blocks.empty()) {
+            h_desc.clear();
+            int sl_start = 0, max_evt = 0;
+            for (int bi : custom_blocks) {
+                auto& block = blocks_[bi];
+                auto& cas = cas_list_[block.cas_idx];
+                ADBlockDesc d;
+                d.d_momenta = cas->getMomenta()[gpu];
+                d.d_slComb = cas->getDeviceSLCombs()[gpu];
+                d.d_slamp_tab = cas->getSLAmpsTab()[gpu];
+                d.d_res = block.d_resonances[gpu];
+                d.d_all_params = block.d_all_params[gpu];
+                d.d_all_channels = block.d_all_channels[gpu];
+                d.d_decayNodes = cas->getDecayNodes()[gpu];
+                d.d_param_map = block.d_param_map_[gpu];
+                d.d_dF_tab = block.d_dF[gpu];
+                d.nSigma = cas->getNSigma();
+                d.d_mom_tab = cas->getMomentaTab()[gpu];
+                d.d_sign_tab = cas->getSignsTab()[gpu];
+                d.resonance_count = block.resonance_count;
+                d.decayChain_size = cas->getDecayChainSize();
+                d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
+                d.nSL = static_cast<int>(cas->getNSLCombs());
+                d.nPolar = static_cast<int>(n_polar);
+                d.sl_start = sl_start;
+                d.site = block.site;
+                h_desc.push_back(d);
+                sl_start += d.nSL;
+                max_evt = std::max(max_evt, d.nEvents);
+            }
+            int nblocks = static_cast<int>(h_desc.size());
+            cudaMemcpy(d_ad_desc_[gpu], h_desc.data(), nblocks * sizeof(ADBlockDesc),
+                       cudaMemcpyHostToDevice);
+            dim3 gridC(static_cast<unsigned int>(sl_start),
+                       (static_cast<unsigned int>(max_evt) + 255) / 256);
+            computeCustomAmpsKernel<<<gridC, blockSize>>>(
+                d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+        }
+
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，
         // 初始化时 getAmps 已计算，fit 循环中跳过重算（纯浪费）
     }
@@ -2396,6 +2570,8 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
 // 本 kernel 只做: -2·sign·Re(conj(w)·v·slamp·∂F/∂θ) 累加
 // 优化：per-block shared 部分和 → 每 block 只做 Nfree 次全局 atomicAdd
 // （50 万事件时全局 atomicAdd 从 200 万次降到 ~8000 次，消除竞争）
+// 注意：Custom 模型（参数数 4-16，运行时）走 resonanceGradientKernelRuntime
+//（下方），不经过本模板 —— computeCustomAmpsKernel 的 d_dF_tab 布局相同。
 template <int Nfree>
 __global__ void resonanceGradientKernel(
     const ctComplex* d_w,
@@ -2485,6 +2661,69 @@ __global__ void computeEffectiveCouplingKernel(
         im += (double)vv.x * sv.imag() + (double)vv.y * sv.real();
     }
     d_T[idx] = ctMake(ctCastFloat(re), ctCastFloat(im));
+}
+
+// ---------------------------------------------------------------------------
+__global__ void resonanceGradientKernelRuntime(
+    const ctComplex* d_w,
+    const thrust::complex<double>* d_slamp_tab,  // [nSigma × nSL×nPol×nEv_total]
+    const ctComplex* d_v,
+    const ctComplex* d_dF_tab,       // [nSigma × nEv_total×nSL×Nfree] 复数导数
+    const int* d_global_idx,         // [Nfree]
+    double* d_grad,
+    int nEvents, int nPolar, int nSLComb, double sign,
+    int evt_off, int site, int n_events_total,
+    int nSigma, const double* d_sign_tab, int Nfree)
+{
+    __shared__ double shm[16];
+    for (int j = 0; j < Nfree; ++j) shm[j] = 0.0;
+    __syncthreads();
+
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt < nEvents) {
+        int global_evt = evt + evt_off;
+        double acc[16];
+        for (int j = 0; j < Nfree; ++j) acc[j] = 0.0;
+
+        size_t slamp_row = (size_t)nSLComb * nPolar * n_events_total;
+        size_t dF_row = (size_t)n_events_total * nSLComb * Nfree;
+
+        for (int sl_idx = 0; sl_idx < nSLComb; ++sl_idx) {
+            ctComplex v_sl = d_v[site + sl_idx];
+
+            for (int s = 0; s < nSigma; ++s) {
+                double sg = (s == 0) ? 1.0 : d_sign_tab[s];
+                const thrust::complex<double>* slam = d_slamp_tab + (size_t)s * slamp_row;
+                const ctComplex* dF_s = d_dF_tab + (size_t)s * dF_row;
+
+                double s_re = 0.0, s_im = 0.0;
+                for (int pol = 0; pol < nPolar; ++pol) {
+                    ctComplex w_val = d_w[evt * nPolar + pol];
+                    int amp_idx = sl_idx * n_events_total * nPolar + global_evt * nPolar + pol;
+                    auto sl_amp = slam[amp_idx];
+                    double sl_re = sl_amp.real();
+                    double sl_im = sl_amp.imag();
+                    double T_re = (double)v_sl.x * sl_re - (double)v_sl.y * sl_im;
+                    double T_im = (double)v_sl.x * sl_im + (double)v_sl.y * sl_re;
+                    s_re += (double)w_val.x * T_re + (double)w_val.y * T_im;
+                    s_im += (double)w_val.x * T_im - (double)w_val.y * T_re;
+                }
+
+                // d_dF 由 reComputeAmps 按全局事件索引写入（含 phsp/data/bkg 全段）
+                int dF_base = (global_evt * nSLComb + sl_idx) * Nfree;
+                for (int j = 0; j < Nfree; ++j) {
+                    ctComplex dF = dF_s[dF_base + j];
+                    acc[j] += -2.0 * sign * sg * (s_re * (double)dF.x - s_im * (double)dF.y);
+                }
+            }
+        }
+        for (int j = 0; j < Nfree; ++j)
+            atomicAdd(&shm[j], acc[j]);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int j = 0; j < Nfree; ++j)
+            atomicAdd(&d_grad[d_global_idx[j]], shm[j]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,7 +2886,14 @@ void AmpCalc::computeResonanceGradient(
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
                     cas->getNSigma(), d_sign_tab);
                 break;
-            default: break;
+            default:
+                // Custom 模型：参数数 4-16 走运行时 Nfree 版（不经 Var 模板）
+                resonanceGradientKernelRuntime<<<grid, kBlockSize>>>(
+                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
+                    d_global_idx, d_grad_per_gpu_[gpu],
+                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
+                    cas->getNSigma(), d_sign_tab, Nlocal);
+                break;
             }
         }
     };
@@ -2843,9 +3089,16 @@ void AmpCalc::computeUnifiedHessian(
                     }
                 }
             }
-            if (Npr < 1 || Npr > 3) continue;
+            // Custom 模型（参数数运行时）→ 标量 Hessian kernel，无模板上限
+            bool is_custom_block = !h_templates_[bi].empty() &&
+                h_templates_[bi][0].type == ResModelType::Custom;
+            if (is_custom_block) {
+                // 仍需要 temp buffer（stage 2 交叉项）— 下方统一分配
+            } else if (Npr < 1 || Npr > 3) {
+                continue;
+            }
 
-            int NT = Npr * Nres;
+            int NT = is_custom_block ? Npr : Npr * Nres;
 
             // 构建全局索引映射（conjugate 块映射到 owner 的 slot 索引）
             std::vector<int> global_idx(NT, -1);
@@ -2888,6 +3141,23 @@ void AmpCalc::computeUnifiedHessian(
             // Conjugate 块：phsp 积分已由 owner 计算，跳过 d_pI_g。
             // phsp 梯度/Hessian（d_pg_g, d_phA_g）通过 owner slot 累加。
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
+
+            if (is_custom_block) {
+                // Custom 标量路径（P 运行时无上限）
+                computeCustomHessianKernel<<<grid, kBlockSize>>>(
+                    cas->getSLAmpsTab()[gpu], d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
+                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx,
+                    d_hess_g, hess_ld, nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
+                    bt.d_dF_re, bt.d_dF_im,
+                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
+                cudaDeviceSynchronize();
+                if (!is_conjugate) first_free_block = false;
+                continue;   // 跳过模板分派
+            }
             if (Npr == 2 && Nres == 2) {
                 hessianStage1Kernel<2,2><<<grid, kBlockSize>>>(
                     cas->getSLAmpsTab()[gpu], d_v_blk,

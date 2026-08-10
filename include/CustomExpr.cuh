@@ -62,7 +62,8 @@ enum CustomOp : int {
     COP_DIV = 8,
     COP_POW = 9,
     COP_NEG = 10,
-    COP_CALL = 11,      // arg0 = CustomFuncId（一元）；pow 用 COP_POW
+    COP_CALL = 11,      // arg0 = CustomFuncId
+    COP_MODEL = 12,     // arg0 = CompositeId（一元）；pow 用 COP_POW
 };
 
 // 设备端解释器（定义在 src/CustomExpr.cu，ResModel.cu 调用）
@@ -85,6 +86,16 @@ __host__ __device__ inline int customSegOffset(const double* aux, int s)
     }
     return off;
 }
+
+// 全段解释器（src/CustomExpr.cu）：值段 + P 个一阶段 + P(P+1)/2 个二阶段
+// 布局与 evalCustomSeg 相同；d2 按 j≤k 段序读取，对称填充 d2[k][j]=d2[j][k]
+__device__ void evalCustomAll(
+    const double* aux, int aux_offset,
+    double m, double q, double q0, int L, double d,
+    const double* params, int P,
+    double& Fr, double& Fi,
+    double* dFr, double* dFi,
+    double* d2Fr, double* d2Fi);
 
 // host 端编译入口（src/CustomExpr.cu）
 // expr: 表达式字符串; params: 参数名列表

@@ -1,3 +1,4 @@
+#include <ComputeResults.cuh>
 #include "ComplexType.h"
 #include <cuda_runtime.h>
 #include <stdio.h>

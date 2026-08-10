@@ -2,6 +2,7 @@
 #define PARAMETERS_CUH
 
 #include <torch/torch.h>
+#include "ComplexType.h"
 
 #include <algorithm>
 #include <complex>

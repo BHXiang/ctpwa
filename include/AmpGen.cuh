@@ -402,4 +402,26 @@ __global__ void resonanceGradientKernel(
     int evt_off, int site, int n_events_total,
     int nSigma, const double* d_sign_tab); // 置换拓扑（σ=0 恒等 +1）
 
+
+// Cross-TU kernel declarations（rdc 多 TU 链接需要）
+__global__ void daxpy_kernel(double* y, const double* x, double alpha, int n);
+
+__global__ void multiplicativeCouplingKernel(
+    ctComplex* d_v, const double* d_params,
+    const int* d_amp_chain,
+    const int* d_step_offsets,
+    const int* d_step_data,
+    const double* d_amp_chain_ratio,
+    int n_amps, int n_step_free, int n_free);
+
+__global__ void multiplicativeGradientKernel(
+    double* d_grad_p,
+    const ctComplex* d_grad_v,
+    const ctComplex* d_v,
+    const double* d_params,
+    const int* d_amp_chain,
+    const int* d_step_offsets,
+    const int* d_step_data,
+    int n_amps, int n_step_free, int n_free);
+
 #endif // AMPGEN_CUH

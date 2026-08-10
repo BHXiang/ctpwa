@@ -1,4 +1,5 @@
 #include <Parameters.cuh>
+#include <AmpGen.cuh>
 
 #include <algorithm>
 #include <iostream>

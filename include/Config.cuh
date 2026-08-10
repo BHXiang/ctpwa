@@ -1,7 +1,6 @@
 #ifndef CONFIG_CUH
 #define CONFIG_CUH
 
-#include <AmpGen.cuh>
 #include <map>
 #include <string>
 #include <vector>
