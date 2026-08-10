@@ -33,6 +33,8 @@ enum CustomVarId : int {
     CVAR_Q0 = 2,  // 标称 breakup momentum
     CVAR_L = 3,   // 角动量
     CVAR_D = 4,   // 势垒半径
+    CVAR_MD1 = 5, // 子粒子 1 质量（运行时提供，导数 0；内置模型 q0 链用）
+    CVAR_MD2 = 6, // 子粒子 2 质量（同上）
 };
 
 // 函数 id
@@ -68,9 +70,12 @@ enum CustomOp : int {
 
 // 设备端解释器（定义在 src/CustomExpr.cu，ResModel.cu 调用）
 // 逐段执行: seg = aux + seg_offset; 输出 out[0]=re, out[1]=im
+// md1/md2: 子粒子质量（内置模型 q0 = breakup(m0, md1, md2) 链用；
+//          Custom DSL 表达式不使用，可传 0）
 __device__ void evalCustomSeg(
     const double* seg, int n_instr,
     double m, double q, double q0, int L, double d,
+    double md1, double md2,
     const double* params, double* out);
 
 // 获取第 s 段在 aux 中的偏移（host 和 device 共用逻辑）
@@ -92,6 +97,7 @@ __host__ __device__ inline int customSegOffset(const double* aux, int s)
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
+    double md1, double md2,
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,

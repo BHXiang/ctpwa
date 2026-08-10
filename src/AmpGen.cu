@@ -2,6 +2,7 @@
 #include <ComputeHessian.cuh>
 #include <HessianStage1Kernel.cuh>
 #include <CustomExpr.cuh>
+#include <SymbolicDiff.cuh>  // Q0MassDep + buildModelAST（addBlock 构建符号微分 aux）
 #include <ComputeNLL.cuh>
 #include <Parameters.cuh>
 #include <thrust/device_vector.h>
@@ -408,6 +409,36 @@ void AmpCasDecay::addParticleIfNotExists(const std::string& name, int spin, int 
         particleMap_[name] = { spin, parity, mass };
         particleNames_.push_back(name);
     }
+}
+
+bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
+    Q0MassDep& md1_dep, double& md1_fixed,
+    Q0MassDep& md2_dep, double& md2_fixed) const
+{
+    if (mother_idx < 0 || mother_idx >= (int)particleNames_.size()) return false;
+    const std::string& mname = particleNames_[mother_idx];
+    for (const auto& node : decayChain_) {
+        if (node.mother != mname) continue;
+        // 质量依赖规则与 AD 版 kernel 的 q0 回退一致:
+        //   固定质量(config 粒子表 mass>0) → FixedMass
+        //   子粒子 = target（共振态，无固定质量）→ M0Param（= m0 参数）
+        //   否则（事件质量）→ EventMass
+        auto dep = [&](const std::string& dname, int d_idx) {
+            auto it = particleMap_.find(dname);
+            double mass = (it != particleMap_.end()) ? it->second.mass : -1.0;
+            if (mass > 0) return std::make_pair(Q0MassDep::FixedMass, mass);
+            if (d_idx == target_idx) return std::make_pair(Q0MassDep::M0Param, 0.0);
+            return std::make_pair(Q0MassDep::EventMass, 0.0);
+        };
+        int d1 = getParticleIndex(node.daug1);
+        int d2 = getParticleIndex(node.daug2);
+        auto p1 = dep(node.daug1, d1);
+        auto p2 = dep(node.daug2, d2);
+        md1_dep = p1.first; md1_fixed = p1.second;
+        md2_dep = p2.first; md2_fixed = p2.second;
+        return true;
+    }
+    return false;
 }
 
 std::vector<std::vector<SL>> AmpCasDecay::getSLCombinations() const
@@ -1865,6 +1896,50 @@ __global__ void computeAmpsKernelAD(
     }
 }
 
+// ============================================================
+// O 因子（非目标节点 Bf 乘积）对质量参数的导数辅助函数
+// O = Π_i Bf(L_i, qq_i, q0_i), q0_i = breakup(m0_i, m1_i, m2_i)
+// 当某子质量经回退等于 target_rp[0]（m0 参数）时，q0 依赖 m0 →
+// dO/dm0 = O · Σ_i ∂lnBf_i/∂q0_i · ∂q0_i/∂m0
+// ============================================================
+
+// ∂q(m,m1,m2)/∂m_which (which=1: m1, which=2: m2)
+// qsq ≤ 0 时 q 被钳位为 0（常数）→ 导数为 0
+__device__ double breakup_dq_dm(int which, double m, double m1, double m2)
+{
+    double s = m1 + m2, d = m1 - m2;
+    double A = m * m - s * s, B = m * m - d * d;
+    double qsq = A * B;
+    if (qsq <= 0.0) return 0.0;
+    double dqsq = (which == 1) ? (-2.0 * s * B - 2.0 * d * A)
+                               : (-2.0 * s * B + 2.0 * d * A);
+    return dqsq / (4.0 * m * sqrt(qsq));
+}
+
+// ∂ln Bf(L,q,q0,d)/∂q0 = 0.5·N0'(z0)/N0(z0)·d, z0 = q0·d
+// N0(z0) 多项式系数与 ResModel.cuh 的 Bf 完全一致
+__device__ double dlnBf_dq0(int L, double q0, double bf_d)
+{
+    double z0 = q0 * bf_d;
+    double z2 = z0 * z0;
+    double n0, dn0;
+    switch (L) {
+    case 0: n0 = 1.0; dn0 = 0.0; break;
+    case 1: n0 = 1.0 + z2; dn0 = 2.0 * z0; break;
+    case 2: n0 = 9.0 + z2 * (3.0 + z2); dn0 = z0 * (6.0 + 4.0 * z2); break;
+    case 3: n0 = 225.0 + z2 * (45.0 + z2 * (6.0 + z2));
+            dn0 = z0 * (90.0 + z2 * (24.0 + 6.0 * z2)); break;
+    case 4: n0 = 11025.0 + z2 * (1575.0 + z2 * (135.0 + z2 * (10.0 + z2)));
+            dn0 = z0 * (3150.0 + z2 * (540.0 + z2 * (60.0 + 8.0 * z2))); break;
+    case 5: n0 = 893025.0 + z2 * (99225.0 + z2 * (6300.0 + z2 * (315.0 + z2 * (15.0 + z2))));
+            dn0 = z0 * (198450.0 + z2 * (25200.0 + z2 * (1890.0 + z2 * (120.0 + 10.0 * z2)))); break;
+    case 6: n0 = 540326025.0 + z2 * (6185025.0 + z2 * (363825.0 + z2 * (17325.0 + z2 * (630.0 + z2 * (21.0 + z2)))));
+            dn0 = z0 * (12370050.0 + z2 * (1455300.0 + z2 * (103950.0 + z2 * (5040.0 + z2 * (210.0 + 12.0 * z2))))); break;
+    default: return 0.0;
+    }
+    return 0.5 * dn0 / n0 * bf_d;
+}
+
 __global__ void computeCustomAmpsKernel(
     ctComplex* amplitudes,
     const ADBlockDesc* desc, int nblocks, int nSL_total,
@@ -1906,6 +1981,7 @@ __global__ void computeCustomAmpsKernel(
 
         // 节点循环（标量）：非目标节点 × Bf；目标节点 = Custom 标量求值
         double Or = 1.0, Oi = 0.0;   // 非目标节点因子积
+        double dlnO_dm0 = 0.0;       // Σ_i ∂lnBf_i/∂m0（经 q0 回退进入 O 的质量导数）
         double Fr = 1.0, Fi = 0.0;   // 目标 Custom F
         bool custom_eval = false;
         for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
@@ -1938,17 +2014,25 @@ __global__ void computeCustomAmpsKernel(
             if (is_target) {
                 if (!custom_eval) {
                     evalCustomAll(aux, aux_offset, mm, qq, q0, L, bf_d,
+                        md1_q0, md2_q0,
                         target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                     custom_eval = true;
                 }
             } else {
                 double bf = Bf<double>(L, qq, q0, bf_d);
                 Or *= bf; Oi *= bf;
+                // q0 回退到 target_rp[0]（m0 参数）→ 累积 d ln Bf / d m0
+                double dq0_dm = 0.0;
+                if (md1_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+                if (md2_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+                dlnO_dm0 += dlnBf_dq0(L, q0, bf_d) * dq0_dm;
             }
         }
 
-        // F_total = O × F_custom; dF_total[j] = O × dF_custom[j]
+        // F_total = O × F_custom; dF_total[j] = O × dF_custom[j] + (dO/dm0)·F_custom·δ_{j0}
+        // （O 经 q0 回退依赖质量参数 m0，宽度参数不进入 O）
         double Ftr = Or * Fr - Oi * Fi, Fti = Or * Fi + Oi * Fr;
+        double dO_dm0 = Or * dlnO_dm0;
 
         if (B.d_dF_tab) {
             int base = (event_idx * B.nSL + sl_idx) * P
@@ -1956,6 +2040,7 @@ __global__ void computeCustomAmpsKernel(
             for (int j = 0; j < P; ++j) {
                 double dtr = Or * dFr[j] - Oi * dFi[j];
                 double dti = Or * dFi[j] + Oi * dFr[j];
+                if (j == 0) { dtr += dO_dm0 * Fr; dti += dO_dm0 * Fi; }
                 B.d_dF_tab[base + j] = ctMake(dtr, dti);
             }
         }
@@ -2134,8 +2219,34 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             h_all_channels.push_back(ch.second);
         }
 
-        // 模型辅助数据（Hist 形状表）→ 同一辅助段
-        const auto& aux = res.getAuxData();
+        // 模型辅助数据 → 同一辅助段
+        // Hist/Custom: 构造时已构建（getAuxData）；内置模型（BWR/BW/ONE/Flatte）:
+        // 符号微分 aux 需要 decay 结构（q0 链的子粒子质量依赖）→ 此处构建。
+        std::vector<double> aux = res.getAuxData();
+        if (aux.empty() &&
+            (dr.type == ResModelType::BWR || dr.type == ResModelType::BW ||
+             dr.type == ResModelType::ONE || dr.type == ResModelType::Flatte)) {
+            const auto& opts = res.getOptions();
+            int L = (dr.type == ResModelType::BWR) ? 1 : 2;
+            auto it = opts.find("L");
+            if (it != opts.end()) L = std::stoi(it->second);
+            double dd = 3.0;
+            it = opts.find("d");
+            if (it != opts.end()) dd = std::stod(it->second);
+            std::vector<double> cf;
+            for (const auto& ch : res.getChannels()) {
+                cf.push_back(ch.first);
+                cf.push_back(ch.second);
+            }
+            Q0MassDep m1d, m2d;
+            double m1f = 0.0, m2f = 0.0;
+            if (!cas->getDaughterMassDep(dr.particle_idx, dr.particle_idx,
+                                         m1d, m1f, m2d, m2f)) {
+                m1d = Q0MassDep::EventMass; m2d = Q0MassDep::EventMass;
+            }
+            aux = buildModelAST(dr.type, L, dd, dr.param_count, dr.n_channels, cf,
+                                m1d, m1f, m2d, m2f);
+        }
         dr.aux_offset = static_cast<int>(h_all_channels.size());
         dr.aux_size = static_cast<int>(aux.size());
         h_all_channels.insert(h_all_channels.end(), aux.begin(), aux.end());
@@ -2388,7 +2499,12 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             // 用 h_templates_ 判断类型（host 端）
             const auto& tmpl = h_templates_[bi];
             bool is_custom = !tmpl.empty() && tmpl[0].type == ResModelType::Custom;
-            if (is_custom) custom_blocks.push_back(static_cast<int>(bi));
+            // 内置模型（BWR/BW/Flatte 等）有符号微分 aux[] 且 Nres=1 → 同样走统一标量
+            // kernel（P4：符号微分替代 AutoDiff；BWR/ONE 的 L 依赖在 aux 段内以
+            // CVAR_L 运行时解析，无需 per-block L 路由）
+            bool has_sym_aux = !tmpl.empty() && tmpl[0].aux_size > 0
+                            && blocks_[bi].resonance_count == 1;
+            if (is_custom || has_sym_aux) custom_blocks.push_back(static_cast<int>(bi));
             else ad_groups[blocks_[bi].nFree].push_back(static_cast<int>(bi));
         }
 
@@ -2864,37 +2980,13 @@ void AmpCalc::computeResonanceGradient(
 
             int nSigma = cas->getNSigma();
             const double* d_sign_tab = cas->getSignsTab()[gpu];
-            switch (Nlocal) {
-            case 1:
-                resonanceGradientKernel<1><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    cas->getNSigma(), d_sign_tab);
-                break;
-            case 2:
-                resonanceGradientKernel<2><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    cas->getNSigma(), d_sign_tab);
-                break;
-            case 3:
-                resonanceGradientKernel<3><<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    cas->getNSigma(), d_sign_tab);
-                break;
-            default:
-                // Custom 模型：参数数 4-16 走运行时 Nfree 版（不经 Var 模板）
-                resonanceGradientKernelRuntime<<<grid, kBlockSize>>>(
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
-                    d_global_idx, d_grad_per_gpu_[gpu],
-                    nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
-                    cas->getNSigma(), d_sign_tab, Nlocal);
-                break;
-            }
+            // P4 统一：所有 block 的 d_dF 由 computeCustomAmpsKernel（符号微分 aux）
+            // 写入 [nSigma × nEv×nSL×Nfree] 布局，梯度统一走运行时 Nfree kernel
+            resonanceGradientKernelRuntime<<<grid, kBlockSize>>>(
+                d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu, block.d_dF[gpu],
+                d_global_idx, d_grad_per_gpu_[gpu],
+                nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
+                cas->getNSigma(), d_sign_tab, Nlocal);
         }
     };
 
@@ -3092,13 +3184,16 @@ void AmpCalc::computeUnifiedHessian(
             // Custom 模型（参数数运行时）→ 标量 Hessian kernel，无模板上限
             bool is_custom_block = !h_templates_[bi].empty() &&
                 h_templates_[bi][0].type == ResModelType::Custom;
-            if (is_custom_block) {
+            // 内置模型有符号微分 aux（Nres=1）→ 同样走标量路径（P4 统一）
+            bool has_sym_aux = !h_templates_[bi].empty() &&
+                h_templates_[bi][0].aux_size > 0 && Nres == 1;
+            if (is_custom_block || has_sym_aux) {
                 // 仍需要 temp buffer（stage 2 交叉项）— 下方统一分配
             } else if (Npr < 1 || Npr > 3) {
                 continue;
             }
 
-            int NT = is_custom_block ? Npr : Npr * Nres;
+            int NT = (is_custom_block || has_sym_aux) ? Npr : Npr * Nres;
 
             // 构建全局索引映射（conjugate 块映射到 owner 的 slot 索引）
             std::vector<int> global_idx(NT, -1);
@@ -3142,8 +3237,8 @@ void AmpCalc::computeUnifiedHessian(
             // phsp 梯度/Hessian（d_pg_g, d_phA_g）通过 owner slot 累加。
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
 
-            if (is_custom_block) {
-                // Custom 标量路径（P 运行时无上限）
+            if (is_custom_block || has_sym_aux) {
+                // Custom / 符号微分标量路径（P 运行时无上限）
                 computeCustomHessianKernel<<<grid, kBlockSize>>>(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,

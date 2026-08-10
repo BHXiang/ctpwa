@@ -513,6 +513,7 @@ void compileNode(const Node& n, std::vector<double>& seg)
 __device__ void evalCustomSeg(
     const double* seg, int n_instr,
     double m, double q, double q0, int L, double d,
+    double md1, double md2,
     const double* params, double* out)
 {
     // 栈式复数求值
@@ -544,6 +545,8 @@ __device__ void evalCustomSeg(
                     case CVAR_Q0: v = q0; break;
                     case CVAR_L: v = (double)L; break;
                     case CVAR_D: v = d; break;
+                    case CVAR_MD1: v = md1; break;
+                    case CVAR_MD2: v = md2; break;
                 }
                 push(v, 0.0); break;
             }
@@ -580,39 +583,39 @@ __device__ void evalCustomSeg(
                 // （kids[0] 最先入栈），arg1 = Flatte 的道数（其他模型 0）
                 switch ((int)a0) {
                     case MODEL_BREAKUP_Q0: {  // [m0, m1, m2]
-                        double m2v, m1v, m0v;
-                        pop(m2v, sim[0]); pop(m1v, sim[0]); pop(m0v, sim[0]);
+                        double m2v, m1v, m0v, _t;
+                        pop(m2v, _t); pop(m1v, _t); pop(m0v, _t);
                         push(computeQ0AD(m0v, m1v, m2v), 0.0);
                         break;
                     }
                     case MODEL_BF: {  // [L, q, q0, d]
-                        double dv, q0v, qv, Lv;
-                        pop(dv, sim[0]); pop(q0v, sim[0]); pop(qv, sim[0]); pop(Lv, sim[0]);
+                        double dv, q0v, qv, Lv, _t;
+                        pop(dv, _t); pop(q0v, _t); pop(qv, _t); pop(Lv, _t);
                         push(Bf<double>((int)Lv, qv, q0v, dv), 0.0);
                         break;
                     }
                     case MODEL_BW: {  // [m, m0, g0]
-                        double g0v, m0v, mv;
-                        pop(g0v, sim[0]); pop(m0v, sim[0]); pop(mv, sim[0]);
+                        double g0v, m0v, mv, _t;
+                        pop(g0v, _t); pop(m0v, _t); pop(mv, _t);
                         auto z = BW<double>(mv, m0v, g0v);
                         push(z.real(), z.imag());
                         break;
                     }
                     case MODEL_BWR: {  // [m, m0, g0, L, q, q0, d]
-                        double dv, q0v, qv, Lv, g0v, m0v, mv;
-                        pop(dv, sim[0]); pop(q0v, sim[0]); pop(qv, sim[0]);
-                        pop(Lv, sim[0]); pop(g0v, sim[0]); pop(m0v, sim[0]); pop(mv, sim[0]);
+                        double dv, q0v, qv, Lv, g0v, m0v, mv, _t;
+                        pop(dv, _t); pop(q0v, _t); pop(qv, _t);
+                        pop(Lv, _t); pop(g0v, _t); pop(m0v, _t); pop(mv, _t);
                         auto z = BWR<double>(mv, m0v, g0v, (int)Lv, qv, q0v, dv);
                         push(z.real(), z.imag());
                         break;
                     }
                     case MODEL_FLATTE: {  // [m, m0, g0..g_{n-1}, (ma,mb)0..]
                         int n_ch = (int)a1;
-                        double g[4], ch[8];
-                        for (int i = 2 * n_ch - 1; i >= 0; --i) pop(ch[i], sim[0]);
-                        for (int i = n_ch - 1; i >= 0; --i) pop(g[i], sim[0]);
+                        double g[4], ch[8], _t;
+                        for (int i = 2 * n_ch - 1; i >= 0; --i) pop(ch[i], _t);
+                        for (int i = n_ch - 1; i >= 0; --i) pop(g[i], _t);
                         double m0v, mv;
-                        pop(m0v, sim[0]); pop(mv, sim[0]);
+                        pop(m0v, _t); pop(mv, _t);
                         auto z = Flatte<double>(mv, m0v, n_ch, g, ch);
                         push(z.real(), z.imag());
                         break;
@@ -670,6 +673,7 @@ __device__ void evalCustomSeg(
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
+    double md1, double md2,
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,
@@ -679,13 +683,13 @@ __device__ void evalCustomAll(
     double out[2];
     // 值段
     int n_instr = (int)aux[seg_off];
-    evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+    evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
     Fr = out[0]; Fi = out[1];
     seg_off += 1 + 3 * n_instr;
     // 一阶段
     for (int j = 0; j < P; ++j) {
         n_instr = (int)aux[seg_off];
-        evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+        evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
         dFr[j] = out[0]; dFi[j] = out[1];
         seg_off += 1 + 3 * n_instr;
     }
@@ -693,7 +697,7 @@ __device__ void evalCustomAll(
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) {
             n_instr = (int)aux[seg_off];
-            evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+            evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
             d2Fr[j * P + k] = out[0]; d2Fi[j * P + k] = out[1];
             d2Fr[k * P + j] = out[0]; d2Fi[k * P + j] = out[1];
             seg_off += 1 + 3 * n_instr;

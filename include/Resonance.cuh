@@ -106,6 +106,8 @@ class Resonance
     int getP() const { return P_; }
     ResModelType getModelType() const { return modelType_; }
     const ResonanceModel& getModel() const { return *model_; }
+    // 模型选项（Hist: file/bins/range；BWR: L/d——addBlock 构建符号微分 aux 用）
+    const std::map<std::string, std::string>& getOptions() const { return options_; }
 
     void setConjugatePartner(const std::string& partnerName)
     {

@@ -564,6 +564,7 @@ __global__ void computeCustomHessianKernel(
                 if (is_target) {
                     if (!custom_eval) {
                         evalCustomAll(aux, aux_offset, mm, qq, q0, L, bf_d,
+                            md1_q0, md2_q0,
                             target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                         custom_eval = true;
                     }

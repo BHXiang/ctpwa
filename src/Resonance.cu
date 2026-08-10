@@ -19,12 +19,9 @@ class BWRModel : public ResonanceModel
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}, {"width", 0.0, false}, {"r", 3.0, true}};
     }
-    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
-        const std::vector<std::pair<double,double>>&) const override {
-        int L=1; auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
-        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
-        return buildModelAST(ResModelType::BWR,L,d,2,0,{});
-    }
+    // 符号微分 aux 在 addBlock 构建（需要 decay 结构的 q0 依赖信息）
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
+        const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
 class BWModel : public ResonanceModel
@@ -36,9 +33,7 @@ class BWModel : public ResonanceModel
         return {{"mass", 0.0, false}, {"width", 0.0, false}};
     }
     std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
-        const std::vector<std::pair<double,double>>&) const override {
-        return buildModelAST(ResModelType::BW,0,3.0,2,0,{});
-    }
+        const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
 class ONEModel : public ResonanceModel
@@ -49,12 +44,8 @@ class ONEModel : public ResonanceModel
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}};
     }
-    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
-        const std::vector<std::pair<double,double>>&) const override {
-        int L=2; auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
-        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
-        return buildModelAST(ResModelType::ONE,L,d,0,0,{});
-    }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
+        const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
 class FlatteModel : public ResonanceModel
@@ -66,14 +57,8 @@ class FlatteModel : public ResonanceModel
         return {{"mass", 0.0, false}};
     }
     std::string extraPrefix() const override { return "g"; }
-    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
-        const std::vector<std::pair<double,double>>& channels) const override {
-        int nch=(int)channels.size(), L=2;
-        auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
-        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
-        std::vector<double> cf; for(auto&ch:channels){cf.push_back(ch.first);cf.push_back(ch.second);}
-        return buildModelAST(ResModelType::Flatte,L,d,1+nch,nch,cf);
-    }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
+        const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
 // Hist：直方图形状模型。无固定参数（可选 mass 用于 q0 归一化）。

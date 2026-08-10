@@ -201,8 +201,27 @@ std::vector<double> buildModelAST(
     int L, double d,
     int P,                              // 自由参数数
     int n_channels,                     // Flatte: 道数; 其他: 0
-    const std::vector<double>& channel_masses)  // Flatte: [m_a0,m_b0, m_a1,m_b1, ...]
+    const std::vector<double>& channel_masses,  // Flatte: [m_a0,m_b0, m_a1,m_b1, ...]
+    Q0MassDep md1_dep, double md1_fixed,
+    Q0MassDep md2_dep, double md2_fixed)
 {
+    // q0 链辅助：把质量依赖描述转成 AST 节点
+    auto massNode = [&](Q0MassDep dep, double val, int cv) -> Node {
+        switch (dep) {
+            case Q0MassDep::FixedMass: return Node::makeNum(val);
+            case Q0MassDep::M0Param:   return Node::makeParam(0);
+            default:                   return Node::makeVar(cv);
+        }
+    };
+    // q0 = breakup(m0, md1, md2) 复合节点（导数规则见 modelDeriv MODEL_BREAKUP_Q0）
+    // m0: 目标共振态质量（BWR/BW/Flatte 是参数 0；ONE 无参数 → 1.0 回退）
+    Node m0_ast = (P > 0) ? Node::makeParam(0) : Node::makeNum(1.0);
+    Node q0_ast = Node::makeComposite(MODEL_BREAKUP_Q0, {
+        m0_ast,
+        massNode(md1_dep, md1_fixed, CVAR_MD1),
+        massNode(md2_dep, md2_fixed, CVAR_MD2)
+    });
+
     Node ast;
     switch (model_type) {
         case ResModelType::BW:
@@ -221,13 +240,13 @@ std::vector<double> buildModelAST(
                 Node::makeParam(1),       // g0
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
-                Node::makeVar(CVAR_Q0),
+                q0_ast,
                 Node::makeNum(d)
             });
             Node bf = Node::makeComposite(MODEL_BF, {
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
-                Node::makeVar(CVAR_Q0),
+                q0_ast,
                 Node::makeNum(d)
             });
             ast = Node::makeOp(NodeType::Mul, bwr, bf);
@@ -238,7 +257,7 @@ std::vector<double> buildModelAST(
             ast = Node::makeComposite(MODEL_BF, {
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
-                Node::makeVar(CVAR_Q0),
+                q0_ast,
                 Node::makeNum(d)
             });
             break;
@@ -259,7 +278,7 @@ std::vector<double> buildModelAST(
             Node bf = Node::makeComposite(MODEL_BF, {
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
-                Node::makeVar(CVAR_Q0),
+                q0_ast,
                 Node::makeNum(d)
             });
             ast = Node::makeOp(NodeType::Mul, flatte, bf);
