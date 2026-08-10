@@ -1959,15 +1959,18 @@ __global__ void computeCustomAmpsKernel(
     for (size_t i = 0; i < (size_t)num_offsets - 1; ++i)
         if (event_idx < event_offsets[i + 1]) { offset_idx = i; break; }
 
-    const DeviceResonance& target_res = B.d_res[0];
-    int P = target_res.param_count;
-    if (P < 1) P = 1;
-    if (P > 16) P = 16;   // 上限保护（实际 K-matrix 等 < 16）
-    const double* target_rp = B.d_all_params + target_res.param_offset;
+    int R = B.resonance_count;
+    if (R > 8) R = 8;
+    const double* all_params = B.d_all_params;
     const double* aux = B.d_all_channels;
-    int aux_offset = target_res.aux_offset;
 
-    double dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
+    // R>1 时使用 Nfree-based d_dF 布局；R==1 沿用旧 P-based 布局以保持完全兼容
+    int Nfree = 0;
+    if (R != 1) {
+        for (int r = 0; r < R; ++r) Nfree += B.res_dF_count[r];
+        if (Nfree < 1) Nfree = 1;
+        if (Nfree > 64) Nfree = 64;
+    }
 
     size_t slamp_row = (size_t)B.nSL * B.nPolar * B.nEvents;
     const int MAX_POL = 32;
@@ -1979,77 +1982,198 @@ __global__ void computeCustomAmpsKernel(
         double sg = (s == 0) ? 1.0 : B.d_sign_tab[s];
         const thrust::complex<double>* slam = B.d_slamp_tab + (size_t)s * slamp_row;
 
-        // 节点循环（标量）：非目标节点 × Bf；目标节点 = Custom 标量求值
-        double Or = 1.0, Oi = 0.0;   // 非目标节点因子积
-        double dlnO_dm0 = 0.0;       // Σ_i ∂lnBf_i/∂m0（经 q0 回退进入 O 的质量导数）
-        double Fr = 1.0, Fi = 0.0;   // 目标 Custom F
-        bool custom_eval = false;
-        for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
-            const DecayNode& node = B.d_decayNodes[nodeIdx];
-            const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
-            int L = sl.L;
+        // ================================================================
+        // R == 1: 与 P4a 单共振态逻辑逐字一致（保持兼容）
+        // ================================================================
+        if (R == 1) {
+            const DeviceResonance& target_res = B.d_res[0];
+            const double* target_rp = all_params + target_res.param_offset;
+            int P = target_res.param_count;
+            if (P < 1) P = 1;
+            if (P > 16) P = 16;
 
-            LorentzVector pM  = dm->getMomentum(event_idx, node.mother_idx);
-            LorentzVector pD1 = dm->getMomentum(event_idx, node.daug1_idx);
-            LorentzVector pD2 = dm->getMomentum(event_idx, node.daug2_idx);
-            double mm = pM.M();
-            double qq = breakup_momentum(mm, pD1.M(), pD2.M());
-            double md1 = pD1.M(), md2 = pD2.M();
-            bool is_target = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
-            // q0 质量回退（与 computeAmpsMergedKernel 一致）:
-            //   目标节点 → 参数 m0；固定质量 → node.mass；其它 → 1.0
-            double m0_q0 = is_target
-                ? ((target_res.param_count > 0) ? target_rp[0] : 1.0)
-                : ((node.mass[0] > 0) ? node.mass[0] : 1.0);
-            // 子粒子是目标共振态（无固定质量）→ 用其 m0 参数
-            // （与 computeAmpsMergedKernel 一致；否则回退到事件质量）
-            double md1_q0 = (node.mass[1] > 0) ? node.mass[1]
-                : ((node.daug1_idx == target_res.particle_idx && target_res.param_count > 0)
-                       ? target_rp[0] : md1);
-            double md2_q0 = (node.mass[2] > 0) ? node.mass[2]
-                : ((node.daug2_idx == target_res.particle_idx && target_res.param_count > 0)
-                       ? target_rp[0] : md2);
-            double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
+            double Or = 1.0, Oi = 0.0;
+            double dlnO_dm0 = 0.0;
+            double Fr = 1.0, Fi = 0.0;
+            double dFr[16], dFi[16], d2Fr[256], d2Fi[256];
+            bool custom_eval = false;
 
-            if (is_target) {
-                if (!custom_eval) {
-                    evalCustomAll(aux, aux_offset, mm, qq, q0, L, bf_d,
-                        md1_q0, md2_q0,
-                        target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
-                    custom_eval = true;
+            for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
+                const DecayNode& node = B.d_decayNodes[nodeIdx];
+                const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+                int L = sl.L;
+
+                LorentzVector pM  = dm->getMomentum(event_idx, node.mother_idx);
+                LorentzVector pD1 = dm->getMomentum(event_idx, node.daug1_idx);
+                LorentzVector pD2 = dm->getMomentum(event_idx, node.daug2_idx);
+                double mm = pM.M();
+                double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+                double md1 = pD1.M(), md2 = pD2.M();
+                bool is_target = (node.mother_idx == target_res.particle_idx && node.mass[0] <= 0);
+
+                double m0_q0 = is_target
+                    ? ((target_res.param_count > 0) ? target_rp[0] : 1.0)
+                    : ((node.mass[0] > 0) ? node.mass[0] : 1.0);
+                double md1_q0 = (node.mass[1] > 0) ? node.mass[1]
+                    : ((node.daug1_idx == target_res.particle_idx && target_res.param_count > 0)
+                           ? target_rp[0] : md1);
+                double md2_q0 = (node.mass[2] > 0) ? node.mass[2]
+                    : ((node.daug2_idx == target_res.particle_idx && target_res.param_count > 0)
+                           ? target_rp[0] : md2);
+                double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
+
+                if (is_target) {
+                    if (!custom_eval) {
+                        evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, bf_d,
+                            md1_q0, md2_q0,
+                            target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                        custom_eval = true;
+                    }
+                } else {
+                    double bf = Bf<double>(L, qq, q0, bf_d);
+                    Or *= bf; Oi *= bf;
+                    double dq0_dm = 0.0;
+                    if (md1_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+                    if (md2_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+                    dlnO_dm0 += dlnBf_dq0(L, q0, bf_d) * dq0_dm;
                 }
-            } else {
-                double bf = Bf<double>(L, qq, q0, bf_d);
-                Or *= bf; Oi *= bf;
-                // q0 回退到 target_rp[0]（m0 参数）→ 累积 d ln Bf / d m0
-                double dq0_dm = 0.0;
-                if (md1_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
-                if (md2_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
-                dlnO_dm0 += dlnBf_dq0(L, q0, bf_d) * dq0_dm;
             }
-        }
 
-        // F_total = O × F_custom; dF_total[j] = O × dF_custom[j] + (dO/dm0)·F_custom·δ_{j0}
-        // （O 经 q0 回退依赖质量参数 m0，宽度参数不进入 O）
-        double Ftr = Or * Fr - Oi * Fi, Fti = Or * Fi + Oi * Fr;
-        double dO_dm0 = Or * dlnO_dm0;
+            double Ftr = Or * Fr - Oi * Fi, Fti = Or * Fi + Oi * Fr;
+            double dO_dm0 = Or * dlnO_dm0;
 
-        if (B.d_dF_tab) {
-            int base = (event_idx * B.nSL + sl_idx) * P
-                     + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * P));
-            for (int j = 0; j < P; ++j) {
-                double dtr = Or * dFr[j] - Oi * dFi[j];
-                double dti = Or * dFi[j] + Oi * dFr[j];
-                if (j == 0) { dtr += dO_dm0 * Fr; dti += dO_dm0 * Fi; }
-                B.d_dF_tab[base + j] = ctMake(dtr, dti);
+            if (B.d_dF_tab) {
+                int base = (event_idx * B.nSL + sl_idx) * P
+                         + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * P));
+                for (int j = 0; j < P; ++j) {
+                    double dtr = Or * dFr[j] - Oi * dFi[j];
+                    double dti = Or * dFi[j] + Oi * dFr[j];
+                    if (j == 0) { dtr += dO_dm0 * Fr; dti += dO_dm0 * Fi; }
+                    B.d_dF_tab[base + j] = ctMake(dtr, dti);
+                }
             }
-        }
 
-        for (int k = 0; k < B.nPolar; ++k) {
-            size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
-            auto sl_amp = slam[idx];
-            R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
-            R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+            for (int k = 0; k < B.nPolar; ++k) {
+                size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+                auto sl_amp = slam[idx];
+                R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
+                R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+            }
+        } else {
+        // ================================================================
+        // R > 1: 多共振态通用路径 — log-derivative 累积
+        // F_total = Π_n F_n,  ∂F_total/∂θ_j = F_total × Σ ∂ln(contrib)/∂θ_j
+        // ================================================================
+            double Ftr = 1.0, Fti = 0.0;
+            double dln_re[64] = {0};
+            double dln_im[64] = {0};
+
+            for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
+                const DecayNode& node = B.d_decayNodes[nodeIdx];
+                const SL& sl = B.d_slComb[nodeIdx + sl_idx * B.decayChain_size];
+                int L = sl.L;
+
+                LorentzVector pM  = dm->getMomentum(event_idx, node.mother_idx);
+                LorentzVector pD1 = dm->getMomentum(event_idx, node.daug1_idx);
+                LorentzVector pD2 = dm->getMomentum(event_idx, node.daug2_idx);
+                double mm = pM.M();
+                double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+                double md1 = pD1.M(), md2 = pD2.M();
+
+                int match_r = -1;
+                for (int r = 0; r < R; ++r) {
+                    if (node.mother_idx == B.d_res[r].particle_idx && node.mass[0] <= 0) {
+                        match_r = r; break;
+                    }
+                }
+
+                double m0_q0;
+                if (match_r >= 0)
+                    m0_q0 = (B.d_res[match_r].param_count > 0)
+                        ? all_params[B.d_res[match_r].param_offset + 0] : 1.0;
+                else if (node.mass[0] > 0)
+                    m0_q0 = node.mass[0];
+                else
+                    m0_q0 = 1.0;
+
+                double md1_q0 = node.mass[1];
+                double md2_q0 = node.mass[2];
+                if (md1_q0 <= 0)
+                    for (int r = 0; r < R; ++r)
+                        if (node.daug1_idx == B.d_res[r].particle_idx && B.d_res[r].param_count > 0)
+                            { md1_q0 = all_params[B.d_res[r].param_offset + 0]; break; }
+                if (md1_q0 <= 0) md1_q0 = md1;
+                if (md2_q0 <= 0)
+                    for (int r = 0; r < R; ++r)
+                        if (node.daug2_idx == B.d_res[r].particle_idx && B.d_res[r].param_count > 0)
+                            { md2_q0 = all_params[B.d_res[r].param_offset + 0]; break; }
+                if (md2_q0 <= 0) md2_q0 = md2;
+                double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
+
+                if (match_r >= 0) {
+                    const DeviceResonance& res = B.d_res[match_r];
+                    const double* rp = all_params + res.param_offset;
+                    int P_r = res.param_count;
+                    if (P_r < 1) P_r = 1;
+                    if (P_r > 16) P_r = 16;
+
+                    double Fr, Fi, dFr[16], dFi[16], d2Fr_tmp[256], d2Fi_tmp[256];
+                    evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+                        md1_q0, md2_q0,
+                        rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp);
+
+                    double den = Fr * Fr + Fi * Fi;
+                    int off = B.res_dF_offset[match_r];
+                    int cnt = B.res_dF_count[match_r];
+                    for (int j_loc = 0; j_loc < cnt; ++j_loc) {
+                        int j_glob = off + j_loc;
+                        int p = B.d_param_map[j_glob];
+                        if (p < 0 || p >= P_r) continue;
+                        dln_re[j_glob] += (dFr[p] * Fr + dFi[p] * Fi) / den;
+                        dln_im[j_glob] += (dFi[p] * Fr - dFr[p] * Fi) / den;
+                    }
+
+                    double nr = Ftr * Fr - Fti * Fi;
+                    double ni = Ftr * Fi + Fti * Fr;
+                    Ftr = nr; Fti = ni;
+                } else {
+                    double bf = Bf<double>(L, qq, q0, bf_d);
+                    Ftr *= bf; Fti *= bf;
+
+                    for (int r = 0; r < R; ++r) {
+                        if (B.d_res[r].param_count <= 0) continue;
+                        double dq0_dm = 0.0;
+                        if (node.mass[1] <= 0 && node.daug1_idx == B.d_res[r].particle_idx)
+                            dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+                        if (node.mass[2] <= 0 && node.daug2_idx == B.d_res[r].particle_idx)
+                            dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+                        double dlnO = dlnBf_dq0(L, q0, bf_d) * dq0_dm;
+                        int off = B.res_dF_offset[r];
+                        int cnt = B.res_dF_count[r];
+                        for (int j_loc = 0; j_loc < cnt; ++j_loc) {
+                            int j_glob = off + j_loc;
+                            if (B.d_param_map[j_glob] == 0) dln_re[j_glob] += dlnO;
+                        }
+                    }
+                }
+            }
+
+            if (B.d_dF_tab) {
+                int base = (event_idx * B.nSL + sl_idx) * Nfree
+                         + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * Nfree));
+                for (int j = 0; j < Nfree; ++j) {
+                    double dtr = Ftr * dln_re[j] - Fti * dln_im[j];
+                    double dti = Ftr * dln_im[j] + Fti * dln_re[j];
+                    B.d_dF_tab[base + j] = ctMake(dtr, dti);
+                }
+            }
+
+            for (int k = 0; k < B.nPolar; ++k) {
+                size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
+                auto sl_amp = slam[idx];
+                R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
+                R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+            }
         }
     }
 
