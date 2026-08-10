@@ -2,24 +2,36 @@
 
 #include <pybind11/pybind11.h>
 
-#include "Amplitude.cu"
+#include <Amplitude.cuh>
 
+#include <DeviceManager.cuh>
+// DeviceManager.cu inline (no device code)
 #include "DeviceManager.cu"
 
-#include "ComputeHessian.cu"
+#include <ComputeHessian.cuh>
 
-#include "AmpGen.cu"
+#include <AmpGen.cuh>
 // #include "ComputeGrad.cu"
-#include "ComputeNLL.cu"
-#include "ComputeResults.cu"
-#include "ComputeBF.cu"
+#include <ComputeNLL.cuh>
+#include <ComputeResults.cuh>
+#include <ComputeBF.cuh>
+#include <Config.cuh>
+// Config inline (host-only, no device code)
 #include "Config.cu"
-#include "Figure.cu"
+#include <Figure.cuh>
+// Analysis inline (no header for analysis class)
 #include "Analysis.cu"
+#include <Info.cuh>
+// Info inline (host-only)
 #include "Info.cu"
-#include "Parameters.cu"
+#include <Parameters.cuh>
+#include <SymbolicDiff.cuh>  // Node/deriv for modelDeriv+buildModelAST
+#include <ResModel.cuh>
+// ResModel inline (templates in header, only host code left)
 #include "ResModel.cu"
-#include "CustomExpr.cu"
+#include <CustomExpr.cuh>
+#include <Resonance.cuh>
+// Resonance inline (host-only, no device code)
 #include "Resonance.cu"
 
 PYBIND11_MODULE(ctpwa, m)

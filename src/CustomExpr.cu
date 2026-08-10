@@ -1,4 +1,6 @@
 #include "CustomExpr.cuh"
+#include "SymbolicDiff.cuh"
+#include "ResModel.cuh"   // COP_MODEL: Bf/BW/BWR/Flatte/computeQ0AD（double 实例化）
 
 #include <cmath>
 #include <cstdio>
@@ -62,35 +64,6 @@ C cpow(const C& b, const C& e) {
 }
 
 // ============================================================================
-// AST
-// ============================================================================
-
-enum class NodeType { Num, Var, Param, Add, Sub, Mul, Div, Pow, Neg, Func };
-
-struct Node {
-    NodeType type;
-    double num = 0.0;          // Num
-    int var_id = 0;            // Var (CustomVarId)
-    int param_id = 0;          // Param
-    int func_id = 0;           // Func (CustomFuncId)
-    std::vector<Node> kids;
-
-    Node() : type(NodeType::Num) {}
-    static Node makeNum(double v) { Node n; n.type = NodeType::Num; n.num = v; return n; }
-    static Node makeVar(int id) { Node n; n.type = NodeType::Var; n.var_id = id; return n; }
-    static Node makeParam(int id) { Node n; n.type = NodeType::Param; n.param_id = id; return n; }
-    static Node makeOp(NodeType t, Node a, Node b) {
-        Node n; n.type = t; n.kids = {a, b}; return n;
-    }
-    static Node makeUnary(NodeType t, Node a) {
-        Node n; n.type = t; n.kids = {a}; return n;
-    }
-    static Node makeFunc(int fid, Node a) {
-        Node n; n.type = NodeType::Func; n.func_id = fid; n.kids = {a}; return n;
-    }
-};
-
-// ============================================================================
 // 求值（host 参考实现，测试用）
 // ============================================================================
 
@@ -131,137 +104,45 @@ C evalNode(const Node& n, double m, double q, double q0, int L, double d,
             }
             return {0, 0};
         }
+        case NodeType::Composite: {
+            // 黑盒模型求值（host 参考实现，与 COP_MODEL 指令一致）
+            auto ev = [&](const Node& k) { return evalNode(k, m, q, q0, L, d, params); };
+            switch (n.composite_id) {
+                case MODEL_BREAKUP_Q0: {  // [m0, m1, m2]
+                    double m0v = ev(n.kids[0]).re, m1v = ev(n.kids[1]).re, m2v = ev(n.kids[2]).re;
+                    return {computeQ0AD(m0v, m1v, m2v), 0.0};
+                }
+                case MODEL_BF: {  // [L, q, q0, d]
+                    double qv = ev(n.kids[1]).re, q0v = ev(n.kids[2]).re, dv = ev(n.kids[3]).re;
+                    return {Bf<double>((int)n.kids[0].num, qv, q0v, dv), 0.0};
+                }
+                case MODEL_BW: {  // [m, m0, g0]
+                    double mv = ev(n.kids[0]).re, m0v = ev(n.kids[1]).re, g0v = ev(n.kids[2]).re;
+                    auto z = BW<double>(mv, m0v, g0v);
+                    return {z.real(), z.imag()};
+                }
+                case MODEL_BWR: {  // [m, m0, g0, L, q, q0, d]
+                    double mv = ev(n.kids[0]).re, m0v = ev(n.kids[1]).re, g0v = ev(n.kids[2]).re;
+                    double qv = ev(n.kids[4]).re, q0v = ev(n.kids[5]).re, dv = ev(n.kids[6]).re;
+                    auto z = BWR<double>(mv, m0v, g0v, (int)n.kids[3].num, qv, q0v, dv);
+                    return {z.real(), z.imag()};
+                }
+                case MODEL_FLATTE: {  // [m, m0, g0..g_{n-1}, (ma,mb)0..]
+                    double mv = ev(n.kids[0]).re, m0v = ev(n.kids[1]).re;
+                    int n_ch = ((int)n.kids.size() - 2) / 3;
+                    double g[4], ch[8];
+                    for (int i = 0; i < n_ch; ++i) g[i] = ev(n.kids[2 + i]).re;
+                    for (int i = 0; i < 2 * n_ch; ++i) ch[i] = ev(n.kids[2 + n_ch + i]).re;
+                    auto z = Flatte<double>(mv, m0v, n_ch, g, ch);
+                    return {z.real(), z.imag()};
+                }
+                case MODEL_ONE:
+                    return {1.0, 0.0};
+            }
+            return {0, 0};
+        }
     }
     return {0, 0};
-}
-
-// ============================================================================
-// 符号微分（复数域链式法则）
-// 对任意树 T 求 ∂/∂θ_p: m/q/q0/L/d 视为常数, 参数 θ_k 的导数为 δ_kp
-// ============================================================================
-
-Node deriv(const Node& n, int p)
-{
-    switch (n.type) {
-        case NodeType::Num:
-        case NodeType::Var:
-            return Node::makeNum(0.0);
-        case NodeType::Param:
-            return Node::makeNum(n.param_id == p ? 1.0 : 0.0);
-        case NodeType::Add:
-            return Node::makeOp(NodeType::Add, deriv(n.kids[0], p), deriv(n.kids[1], p));
-        case NodeType::Sub:
-            return Node::makeOp(NodeType::Sub, deriv(n.kids[0], p), deriv(n.kids[1], p));
-        case NodeType::Mul:
-            return Node::makeOp(NodeType::Add,
-                Node::makeOp(NodeType::Mul, deriv(n.kids[0], p), n.kids[1]),
-                Node::makeOp(NodeType::Mul, n.kids[0], deriv(n.kids[1], p)));
-        case NodeType::Div:
-            // (a'b - ab')/b²
-            return Node::makeOp(NodeType::Div,
-                Node::makeOp(NodeType::Sub,
-                    Node::makeOp(NodeType::Mul, deriv(n.kids[0], p), n.kids[1]),
-                    Node::makeOp(NodeType::Mul, n.kids[0], deriv(n.kids[1], p))),
-                Node::makeOp(NodeType::Mul, n.kids[1], n.kids[1]));
-        case NodeType::Pow: {
-            // d(a^b) = a^b * (b'·log(a) + b·a'/a)
-            Node da = deriv(n.kids[0], p), db = deriv(n.kids[1], p);
-            Node loga = Node::makeFunc(CFUNC_LOG, n.kids[0]);
-            Node term = Node::makeOp(NodeType::Add,
-                Node::makeOp(NodeType::Mul, db, loga),
-                Node::makeOp(NodeType::Mul, n.kids[1],
-                    Node::makeOp(NodeType::Div, da, n.kids[0])));
-            return Node::makeOp(NodeType::Mul, n, term);
-        }
-        case NodeType::Neg:
-            return Node::makeUnary(NodeType::Neg, deriv(n.kids[0], p));
-        case NodeType::Func: {
-            Node a = n.kids[0], da = deriv(a, p);
-            switch (n.func_id) {
-                case CFUNC_EXP:
-                    return Node::makeOp(NodeType::Mul, n, da);
-                case CFUNC_LOG:
-                    return Node::makeOp(NodeType::Div, da, a);
-                case CFUNC_SIN:
-                    return Node::makeOp(NodeType::Mul,
-                        Node::makeFunc(CFUNC_COS, a), da);
-                case CFUNC_COS:
-                    return Node::makeUnary(NodeType::Neg,
-                        Node::makeOp(NodeType::Mul,
-                            Node::makeFunc(CFUNC_SIN, a), da));
-                case CFUNC_SQRT:
-                case CFUNC_CSQRT:
-                    return Node::makeOp(NodeType::Div, da,
-                        Node::makeOp(NodeType::Mul, Node::makeNum(2.0), n));
-                case CFUNC_ABS: {
-                    // d|z| = Re(conj(z)·dz)/|z|
-                    Node conjz = Node::makeFunc(CFUNC_CONJ, a);
-                    Node prod = Node::makeOp(NodeType::Mul, conjz, da);
-                    return Node::makeOp(NodeType::Div,
-                        Node::makeFunc(CFUNC_RE, prod), n);
-                }
-                case CFUNC_RE:
-                    return Node::makeFunc(CFUNC_RE, da);
-                case CFUNC_IM:
-                    return Node::makeFunc(CFUNC_IM, da);
-                case CFUNC_CONJ:
-                    return Node::makeFunc(CFUNC_CONJ, da);
-            }
-            return Node::makeNum(0.0);
-        }
-    }
-    return Node::makeNum(0.0);
-}
-
-// 化简: 0±x → x, x±0 → x, 0*x → 0, x*1 → x, 1*x → x, 0/x → 0, x/1 → x,
-//       x^1 → x, 1^x → 1, 0^x → 0, -( -x ) → x, 数值折叠
-bool isZero(const Node& n) { return n.type == NodeType::Num && n.num == 0.0; }
-bool isOne(const Node& n) { return n.type == NodeType::Num && n.num == 1.0; }
-bool isConst(const Node& n) { return n.type == NodeType::Num; }
-
-Node simplify(Node n)
-{
-    for (auto& k : n.kids) k = simplify(k);
-    switch (n.type) {
-        case NodeType::Add:
-            if (isZero(n.kids[0])) return n.kids[1];
-            if (isZero(n.kids[1])) return n.kids[0];
-            if (isConst(n.kids[0]) && isConst(n.kids[1]))
-                return Node::makeNum(n.kids[0].num + n.kids[1].num);
-            break;
-        case NodeType::Sub:
-            if (isZero(n.kids[1])) return n.kids[0];
-            if (isConst(n.kids[0]) && isConst(n.kids[1]))
-                return Node::makeNum(n.kids[0].num - n.kids[1].num);
-            break;
-        case NodeType::Mul:
-            if (isZero(n.kids[0]) || isZero(n.kids[1])) return Node::makeNum(0.0);
-            if (isOne(n.kids[0])) return n.kids[1];
-            if (isOne(n.kids[1])) return n.kids[0];
-            if (isConst(n.kids[0]) && isConst(n.kids[1]))
-                return Node::makeNum(n.kids[0].num * n.kids[1].num);
-            break;
-        case NodeType::Div:
-            if (isZero(n.kids[0])) return Node::makeNum(0.0);
-            if (isOne(n.kids[1])) return n.kids[0];
-            if (isConst(n.kids[0]) && isConst(n.kids[1]) && n.kids[1].num != 0.0)
-                return Node::makeNum(n.kids[0].num / n.kids[1].num);
-            break;
-        case NodeType::Pow:
-            if (isOne(n.kids[1])) return n.kids[0];
-            if (isOne(n.kids[0])) return Node::makeNum(1.0);
-            if (isZero(n.kids[0])) return Node::makeNum(0.0);
-            if (isConst(n.kids[0]) && isConst(n.kids[1]))
-                return Node::makeNum(std::pow(n.kids[0].num, n.kids[1].num));
-            break;
-        case NodeType::Neg:
-            if (n.kids[0].type == NodeType::Neg) return n.kids[0].kids[0];
-            if (isConst(n.kids[0])) return Node::makeNum(-n.kids[0].num);
-            if (isZero(n.kids[0])) return Node::makeNum(0.0);
-            break;
-        default: break;
-    }
-    return n;
 }
 
 // ============================================================================
@@ -455,8 +336,147 @@ class Parser {
     }
 };
 
+}  // namespace
+
 // ============================================================================
-// 字节码编译（AST → 指令段）
+// 符号微分（复数域链式法则，全局 API，见 SymbolicDiff.cuh）
+// 对任意树 T 求 ∂/∂θ_p: m/q/q0/L/d 视为常数, 参数 θ_k 的导数为 δ_kp
+// Composite 节点: dC/dθ = Σ_k (∂C/∂arg_k)·deriv(arg_k, p)，其中
+// ∂C/∂arg_k 由模型注册的导数规则产生（注册见下，Phase 2 填充）
+// ============================================================================
+
+Node deriv(const Node& n, int p)
+{
+    switch (n.type) {
+        case NodeType::Num:
+        case NodeType::Var:
+            return Node::makeNum(0.0);
+        case NodeType::Param:
+            return Node::makeNum(n.param_id == p ? 1.0 : 0.0);
+        case NodeType::Add:
+            return Node::makeOp(NodeType::Add, deriv(n.kids[0], p), deriv(n.kids[1], p));
+        case NodeType::Sub:
+            return Node::makeOp(NodeType::Sub, deriv(n.kids[0], p), deriv(n.kids[1], p));
+        case NodeType::Mul:
+            return Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Mul, deriv(n.kids[0], p), n.kids[1]),
+                Node::makeOp(NodeType::Mul, n.kids[0], deriv(n.kids[1], p)));
+        case NodeType::Div:
+            // (a'b - ab')/b²
+            return Node::makeOp(NodeType::Div,
+                Node::makeOp(NodeType::Sub,
+                    Node::makeOp(NodeType::Mul, deriv(n.kids[0], p), n.kids[1]),
+                    Node::makeOp(NodeType::Mul, n.kids[0], deriv(n.kids[1], p))),
+                Node::makeOp(NodeType::Mul, n.kids[1], n.kids[1]));
+        case NodeType::Pow: {
+            // d(a^b) = a^b * (b'·log(a) + b·a'/a)
+            Node da = deriv(n.kids[0], p), db = deriv(n.kids[1], p);
+            Node loga = Node::makeFunc(CFUNC_LOG, n.kids[0]);
+            Node term = Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Mul, db, loga),
+                Node::makeOp(NodeType::Mul, n.kids[1],
+                    Node::makeOp(NodeType::Div, da, n.kids[0])));
+            return Node::makeOp(NodeType::Mul, n, term);
+        }
+        case NodeType::Neg:
+            return Node::makeUnary(NodeType::Neg, deriv(n.kids[0], p));
+        case NodeType::Func: {
+            Node a = n.kids[0], da = deriv(a, p);
+            switch (n.func_id) {
+                case CFUNC_EXP:
+                    return Node::makeOp(NodeType::Mul, n, da);
+                case CFUNC_LOG:
+                    return Node::makeOp(NodeType::Div, da, a);
+                case CFUNC_SIN:
+                    return Node::makeOp(NodeType::Mul,
+                        Node::makeFunc(CFUNC_COS, a), da);
+                case CFUNC_COS:
+                    return Node::makeUnary(NodeType::Neg,
+                        Node::makeOp(NodeType::Mul,
+                            Node::makeFunc(CFUNC_SIN, a), da));
+                case CFUNC_SQRT:
+                case CFUNC_CSQRT:
+                    return Node::makeOp(NodeType::Div, da,
+                        Node::makeOp(NodeType::Mul, Node::makeNum(2.0), n));
+                case CFUNC_ABS: {
+                    // d|z| = Re(conj(z)·dz)/|z|
+                    Node conjz = Node::makeFunc(CFUNC_CONJ, a);
+                    Node prod = Node::makeOp(NodeType::Mul, conjz, da);
+                    return Node::makeOp(NodeType::Div,
+                        Node::makeFunc(CFUNC_RE, prod), n);
+                }
+                case CFUNC_RE:
+                    return Node::makeFunc(CFUNC_RE, da);
+                case CFUNC_IM:
+                    return Node::makeFunc(CFUNC_IM, da);
+                case CFUNC_CONJ:
+                    return Node::makeFunc(CFUNC_CONJ, da);
+            }
+            return Node::makeNum(0.0);
+        }
+        case NodeType::Composite:
+            // 模型注册表（src/ResModel.cu）: ∂C/∂θ_p = Σ_k (∂C/∂arg_k)·deriv(arg_k, p)
+            return modelDeriv(n.composite_id, n, p);
+    }
+    return Node::makeNum(0.0);
+}
+
+// 化简: 0±x → x, x±0 → x, 0*x → 0, x*1 → x, 1*x → x, 0/x → 0, x/1 → x,
+//       x^1 → x, 1^x → 1, 0^x → 0, -( -x ) → x, 数值折叠
+bool isZero(const Node& n) { return n.type == NodeType::Num && n.num == 0.0; }
+bool isOne(const Node& n) { return n.type == NodeType::Num && n.num == 1.0; }
+bool isConst(const Node& n) { return n.type == NodeType::Num; }
+
+Node simplify(Node n)
+{
+    for (auto& k : n.kids) k = simplify(k);
+    switch (n.type) {
+        case NodeType::Add:
+            if (isZero(n.kids[0])) return n.kids[1];
+            if (isZero(n.kids[1])) return n.kids[0];
+            if (isConst(n.kids[0]) && isConst(n.kids[1]))
+                return Node::makeNum(n.kids[0].num + n.kids[1].num);
+            break;
+        case NodeType::Sub:
+            if (isZero(n.kids[1])) return n.kids[0];
+            if (isConst(n.kids[0]) && isConst(n.kids[1]))
+                return Node::makeNum(n.kids[0].num - n.kids[1].num);
+            break;
+        case NodeType::Mul:
+            if (isZero(n.kids[0]) || isZero(n.kids[1])) return Node::makeNum(0.0);
+            if (isOne(n.kids[0])) return n.kids[1];
+            if (isOne(n.kids[1])) return n.kids[0];
+            if (isConst(n.kids[0]) && isConst(n.kids[1]))
+                return Node::makeNum(n.kids[0].num * n.kids[1].num);
+            break;
+        case NodeType::Div:
+            if (isZero(n.kids[0])) return Node::makeNum(0.0);
+            if (isOne(n.kids[1])) return n.kids[0];
+            if (isConst(n.kids[0]) && isConst(n.kids[1]) && n.kids[1].num != 0.0)
+                return Node::makeNum(n.kids[0].num / n.kids[1].num);
+            break;
+        case NodeType::Pow:
+            if (isOne(n.kids[1])) return n.kids[0];
+            if (isOne(n.kids[0])) return Node::makeNum(1.0);
+            if (isZero(n.kids[0])) return Node::makeNum(0.0);
+            if (isConst(n.kids[0]) && isConst(n.kids[1]))
+                return Node::makeNum(std::pow(n.kids[0].num, n.kids[1].num));
+            break;
+        case NodeType::Neg:
+            if (n.kids[0].type == NodeType::Neg) return n.kids[0].kids[0];
+            if (isConst(n.kids[0])) return Node::makeNum(-n.kids[0].num);
+            if (isZero(n.kids[0])) return Node::makeNum(0.0);
+            break;
+        case NodeType::Composite:
+            // 黑盒节点原样穿越（导数规则在 deriv 的 Composite case 展开）
+            break;
+        default: break;
+    }
+    return n;
+}
+
+// ============================================================================
+// 字节码编译（AST → 指令段，全局 API，见 SymbolicDiff.cuh）
 // ============================================================================
 
 void compileNode(const Node& n, std::vector<double>& seg)
@@ -478,10 +498,13 @@ void compileNode(const Node& n, std::vector<double>& seg)
             compileNode(n.kids[0], seg);
             emit(COP_CALL, n.func_id, 0);
             return;
+        case NodeType::Composite:
+            // 参数按注册表顺序入栈: 先编译 kids[0]（第一个参数先入）
+            for (const auto& k : n.kids) compileNode(k, seg);
+            emit(COP_MODEL, n.composite_id, 0);
+            return;
     }
 }
-
-}  // namespace
 
 // ============================================================================
 // 设备解释器
@@ -552,6 +575,56 @@ __device__ void evalCustomSeg(
                 break;
             }
             case COP_NEG: { double ar, ai; pop(ar, ai); push(-ar, -ai); break; }
+            case COP_MODEL: {
+                // 内置共振态黑盒求值。参数在栈上按注册表顺序
+                // （kids[0] 最先入栈），arg1 = Flatte 的道数（其他模型 0）
+                switch ((int)a0) {
+                    case MODEL_BREAKUP_Q0: {  // [m0, m1, m2]
+                        double m2v, m1v, m0v;
+                        pop(m2v, sim[0]); pop(m1v, sim[0]); pop(m0v, sim[0]);
+                        push(computeQ0AD(m0v, m1v, m2v), 0.0);
+                        break;
+                    }
+                    case MODEL_BF: {  // [L, q, q0, d]
+                        double dv, q0v, qv, Lv;
+                        pop(dv, sim[0]); pop(q0v, sim[0]); pop(qv, sim[0]); pop(Lv, sim[0]);
+                        push(Bf<double>((int)Lv, qv, q0v, dv), 0.0);
+                        break;
+                    }
+                    case MODEL_BW: {  // [m, m0, g0]
+                        double g0v, m0v, mv;
+                        pop(g0v, sim[0]); pop(m0v, sim[0]); pop(mv, sim[0]);
+                        auto z = BW<double>(mv, m0v, g0v);
+                        push(z.real(), z.imag());
+                        break;
+                    }
+                    case MODEL_BWR: {  // [m, m0, g0, L, q, q0, d]
+                        double dv, q0v, qv, Lv, g0v, m0v, mv;
+                        pop(dv, sim[0]); pop(q0v, sim[0]); pop(qv, sim[0]);
+                        pop(Lv, sim[0]); pop(g0v, sim[0]); pop(m0v, sim[0]); pop(mv, sim[0]);
+                        auto z = BWR<double>(mv, m0v, g0v, (int)Lv, qv, q0v, dv);
+                        push(z.real(), z.imag());
+                        break;
+                    }
+                    case MODEL_FLATTE: {  // [m, m0, g0..g_{n-1}, (ma,mb)0..]
+                        int n_ch = (int)a1;
+                        double g[4], ch[8];
+                        for (int i = 2 * n_ch - 1; i >= 0; --i) pop(ch[i], sim[0]);
+                        for (int i = n_ch - 1; i >= 0; --i) pop(g[i], sim[0]);
+                        double m0v, mv;
+                        pop(m0v, sim[0]); pop(mv, sim[0]);
+                        auto z = Flatte<double>(mv, m0v, n_ch, g, ch);
+                        push(z.real(), z.imag());
+                        break;
+                    }
+                    case MODEL_ONE:
+                        push(1.0, 0.0);
+                        break;
+                    default:
+                        push(0.0, 0.0);
+                }
+                break;
+            }
             case COP_CALL: {
                 double ar, ai;
                 pop(ar, ai);
@@ -594,6 +667,40 @@ __device__ void evalCustomSeg(
     else { out[0] = 0; out[1] = 0; }
 }
 
+__device__ void evalCustomAll(
+    const double* aux, int aux_offset,
+    double m, double q, double q0, int L, double d,
+    const double* params, int P,
+    double& Fr, double& Fi,
+    double* dFr, double* dFi,
+    double* d2Fr, double* d2Fi)
+{
+    int seg_off = aux_offset + 2;
+    double out[2];
+    // 值段
+    int n_instr = (int)aux[seg_off];
+    evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+    Fr = out[0]; Fi = out[1];
+    seg_off += 1 + 3 * n_instr;
+    // 一阶段
+    for (int j = 0; j < P; ++j) {
+        n_instr = (int)aux[seg_off];
+        evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+        dFr[j] = out[0]; dFi[j] = out[1];
+        seg_off += 1 + 3 * n_instr;
+    }
+    // 二阶段（段序 j≤k，对称填充）
+    for (int j = 0; j < P; ++j)
+        for (int k = j; k < P; ++k) {
+            n_instr = (int)aux[seg_off];
+            evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, params, out);
+            d2Fr[j * P + k] = out[0]; d2Fi[j * P + k] = out[1];
+            d2Fr[k * P + j] = out[0]; d2Fi[k * P + j] = out[1];
+            seg_off += 1 + 3 * n_instr;
+        }
+}
+
+
 // ============================================================================
 // host 编译入口
 // ============================================================================
@@ -602,8 +709,8 @@ std::vector<double> compileCustomExpr(
     const std::string& expr,
     const std::vector<std::string>& params)
 {
-    if (params.size() > 3)
-        throw std::runtime_error("CustomExpr: at most 3 free params supported");
+    if (params.size() > 16)
+        throw std::runtime_error("CustomExpr: at most 16 free params supported");
 
     std::map<std::string, int> param_map;
     for (size_t i = 0; i < params.size(); ++i) param_map[params[i]] = (int)i;

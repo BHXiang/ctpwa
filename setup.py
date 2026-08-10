@@ -2,7 +2,6 @@
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
-import shutil
 import subprocess
 
 # 获取环境变量中的路径
@@ -13,19 +12,8 @@ project_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 class ForceBuildExtension(BuildExtension):
-    """强制全量重编（build_ext 子类）。
-
-    main.cu #include 全部 .cu 的单文件架构下，增量编译不可靠：
-    setuptools（use_ninja=False）不跟踪 include 依赖，改 .cu 不触发重编；
-    ninja 在编辑与 install 同秒（mtime 精度 1s）时判定依赖未变而跳过。
-    两者都会链接新旧混合的 .so（实测 Hessian 慢 27×）。
-    清 build_temp 保证每次全量重编，产物一致（单文件架构下本来每次
-    都重编整个 main.cu，无额外成本）。
-    """
+    """多文件编译构建扩展（不再每次清 build_temp，ninja 跟踪依赖）。"""
     def run(self):
-        bt = self.build_temp
-        if bt and os.path.isdir(bt):
-            shutil.rmtree(bt, ignore_errors=True)
         super().run()
 
 
@@ -133,6 +121,15 @@ extension = CUDAExtension(
     name="ctpwa",
     sources=[
         "src/main.cu",
+        "src/Amplitude.cu",
+        "src/ComputeHessian.cu",
+        "src/AmpGen.cu",
+        "src/ComputeNLL.cu",
+        "src/ComputeResults.cu",
+        "src/ComputeBF.cu",
+        "src/Figure.cu",
+        "src/Parameters.cu",
+        "src/CustomExpr.cu",
     ],
     include_dirs=[
         os.path.join(project_dir, "include"),
@@ -170,6 +167,7 @@ extension = CUDAExtension(
             # 本机开发不设置时 torch 自动检测 GPU；CI 构建 wheel 时显式设置
             # 多架构列表（无 GPU 的 runner 上 torch 检测不到架构会 IndexError）。
             #"-arch=sm_120",
+            "-rdc=true",
             "--expt-relaxed-constexpr",
             # "--use_fast_math",
             # "-Xcompiler",
@@ -184,6 +182,9 @@ extension = CUDAExtension(
             # 如果遇到内存对齐问题，可以添加
             # '--ptxas-options=-v',
             # '--maxrregcount=32',
+        ],
+        "nvcc_dlink": [
+            "-dlink",
         ],
     },
     extra_link_args=[

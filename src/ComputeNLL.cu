@@ -1,3 +1,4 @@
+#include <ComputeNLL.cuh>
 #include <complex>
 #include "ComplexType.h"
 #include <cublas_v2.h>

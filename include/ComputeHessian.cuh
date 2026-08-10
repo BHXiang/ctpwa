@@ -3,6 +3,7 @@
 
 #include "ComplexType.h"
 #include <cuda_runtime.h>
+#include <AmpGen.cuh>
 
 // 计算data/bkg事件的Hessian贡献（含权重）
 // d_amp: nEvents×n_polar×n_amplitudes (行主序)
@@ -59,4 +60,85 @@ void reduceHessianWithConstraints(
 // H: [2*nv × 2*nv], stride = n2 (for full matrix: n2 = total, for vv-only: n2 = 2*nv)
 void reorderVVBlockInterleavedToGrouped(
     double* H, int nv, int stride);
+
+// ============================================================================
+// Device kernel declarations（rdc 多 TU 链接需要）
+// ============================================================================
+
+__global__ void computeSfromAmpsKernel(
+    double* d_S_re, double* d_S_im, double* d_I,
+    const ctComplex* d_amp, const ctComplex* d_v,
+    int nEvents, int nPolar, int n_amp,
+    double* d_phsp_t3_re, double* d_phsp_t3_im);
+
+__global__ void computeCustomHessianKernel(
+    const thrust::complex<double>* d_slamp_tab,
+    const ctComplex* d_v,
+    const DeviceMomenta* d_momenta,
+    const DecayNode* d_decayNodes, int decayChain_size,
+    const SL* d_slComb,
+    const DeviceResonance* d_resonances,
+    const double* d_all_params,
+    const double* d_all_channels,
+    const int* d_global_idx,
+    double* d_hess, int hess_ld,
+    int nEvents, int nSL, int nPolar, double bf_d, double default_weight,
+    const double* d_event_weights,
+    const double* d_S_re_full, const double* d_S_im_full,
+    double* d_g_out,
+    double* d_dS_re_out, double* d_dS_im_out,
+    double* d_dF_re_out, double* d_dF_im_out,
+    double* d_phsp_I, double* d_phsp_grad, double* d_phsp_hessA,
+    int evt_offset,
+    int nSigma,
+    const DeviceMomenta* d_mom_tab,
+    const double* d_sign_tab);
+
+__global__ void hessianCrossBlockKernel(
+    const double* d_g_A, const double* d_dS_re_A, const double* d_dS_im_A,
+    const double* d_g_B,
+    const double* d_dS_re_B, const double* d_dS_im_B,
+    const double* d_I,
+    const int* d_global_idx_A, const int* d_global_idx_B,
+    int NTA, int NTB, int nEvents, int nPolar,
+    double* d_hess, int hess_ld,
+    double default_weight, const double* d_event_weights,
+    double* d_phsp_hessA,
+    int phsp_ld);
+
+__global__ void hessianMixedBlockKernel(
+    const double* d_S_re, const double* d_S_im,
+    const double* d_I,
+    const ctComplex* d_amp,
+    const thrust::complex<double>* d_slamp_tab,
+    const double* d_g, const double* d_dS_re, const double* d_dS_im,
+    const double* d_dF_re, const double* d_dF_im,
+    const int* d_global_idx,
+    double* d_mixed, int mixed_ld,
+    int nEvents, int nSL, int Npr, int nPolar, int n_amp_total, int site,
+    int nTotal_slamp,
+    double default_weight, const double* d_event_weights,
+    double* d_phsp_sum,
+    int evt_offset,
+    int nSigma, const double* d_sign_tab);
+
+__global__ void hessianCrossMixedKernel(
+    const double* d_S_re, const double* d_S_im,
+    const double* d_I,
+    const ctComplex* d_amp,
+    const double* d_g_B, const double* d_dS_re_B, const double* d_dS_im_B,
+    const int* d_gidx_B, int NTb,
+    int nSL_A, int site_A,
+    int nEvents, int nPolar, int n_amp_total,
+    double* d_mixed, int mixed_ld,
+    double default_weight, const double* d_event_weights,
+    double* d_phsp_sum,
+    int evt_offset);
+
+__global__ void negateWeightsKernel(double* out, const double* in, int n);
+
+__global__ void scalePhspAmpsKernel(
+    ctComplex* d_amp, const double* d_weights,
+    int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset);
+
 #endif

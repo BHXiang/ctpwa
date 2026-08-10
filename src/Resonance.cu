@@ -1,5 +1,6 @@
 #include <Resonance.cuh>
 #include <CustomExpr.cuh>
+#include <SymbolicDiff.cuh>  // buildModelAST
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -18,6 +19,12 @@ class BWRModel : public ResonanceModel
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}, {"width", 0.0, false}, {"r", 3.0, true}};
     }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
+        const std::vector<std::pair<double,double>>&) const override {
+        int L=1; auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
+        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
+        return buildModelAST(ResModelType::BWR,L,d,2,0,{});
+    }
 };
 
 class BWModel : public ResonanceModel
@@ -27,6 +34,10 @@ class BWModel : public ResonanceModel
     ResModelType type() const override { return ResModelType::BW; }
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}, {"width", 0.0, false}};
+    }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
+        const std::vector<std::pair<double,double>>&) const override {
+        return buildModelAST(ResModelType::BW,0,3.0,2,0,{});
     }
 };
 
@@ -38,6 +49,12 @@ class ONEModel : public ResonanceModel
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}};
     }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
+        const std::vector<std::pair<double,double>>&) const override {
+        int L=2; auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
+        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
+        return buildModelAST(ResModelType::ONE,L,d,0,0,{});
+    }
 };
 
 class FlatteModel : public ResonanceModel
@@ -48,7 +65,15 @@ class FlatteModel : public ResonanceModel
     std::vector<ParamSpec> paramSpecs() const override {
         return {{"mass", 0.0, false}};
     }
-    std::string extraPrefix() const override { return "g"; }  // g1, g2, ...
+    std::string extraPrefix() const override { return "g"; }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
+        const std::vector<std::pair<double,double>>& channels) const override {
+        int nch=(int)channels.size(), L=2;
+        auto it=opts.find("L"); if(it!=opts.end()) L=std::stoi(it->second);
+        double d=3.0; it=opts.find("d"); if(it!=opts.end()) d=std::stod(it->second);
+        std::vector<double> cf; for(auto&ch:channels){cf.push_back(ch.first);cf.push_back(ch.second);}
+        return buildModelAST(ResModelType::Flatte,L,d,1+nch,nch,cf);
+    }
 };
 
 // Hist：直方图形状模型。无固定参数（可选 mass 用于 q0 归一化）。
@@ -62,7 +87,8 @@ class HistModel : public ResonanceModel
         return {{"mass", 1.0, true}};   // 可选质量（用于 q0 归一化）
     }
     std::vector<double> buildAuxData(
-        const std::map<std::string, std::string>& options) const override
+        const std::map<std::string, std::string>& options,
+        const std::vector<std::pair<double, double>>&) const override
     {
         auto opt = [&](const std::string& k) -> std::string {
             auto it = options.find(k);
@@ -152,14 +178,15 @@ class CustomModel : public ResonanceModel
     }
 
     std::vector<double> buildAuxData(
-        const std::map<std::string, std::string>& options) const override
+        const std::map<std::string, std::string>& options,
+        const std::vector<std::pair<double, double>>&) const override
     {
         auto expr_it = options.find("expr");
         if (expr_it == options.end())
             throw std::runtime_error("Custom model requires expr option");
         auto names = paramNamesFromOptions(options);
-        if (names.size() > 3)
-            throw std::runtime_error("Custom model supports at most 3 free params");
+        if (names.size() > 16)
+            throw std::runtime_error("Custom model supports at most 16 free params");
         return compileCustomExpr(expr_it->second, names);
     }
 };
@@ -254,7 +281,7 @@ Resonance::Resonance(const std::string& name, const std::string& tag, int J,
     modelType_ = model_->type();
     setParamsFromModel(params);
     // 模型专属辅助数据（Hist 形状表；非 aux 模型为空）
-    aux_data_ = model_->buildAuxData(options_);
+    aux_data_ = model_->buildAuxData(options_, channels_);
 }
 
 ResModelType Resonance::modelTypeFromString(const std::string& modelStr)

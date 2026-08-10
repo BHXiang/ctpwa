@@ -47,6 +47,6 @@ struct LorentzVector {
 
 __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
                         int dim_j1, LorentzVector p2, int dim_j2, int dim_j,
-                        float dS, int dL, thrust::complex<double> *shared_buf);
+                        int dim_S, int dL, thrust::complex<double> *shared_buf);
 
 #endif // AMPLITUDE_CUH

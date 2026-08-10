@@ -1,4 +1,5 @@
 #include "Config.cuh"
+#include <complex>
 #include <algorithm>
 #include <fstream>
 #include <iostream>

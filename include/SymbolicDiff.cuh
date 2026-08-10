@@ -1,0 +1,127 @@
+#ifndef SYMBOLIC_DIFF_CUH
+#define SYMBOLIC_DIFF_CUH
+
+#include "CustomExpr.cuh"   // CustomVarId / CustomFuncId / CustomOp 枚举
+
+// ============================================================================
+// 符号微分引擎（host-only）
+//
+// 通用符号微分基础设施: AST → 复数域符号导数 → 代数化简 → 字节码段。
+// 由 Custom DSL（src/CustomExpr.cu）与内置共振态模型（src/ResModel.cu /
+// src/Resonance.cu 的 buildModelAST）共享。
+//
+// 所有函数均为 host 端（config 加载时一次性执行），不进入 GPU 编译路径。
+// 语义约定（与 AutoDiff 一致）:
+//   - m/q/q0/L/d（运动学变量, NodeType::Var）视为常数, 导数 0
+//   - 参数 θ_k（NodeType::Param）导数为 δ_kp（参数始终 push 为纯实数）
+//   - 复数域普通链式法则（非 Wirtinger）
+//
+// 布局约定（aux[]，与 CustomExpr.cuh 中 evalCustomAll 匹配）:
+//   aux[0] = P                     # 自由参数数
+//   aux[1] = n_seg = 1 + P + P(P+1)/2
+//   aux[2..] = 每段 [n_instr, (op,arg0,arg1)×n_instr]  (每段 3 doubles)
+//   段 0 = 值 F; 段 1..P = ∂F/∂θ_j; 段 P+1.. = ∂²F/∂θ_j∂θ_k (j≤k)
+// ============================================================================
+
+#include <vector>
+
+// ============================================================================
+// 表达式 AST
+// ============================================================================
+
+enum class NodeType {
+    Num, Var, Param, Add, Sub, Mul, Div, Pow, Neg, Func,
+    Composite,  // 黑盒复合节点（Bf/BWR/BW/Flatte/breakup q0/ONE）
+                // 前向求值 + 导数规则预注册，不展开为基础运算树
+};
+
+// 复合节点 id（模型注册表，见 src/ResModel.cu buildModelAST）
+enum CompositeId : int {
+    MODEL_BREAKUP_Q0 = 0,  // q0 = breakup(m0, md1, md2)
+    MODEL_BF = 1,          // Bf(L, q, q0, d) —— L 为固定常量参数
+    MODEL_BW = 2,          // BW(m, m0, w0) = 1/(m0²-m² - i·m0·w0)
+    MODEL_BWR = 3,         // BWR(m, m0, g0, L, q, q0, d)（含内部 Bf² 链）
+    MODEL_FLATTE = 4,      // Flatte(m, m0, [g_i, (ma,mb)_i]...)
+    MODEL_ONE = 5,         // 1 + 0i
+};
+
+// AST 节点（host-only；派生规则与编译都在 host 端执行）
+struct Node {
+    NodeType type;
+    double num = 0.0;          // Num
+    int var_id = 0;            // Var（CustomVarId，见 CustomExpr.cuh）
+    int param_id = 0;          // Param
+    int func_id = 0;           // Func（CustomFuncId，见 CustomExpr.cuh）
+    int composite_id = 0;      // Composite（CompositeId）
+    std::vector<Node> kids;
+
+    Node() : type(NodeType::Num) {}
+    static Node makeNum(double v) { Node n; n.type = NodeType::Num; n.num = v; return n; }
+    static Node makeVar(int id) { Node n; n.type = NodeType::Var; n.var_id = id; return n; }
+    static Node makeParam(int id) { Node n; n.type = NodeType::Param; n.param_id = id; return n; }
+    static Node makeOp(NodeType t, Node a, Node b) {
+        Node n; n.type = t; n.kids = {a, b}; return n;
+    }
+    static Node makeUnary(NodeType t, Node a) {
+        Node n; n.type = t; n.kids = {a}; return n;
+    }
+    static Node makeFunc(int fid, Node a) {
+        Node n; n.type = NodeType::Func; n.func_id = fid; n.kids = {a}; return n;
+    }
+    static Node makeComposite(int cid, std::vector<Node> args) {
+        Node n; n.type = NodeType::Composite; n.composite_id = cid;
+        n.kids = std::move(args); return n;
+    }
+};
+
+// ============================================================================
+// AST 构建便捷别名（host）
+// ============================================================================
+
+inline Node astNum(double v) { return Node::makeNum(v); }
+inline Node astAdd(Node a, Node b) { return Node::makeOp(NodeType::Add, std::move(a), std::move(b)); }
+inline Node astSub(Node a, Node b) { return Node::makeOp(NodeType::Sub, std::move(a), std::move(b)); }
+inline Node astMul(Node a, Node b) { return Node::makeOp(NodeType::Mul, std::move(a), std::move(b)); }
+inline Node astDiv(Node a, Node b) { return Node::makeOp(NodeType::Div, std::move(a), std::move(b)); }
+inline Node astNeg(Node a) { return Node::makeUnary(NodeType::Neg, std::move(a)); }
+inline Node astSq(Node a) { return Node::makeOp(NodeType::Mul, a, a); }  // a²
+inline Node astI() { return Node::makeFunc(CFUNC_CSQRT, Node::makeNum(-1.0)); }  // 1j
+
+// ============================================================================
+// 编译流水线（host）
+// ============================================================================
+
+// 符号微分: ∂n/∂θ_p。Composite 节点按注册表规则展开（见 src/CustomExpr.cu）
+Node deriv(const Node& n, int p);
+
+// 代数化简: 0±x→x, x*1→x, x^1→x, 数值折叠, Neg 折叠；Composite 原样穿越
+Node simplify(Node n);
+
+// AST → 字节码段（每指令 3 doubles: op, arg0, arg1；op 见 CustomOp/CustomExpr.cuh）
+void compileNode(const Node& n, std::vector<double>& seg);
+
+// ============================================================================
+// 模型注册表（实现 src/ResModel.cu）
+// ============================================================================
+
+// 复合节点 ∂n/∂θ_p 的符号导数。n.type 必须为 NodeType::Composite。
+// 模型导数规则以 AST 模板表达（∂C/∂arg_k 展开为代数式/嵌套 Composite），
+// 链式法则所需的其他复合节点导数通过 deriv() 递归。
+Node modelDeriv(int composite_id, const Node& n, int p);
+
+// ============================================================================
+// 内置模型符号微分（host，替代 computeNodeFactor<Var>）
+// ============================================================================
+
+#include <Resonance.cuh>  // ResModelType
+
+// 程序化构建模型 AST → deriv → simplify → compileNode → aux[]
+// 返回标准 aux 布局 [P, n_seg, 段...]（与 compileCustomExpr/evalCustomAll 一致）
+// P: 自由参数数; L/d: 块级势垒参数; channels: Flatte 道质量列表
+std::vector<double> buildModelAST(
+    ResModelType model_type,
+    int L, double d,
+    int P, int n_channels,
+    const std::vector<double>& channel_masses);
+
+#endif // SYMBOLIC_DIFF_CUH
