@@ -216,6 +216,8 @@ struct ADBlockDesc {
     const DeviceMomenta* d_mom_tab;  // [nSigma] DeviceMomenta 数组（σ 拓扑的重建动量）
     const double* d_sign_tab;    // [nSigma]（sign[0]=+1）
     int resonance_count;
+    int res_dF_offset[8];        // per-resonance: base offset in d_dF_tab local free index
+    int res_dF_count[8];         // per-resonance: number of free params (0 if fixed)
     int decayChain_size;
     int nEvents;                 // 本 GPU 上该 block 的事件数
     int nSL;                     // 本 block 的 SL 组合数
@@ -238,6 +240,8 @@ public:
         std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
         std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（AD kernel 输出）
         int resonance_count;
+        std::vector<int> res_dF_offset_;               // per-resonance: d_dF_tab local free index offset
+        std::vector<int> res_dF_count_;                // per-resonance: number of free params
         int site;                                     // gls_index，对应 d_all_amplitudes 的列偏移
         int nFree = 0;                                // 该块自由参数数（conjugate 块=owner 的）
         std::vector<int> free_global_idx;             // d_dF[j] → slots_[j] 全局索引（host）

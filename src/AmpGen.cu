@@ -2342,6 +2342,24 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             blocks_.back().nFree++;
         }
     }
+
+    // 计算 per-resonance d_dF offset/count（符号微分 kernel 用）
+    int R = static_cast<int>(resonances.size());
+    auto& off = blocks_.back().res_dF_offset_;
+    auto& cnt = blocks_.back().res_dF_count_;
+    off.assign(R, 0);
+    cnt.assign(R, 0);
+    for (int s = 0; s < (int)slots_.size(); ++s) {
+        if (slots_[s].block_idx == block_idx) {
+            int r = slots_[s].res_idx;
+            if (r >= 0 && r < R) cnt[r]++;
+        }
+    }
+    int cur = 0;
+    for (int r = 0; r < R; ++r) {
+        off[r] = cur;
+        cur += cnt[r];
+    }
 }
 
 void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
@@ -2643,6 +2661,10 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 d.d_mom_tab = cas->getMomentaTab()[gpu];
                 d.d_sign_tab = cas->getSignsTab()[gpu];
                 d.resonance_count = block.resonance_count;
+                for (int r = 0; r < block.resonance_count && r < 8; ++r) {
+                    d.res_dF_offset[r] = block.res_dF_offset_[r];
+                    d.res_dF_count[r] = block.res_dF_count_[r];
+                }
                 d.decayChain_size = cas->getDecayChainSize();
                 d.nEvents = static_cast<int>(cas->getNEventsVec()[gpu]);
                 d.nSL = static_cast<int>(cas->getNSLCombs());
