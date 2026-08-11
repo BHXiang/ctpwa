@@ -1,18 +1,16 @@
 # ============================================================
-# ctpwa config.yml — compact format
+# ctpwa config.yml — 示例配置（展示所有功能）
 # ============================================================
-# 衰变链支持两种写法：
+# 衰变链支持两种等价写法：
 #   紧凑格式（推荐）:
 #     chain_name:
 #       mother:
-#         - [daughter1, intermediate]      # 含中间态
-#         - [daughter2, intermediate]
-#       intermediate: [d1, d2]             # 中间态衰变
-#
-#       intermediates:                     # 中间态共振态配置
+#         - [daughter1, intermediate]
+#       intermediate: [d1, d2]
+#       intermediates:
 #         intermediate:
 #           - [J: 1, P: -1]: [res1, res2]
-#   展开格式 (等价):
+#   展开格式:
 #     chain_name:
 #       decay:
 #         - mother: [daughter1, intermediate]
@@ -20,114 +18,153 @@
 #       intermediate:
 #         - [J: 1, P: -1]: [res1, res2]
 #
-# 约束:
-#   trans: 跨链全同约束。[chain_substr_A, chain_substr_B]: ratio
-#   identical: 全同粒子组，自动施加 (-1)^{L+S} 选择定则
-#   maxL: 全局轨道角动量上限
+# 可用模型: BWR | BW | Flatte | GS | ONE | Interp | Custom
 # ============================================================
 
+# ---- 粒子定义 ----
 Particles:
-  Jpsi:
-    J: 1; P: -1; mass: 3.0969
-    # polarization: [1, -1]  # 横极化 (仅 m=±1)
-    tex: ['J/\\psi']
-  eta:
-    J: 0; P: -1; mass: 0.5478
-    tex: ['\\eta']
-  Kp:
-    J: 0; P: -1; mass: 0.4937
-    tex: ['K^{+}']
-  Km:
-    J: 0; P: -1; mass: 0.4937
-    tex: ['K^{-}']
+  Jpsi:       {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  eta:        {J: 0, P: -1, mass: 0.5478, tex: ['\\eta']}
+  Kp:         {J: 0, P: -1, mass: 0.4937, tex: ['K^{+}']}
+  Km:         {J: 0, P: -1, mass: 0.4937, tex: ['K^{-}']}
+  pi0:        {J: 0, P: -1, mass: 0.1350, tex: ['\\pi^{0}']}
+  pip:        {J: 0, P: -1, mass: 0.1396, tex: ['\\pi^{+}']}
+  pim:        {J: 0, P: -1, mass: 0.1396, tex: ['\\pi^{-}']}
 
+# ---- 数据源 ----
 Data:
   order: [Kp, Km, eta]
   data:  [dat, "./data.dat"]
   phsp:  [dat, "./phsp.dat"]
   # bkg:   [dat, "./bkg.dat"]
-  # bkg_weights: [dat, "./bkg_weights.dat"]
 
-  # 使用root文件 （TBranch名字与order中粒子名字顺序一致）
-  # data: [ROOT, "/file.root", TTree, TBranch1, TBranch2, TBranch3, ...]
-  # phsp: [ROOT, "/file.root", TTree, TBranch1, TBranch2, TBranch3, ...]
-  # bkg:  [ROOT, "/file.root", TTree, TBranch1, TBranch2, TBranch3, ...]
-  # bkg_weights: [ROOT, "/file.root", TTree, TBranch1(weight)]
-  # 也可混合使用
+  # ROOT 文件格式 (TBranch 名与 order 中粒子名顺序一致):
+  # data: [ROOT, "/path/file.root", TTree, Kp, Km, eta]
+  # phsp: [ROOT, "/path/file.root", TTree, Kp, Km, eta]
 
-# ============================================================
-# 衰变链: J/psi → eta KK / Kp Keta / Km Keta
-# BFS 自动展开所有中间态 J^P 组合 × 共振态组合
-# ============================================================
+# ---- 衰变链 ----
 DecayChains:
+  # 链 1: J/ψ → η KK / K⁺ Kη / K⁻ Kη (三体衰变)
   decay1:
-    Jpsi: 
-      - [eta, R_KK] # [eta, R_KK, {if some requirement, like p_break: true}]
-      - [Kp, R_Kpeta]
-      - [Km, R_Kmeta]
-    R_KK: [Kp, Km]
-    R_Kpeta: 
-      - [Kp, eta] # R_Keta_0      
-      - [Km, eta] # R_Keta_1
+    Jpsi:
+      - [eta, R_KK]
+      - [Kp, R_Keta]
+      - [Km, R_Keta]
+    R_KK:    [Kp, Km]
+    R_Keta:
+      - [Km, eta]          # R_Keta_0
+      - [Kp, eta]          # R_Keta_1
 
     intermediates:
       R_KK:
-        - [J: 1, P: -1]: [phi1020, omega1420]
-        - [J: 3, P: -1]: [omega3_1670]
+        - [J: 1, P: -1]: [phi1020, rho1700]
+        - [J: 0, P: +1]: [f0_980]
       R_Keta:
         - [J: 1, P: -1]: [K1_1410]
-        - [J: 2, P: +1]: [K2_1430]
-    legends:
-      - ['R_KK', ' \\to ', 'eta']         # chain 0: R_KK 的第0个共振态
-      - ['R_Keta_0', ' \\to ', 'Kp']       # chain 1
-      - ['R_Keta_1', ' \\to ', 'Km']       # chain 2
 
+    legends:
+      - ['R_KK',     ' → ', 'eta']
+      - ['R_Keta_0', ' → ', 'Kp']
+      - ['R_Keta_1', ' → ', 'Km']
+
+  # 链 2: J/ψ → η f0, f0 → π⁺π⁻ (GS 模型演示)
+  chain2:
+    Jpsi: [[eta, R_pipi]]
+    R_pipi: [pip, pim]
+    intermediates:
+      R_pipi:
+        - [J: 1, P: -1]: [rho_770]
+    legends: [['R_pipi', ' → ', 'eta']]
+
+# ---- 约束 ----
 Constraints:
-  # R_Keta_0 和 R_Keta_1 通过 trans 约束共享参数（互为相反数）
   trans:
-    - [R_Keta_0, R_Keta_1]: -1
-  # 全局参数
-  # maxL: 4
-  bf_d: 3.0
+    - [R_Keta_0, R_Keta_1]: -1   # Kη 两个道共享参数，互为相反数
+  # identical:                     # 全同粒子组（自动 Bose/Fermi 对称化）
+  #   - [pi0, pi0]: true
+  # maxL: 4                        # 全局轨道角动量上限
+  bf_d: 3.0                        # 势垒半径 (GeV⁻¹)
 
 # ============================================================
-# 共振态配置
-# model: BWR (Breit-Wigner), Flatte, ONE (常数), BWR_Bf (含势垒)
-# free: 自由参数下标，-1 表示全部自由
-# free_range: 自由参数拟合范围
+# 共振态 — 每种模型一个示例
 # ============================================================
 Resonances:
-  # ---- R_KK 共振态 ----
+  # ---------- BWR (相对论 BW, 默认模型) ----------
   phi1020:
     J: 1; P: -1; model: BWR
-    parameters: [1.0195, 0.0045]
+    parameters: [1.0195, 0.0045]          # [mass, width]
     tex: ["\\phi(1020)"]
 
-  omega1420:
+  rho1700:
     J: 1; P: -1; model: BWR
-    parameters: [1.41, 0.35]
-    tex: ["\\omega(1420)"]
+    parameters: [1.72, 0.25]
+    free: [0, 1]                          # 放开拟合
+    free_range: [[1.6, 1.8], [0.1, 0.5]] # 拟合范围
+    tex: ["\\rho(1700)"]
 
-  omega3_1670:
-    J: 3; P: -1; model: BWR
-    parameters: [1.667, 0.168]
-    tex: ["\\omega_{3}(1670)"]
+  # ---------- BW (非相对论 BW, 无势垒因子) ----------
+  # K1_1410:
+  #   J: 1; P: -1; model: BW
+  #   parameters: [1.414, 0.232]
+  #   free: [0, 1]
+  #   tex: ["K_{1}(1410)"]
 
-  # ---- R_Keta 共振态 (Kpi) ----
-  K1_1410:
-    J: 1; P: -1; model: BWR
-    parameters: [1.414, 0.232]
-    tex: ["K_{1}(1410)"]
+  # ---------- Flatte (耦合道, 近阈共振态) ----------
+  # f0_980 耦合到 ππ 和 KK, 参数 [mass, g_ππ, g_KK]
+  f0_980:
+    J: 0; P: +1; model: Flatte
+    parameters: [0.99, 0.2, 0.4]               # [m0, g_pipi, g_KK]
+    free: [0, 1, 2]
+    channels: [[0.1396, 0.1396], [0.4937, 0.4937]]
+    tex: ["f_{0}(980)"]
 
-  K2_1430:
-    J: 2; P: +1; model: BWR
-    parameters: [1.432, 0.109]
-    tex: ["K_{2}^{*}(1430)"]
+  # ---------- GS (Gounaris-Sakurai, ρ→ππ P 波) ----------
+  rho_770:
+    J: 1; P: -1; model: GS
+    parameters: [0.775, 0.149]                  # [mass, width]
+    free: [0, 1]
+    channels: [[0.1396, 0.1396]]               # 道质量 [m_π⁺, m_π⁻]
+    tex: ["\\rho(770)"]
 
-# ============================================================
-# ROOT 输出绘图
-# ============================================================
+  # ---------- ONE (纯势垒因子, 无共振态传播子) ----------
+  # K1_1410:
+  #   J: 1; P: -1; model: ONE
+  #   parameters: []
+
+  # ---------- Interp (统一插值模型: hist/linear/spline) ----------
+  # bg_shape:
+  #   J: 1; P: -1; model: Interp
+  #   parameters: []                          # 无自由参数
+  #   options:
+  #     file: "./data/shape.dat"              # 两列: m, value
+  #     method: spline                        # hist | linear | spline
+
+  # ---------- Custom DSL (用户自定义表达式) ----------
+  # 可用变量: m, q, q0, L, d, md1, md2
+  #           p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi
+  # 可用参数: p0, p1, p2, ... (对应 parameters 列表)
+  # 可用函数: exp, log, sin, cos, sqrt, csqrt, abs, re, im, conj
+  # 可用常量: pi, i (虚数单位)
+  #
+  # 示例: BWR 变体, 用 |p1| 代替 q
+  # my_res:
+  #   J: 1; P: -1; model: Custom
+  #   parameters: [1.5, 0.12]                # p0=mass, p1=width
+  #   free: [0, 1]
+  #   expression: "p0^2/(p0^2 - m^2 - i*p0*p1*(p1p/q0)*(p0/m)*(p1p^2+q0^2)/q0^2)"
+  #   tex: ["MyRes"]
+
+  # BWR 使用 Custom DSL 等价写法 (g0=1, φ=0 时 ≡ 内置 BW):
+  # bw_custom:
+  #   J: 1; P: -1; model: Custom
+  #   parameters: [1.66, 0.125]
+  #   free: [0, 1]
+  #   expression: "p0^2/(p0^2 - m^2 - i*p0*p1)"
+  #   tex: ["BW", "(custom)"]
+
+# ---- 输出绘图 ----
 Plot:
+  # 不变质量谱
   mass:
     - input: [Kp, Km]
       bins: 100; range: [1.0, 2.6]
@@ -138,10 +175,17 @@ Plot:
     - input: [Km, eta]
       bins: 100; range: [1.0, 2.6]
       display: ["M(K^{-}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
+    - input: [pip, pim]
+      bins: 100; range: [0.27, 1.5]
+      display: ["M(\\pi^{+}\\pi^{-}) (GeV/c^{2})", "Events/12.3 MeV/c^{2}"]
+
+  # 螺旋度角
   cosbeta:
     - input: [[Jpsi], [Kp, Km], [Kp]]
       bins: 100; range: [-1.0, 1.0]
       display: ["cos\\beta(K^{+}K^{-})", "Events/0.02"]
+
+  # Dalitz 图
   dalitz:
     - input: [[Kp, Km], [Kp, eta]]
       bins: [100, 100]; range: [[1.0, 6.8], [1.0, 6.8]]
