@@ -1383,6 +1383,10 @@ public:
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
+        TORCH_CHECK(params.device().is_cuda() && params.device().index() == primary_dev_,
+            "params 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
+            "当前在 cuda:" + std::to_string(params.device().index()) + "。"
+            "跨 GPU 归一化缓冲 (d_phsp_matrix_) 固定在主 GPU 上");
         //     const auto& cm = params_.couplingMatrix();
         //     int ncf = cm.n_free;
         //     int na  = cm.n_amps;
@@ -2373,6 +2377,10 @@ public:
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be complex128");
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
+        TORCH_CHECK(vector.device().index() == primary_dev_,
+            "vector 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
+            "当前在 cuda:" + std::to_string(vector.device().index()) + "。"
+            "跨 GPU 归一化缓冲 (d_phsp_matrix_) 固定在主 GPU 上");
 
         const int n = vector.numel();
         torch::Device dev = vector.device();
@@ -2526,6 +2534,10 @@ public:
     torch::Tensor getHessian(torch::Tensor params) {
         TORCH_CHECK(params.is_cuda() && params.dtype() == torch::kFloat64,
             "params must be float64 CUDA tensor");
+        TORCH_CHECK(params.device().index() == primary_dev_,
+            "params 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
+            "当前在 cuda:" + std::to_string(params.device().index()) + "。"
+            "跨 GPU 归一化缓冲 (d_phsp_matrix_) 固定在主 GPU 上");
 
         // ---- 1. Setup: determine nv, vector, theta ----
         bool is_coupling = params_.hasCouplingMatrix();
@@ -3749,6 +3761,7 @@ private:
     std::vector<ChainInfo> chains_info_;
     AmpCalc amp_calc_;
     bool initialized_ = false;
+    int primary_dev_ = 0;  // 主 GPU：构造时 torch 当前设备；d_phsp_matrix_ 等跨 GPU 缓冲所在
 
     // fit mode: 0 = FREEPARAMS (chain×step), 1 = VSPACE (direct amplitudes, default)
     int fit_mode_ = 1;
@@ -3767,6 +3780,10 @@ private:
             << std::endl;
         std::cout << "Constraints: " << config_parser_.getConstraints().size()
             << std::endl;
+
+        // 捕获主 GPU（torch 当前设备）。d_phsp_matrix_ 等跨 GPU 缓冲分配在此设备，
+        // 后续所有 params 张量必须位于该设备（getNLL/getHessian 入口有 TORCH_CHECK）
+        cudaGetDevice(&primary_dev_);
 
         // 初始化粒子信息
         initializeParticles();
@@ -4017,7 +4034,7 @@ private:
         }
         if (W_total <= 0.0) W_total = 1.0;
 
-        cudaSetDevice(0);  // ensure d_phsp_matrix_ is allocated on GPU 0
+        cudaSetDevice(primary_dev_);  // ensure d_phsp_matrix_ is allocated on primary GPU
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
         cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
@@ -4048,19 +4065,19 @@ private:
             cublasDestroy(h);
             cudaFree(d_phsp_scaled);
 
-            if (gpu == 0) {
+            if (gpu == (size_t)primary_dev_) {
                 ctComplex one = ctMake(1.0f, 0.0f);
                 axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                 cudaFree(d_phsp_gpu);
             } else {
-                cudaSetDevice(0);
+                cudaSetDevice(primary_dev_);
                 ctComplex* d_temp;
                 cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                cudaMemcpyPeer(d_temp, 0, d_phsp_gpu, gpu,
+                cudaMemcpyPeer(d_temp, primary_dev_, d_phsp_gpu, gpu,
                     n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cudaSetDevice(gpu);
                 cudaFree(d_phsp_gpu);
-                cudaSetDevice(0);
+                cudaSetDevice(primary_dev_);
                 ctComplex one = ctMake(1.0f, 0.0f);
                 axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                 cudaFree(d_temp);
