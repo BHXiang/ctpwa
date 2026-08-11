@@ -132,14 +132,13 @@ void DecayInfo::buildDecayChains(
                     for (size_t i = 0; i < step.daughters.size(); ++i)
                         if (res_jp.name == step.daughters[i]) { spins[i+1] = res_jp.spin; parities[i+1] = res_jp.parity; }
                 }
+                // 全同粒子由 Constraints.identical 自动检测（无需手动开关）
                 bool identical_d = false; bool is_boson = true;
-                if (chain.symmetrize) {
-                    const Particle *d1 = nullptr, *d2 = nullptr;
-                    for (const auto& p : particles_)
-                        { if (p.name == step.daughters[0]) d1 = &p; if (p.name == step.daughters[1]) d2 = &p; }
-                    if (d1 && d2 && !d1->identical_group.empty() && d1->identical_group == d2->identical_group)
-                        { identical_d = true; is_boson = !d1->is_fermion(); }
-                }
+                const Particle *d1 = nullptr, *d2 = nullptr;
+                for (const auto& p : particles_)
+                    { if (p.name == step.daughters[0]) d1 = &p; if (p.name == step.daughters[1]) d2 = &p; }
+                if (d1 && d2 && !d1->identical_group.empty() && d1->identical_group == d2->identical_group)
+                    { identical_d = true; is_boson = !d1->is_fermion(); }
                 int maxL = global_max_l;
                 Amp2BD amp2bd(spins, parities, identical_d, is_boson, maxL, step.p_break, step.is_bf);
                 cas->addDecay(amp2bd, step.mother, step.daughters[0], step.daughters[1]);
