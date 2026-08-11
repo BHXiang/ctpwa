@@ -332,9 +332,6 @@ public:
     const std::vector<ParamSlot>& slots() const { return slots_; }
     const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
 
-    // 测试：用 AutoDiff 计算 BWR Hessian
-    static void testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d, double* out);
-
 private:
     std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放
     std::vector<ResBlock> blocks_;

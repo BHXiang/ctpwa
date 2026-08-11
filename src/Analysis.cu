@@ -3220,13 +3220,6 @@ public:
             h_scattering.data(), out_bf.data(), npartials, dataIntegral);
     }
 
-    // 测试：用 AutoDiff 计算 BWR Hessian，返回 [12] float64 tensor
-    torch::Tensor testBWRHessian(double m, double m0, double g0, int L, double q, double q0, double d)
-    {
-        torch::Tensor out = torch::empty({12}, torch::kFloat64);
-        AmpCalc::testBWRHessian(m, m0, g0, L, q, q0, d, out.data_ptr<double>());
-        return out;
-    }
 
     // =====================================================================
     // 公共: phsp_truth（无效率 MC）批处理积分 + Jacobian 扰动积分

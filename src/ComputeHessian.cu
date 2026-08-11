@@ -5,7 +5,6 @@
 
 #include <ComputeHessian.cuh>
 #include <CustomExpr.cuh>
-#include <HessianStage1Kernel.cuh>
 #include "AmpGen.cuh"
 
 // 就地共轭kernel
