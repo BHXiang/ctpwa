@@ -1674,8 +1674,16 @@ __global__ void computeCustomAmpsKernel(
                             interpEval(aux + target_res.aux_offset, mm,
                                        Fr, Fi, dFr, dFi, P);
                         } else {
+                            double p1_P = pD1.P(), p1_E = pD1.E;
+                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                            double p1_phi = atan2(pD1.Py, pD1.Px);
+                            double p2_P = pD2.P(), p2_E = pD2.E;
+                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                            double p2_phi = atan2(pD2.Py, pD2.Px);
                             evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, bf_d,
                                 md1_q0, md2_q0,
+                                p1_P, p1_E, p1_ct, p1_phi,
+                                p2_P, p2_E, p2_ct, p2_phi,
                                 target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                         }
                         custom_eval = true;
@@ -1773,8 +1781,16 @@ __global__ void computeCustomAmpsKernel(
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
                     } else {
+                        double p1_P = pD1.P(), p1_E = pD1.E;
+                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                        double p1_phi = atan2(pD1.Py, pD1.Px);
+                        double p2_P = pD2.P(), p2_E = pD2.E;
+                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                        double p2_phi = atan2(pD2.Py, pD2.Px);
                         evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
                             md1_q0, md2_q0,
+                            p1_P, p1_E, p1_ct, p1_phi,
+                            p2_P, p2_E, p2_ct, p2_phi,
                             rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp);
                     }
 
