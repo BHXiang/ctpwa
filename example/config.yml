@@ -76,6 +76,10 @@ DecayChains:
         - [J: 1, P: -1]: [rho_770]
     legends: [['R_pipi', ' → ', 'eta']]
 
+  # 次级衰变 opts 支持: is_bf / p_break / sl（分波白名单, S 为 2S+1 记号）
+  #   R_KK: [Kp, Km, {sl: [[1, 0], [3, 2]]}]   # 只保留指定 (S,L)
+  #   Jpsi: [[eta, R_KK, {sl: [3, 1]}]]        # 第一步只保留 S=1, L=1
+
 # ---- 约束 ----
 Constraints:
   trans:
@@ -84,6 +88,9 @@ Constraints:
   #   - [pi0, pi0]: true
   # maxL: 4                        # 全局轨道角动量上限
   bf_d: 3.0                        # 势垒半径 (GeV⁻¹)
+  # chains:                        # 链过滤器: 只跑名中包含子串的衰变链
+  #   - decay1                     #   内联列表
+  # chains: "chains_to_fit.txt"    #   或外部文件（每行一个子串, # 注释）
 
 # ============================================================
 # 共振态 — 每种模型一个示例

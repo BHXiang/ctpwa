@@ -31,6 +31,7 @@ float transJValue(const std::string &str)
 
 ConfigParser::ConfigParser(const std::string &config_file)
 {
+    config_file_ = config_file;
     try {
         YAML::Node config = YAML::LoadFile(config_file);
 
@@ -52,6 +53,33 @@ ConfigParser::ConfigParser(const std::string &config_file)
                         if (p.name == name) p.identical_group = group_name;
                     }
                 }
+            }
+        }
+
+        // 链过滤器（Constraints.chains）早提：需在 DecayChains 解析前读取
+        if (config["Constraints"] && config["Constraints"]["chains"]) {
+            const auto& ch = config["Constraints"]["chains"];
+            if (ch.IsScalar()) {
+                // 外部文件：每行一个子串（跳过空行与 # 注释），相对 config.yml 所在目录
+                std::filesystem::path filter_path =
+                    std::filesystem::path(config_file).parent_path() /
+                    ch.as<std::string>();
+                std::ifstream f(filter_path);
+                std::string line;
+                while (std::getline(f, line)) {
+                    // 去首尾空白
+                    size_t b = line.find_first_not_of(" \t\r\n");
+                    if (b == std::string::npos) continue;
+                    size_t e = line.find_last_not_of(" \t\r\n");
+                    std::string pat = line.substr(b, e - b + 1);
+                    if (pat.empty() || pat[0] == '#') continue;
+                    chain_filter_.push_back(pat);
+                }
+                if (chain_filter_.empty())
+                    std::cerr << "Warning: chain filter file \"" << filter_path
+                              << "\" empty or not found" << std::endl;
+            } else if (ch.IsSequence()) {
+                chain_filter_ = ch.as<std::vector<std::string>>();
             }
         }
 
@@ -88,6 +116,22 @@ ConfigParser::ConfigParser(const std::string &config_file)
         // 用户请求的精度（auto=不检查，显式 float/double 时与 .so 比对）
         if (config["precision"])
             precision_ = config["precision"].as<std::string>();
+
+        // 链过滤器: 子串匹配剔除不想要的衰变链（确保 legends/Info/Analysis 一致）
+        if (!chain_filter_.empty() && !decay_chains_.empty()) {
+            std::vector<DecayChainConfig> kept;
+            for (const auto& dc : decay_chains_) {
+                for (const auto& pat : chain_filter_) {
+                    if (dc.name.find(pat) != std::string::npos) {
+                        kept.push_back(dc);
+                        break;
+                    }
+                }
+            }
+            std::cout << "Chain filter: " << kept.size() << "/" << decay_chains_.size()
+                      << " chains selected" << std::endl;
+            decay_chains_ = std::move(kept);
+        }
     } catch (const YAML::Exception &e) {
         std::cerr << "Warning: Failed to parse config file \"" << config_file
                   << "\": " << e.what() << std::endl;
@@ -417,10 +461,10 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 if (key == "intermediates" || key == "legend" || key == "symmetrize")
                     continue;
                 if (particle_names.count(key) && kv.second.IsSequence()) {
-                    // Must be a sequence of [bachelor, intermediate] pairs
+                    // Must be a sequence of [bachelor, intermediate, {opts}] pairs
                     if (kv.second.size() > 0 &&
                         kv.second[0].IsSequence() &&
-                        kv.second[0].size() == 2) {
+                        kv.second[0].size() >= 2) {
                         mother = key;
                         is_compact = true;
                         break;
@@ -442,6 +486,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 std::string d1, d2;
                 bool is_bf = true;
                 bool p_break = false;
+                std::vector<std::vector<int>> sl_filter; // 允许的 [S, L] 分波; 空 = 全允许
             };
             std::map<std::string, std::vector<IntDecay>> int_decay_modes;
             for (const auto& kv : chain_data) {
@@ -459,6 +504,13 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         const auto& dopts = node[2];
                         if (dopts["is_bf"])   id.is_bf   = dopts["is_bf"].as<bool>();
                         if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
+                        if (dopts["sl"]) {
+                            // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
+                            if (dopts["sl"][0].IsSequence())
+                                id.sl_filter = dopts["sl"].as<std::vector<std::vector<int>>>();
+                            else
+                                id.sl_filter.push_back(dopts["sl"].as<std::vector<int>>());
+                        }
                     }
                     return id;
                 };
@@ -557,6 +609,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 bool ch_is_bf1 = true, ch_is_bf2 = true;
                 bool ch_p_break1 = false, ch_p_break2 = false;
                 bool has_ch_is_bf = false, has_ch_p_break = false;
+                std::vector<std::vector<int>> ch_sl_filter; // 第一步 (mother) 的分波白名单
                 std::vector<std::string> ch_legend;
                 // Fall back to top-level legends list
                 if (ch_idx < all_legends.size())
@@ -583,6 +636,13 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         } else {
                             ch_p_break1 = ch_p_break2 = opts["p_break"].as<bool>();
                         }
+                    }
+                    if (opts["sl"]) {
+                        // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]（作用于第一步）
+                        if (opts["sl"][0].IsSequence())
+                            ch_sl_filter = opts["sl"].as<std::vector<std::vector<int>>>();
+                        else
+                            ch_sl_filter.push_back(opts["sl"].as<std::vector<int>>());
                     }
                 }
 
@@ -628,6 +688,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     step1.daughters = {bachelor, intermediate};
                     step1.is_bf = ch_is_bf1;
                     step1.p_break = ch_p_break1;
+                    step1.sl_filter = ch_sl_filter;
                     chain.decay_steps.push_back(step1);
 
                     // --- Determine which daughters are intermediates (not known particles) ---
@@ -650,7 +711,12 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     }
 
                     // --- BFS: recursively resolve intermediates ---
-                    struct BFSItem { std::string name; bool is_first; bool bf, pb; };
+                    struct BFSItem {
+                        std::string name;
+                        bool is_first;
+                        bool bf, pb;
+                        std::vector<std::vector<int>> sl; // 该步的分波白名单
+                    };
                     std::queue<BFSItem> queue;
 
                     if (intermediate_decays) {
@@ -658,14 +724,16 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             bachelor_drives_modes ? 0 : mi);
                         bool step2_is_bf   = has_ch_is_bf   ? ch_is_bf2   : (ifm ? ifm->is_bf : true);
                         bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
-                        queue.push({intermediate, !bachelor_drives_modes, step2_is_bf, step2_p_break});
+                        queue.push({intermediate, !bachelor_drives_modes, step2_is_bf, step2_p_break,
+                            ifm ? ifm->sl_filter : std::vector<std::vector<int>>{}});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
                             bachelor_drives_modes ? mi : 0);
                         queue.push({bachelor, bachelor_drives_modes,
                             bm ? bm->is_bf : true,
-                            bm ? bm->p_break : false});
+                            bm ? bm->p_break : false,
+                            bm ? bm->sl_filter : std::vector<std::vector<int>>{}});
                     }
 
                     while (!queue.empty()) {
@@ -679,6 +747,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         substep.daughters = {mode->d1, mode->d2};
                         substep.is_bf   = item.bf;
                         substep.p_break = item.pb;
+                        substep.sl_filter = item.sl;
                         chain.decay_steps.push_back(substep);
 
                         // Resonance chain for this intermediate
@@ -691,7 +760,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                                 const auto* dm = getDecayMode(d, 0);
                                 queue.push({d, false,
                                     dm ? dm->is_bf   : true,
-                                    dm ? dm->p_break : false});
+                                    dm ? dm->p_break : false,
+                                    dm ? dm->sl_filter : std::vector<std::vector<int>>{}});
                             }
                         };
                         enqueue(mode->d1);
@@ -735,6 +805,16 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             if (decay_pair.second["p_break"])
                                 step.p_break =
                                     decay_pair.second["p_break"].as<bool>();
+                            if (decay_pair.second["sl"]) {
+                                // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
+                                if (decay_pair.second["sl"][0].IsSequence())
+                                    step.sl_filter = decay_pair.second["sl"]
+                                        .as<std::vector<std::vector<int>>>();
+                                else
+                                    step.sl_filter.push_back(
+                                        decay_pair.second["sl"]
+                                            .as<std::vector<int>>());
+                            }
                         }
                         chain.decay_steps.push_back(step);
                     }
