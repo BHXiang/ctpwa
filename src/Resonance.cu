@@ -73,6 +73,56 @@ class GSModel : public ResonanceModel
         const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
+// Interp: 统一插值模型（hist/linear/spline）。无固定参数。
+// aux = [method, N, x_min, dx, y_0...y_{N-1}] (等距 bin)
+class InterpModel : public ResonanceModel
+{
+  public:
+    std::string name() const override { return "Interp"; }
+    ResModelType type() const override { return ResModelType::Interp; }
+    std::vector<ParamSpec> paramSpecs() const override { return {}; }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>& opts,
+        const std::vector<std::pair<double,double>>&) const override
+    {
+        // method: hist=0, linear=1, spline=2
+        int method = 1;  // default: linear
+        auto it = opts.find("method");
+        if (it != opts.end()) {
+            if (it->second == "hist") method = 0;
+            else if (it->second == "spline") method = 2;
+        }
+        // 读取数据文件
+        it = opts.find("file");
+        if (it == opts.end()) return {};  // no file → empty
+        std::ifstream f(it->second);
+        if (!f) return {};
+        std::vector<double> x, y;
+        double a, b;
+        while (f >> a >> b) { x.push_back(a); y.push_back(b); }
+        if (x.size() < 2) return {};
+        // 检查是否等距
+        double dx = x[1] - x[0];
+        bool uniform = true;
+        for (size_t i = 1; i < x.size(); ++i) {
+            if (fabs(x[i] - x[i-1] - dx) > 1e-10) { uniform = false; break; }
+        }
+        std::vector<double> aux;
+        if (uniform) {
+            aux.push_back((double)method);   // method
+            aux.push_back((double)x.size()); // N
+            aux.push_back(x[0]);             // x_min
+            aux.push_back(dx);               // dx
+            aux.insert(aux.end(), y.begin(), y.end());
+        } else {
+            aux.push_back((double)-(method+1)); // negative = non-uniform
+            aux.push_back((double)x.size());
+            aux.insert(aux.end(), x.begin(), x.end());
+            aux.insert(aux.end(), y.begin(), y.end());
+        }
+        return aux;
+    }
+};
+
 // Hist：直方图形状模型。无固定参数（可选 mass 用于 q0 归一化）。
 // aux 数据 = 读直方图文件 → [m_min, m_max, n_bins, values...]
 class HistModel : public ResonanceModel
@@ -204,6 +254,7 @@ std::map<std::string, std::unique_ptr<ResonanceModel>>& ModelRegistry::table()
         m.emplace("ONE", std::make_unique<ONEModel>());
         m.emplace("Flatte", std::make_unique<FlatteModel>());
         m.emplace("GS", std::make_unique<GSModel>());
+        m.emplace("Interp", std::make_unique<InterpModel>());
         m.emplace("Hist", std::make_unique<HistModel>());
         m.emplace("Custom", std::make_unique<CustomModel>());
         return m;
