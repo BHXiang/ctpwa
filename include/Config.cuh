@@ -46,6 +46,7 @@ struct DecayStep {
   std::vector<std::string> daughters;
   bool is_bf = true;    // 是否施加势垒因子
   bool p_break = false; // 是否宇称破缺（如弱衰变）
+  std::vector<std::vector<int>> sl_filter; // 允许的 [S, L] 分波（S 为 2S+1）; 空 = 全允许
 };
 
 struct DecayChainConfig {
@@ -53,7 +54,6 @@ struct DecayChainConfig {
   std::vector<DecayStep> decay_steps;
   std::vector<ResonanceChainConfig> resonance_chains;
   std::vector<std::string> legend_template;
-  bool symmetrize = false; // enable identical particle symmetrization for this chain
 };
 
 
@@ -116,6 +116,8 @@ private:
 
   std::vector<Particle> particles_;
   std::vector<DecayChainConfig> decay_chains_;
+  std::string config_file_;                    // 配置文件路径（供解析相对路径）
+  std::vector<std::string> chain_filter_;      // Constraints.chains 子串过滤; 空 = 全跑
   std::map<std::string, ResonanceConfig> resonances_;
   std::map<std::string, std::vector<std::string>> data_files_;
   std::vector<std::string> data_order_;

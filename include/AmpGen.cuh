@@ -69,7 +69,8 @@ class Amp2BD {
 public:
     Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
            bool identical_daughters = false, bool is_boson = true,
-           int maxL = -1, bool p_break = false, bool is_bf = true);
+           int maxL = -1, bool p_break = false, bool is_bf = true,
+           std::set<std::pair<int, int>> sl_filter = {});
     const std::vector<SL>& getSL() const { return spinOrbitCombinations_; }
     const std::array<int, 3>& getJValues() const { return jvalues_; }
     const std::array<int, 3>& getParities() const { return parities_; }
@@ -86,6 +87,7 @@ private:
     int maxL_;      // 轨道角动量上限; -1 = 无限制
     bool p_break_;  // 宇称是否破缺（弱衰变）
     bool is_bf_;    // 是否施加势垒因子
+    std::set<std::pair<int, int>> sl_filter_; // 允许的 (S, L) 分波白名单; 空 = 全允许
     std::vector<SL> spinOrbitCombinations_;
 };
 

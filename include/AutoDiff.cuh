@@ -2,7 +2,7 @@
 #define AUTODIFF_CUH
 
 #include <cuda_runtime.h>
-#include "ComplexType.h"
+#include <ComplexType.h>
 #include <cmath>
 #include <iostream>
 

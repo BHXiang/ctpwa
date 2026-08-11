@@ -11,10 +11,11 @@
 
 // Amp2BD 类实现
 Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
-    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool is_bf)
+    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool is_bf,
+    std::set<std::pair<int, int>> sl_filter)
     : jvalues_(jvalues), parities_(parities),
     identical_daughters_(identical_daughters), is_boson_(is_boson),
-    maxL_(maxL), p_break_(p_break), is_bf_(is_bf)
+    maxL_(maxL), p_break_(p_break), is_bf_(is_bf), sl_filter_(std::move(sl_filter))
 {
     spinOrbitCombinations_ = ComSL(jvalues, parities);
 }
@@ -90,6 +91,12 @@ std::vector<SL> Amp2BD::ComSL(const std::array<int, 3>& spins, const std::array<
 
                 // 轨道角动量上限截断
                 if (maxL_ > 0 && L > maxL_) continue;
+
+                // 分波白名单: 仅保留用户指定的 (S, L)（S 为 2S+1 记号）
+                if (!sl_filter_.empty()) {
+                    int S_multi = two_S + 1;
+                    if (sl_filter_.find({S_multi, L}) == sl_filter_.end()) continue;
+                }
 
                 // 存储实际的自旋量子数（不是两倍值）
                 // int S = two_S / 2; // 实际的总自旋量子数

@@ -4441,10 +4441,11 @@ private:
             auto intermediate_combs = chain_info.intermediate_combs;
 
             // 跨链全同粒子: 收集链中出现的全同组（≥2 成员）→ cas 生成置换拓扑。
+            // 全同组由 Constraints.identical 声明，自动检测；无全同粒子时结果为空，等效关闭。
             // coset 生成（子树感知、稳定子、费米子 sgn）在 computeSLAmps 内部完成，
             // 这里只需把 (成员名, is_boson) 传给 cas。
             std::vector<std::pair<std::vector<std::string>, bool>> identical_groups;
-            if (chain.symmetrize) {
+            {
                 std::set<std::string> chain_particles;
                 for (const auto& step : chain.decay_steps) {
                     chain_particles.insert(step.mother);
@@ -4510,10 +4511,10 @@ private:
                             }
                         }
                     }
-                    // 检查两个子粒子是否全同
+                    // 检查两个子粒子是否全同（Constraints.identical 自动检测）
                     bool identical_daughters2 = false;
                     bool is_boson2 = true;
-                    if (chain.symmetrize) {
+                    {
                         const Particle* p_d1 = nullptr, * p_d2 = nullptr;
                         for (const auto& p : particles_) {
                             if (p.name == step.daughters[0]) p_d1 = &p;

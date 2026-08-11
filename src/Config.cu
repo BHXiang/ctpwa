@@ -1,6 +1,7 @@
 #include "Config.cuh"
 #include <complex>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <queue>
@@ -40,7 +41,7 @@ ConfigParser::ConfigParser(const std::string &config_file)
             parseData(config["Data"]);
 
         // Parse identical groups from Constraints BEFORE DecayChains
-        // so that symmetrize auto-detection can see them
+        // so that symmetrization auto-detection can see them
         if (config["Constraints"] && config["Constraints"]["identical"]) {
             int group_idx = 1;
             for (const auto& group : config["Constraints"]["identical"]) {
@@ -54,8 +55,26 @@ ConfigParser::ConfigParser(const std::string &config_file)
             }
         }
 
-        if (config["Resonances"])
-            parseResonances(config["Resonances"]);
+        if (config["Resonances"]) {
+            if (config["Resonances"].IsScalar()) {
+                // 外部共振态文件: Resonances 栏写文件名 → 从该文件读取（相对 config.yml 所在目录）
+                std::filesystem::path res_path =
+                    std::filesystem::path(config_file).parent_path() /
+                    config["Resonances"].as<std::string>();
+                try {
+                    YAML::Node res_node = YAML::LoadFile(res_path.string());
+                    // 容错: 外部文件若带顶层 Resonances 键则取其子节点
+                    if (res_node["Resonances"])
+                        res_node = res_node["Resonances"];
+                    parseResonances(res_node);
+                } catch (const YAML::Exception &e) {
+                    std::cerr << "Warning: failed to load external resonance file \""
+                              << res_path << "\": " << e.what() << std::endl;
+                }
+            } else {
+                parseResonances(config["Resonances"]);
+            }
+        }
 
         if (config["DecayChains"])
             parseDecayChains(config["DecayChains"]);
@@ -521,11 +540,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 }
             }
 
-            // --- symmetrize ---
-            bool symmetrize = false;
-            if (chain_data["symmetrize"])
-                symmetrize = chain_data["symmetrize"].as<bool>();
-
             // --- legends: one per channel, in order ---
             std::vector<std::vector<std::string>> all_legends;
             if (chain_data["legends"] && chain_data["legends"].IsSequence()) {
@@ -540,7 +554,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 std::string intermediate = ch[1].as<std::string>();
 
                 // Parse per-channel constraints (3rd element) — overrides all defaults
-                bool ch_symmetrize = symmetrize;
                 bool ch_is_bf1 = true, ch_is_bf2 = true;
                 bool ch_p_break1 = false, ch_p_break2 = false;
                 bool has_ch_is_bf = false, has_ch_p_break = false;
@@ -551,8 +564,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
 
                 if (ch.size() >= 3 && ch[2].IsMap()) {
                     const auto& opts = ch[2];
-                    if (opts["symmetrize"])
-                        ch_symmetrize = opts["symmetrize"].as<bool>();
                     if (opts["legend"])
                         ch_legend = opts["legend"].as<std::vector<std::string>>();
                     if (opts["is_bf"]) {
@@ -634,7 +645,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         chain.legend_template = ch_legend.empty()
                             ? std::vector<std::string>{intermediate, " ", bachelor}
                             : ch_legend;
-                        chain.symmetrize = ch_symmetrize;
                         decay_chains_.push_back(chain);
                         continue;
                     }
@@ -686,32 +696,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         };
                         enqueue(mode->d1);
                         enqueue(mode->d2);
-                    }
-
-                    // --- symmetrize: auto-detect ---
-                    {
-                        bool sym_explicit = (ch.size() >= 3 && ch[2].IsMap() &&
-                                             ch[2]["symmetrize"]);
-                        if (sym_explicit) {
-                            chain.symmetrize = ch_symmetrize;
-                        } else {
-                            // Use symmetrize from block-level default
-                            chain.symmetrize = symmetrize;
-                            // Also auto-detect: any step has identical daughters?
-                            for (const auto& step : chain.decay_steps) {
-                                const Particle *pd1 = nullptr, *pd2 = nullptr;
-                                for (const auto& p : particles_) {
-                                    if (p.name == step.daughters[0]) pd1 = &p;
-                                    if (p.name == step.daughters[1]) pd2 = &p;
-                                }
-                                if (pd1 && pd2 &&
-                                    !pd1->identical_group.empty() &&
-                                    pd1->identical_group == pd2->identical_group) {
-                                    chain.symmetrize = true;
-                                    break;
-                                }
-                            }
-                        }
                     }
 
                     // --- Legend ---
@@ -794,9 +778,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             if (chain_data["legend"])
                 chain.legend_template =
                     chain_data["legend"].as<std::vector<std::string>>();
-
-            if (chain_data["symmetrize"])
-                chain.symmetrize = chain_data["symmetrize"].as<bool>();
 
             decay_chains_.push_back(chain);
         }
