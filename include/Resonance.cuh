@@ -19,7 +19,8 @@ enum class ResModelType : int
     Flatte = 3,
     Hist = 4,     // 直方图形状模型（查表，无自由参数）
     Custom = 5,   // 用户自定义表达式模型（DSL 字节码解释）
-    GS = 6        // Gounaris-Sakurai (ρ→ππ P-wave)
+    GS = 6,       // Gounaris-Sakurai (ρ→ππ P-wave)
+    Interp = 7    // 统一插值模型 (hist/linear/spline)
 };
 
 // 设备端共振结构体（轻量，固定大小）

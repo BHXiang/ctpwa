@@ -1475,6 +1475,73 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
 }
 
 // ============================================================
+// 统一插值求值（Interp 模型：hist / linear / spline）
+// aux 格式: [method, N, x_min, dx, y_0..y_{N-1}] (等距)
+//            [-(method+1), N, x_0..x_{N-1}, y_0..y_{N-1}] (非等距)
+// ============================================================
+__device__ void interpEval(const double* tab, double x,
+    double& Fr, double& Fi, double* dFr, double* dFi, int P)
+{
+    int hdr = (int)tab[0];
+    int method = (hdr >= 0) ? hdr : -(hdr + 1);
+    int N = (int)tab[1];
+
+    int i; double frac;
+    if (hdr >= 0) {
+        // 等距 bin
+        double xmin = tab[2], dx = tab[3];
+        const double* y = tab + 4;
+        double pos = (x - xmin) / dx;
+        i = (int)pos;
+        if (i < 0) { i = 0; frac = 0.0; }
+        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
+        else { frac = pos - (double)i; }
+        switch (method) {
+        case 0: Fr = y[i]; break;                          // hist
+        case 1: Fr = y[i] + (y[i+1] - y[i]) * frac; break; // linear
+        case 2: {                                          // spline (Catmull-Rom)
+            double y0 = (i > 0) ? y[i-1] : y[i] - (y[i+1]-y[i]);
+            double y1 = y[i], y2 = y[i+1];
+            double y3 = (i+2 < N) ? y[i+2] : y[i+1] + (y[i+1]-y[i]);
+            double f2 = frac * frac, f3 = f2 * frac;
+            Fr = 0.5 * ((2*y1) + (-y0 + y2) * frac +
+                        (2*y0 - 5*y1 + 4*y2 - y3) * f2 +
+                        (-y0 + 3*y1 - 3*y2 + y3) * f3);
+            break;
+        }
+        default: Fr = y[i]; break;
+        }
+    } else {
+        // 非等距点：二分查找
+        const double* xv = tab + 2;
+        const double* yv = tab + 2 + N;
+        int lo = 0, hi = N - 1;
+        while (lo < hi - 1) {
+            int mid = (lo + hi) / 2;
+            if (x < xv[mid]) hi = mid; else lo = mid;
+        }
+        i = lo;
+        if (i < 0) { i = 0; frac = 0.0; }
+        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
+        else { frac = (x - xv[i]) / (xv[i+1] - xv[i]); }
+        switch (method) {
+        case 0: Fr = yv[i]; break;
+        case 1: Fr = yv[i] + (yv[i+1] - yv[i]) * frac; break;
+        default: Fr = yv[i]; break;  // spline for non-uniform not yet implemented
+        }
+    }
+    Fi = 0.0;
+    // 梯度：bin 高度为拟合参数时（极少见）
+    for (int j = 0; j < P && j < 16; ++j) dFr[j] = dFi[j] = 0.0;
+    if (P > 0 && method < 2) {
+        if (hdr >= 0 && i < P)
+            dFr[i] = (method == 0) ? 1.0 : 1.0 - frac;
+        if (hdr >= 0 && i + 1 < P && method == 1)
+            dFr[i + 1] = frac;
+    }
+}
+
+// ============================================================
 // O 因子（非目标节点 Bf 乘积）对质量参数的导数辅助函数
 // O = Π_i Bf(L_i, qq_i, q0_i), q0_i = breakup(m0_i, m1_i, m2_i)
 // 当某子质量经回退等于 target_rp[0]（m0 参数）时，q0 依赖 m0 →
@@ -1602,9 +1669,15 @@ __global__ void computeCustomAmpsKernel(
 
                 if (is_target) {
                     if (!custom_eval) {
-                        evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, bf_d,
-                            md1_q0, md2_q0,
-                            target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                        if (target_res.type == ResModelType::Interp) {
+                            for (int j = 0; j < 256; ++j) d2Fr[j] = d2Fi[j] = 0.0;
+                            interpEval(aux + target_res.aux_offset, mm,
+                                       Fr, Fi, dFr, dFi, P);
+                        } else {
+                            evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, bf_d,
+                                md1_q0, md2_q0,
+                                target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                        }
                         custom_eval = true;
                     }
                 } else {
@@ -1696,9 +1769,14 @@ __global__ void computeCustomAmpsKernel(
                     if (P_r > 16) P_r = 16;
 
                     double Fr, Fi, dFr[16], dFi[16], d2Fr_tmp[256], d2Fi_tmp[256];
-                    evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
-                        md1_q0, md2_q0,
-                        rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp);
+                    if (res.type == ResModelType::Interp) {
+                        for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
+                        interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
+                    } else {
+                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+                            md1_q0, md2_q0,
+                            rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp);
+                    }
 
                     double den = Fr * Fr + Fi * Fi;
                     int off = B.res_dF_offset[match_r];
