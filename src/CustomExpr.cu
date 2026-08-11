@@ -314,6 +314,14 @@ class Parser {
             if (t.str == "q0") return Node::makeVar(CVAR_Q0);
             if (t.str == "L") return Node::makeVar(CVAR_L);
             if (t.str == "d") return Node::makeVar(CVAR_D);
+            if (t.str == "p1p") return Node::makeVar(CVAR_P1P);
+            if (t.str == "p1e") return Node::makeVar(CVAR_P1E);
+            if (t.str == "p1costheta") return Node::makeVar(CVAR_P1COSTHETA);
+            if (t.str == "p1phi") return Node::makeVar(CVAR_P1PHI);
+            if (t.str == "p2p") return Node::makeVar(CVAR_P2P);
+            if (t.str == "p2e") return Node::makeVar(CVAR_P2E);
+            if (t.str == "p2costheta") return Node::makeVar(CVAR_P2COSTHETA);
+            if (t.str == "p2phi") return Node::makeVar(CVAR_P2PHI);
             // 函数
             static const std::map<std::string, int> funcs = {
                 {"exp", CFUNC_EXP}, {"log", CFUNC_LOG}, {"ln", CFUNC_LOG},
@@ -530,6 +538,8 @@ __device__ void evalCustomSeg(
     const double* seg, int n_instr,
     double m, double q, double q0, int L, double d,
     double md1, double md2,
+    double p1p, double p1e, double p1costheta, double p1phi,
+    double p2p, double p2e, double p2costheta, double p2phi,
     const double* params, double* out)
 {
     // 栈式复数求值
@@ -563,6 +573,14 @@ __device__ void evalCustomSeg(
                     case CVAR_D: v = d; break;
                     case CVAR_MD1: v = md1; break;
                     case CVAR_MD2: v = md2; break;
+                    case CVAR_P1P: v = p1p; break;
+                    case CVAR_P1E: v = p1e; break;
+                    case CVAR_P1COSTHETA: v = p1costheta; break;
+                    case CVAR_P1PHI: v = p1phi; break;
+                    case CVAR_P2P: v = p2p; break;
+                    case CVAR_P2E: v = p2e; break;
+                    case CVAR_P2COSTHETA: v = p2costheta; break;
+                    case CVAR_P2PHI: v = p2phi; break;
                 }
                 push(v, 0.0); break;
             }
@@ -712,6 +730,8 @@ __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
     double md1, double md2,
+    double p1p, double p1e, double p1costheta, double p1phi,
+    double p2p, double p2e, double p2costheta, double p2phi,
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,
@@ -721,13 +741,15 @@ __device__ void evalCustomAll(
     double out[2];
     // 值段
     int n_instr = (int)aux[seg_off];
-    evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
+    evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
+                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
     Fr = out[0]; Fi = out[1];
     seg_off += 1 + 3 * n_instr;
     // 一阶段
     for (int j = 0; j < P; ++j) {
         n_instr = (int)aux[seg_off];
-        evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
+        evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
+                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
         dFr[j] = out[0]; dFi[j] = out[1];
         seg_off += 1 + 3 * n_instr;
     }
@@ -735,7 +757,8 @@ __device__ void evalCustomAll(
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) {
             n_instr = (int)aux[seg_off];
-            evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2, params, out);
+            evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
+                          p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
             d2Fr[j * P + k] = out[0]; d2Fi[j * P + k] = out[1];
             d2Fr[k * P + j] = out[0]; d2Fi[k * P + j] = out[1];
             seg_off += 1 + 3 * n_instr;

@@ -35,6 +35,10 @@ enum CustomVarId : int {
     CVAR_D = 4,   // 势垒半径
     CVAR_MD1 = 5, // 子粒子 1 质量（运行时提供，导数 0；内置模型 q0 链用）
     CVAR_MD2 = 6, // 子粒子 2 质量（同上）
+    CVAR_P1P = 7,        CVAR_P1E = 8,        // |p1|, E1
+    CVAR_P1COSTHETA = 9, CVAR_P1PHI = 10,     // cosθ1, φ1
+    CVAR_P2P = 11,       CVAR_P2E = 12,       // |p2|, E2
+    CVAR_P2COSTHETA = 13,CVAR_P2PHI = 14      // cosθ2, φ2
 };
 
 // 函数 id
@@ -76,6 +80,8 @@ __device__ void evalCustomSeg(
     const double* seg, int n_instr,
     double m, double q, double q0, int L, double d,
     double md1, double md2,
+    double p1p, double p1e, double p1costheta, double p1phi,
+    double p2p, double p2e, double p2costheta, double p2phi,
     const double* params, double* out);
 
 // 获取第 s 段在 aux 中的偏移（host 和 device 共用逻辑）
@@ -98,6 +104,8 @@ __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
     double md1, double md2,
+    double p1p, double p1e, double p1costheta, double p1phi,
+    double p2p, double p2e, double p2costheta, double p2phi,
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,
