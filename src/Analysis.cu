@@ -4527,9 +4527,13 @@ private:
                             is_boson2 = !p_d1->is_fermion();
                         }
                     }
+                    // 分波白名单: [[S, L], ...] → set<pair<int,int>>
+                    std::set<std::pair<int, int>> sl_filter;
+                    for (const auto& sf : step.sl_filter)
+                        if (sf.size() >= 2) sl_filter.insert({ sf[0], sf[1] });
                     int maxL2 = config_parser_.getGlobalMaxL();
                     cas->addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2,
-                                        step.p_break, step.is_bf),
+                                        step.p_break, step.is_bf, std::move(sl_filter)),
                         step.mother, step.daughters[0], step.daughters[1]);
                 }
 
