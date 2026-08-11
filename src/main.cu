@@ -106,10 +106,6 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)
-        .def("testBWRHessian", &analysis::testBWRHessian,
-             pybind11::arg("m"), pybind11::arg("m0"), pybind11::arg("g0"),
-             pybind11::arg("L"), pybind11::arg("q"), pybind11::arg("q0"), pybind11::arg("d") = 3.0,
-             "Test AutoDiff BWR Hessian. Returns [R_re,R_im, dRe_dm0,dRe_dg0,dIm_dm0,dIm_dg0, d2Re_dm02,d2Re_dm0dg0,d2Re_dg02, d2Im_dm02,d2Im_dm0dg0,d2Im_dg02]")
         .def("getFitFractions", &analysis::getFitFractions,
              "Fit fractions: FF_i = ∫|A_i|² / ∫|ΣA|² (pure shape, no efficiency). "
              "Returns [npartials, 2] = [center, error]. BF_i = BF_total × FF_i.")
