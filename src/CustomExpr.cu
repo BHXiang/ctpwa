@@ -136,6 +136,22 @@ C evalNode(const Node& n, double m, double q, double q0, int L, double d,
                     auto z = Flatte<double>(mv, m0v, n_ch, g, ch);
                     return {z.real(), z.imag()};
                 }
+                case MODEL_FLATTE_RHO_RE:
+                case MODEL_FLATTE_RHO_IM: {  // [s, ma, mb]
+                    double sv = ev(n.kids[0]).re, mav = ev(n.kids[1]).re, mbv = ev(n.kids[2]).re;
+                    double S = (mav + mbv) * (mav + mbv);
+                    double D = (mav - mbv) * (mav - mbv);
+                    double f1_sq = 1.0 - S / sv;
+                    double f1_re, f1_im;
+                    if (f1_sq >= 0.0) { f1_re = sqrt(f1_sq); f1_im = 0.0; }
+                    else              { f1_re = 0.0; f1_im = sqrt(-f1_sq); }
+                    double f2_sq = 1.0 - D / sv;
+                    double f2 = (f2_sq > 0.0) ? sqrt(f2_sq) : 0.0;
+                    if (n.composite_id == MODEL_FLATTE_RHO_RE)
+                        return {f1_re * f2, 0.0};
+                    else
+                        return {f1_im * f2, 0.0};
+                }
                 case MODEL_ONE:
                     return {1.0, 0.0};
             }
@@ -618,6 +634,28 @@ __device__ void evalCustomSeg(
                         pop(m0v, _t); pop(mv, _t);
                         auto z = Flatte<double>(mv, m0v, n_ch, g, ch);
                         push(z.real(), z.imag());
+                        break;
+                    }
+                    case MODEL_FLATTE_RHO_RE:
+                    case MODEL_FLATTE_RHO_IM: {
+                        // [s, ma, mb] → ρ = csqrt(1-(ma+mb)²/s) * √(clip(1-(ma-mb)²/s,0))
+                        double mb_im, ma_im, s_im;
+                        double mbv, mav, sv;
+                        pop(mbv, mb_im); pop(mav, ma_im); pop(sv, s_im);
+                        double S = (mav + mbv) * (mav + mbv);
+                        double D = (mav - mbv) * (mav - mbv);
+                        double f1_sq = 1.0 - S / sv;
+                        double f1_re, f1_im;
+                        if (f1_sq >= 0.0) { f1_re = sqrt(f1_sq); f1_im = 0.0; }
+                        else              { f1_re = 0.0; f1_im = sqrt(-f1_sq); }
+                        double f2_sq = 1.0 - D / sv;
+                        double f2 = (f2_sq > 0.0) ? sqrt(f2_sq) : 0.0;
+                        double rho_re = f1_re * f2;
+                        double rho_im = f1_im * f2;
+                        if ((int)a0 == MODEL_FLATTE_RHO_RE)
+                            push(rho_re, 0.0);
+                        else
+                            push(rho_im, 0.0);
                         break;
                     }
                     case MODEL_ONE:
