@@ -120,6 +120,8 @@ class Resonance
 
     // 按规范顺序返回自由参数值（与 d_all_params 中的排列一致）
     std::vector<double> getOrderedParams() const;
+    // 按规范顺序下标设置单个参数值（Constraints.fix_var 用）
+    void setParam(int idx, double value);
     // 返回 channel masses（仅 Flatte 有效）
     const std::vector<std::pair<double, double>>& getChannels() const { return channels_; }
     // 返回模型辅助数据（Hist: [m_min, m_max, n_bins, values...]；非 aux 模型为空）

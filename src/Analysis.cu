@@ -1203,6 +1203,10 @@ public:
         //     total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
 
         double loss = total_data_nll - total_bkg_nll + (totalDataWeight - bkg_integral_) * log(phsp_factor);
+        // Constraints.gauss_constr: 罚项 Σ(x-μ)²/(2σ²)
+        // （NaN 情况下由下方 loss_reset 逻辑一并处理）
+        if (params_mgr->nGaussConstr() > 0 && n_free_res > 0 && theta.numel() > 0)
+            loss += params_mgr->gaussPenalty(theta);
         // std::cout << "Data NLL: " << total_data_nll << ", Bkg NLL: " << total_bkg_nll
         //           << ", PHSP factor: " << phsp_factor
         //           << ", Total loss: " << loss << std::endl;
@@ -1224,6 +1228,13 @@ public:
             axpyComplex(d_grad_global, d_P_vec, scale_phsp, extended_n_gls);
         }
         cudaFree(d_P_vec);
+
+        // gauss_constr 罚项梯度 (x-μ)/σ² 累加到 grad_theta
+        // （loss_reset 时 grad_theta 已清零，跳过以免注入 NaN）
+        if (!loss_reset && params_mgr->nGaussConstr() > 0 && n_free_res > 0
+            && grad_theta.numel() > 0) {
+            params_mgr->gaussPenaltyGrad(theta, grad_theta);
+        }
 
         // 6. 保存梯度和loss到ctx
         cudaSetDevice(primary_dev);
@@ -3110,6 +3121,10 @@ public:
                 hess_fit.data_ptr<double>(),
                 nv, ncf, nt);
             cudaFree(d_g_v);
+            // Constraints.gauss_constr: 罚项 Hessian 对角 1/σ²（θ 块起点 = 2*ncf；
+            // transform 对 θθ 块是直接拷贝，变换前后追加等价）
+            if (params_.nGaussConstr() > 0)
+                params_.addGaussHessianDiag(hess_fit, 2 * ncf);
 
             if (hprof) {
                 auto hTend = std::chrono::high_resolution_clock::now();
@@ -3122,6 +3137,10 @@ public:
         }
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
+
+        // Constraints.gauss_constr: 罚项 Hessian 对角 1/σ²（θ 块起点 = n2）
+        if (params_.nGaussConstr() > 0)
+            params_.addGaussHessianDiag(hessian, n2);
 
         if (hprof) {
             auto hTend = std::chrono::high_resolution_clock::now();
@@ -3693,8 +3712,7 @@ public:
 
         amp_calc_.reComputeAmps(d_all_amplitudes_,
             reinterpret_cast<const double*>(params.data_ptr()),
-            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
-            config_parser_.getBfD());
+            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
     }
 
     torch::Tensor getFreeResParams() const
@@ -3720,6 +3738,7 @@ public:
 private:
     int n_gls_;
     int n_polar_ = 1;
+    int n_coupling_names_ = 0;   // 耦合参数名段长度（fix_var/var_equal 后 theta 名重建用）
     int n_polar_total_ = 1;               // total tensor polarizations (before mask)
     std::vector<int> polarization_map_;    // output_idx -> tensor_idx for polarization mask
     std::vector<int> nSLvectors_;
@@ -3917,9 +3936,35 @@ private:
         }
         d_all_amplitudes_ = calculateAmplitudes(Vp4_all_, &amp_calc_);
 
-        // 设置共振态自由参数个数
+        // 设置共振态自由参数个数（calculateAmplitudes 内部已应用 var_equal 槽合并）
         if (!amp_calc_.empty()) {
             params_.setNFreeTheta(amp_calc_.nFreeResParams());
+            // fix_var/var_equal 移除了部分槽: 用实际槽名重建 theta 参数名段，
+            // 保证参数名与自由参数一一对应（getParamNames 长度不变量）
+            const auto& slots = amp_calc_.slots();
+            auto names = params_.paramNames();
+            if (static_cast<int>(names.size()) >= n_coupling_names_) {
+                names.resize(n_coupling_names_);
+                for (const auto& s : slots) names.push_back(s.name);
+                params_.setParamNames(names);
+            }
+        }
+
+        // Constraints.gauss_constr: name → theta 下标映射（μ 默认取 slot 初值）
+        if (!amp_calc_.empty() && !config_parser_.getGaussConstr().empty()) {
+            const auto& gc = config_parser_.getGaussConstr();
+            const auto& slots = amp_calc_.slots();
+            std::map<std::string, int> name_to_idx;
+            std::map<std::string, double> sigma, mu;
+            for (size_t s = 0; s < slots.size(); ++s) {
+                auto git = gc.find(slots[s].name);
+                if (git != gc.end()) {
+                    name_to_idx[slots[s].name] = static_cast<int>(s);
+                    sigma[slots[s].name] = git->second;
+                    mu[slots[s].name] = slots[s].init_value;
+                }
+            }
+            params_.setGaussConstr(name_to_idx, sigma, mu);
         }
 
         // 输出d_all_amplitudes_[0]所有内容:
@@ -4235,6 +4280,8 @@ private:
             const auto& rnames = info.resonanceParamNames();
             all_names.insert(all_names.end(), rnames.begin(), rnames.end());
             params_.setParamNames(all_names);
+            // 耦合参数名段长度（theta 段重建时保留）
+            n_coupling_names_ = static_cast<int>(info.paramNames().size());
 
             // std::cout << "Coupling matrix: " << info.couplingMatrix().n_amps
             //           << " amplitudes → " << info.couplingMatrix().n_free
@@ -4550,7 +4597,7 @@ private:
                         if (sf.size() >= 2) sl_filter.insert({ sf[0], sf[1] });
                     int maxL2 = config_parser_.getGlobalMaxL();
                     cas->addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2,
-                                        step.p_break, step.is_bf, std::move(sl_filter)),
+                                        step.p_break, step.has_bf, step.bf_d, std::move(sl_filter)),
                         step.mother, step.daughters[0], step.daughters[1]);
                 }
 
@@ -4578,6 +4625,26 @@ private:
                     resonance_combinations = std::move(temp);
                 }
 
+                // Constraints.fix_var: 覆盖命名参数值（fix_var \ free_var）。
+                // 作用于组合副本，不影响其他 chain 的共振态对象。
+                {
+                    const auto& fix_var_map = config_parser_.getFixVar();
+                    const auto& free_var_set = config_parser_.getFreeVar();
+                    if (!fix_var_map.empty()) {
+                        for (auto& res_combo : resonance_combinations) {
+                            for (auto& res : res_combo) {
+                                const auto& pnames = res.getOrderedParamNames();
+                                for (size_t pi = 0; pi < pnames.size(); ++pi) {
+                                    std::string nm = res.getName() + "_" + pnames[pi];
+                                    auto it = fix_var_map.find(nm);
+                                    if (it != fix_var_map.end() && !free_var_set.count(nm))
+                                        res.setParam(static_cast<int>(pi), it->second);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 计算SL振幅（多GPU版本）
                 cas->computeSLAmps(Vp4);
                 // int nSLcombs = cas->getNSLCombs();
@@ -4586,12 +4653,15 @@ private:
                 // 调用多GPU版本的getAmps函数
                 for (const auto resonance : resonance_combinations)
                 {
-                    cas->getAmps(d_all_amplitudes_vec, resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_, config_parser_.getBfD());
+                    cas->getAmps(d_all_amplitudes_vec, resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_);
 
                     // 如果有 scan 配置且 amp_calc 非空，注册到 AmpCalc
                     if (amp_calc)
                     {
                         const auto& config_res = config_parser_.getResonances();
+                        const auto& fix_var_map = config_parser_.getFixVar();
+                        const auto& free_var_set = config_parser_.getFreeVar();
+                        const auto& var_range_map = config_parser_.getVarRange();
                         std::vector<std::vector<int>> all_free;
                         std::vector<std::vector<std::vector<double>>> all_free_ranges;
                         std::set<std::string> skip_slots_for;
@@ -4608,16 +4678,30 @@ private:
                                 (it->second.type == "custom" || it->second.type == "Custom");
                             if (it != config_res.end() && (is_custom || !it->second.free.empty()))
                             {
-                                if (is_custom) {
-                                    std::vector<int> all_idx;
+                                std::vector<int> free_idx;
+                                if (is_custom ||
+                                    (it->second.free.size() == 1 && it->second.free[0] == -1)) {
                                     for (int pi = 0; pi < (int)res.getOrderedParamNames().size(); ++pi)
-                                        all_idx.push_back(pi);
-                                    all_free.push_back(all_idx);
-                                    all_free_ranges.push_back({});
+                                        free_idx.push_back(pi);
                                 } else {
-                                    all_free.push_back(it->second.free);
-                                    all_free_ranges.push_back(it->second.free_range);
+                                    free_idx = it->second.free;
                                 }
+                                // fix_var: 从自由列表中移除固定参数（free_var 取消 fix）
+                                if (!fix_var_map.empty()) {
+                                    const auto& pnames = res.getOrderedParamNames();
+                                    for (auto itf = free_idx.begin(); itf != free_idx.end(); ) {
+                                        std::string nm = ((int)*itf < (int)pnames.size())
+                                            ? res.getName() + "_" + pnames[*itf]
+                                            : res.getName() + "_p" + std::to_string(*itf);
+                                        if (fix_var_map.count(nm) && !free_var_set.count(nm))
+                                            itf = free_idx.erase(itf);
+                                        else ++itf;
+                                    }
+                                }
+                                all_free.push_back(std::move(free_idx));
+                                all_free_ranges.push_back(is_custom
+                                    ? std::vector<std::vector<double>>{}
+                                    : it->second.free_range);
                             }
                             else
                             {
@@ -4652,13 +4736,18 @@ private:
                         }
                         // Always add block — even without free params, its SL channels
                         // contribute to cross-block mixed Hessian (vθ).
-                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges, skip_slots_for, conjugate_name_map);
+                        amp_calc->addBlock(cas, resonance, gls_index, all_free, all_free_ranges,
+                                           skip_slots_for, conjugate_name_map, var_range_map);
                     }
 
                     gls_index += cas->getNSLCombs();
                 }
             }
         }
+
+        // Constraints.var_equal: 所有 block 注册完毕后合并共享参数槽
+        // （必须在此处——setNFreeTheta 之前——以便参数数一致）
+        if (amp_calc) amp_calc->applyVarEqual(config_parser_.getVarEqual());
 
         return d_all_amplitudes_vec;
     }

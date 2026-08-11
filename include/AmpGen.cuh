@@ -44,6 +44,9 @@ struct DecayNode {
     int daug1_idx;  // 子粒子1索引
     int daug2_idx;  // 子粒子2索引
     double mass[3] = { -1, -1, -1 };
+    // 势垒因子（三级作用域决议后的最终值）: has_bf 是否施加；bf_d 势垒半径
+    bool has_bf = true;
+    double bf_d = 3.0;
 };
 
 // 工具函数声明 (定义在 AmpGen.cu)
@@ -69,13 +72,15 @@ class Amp2BD {
 public:
     Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
            bool identical_daughters = false, bool is_boson = true,
-           int maxL = -1, bool p_break = false, bool is_bf = true,
+           int maxL = -1, bool p_break = false, bool has_bf = true,
+           double bf_d = 3.0,
            std::set<std::pair<int, int>> sl_filter = {});
     const std::vector<SL>& getSL() const { return spinOrbitCombinations_; }
     const std::array<int, 3>& getJValues() const { return jvalues_; }
     const std::array<int, 3>& getParities() const { return parities_; }
     bool getPbreak() const { return p_break_; }
-    bool getIsBf() const { return is_bf_; }
+    bool getHasBf() const { return has_bf_; }
+    double getBfD() const { return bf_d_; }
 
 private:
     std::vector<SL> ComSL(const std::array<int, 3>& spins,
@@ -86,7 +91,8 @@ private:
     bool is_boson_; // true=boson(symmetric, +), false=fermion(antisymmetric, -)
     int maxL_;      // 轨道角动量上限; -1 = 无限制
     bool p_break_;  // 宇称是否破缺（弱衰变）
-    bool is_bf_;    // 是否施加势垒因子
+    bool has_bf_;   // 是否有势垒因子（三级作用域决议后的最终值）
+    double bf_d_;   // 势垒半径 d
     std::set<std::pair<int, int>> sl_filter_; // 允许的 (S, L) 分波白名单; 空 = 全允许
     std::vector<SL> spinOrbitCombinations_;
 };
@@ -165,8 +171,7 @@ public:
         const int site,
         const int n_amplitudes,
         const std::vector<std::vector<int>>& event_offsets,
-        const std::vector<std::vector<int>>& amp_offsets,
-        double bf_d = 3.0);
+        const std::vector<std::vector<int>>& amp_offsets);
 
     // Getter函数
     size_t getNSLCombs() const { return nSLCombs_; }
@@ -218,6 +223,7 @@ struct ADBlockDesc {
     const DeviceMomenta* d_mom_tab;  // [nSigma] DeviceMomenta 数组（σ 拓扑的重建动量）
     const double* d_sign_tab;    // [nSigma]（sign[0]=+1）
     int resonance_count;
+    int nFree;                   // 本 block 自由参数条目数（= 消费端 Nlocal；conjugate 块=owner）
     int res_dF_offset[8];        // per-resonance: base offset in d_dF_tab local free index
     int res_dF_count[8];         // per-resonance: number of free params (0 if fixed)
     int decayChain_size;
@@ -279,7 +285,14 @@ public:
                   const std::vector<std::vector<int>>& free_indices,
                   const std::vector<std::vector<std::vector<double>>>& free_ranges,
                   const std::set<std::string>& skip_slots_for = {},
-                  const std::map<std::string, std::string>& conjugate_name_map = {});
+                  const std::map<std::string, std::string>& conjugate_name_map = {},
+                  const std::map<std::string, std::pair<double, double>>& var_range_override = {});
+
+    // 应用 var_equal 约束：每组 [n1, n2, ...] 共享一个参数槽。
+    // owner = 组内第一个有槽的名字；其余成员移除自己的槽，
+    // 并在 reComputeAmps 中把 owner 的参数值广播到成员的 DeviceResonance。
+    // 必须在所有 addBlock 之后、首次使用参数之前调用。
+    void applyVarEqual(const std::vector<std::vector<std::string>>& var_equal_groups);
 
     // 用新参数重算所有振幅
     void reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
@@ -287,8 +300,7 @@ public:
                        int n_amplitudes,
                        const std::vector<std::vector<int>>& event_offsets,
                        const std::vector<std::vector<int>>& amp_offsets,
-                       size_t n_polar,
-                       double bf_d = 3.0);
+                       size_t n_polar);
 
     // 预计算有效耦合 T_{r,e,p} = Σ_i v_i * sl_i （对每个 block）
     // 必须在 computeResonanceGradient 之前调用，且在耦合向量 v 改变后重新调用
@@ -345,6 +357,14 @@ private:
     // conjugate_broadcast_: 跨链同名共振态参数共享
     // {conjugate_block_idx, conjugate_res_idx} → {owner_block_idx, owner_res_idx}
     std::map<std::pair<int,int>, std::pair<int,int>> conjugate_broadcast_;
+    // var_equal ghost: 被合并成员的 (block, res, param) → owner 的全局槽下标。
+    // ghost 条目挂到成员所在 block 的自由参数列表尾部：updateResonanceParamsKernel
+    // 用 owner 槽的值写成员参数（值广播），梯度/Hessian 的导数累加到 owner 槽。
+    struct VarEqualGhost {
+        int member_block, member_res, member_param;
+        int owner_global;
+    };
+    std::vector<VarEqualGhost> var_equal_ghosts_;
     // Track which (block_idx, res_idx) first registered each resonance name
     std::map<std::string, std::pair<int,int>> resonance_owners_;
     // ---- 持久化跨调用缓冲（懒分配；避免每次调用 cudaMalloc/cudaFree + 隐含同步）----
@@ -390,8 +410,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_amp_offsets, int n_amplitudes, int site,
-    double bf_d);
+    int num_amp_offsets, int n_amplitudes, int site);
 
 // 合并 AD kernel：一次启动处理多个同 Nfree 的 block
 template <int Nfree>
@@ -399,7 +418,7 @@ __global__ void computeAmpsMergedKernel(
     ctComplex* amplitudes,
     const ADBlockDesc* desc, int nblocks, int nSL_total,
     const int* amp_offsets, const int* event_offsets, int num_offsets,
-    int n_amplitudes, double bf_d);
+    int n_amplitudes);
 
 // 共振态参数梯度 kernel：对 block 的 Nfree 个自由参数计算 ∂NLL/∂θ
 // （d_dF 由 reComputeAmps 的 AD kernel 预计算；本 kernel 纯读取）

@@ -465,9 +465,11 @@ __global__ void computeCustomHessianKernel(
     const DeviceResonance* d_resonances,
     const double* d_all_params,
     const double* d_all_channels,
-    const int* d_global_idx,          // [P] 自由参数 → 全局 slot 下标
+    const int* d_global_idx,          // [Npr] 自由参数 → 全局 slot 下标
+    const int* d_param_map,           // [Npr] 位置 j → 参数下标（null → 恒等）
+    int Npr,                          // 自由参数数（≤ P；fix_var/var_equal 后 < P）
     double* d_hess, int hess_ld,
-    int nEvents, int nSL, int nPolar, double bf_d, double default_weight,
+    int nEvents, int nSL, int nPolar, double default_weight,
     const double* d_event_weights,
     const double* d_S_re_full, const double* d_S_im_full,
     double* d_g_out,
@@ -489,6 +491,10 @@ __global__ void computeCustomHessianKernel(
     int P = target.param_count;
     if (P < 1) return;
     if (P > 16) P = 16;
+    if (Npr < 0) Npr = P;
+    if (Npr > 16) Npr = 16;
+    // 位置 j → 参数下标（fix_var 固定 / var_equal 合并的参数不求导；null → 恒等）
+    const int* pm = d_param_map;
     const double* target_rp = d_all_params + target.param_offset;
     const double* aux = d_all_channels;
     int aux_offset = target.aux_offset;
@@ -512,10 +518,10 @@ __global__ void computeCustomHessianKernel(
     // dS / d2S 累加（σ 求和）
     double dS_re[16][32], dS_im[16][32];
     double d2S_re[16][16][32], d2S_im[16][16][32];
-    for (int j = 0; j < P; ++j)
+    for (int j = 0; j < Npr; ++j)
         for (int p = 0; p < nPolar; ++p) { dS_re[j][p] = 0; dS_im[j][p] = 0; }
-    for (int j = 0; j < P; ++j)
-        for (int k = 0; k < P; ++k)
+    for (int j = 0; j < Npr; ++j)
+        for (int k = 0; k < Npr; ++k)
             for (int p = 0; p < nPolar; ++p) { d2S_re[j][k][p] = 0; d2S_im[j][k][p] = 0; }
 
     // 每个 SL 组合（本 block nSL 个；SL 与共振态共享，需遍历 SL 求导）
@@ -568,15 +574,15 @@ __global__ void computeCustomHessianKernel(
                         double p2_P = pD2.P(), p2_E = pD2.E;
                         double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                         double p2_phi = atan2(pD2.Py, pD2.Px);
-                        evalCustomAll(aux, aux_offset, mm, qq, q0, L, bf_d,
+                        evalCustomAll(aux, aux_offset, mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
                             p1_P, p1_E, p1_ct, p1_phi,
                             p2_P, p2_E, p2_ct, p2_phi,
                             target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                         custom_eval = true;
                     }
-                } else {
-                    double bf = Bf<double>(L, qq, q0, bf_d);
+                } else if (node.has_bf) {
+                    double bf = Bf<double>(L, qq, q0, node.bf_d);
                     Or *= bf; Oi *= bf;
                 }
             }
@@ -597,12 +603,13 @@ __global__ void computeCustomHessianKernel(
 
             // dF 输出（mixed Hessian 用）: [nSigma × nEv*nSL*Npr]
             if (d_dF_re_out) {
-                size_t row = (size_t)s * ((size_t)nEvents * nSL * P);
-                size_t base = row + (size_t)evt * nSL * P + sl_idx * P;
-                for (int j = 0; j < P; ++j)
-                    d_dF_re_out[base + j] = dF_t[j];
-                for (int j = 0; j < P; ++j)
-                    d_dF_im_out[base + j] = dF_ti[j];
+                size_t row = (size_t)s * ((size_t)nEvents * nSL * Npr);
+                size_t base = row + (size_t)evt * nSL * Npr + sl_idx * Npr;
+                for (int j = 0; j < Npr; ++j) {
+                    int pj = pm ? pm[j] : j;
+                    d_dF_re_out[base + j] = dF_t[pj];
+                    d_dF_im_out[base + j] = dF_ti[pj];
+                }
             }
 
             // dS[j][p] = Σ_sl v_sl · dF_j · slamp_sl
@@ -615,22 +622,26 @@ __global__ void computeCustomHessianKernel(
                 // t = vv × slamp
                 double t_re = (double)vv.x * sl_amp.real() - (double)vv.y * sl_amp.imag();
                 double t_im = (double)vv.x * sl_amp.imag() + (double)vv.y * sl_amp.real();
-                for (int j = 0; j < P; ++j) {
-                    dS_re[j][p] += sg * (dF_t[j] * t_re - dF_ti[j] * t_im);
-                    dS_im[j][p] += sg * (dF_t[j] * t_im + dF_ti[j] * t_re);
+                for (int j = 0; j < Npr; ++j) {
+                    int pj = pm ? pm[j] : j;
+                    dS_re[j][p] += sg * (dF_t[pj] * t_re - dF_ti[pj] * t_im);
+                    dS_im[j][p] += sg * (dF_t[pj] * t_im + dF_ti[pj] * t_re);
                 }
-                for (int j = 0; j < P; ++j)
-                    for (int k = 0; k < P; ++k) {
-                        d2S_re[j][k][p] += sg * (d2F_t[j * P + k] * t_re - d2F_ti[j * P + k] * t_im);
-                        d2S_im[j][k][p] += sg * (d2F_t[j * P + k] * t_im + d2F_ti[j * P + k] * t_re);
+                for (int j = 0; j < Npr; ++j) {
+                    int pj = pm ? pm[j] : j;
+                    for (int k = 0; k < Npr; ++k) {
+                        int pk = pm ? pm[k] : k;
+                        d2S_re[j][k][p] += sg * (d2F_t[pj * P + pk] * t_re - d2F_ti[pj * P + pk] * t_im);
+                        d2S_im[j][k][p] += sg * (d2F_t[pj * P + pk] * t_im + d2F_ti[pj * P + pk] * t_re);
                     }
+                }
             }
         }
     }
 
     // g[j] = -2·Σ_p (cwr·dS_re − cwi·dS_im)
     double g[16];
-    for (int j = 0; j < P; ++j) {
+    for (int j = 0; j < Npr; ++j) {
         double acc = 0.0;
         for (int p = 0; p < nPolar; ++p) {
             double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;
@@ -640,22 +651,22 @@ __global__ void computeCustomHessianKernel(
     }
 
     // 输出 g / dS（供 cross-block stage 2）
-    for (int j = 0; j < P; ++j) {
+    for (int j = 0; j < Npr; ++j) {
         int gj = d_global_idx[j];
-        if (gj >= 0) d_g_out[evt * P + j] = g[j];
+        if (gj >= 0) d_g_out[evt * Npr + j] = g[j];
     }
-    for (int j = 0; j < P; ++j)
+    for (int j = 0; j < Npr; ++j)
         for (int p = 0; p < nPolar; ++p) {
-            int idx = evt * P * nPolar + j * nPolar + p;
+            int idx = evt * Npr * nPolar + j * nPolar + p;
             d_dS_re_out[idx] = dS_re[j][p];
             d_dS_im_out[idx] = dS_im[j][p];
         }
 
     // 同块 Hessian：Term A + B + C（j,k 同 Custom 模型）
-    for (int j = 0; j < P; ++j) {
+    for (int j = 0; j < Npr; ++j) {
         int gj = d_global_idx[j];
         if (gj < 0) continue;
-        for (int k = j; k < P; ++k) {
+        for (int k = j; k < Npr; ++k) {
             int gk = d_global_idx[k];
             if (gk < 0) continue;
             double hjk = g[j] * g[k];  // Term A
@@ -682,7 +693,7 @@ __global__ void computeCustomHessianKernel(
     // phsp: I 和 I·g
     if (default_weight == 0.0 && d_phsp_I != nullptr) atomicAdd(d_phsp_I, I_val);
     if (default_weight == 0.0 && d_phsp_grad != nullptr)
-        for (int j = 0; j < P; ++j) {
+        for (int j = 0; j < Npr; ++j) {
             int gj = d_global_idx[j];
             if (gj >= 0) atomicAdd(&d_phsp_grad[gj], I_val * g[j]);
         }

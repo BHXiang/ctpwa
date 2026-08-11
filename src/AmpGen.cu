@@ -11,11 +11,12 @@
 
 // Amp2BD 类实现
 Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
-    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool is_bf,
-    std::set<std::pair<int, int>> sl_filter)
+    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool has_bf,
+    double bf_d, std::set<std::pair<int, int>> sl_filter)
     : jvalues_(jvalues), parities_(parities),
     identical_daughters_(identical_daughters), is_boson_(is_boson),
-    maxL_(maxL), p_break_(p_break), is_bf_(is_bf), sl_filter_(std::move(sl_filter))
+    maxL_(maxL), p_break_(p_break), has_bf_(has_bf), bf_d_(bf_d),
+    sl_filter_(std::move(sl_filter))
 {
     spinOrbitCombinations_ = ComSL(jvalues, parities);
 }
@@ -682,6 +683,10 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             indexed_node.mass[1] = particleMap_[node.daug1].mass;
             indexed_node.mass[2] = particleMap_[node.daug2].mass;
 
+            // 势垒因子（三级作用域决议后的最终值，随 DecayNode 进入内核）
+            indexed_node.has_bf = node.amp.getHasBf();
+            indexed_node.bf_d = node.amp.getBfD();
+
             host_decayNodes.push_back(indexed_node);
         }
 
@@ -1162,8 +1167,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     const int site,
     const int n_amplitudes,
     const std::vector<std::vector<int>>& event_offsets,
-    const std::vector<std::vector<int>>& amp_offsets,
-    double bf_d)
+    const std::vector<std::vector<int>>& amp_offsets)
 {
     for (size_t i = 0; i < d_amplitudes.size(); ++i)
     {
@@ -1276,8 +1280,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                 d_event_offsets,    // 事件偏移量
                 num_offsets,        // 偏移量数量
                 n_amplitudes,       // 振幅数量
-                site,               // 位置
-                bf_d                // 势垒因子 d
+                site                // 位置
                 );
 
         cudaDeviceSynchronize();
@@ -1314,8 +1317,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_offsets, int n_amplitudes, int site,
-    double bf_d)
+    int num_offsets, int n_amplitudes, int site)
 {
     // int event_idx = threadIdx.x * blockDim.x + threadIdx.x;
     int sl_idx = blockIdx.x;
@@ -1431,9 +1433,10 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
 
         if (nodeIdx == 0)
         {
-            // 第一个节点特殊处理
+            // 第一个节点特殊处理（Bf 按节点门控: node.has_bf / node.bf_d）
             // resAmp *= BlattWeisskopf(sl.L, qq, q0);
-            resAmp *= Bf<double>(sl.L, qq, q0, bf_d);
+            if (node.has_bf)
+                resAmp *= Bf<double>(sl.L, qq, q0, node.bf_d);
 
             // printf("Event %d, SL %d, Node %d: First node, resAmp = (%f, %f)\n",
             //     event_idx, sl_idx, nodeIdx, resAmp.real(), resAmp.imag());
@@ -1450,7 +1453,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
             resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
                 p, current_res.param_count, current_res.type,
                 ch, current_res.n_channels,
-                d_all_channels, current_res.aux_offset, bf_d);
+                d_all_channels, current_res.aux_offset, node.bf_d, node.has_bf);
         }
     }
 
@@ -1596,7 +1599,7 @@ __global__ void computeCustomAmpsKernel(
     ctComplex* amplitudes,
     const ADBlockDesc* desc, int nblocks, int nSL_total,
     const int* amp_offsets, const int* event_offsets, int num_offsets,
-    int n_amplitudes, double bf_d)
+    int n_amplitudes)
 {
     int slg = blockIdx.x;
     int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
@@ -1616,13 +1619,14 @@ __global__ void computeCustomAmpsKernel(
     const double* all_params = B.d_all_params;
     const double* aux = B.d_all_channels;
 
-    // R>1 时使用 Nfree-based d_dF 布局；R==1 沿用旧 P-based 布局以保持完全兼容
-    int Nfree = 0;
-    if (R != 1) {
-        for (int r = 0; r < R; ++r) Nfree += B.res_dF_count[r];
-        if (Nfree < 1) Nfree = 1;
-        if (Nfree > 64) Nfree = 64;
-    }
+    // Nfree-based d_dF 布局（R==1 与 R>1 统一，与分配/消费端一致）：
+    // Nfree = 本 block 自由参数条目数 = B.nFree —— 消费端
+    // (resonanceGradientKernelRuntime) 的 Nlocal 就是 block.nFree，两者必须相同。
+    // 对 conjugate (trans) 块，res_dF_count 为 0 但 nFree = owner 的条目数
+    // （reComputeAmps 复制）；var_equal ghost 也计入 res_dF_count/nFree。
+    int Nfree = B.nFree;
+    if (Nfree < 1) Nfree = 1;
+    if (Nfree > 64) Nfree = 64;
 
     size_t slamp_row = (size_t)B.nSL * B.nPolar * B.nEvents;
     const int MAX_POL = 32;
@@ -1687,7 +1691,7 @@ __global__ void computeCustomAmpsKernel(
                             double p2_P = pD2.P(), p2_E = pD2.E;
                             double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                             double p2_phi = atan2(pD2.Py, pD2.Px);
-                            evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, bf_d,
+                            evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
                                 md1_q0, md2_q0,
                                 p1_P, p1_E, p1_ct, p1_phi,
                                 p2_P, p2_E, p2_ct, p2_phi,
@@ -1695,13 +1699,13 @@ __global__ void computeCustomAmpsKernel(
                         }
                         custom_eval = true;
                     }
-                } else {
-                    double bf = Bf<double>(L, qq, q0, bf_d);
+                } else if (node.has_bf) {
+                    double bf = Bf<double>(L, qq, q0, node.bf_d);
                     Or *= bf; Oi *= bf;
                     double dq0_dm = 0.0;
                     if (md1_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
                     if (md2_q0 == target_rp[0]) dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
-                    dlnO_dm0 += dlnBf_dq0(L, q0, bf_d) * dq0_dm;
+                    dlnO_dm0 += dlnBf_dq0(L, q0, node.bf_d) * dq0_dm;
                 }
             }
 
@@ -1709,12 +1713,14 @@ __global__ void computeCustomAmpsKernel(
             double dO_dm0 = Or * dlnO_dm0;
 
             if (B.d_dF_tab) {
-                int base = (event_idx * B.nSL + sl_idx) * P
-                         + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * P));
-                for (int j = 0; j < P; ++j) {
-                    double dtr = Or * dFr[j] - Oi * dFi[j];
-                    double dti = Or * dFi[j] + Oi * dFr[j];
-                    if (j == 0) { dtr += dO_dm0 * Fr; dti += dO_dm0 * Fi; }
+                int base = (event_idx * B.nSL + sl_idx) * Nfree
+                         + (int)((size_t)s * ((size_t)B.nEvents * B.nSL * Nfree));
+                for (int j = 0; j < Nfree; ++j) {
+                    int p = B.d_param_map[j];
+                    if (p < 0 || p >= P) continue;
+                    double dtr = Or * dFr[p] - Oi * dFi[p];
+                    double dti = Or * dFi[p] + Oi * dFr[p];
+                    if (p == 0) { dtr += dO_dm0 * Fr; dti += dO_dm0 * Fi; }
                     B.d_dF_tab[base + j] = ctMake(dtr, dti);
                 }
             }
@@ -1794,7 +1800,7 @@ __global__ void computeCustomAmpsKernel(
                         double p2_P = pD2.P(), p2_E = pD2.E;
                         double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                         double p2_phi = atan2(pD2.Py, pD2.Px);
-                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
                             p1_P, p1_E, p1_ct, p1_phi,
                             p2_P, p2_E, p2_ct, p2_phi,
@@ -1815,8 +1821,8 @@ __global__ void computeCustomAmpsKernel(
                     double nr = Ftr * Fr - Fti * Fi;
                     double ni = Ftr * Fi + Fti * Fr;
                     Ftr = nr; Fti = ni;
-                } else {
-                    double bf = Bf<double>(L, qq, q0, bf_d);
+                } else if (node.has_bf) {
+                    double bf = Bf<double>(L, qq, q0, node.bf_d);
                     Ftr *= bf; Fti *= bf;
 
                     for (int r = 0; r < R; ++r) {
@@ -1826,7 +1832,7 @@ __global__ void computeCustomAmpsKernel(
                             dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
                         if (node.mass[2] <= 0 && node.daug2_idx == B.d_res[r].particle_idx)
                             dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
-                        double dlnO = dlnBf_dq0(L, q0, bf_d) * dq0_dm;
+                        double dlnO = dlnBf_dq0(L, q0, node.bf_d) * dq0_dm;
                         int off = B.res_dF_offset[r];
                         int cnt = B.res_dF_count[r];
                         for (int j_loc = 0; j_loc < cnt; ++j_loc) {
@@ -1969,7 +1975,8 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        const std::vector<std::vector<int>>& free_indices,
                        const std::vector<std::vector<std::vector<double>>>& free_ranges,
                        const std::set<std::string>& skip_slots_for,
-                       const std::map<std::string, std::string>& conjugate_name_map)
+                       const std::map<std::string, std::string>& conjugate_name_map,
+                       const std::map<std::string, std::pair<double, double>>& var_range_override)
 {
     // 1. 查找或添加 cas 到 cas_list_
     int cas_idx = -1;
@@ -2037,6 +2044,10 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             double dd = 3.0;
             it = opts.find("d");
             if (it != opts.end()) dd = std::stod(it->second);
+            // 目标节点势垒因子: 由 Info.cu 构造 Resonance 时注入解析后的最终值
+            bool has_bf = true;
+            it = opts.find("has_bf");
+            if (it != opts.end()) has_bf = (it->second == "1" || it->second == "true");
             std::vector<double> cf;
             for (const auto& ch : res.getChannels()) {
                 cf.push_back(ch.first);
@@ -2049,7 +2060,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                 m1d = Q0MassDep::EventMass; m2d = Q0MassDep::EventMass;
             }
             aux = buildModelAST(dr.type, L, dd, dr.param_count, dr.n_channels, cf,
-                                m1d, m1f, m2d, m2f);
+                                m1d, m1f, m2d, m2f, has_bf);
         }
         dr.aux_offset = static_cast<int>(h_all_channels.size());
         dr.aux_size = static_cast<int>(aux.size());
@@ -2130,8 +2141,15 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             const auto& pnames = resonances[i].getOrderedParamNames();
             std::string pname = (p_idx < (int)pnames.size()) ? pnames[p_idx]
                                                             : ("p" + std::to_string(p_idx));
+            std::string slot_name = resonances[i].getName() + "_" + pname;
+            // Constraints.var_range: 按名字覆盖拟合范围
+            auto vri = var_range_override.find(slot_name);
+            if (vri != var_range_override.end()) {
+                lower = vri->second.first;
+                upper = vri->second.second;
+            }
             slots_.push_back({block_idx, static_cast<int>(i), p_idx, val, lower,
-                              upper, resonances[i].getName() + "_" + pname});
+                              upper, std::move(slot_name)});
         }
     }
 
@@ -2166,13 +2184,112 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     }
 }
 
+void AmpCalc::applyVarEqual(const std::vector<std::vector<std::string>>& groups)
+{
+    if (groups.empty() || slots_.empty()) return;
+
+    // name → slot 下标
+    std::map<std::string, int> name_to_slot;
+    for (size_t s = 0; s < slots_.size(); ++s)
+        name_to_slot[slots_[s].name] = static_cast<int>(s);
+
+    std::set<int> to_remove;   // 成员 slot 下标（降序移除）
+    // (ghost, owner 移除前下标) — owner 槽下标在移除后重映射
+    struct PendingGhost { VarEqualGhost g; int owner_pre; };
+    std::vector<PendingGhost> pending;
+
+    for (const auto& group : groups) {
+        if (group.size() < 2) continue;
+        // owner = 组内第一个有槽的名字
+        int owner_slot = -1;
+        for (const auto& nm : group) {
+            auto it = name_to_slot.find(nm);
+            if (it != name_to_slot.end()) { owner_slot = it->second; break; }
+        }
+        if (owner_slot < 0) {
+            std::cerr << "Warning: var_equal 组中没有可用参数槽 (fix_var/trans 折叠后): [";
+            for (size_t i = 0; i < group.size(); ++i) {
+                if (i) std::cerr << ", ";
+                std::cerr << group[i];
+            }
+            std::cerr << "]" << std::endl;
+            continue;
+        }
+        if (to_remove.count(owner_slot)) {
+            std::cerr << "Warning: var_equal 组的 owner 已被其他组合并，跳过: "
+                      << slots_[owner_slot].name << std::endl;
+            continue;
+        }
+        for (const auto& nm : group) {
+            auto it = name_to_slot.find(nm);
+            if (it == name_to_slot.end() || it->second == owner_slot) continue;
+            int ms = it->second;
+            const auto& ms_ = slots_[ms];
+            pending.push_back(
+                {{ms_.block_idx, ms_.res_idx, ms_.param_idx, -1}, owner_slot});
+            to_remove.insert(ms);
+        }
+    }
+    if (to_remove.empty()) return;
+
+    // 移除成员槽（降序，避免下标漂移）
+    for (auto it = to_remove.rbegin(); it != to_remove.rend(); ++it)
+        slots_.erase(slots_.begin() + *it);
+
+    // owner 全局槽下标重映射：被移除且下标 < owner 的槽使 owner 下标左移
+    for (auto& p : pending) {
+        int owner_after = p.owner_pre;
+        for (int m : to_remove)
+            if (m < owner_after) --owner_after;
+        p.g.owner_global = owner_after;
+        var_equal_ghosts_.push_back(p.g);
+    }
+
+    // 重建各 block 的自由参数信息（slot 下标已变；ghost 追加到 block 列表尾部）
+    for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+        auto& b = blocks_[bi];
+        b.free_global_idx.clear();
+        b.free_param_idx.clear();
+        b.nFree = 0;
+        for (int s = 0; s < (int)slots_.size(); ++s) {
+            if (slots_[s].block_idx == (int)bi) {
+                b.free_global_idx.push_back(s);
+                b.free_param_idx.push_back(slots_[s].param_idx);
+                b.nFree++;
+            }
+        }
+        // var_equal ghost：值写入 + 梯度/Hessian 累加归属 owner 全局槽
+        for (const auto& g : var_equal_ghosts_) {
+            if (g.member_block == (int)bi) {
+                b.free_global_idx.push_back(g.owner_global);
+                b.free_param_idx.push_back(g.member_param);
+                b.nFree++;
+            }
+        }
+        int R = b.resonance_count;
+        b.res_dF_offset_.assign(R, 0);
+        b.res_dF_count_.assign(R, 0);
+        for (int s = 0; s < (int)slots_.size(); ++s) {
+            if (slots_[s].block_idx == (int)bi) {
+                int r = slots_[s].res_idx;
+                if (r >= 0 && r < R) b.res_dF_count_[r]++;
+            }
+        }
+        for (const auto& g : var_equal_ghosts_) {
+            if (g.member_block == (int)bi && g.member_res >= 0 && g.member_res < R)
+                b.res_dF_count_[g.member_res]++;
+        }
+        int cur = 0;
+        for (int r = 0; r < R; ++r) { b.res_dF_offset_[r] = cur; cur += b.res_dF_count_[r]; }
+    }
+}
+
 void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             const double* d_params,
                             int n_amplitudes,
                             const std::vector<std::vector<int>>& event_offsets,
                             const std::vector<std::vector<int>>& amp_offsets,
-                            size_t n_polar,
-                            double bf_d)
+                            size_t n_polar)
 {
     int n_gpu = static_cast<int>(d_amplitudes.size());
     int n_free = nFreeResParams();
@@ -2254,6 +2371,15 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     local_global_offset.push_back(s);
                 }
             }
+            // 追加 var_equal ghost 成员：值写 owner 槽的 θ（广播），
+            // 与真实槽同样进入 updateResonanceParamsKernel（写入成员参数位置）
+            for (const auto& g : var_equal_ghosts_) {
+                if (g.member_block == static_cast<int>(bi)) {
+                    local_res_idx.push_back(g.member_res);
+                    local_param_idx.push_back(g.member_param);
+                    local_global_offset.push_back(g.owner_global);
+                }
+            }
             int n_local = static_cast<int>(local_res_idx.size());
             if (n_local == 0) continue;
 
@@ -2296,6 +2422,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaMemcpy(d_cj_params, d_ow_params,
                        ow_count * sizeof(double), cudaMemcpyDeviceToDevice);
         }
+
+        // var_equal 值广播由 updateResonanceParamsKernel 的 ghost 条目完成
+        // （ghost 的 d_global_offset 指向 owner 槽，写入即 θ[owner]）
 
         // 为 conjugate 块填充自由参数信息（从 owner 复制；参数值已广播）
         for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
@@ -2370,6 +2499,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 d.d_mom_tab = cas->getMomentaTab()[gpu];
                 d.d_sign_tab = cas->getSignsTab()[gpu];
                 d.resonance_count = block.resonance_count;
+                d.nFree = block.nFree;
                 for (int r = 0; r < block.resonance_count && r < 8; ++r) {
                     d.res_dF_offset[r] = block.res_dF_offset_[r];
                     d.res_dF_count[r] = block.res_dF_count_[r];
@@ -2391,7 +2521,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                        (static_cast<unsigned int>(max_evt) + 255) / 256);
             computeCustomAmpsKernel<<<gridC, blockSize>>>(
                 d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, bf_d);
+                d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes);
         }
 
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，
@@ -2814,10 +2944,8 @@ void AmpCalc::computeUnifiedHessian(
             int nPol = static_cast<int>(cas->getNPolarizations());
             int dsz = cas->getDecayChainSize();
 
-            int Npr = 0;
-            for (int s = 0; s < n_free; ++s) {
-                if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
-            }
+            // 自由参数数（res 0；含 var_equal ghost 条目）
+            int Npr = (int)blk.res_dF_count_[0];
 
             // 检查是否为 conjugate 块：如果 Npr==0，查 conjugate_broadcast_
             //（该块的所有共振态通过 trans 约束与 owner 块共享参数）
@@ -2832,9 +2960,7 @@ void AmpCalc::computeUnifiedHessian(
                     }
                 }
                 if (is_conjugate && ow_bi >= 0) {
-                    for (int s = 0; s < n_free; ++s) {
-                        if (slots_[s].block_idx == ow_bi && slots_[s].res_idx == 0) ++Npr;
-                    }
+                    Npr = (int)blocks_[ow_bi].res_dF_count_[0];
                 }
             }
             // Custom 模型（参数数运行时）→ 标量 Hessian kernel，无模板上限
@@ -2872,6 +2998,14 @@ void AmpCalc::computeUnifiedHessian(
                         if (count < Npr) { global_idx[r * Npr + count] = s; ++count; }
                     }
                 }
+                // var_equal ghost 成员 → owner 全局槽（二阶导数归属 owner）
+                for (const auto& g : var_equal_ghosts_) {
+                    if (g.member_block == target_bi && g.member_res == target_ri
+                        && count < Npr) {
+                        global_idx[r * Npr + count] = g.owner_global;
+                        ++count;
+                    }
+                }
             }
 
             // Allocate temp buffers for this block
@@ -2896,13 +3030,27 @@ void AmpCalc::computeUnifiedHessian(
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
 
             if (is_custom_block || has_sym_aux) {
+                // d_param_map 懒上传（getHessian 可能先于 reComputeAmps 调用；
+                // conjugate 块用 owner 的 free_param_idx）
+                const int* d_pmap = blk.d_param_map_[gpu];
+                if (!d_pmap && Npr > 0) {
+                    if (!blk.d_param_map_.size()) blk.d_param_map_.assign(n_gpu, nullptr);
+                    const std::vector<int>& pm_host = is_conjugate
+                        ? blocks_[ow_bi].free_param_idx : blk.free_param_idx;
+                    int pm_n = std::min(Npr, (int)pm_host.size());
+                    cudaMalloc(&blk.d_param_map_[gpu], Npr * sizeof(int));
+                    cudaMemcpy(blk.d_param_map_[gpu], pm_host.data(),
+                               pm_n * sizeof(int), cudaMemcpyHostToDevice);
+                    d_pmap = blk.d_param_map_[gpu];
+                }
                 // Custom / 符号微分标量路径（P 运行时无上限）
                 computeCustomHessianKernel<<<grid, kBlockSize>>>(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx,
-                    d_hess_g, hess_ld, nEv, nSL, nPol, 3.0, default_weight, d_w,
+                    d_pmap, Npr,
+                    d_hess_g, hess_ld, nEv, nSL, nPol, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,

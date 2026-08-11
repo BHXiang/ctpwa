@@ -90,7 +90,7 @@ __device__ auto computeNodeFactor(
     ResModelType model_type,
     const double* channels, int n_channels,
     const double* aux, int aux_offset,   // Hist 形状表（与 channels 同辅助段；非 Hist 传 nullptr/0）
-    double bf_d
+    double bf_d, bool has_bf = true
 ) -> typename ResResult<T>::type;
 
 // ============================================================================
@@ -142,18 +142,29 @@ __device__ auto computeNodeFactor(
     ResModelType model_type,
     const double* channels, int n_channels,
     const double* aux, int aux_offset,
-    double bf_d
+    double bf_d, bool has_bf
 ) -> typename ResResult<T>::type
 {
     switch (model_type) {
         case ResModelType::BWR: {
             T m0 = params[0], g0 = params[1];
-            auto bw = BWR<T>(mm, m0, g0, L, q_ad, q0_ad, bf_d);
-            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
-            if constexpr (std::is_arithmetic_v<T>) {
-                return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
+            // has_bf=false 时传播子内部宽度也不含 Bf（BWR 的 gamma 含 Bf²）
+            // → 传 d=0.0 使 Bf≡1，与 bf_d=0.0 完全等价
+            auto bw = BWR<T>(mm, m0, g0, L, q_ad, q0_ad, has_bf ? bf_d : 0.0);
+            // 势垒因子门控: has_bf=false 时传播子不含 Bf
+            if (has_bf) {
+                auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+                if constexpr (std::is_arithmetic_v<T>) {
+                    return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
+                } else {
+                    return ResResult<T>::make(bw.real * bf, bw.imag * bf);
+                }
             } else {
-                return ResResult<T>::make(bw.real * bf, bw.imag * bf);
+                if constexpr (std::is_arithmetic_v<T>) {
+                    return ResResult<T>::make(bw.real(), bw.imag());
+                } else {
+                    return ResResult<T>::make(bw.real, bw.imag);
+                }
             }
         }
         case ResModelType::BW: {
@@ -161,8 +172,12 @@ __device__ auto computeNodeFactor(
             return BW<T>(mm, m0, g0);
         }
         case ResModelType::ONE: {
-            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
-            return ResResult<T>::make(bf, T(0.0));
+            // ONE = 无传播子（单位因子）; 有 Bf 时为 Bf，否则为 1
+            if (has_bf) {
+                auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+                return ResResult<T>::make(bf, T(0.0));
+            }
+            return ResResult<T>::make(T(1.0), T(0.0));
         }
         case ResModelType::Flatte: {
             T mass = params[0];
@@ -170,11 +185,20 @@ __device__ auto computeNodeFactor(
             for (int i = 0; i < n_channels && i < 4; ++i)
                 couplings[i] = params[1 + i];
             auto fl = Flatte<T>(mm, mass, n_channels, couplings, channels);
-            auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
-            if constexpr (std::is_arithmetic_v<T>) {
-                return ResResult<T>::make(fl.real() * bf, fl.imag() * bf);
+            // 势垒因子门控: has_bf=false 时 Flatte 不含 Bf
+            if (has_bf) {
+                auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
+                if constexpr (std::is_arithmetic_v<T>) {
+                    return ResResult<T>::make(fl.real() * bf, fl.imag() * bf);
+                } else {
+                    return ResResult<T>::make(fl.real * bf, fl.imag * bf);
+                }
             } else {
-                return ResResult<T>::make(fl.real * bf, fl.imag * bf);
+                if constexpr (std::is_arithmetic_v<T>) {
+                    return ResResult<T>::make(fl.real(), fl.imag());
+                } else {
+                    return ResResult<T>::make(fl.real, fl.imag);
+                }
             }
         }
         case ResModelType::Hist: {
