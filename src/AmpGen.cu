@@ -1927,7 +1927,8 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
         std::vector<double> aux = res.getAuxData();
         if (aux.empty() &&
             (dr.type == ResModelType::BWR || dr.type == ResModelType::BW ||
-             dr.type == ResModelType::ONE || dr.type == ResModelType::Flatte)) {
+             dr.type == ResModelType::ONE || dr.type == ResModelType::Flatte ||
+             dr.type == ResModelType::GS)) {
             const auto& opts = res.getOptions();
             int L = (dr.type == ResModelType::BWR) ? 1 : 2;
             auto it = opts.find("L");

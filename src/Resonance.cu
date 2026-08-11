@@ -61,6 +61,18 @@ class FlatteModel : public ResonanceModel
         const std::vector<std::pair<double,double>>&) const override { return {}; }
 };
 
+class GSModel : public ResonanceModel
+{
+  public:
+    std::string name() const override { return "GS"; }
+    ResModelType type() const override { return ResModelType::GS; }
+    std::vector<ParamSpec> paramSpecs() const override {
+        return {{"mass", 0.0, false}, {"width", 0.0, false}};
+    }
+    std::vector<double> buildAuxData(const std::map<std::string,std::string>&,
+        const std::vector<std::pair<double,double>>&) const override { return {}; }
+};
+
 // Hist：直方图形状模型。无固定参数（可选 mass 用于 q0 归一化）。
 // aux 数据 = 读直方图文件 → [m_min, m_max, n_bins, values...]
 class HistModel : public ResonanceModel
@@ -191,6 +203,7 @@ std::map<std::string, std::unique_ptr<ResonanceModel>>& ModelRegistry::table()
         m.emplace("BW", std::make_unique<BWModel>());
         m.emplace("ONE", std::make_unique<ONEModel>());
         m.emplace("Flatte", std::make_unique<FlatteModel>());
+        m.emplace("GS", std::make_unique<GSModel>());
         m.emplace("Hist", std::make_unique<HistModel>());
         m.emplace("Custom", std::make_unique<CustomModel>());
         return m;

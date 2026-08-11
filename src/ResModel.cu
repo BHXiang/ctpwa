@@ -308,6 +308,79 @@ std::vector<double> buildModelAST(
             ast = Node::makeOp(NodeType::Mul, flatte, bf);
             break;
         }
+        case ResModelType::GS: {
+            // Gounaris-Sakurai for ρ→ππ: F = (1 + d·g₀/m₀) / (m₀² - m² + f - i·m₀·Γ) × Bf
+            // Decomposed into MODEL_BREAKUP_Q0 (q₀) + arithmetic (h, d, h₀, h'₀, Γ, f)
+            double mpi = (n_channels > 0) ? channel_masses[0] : 0.1396;
+            double pi = 3.14159265358979323846;
+
+            Node m0 = Node::makeParam(0);
+            Node g0 = Node::makeParam(1);
+            Node m  = Node::makeVar(CVAR_M);
+            Node q  = Node::makeVar(CVAR_Q);
+            // q0_ast = MODEL_BREAKUP_Q0(m0, md1, md2) — 已在上方构造，对等质量 pion 导数正确
+
+            auto astLog = [](Node a) { return Node::makeFunc(CFUNC_LOG, a); };
+            // h(m) = (2/π)*(q/m)*log((m+2q)/(2mpi))
+            Node hm = astMul(astNum(2.0/pi),
+                astMul(astDiv(q, m),
+                    astLog(astDiv(astAdd(m, astMul(astNum(2.0), q)),
+                                  astNum(2.0*mpi)))));
+
+            // d = (3/π)*(mpi²/q0²)*log((m0+2q0)/(2mpi)) + m0/(2πq0) - mpi²*m0/(πq0³)
+            auto astPow = [](Node a, int n) {
+                Node r = a;
+                for (int i = 1; i < n; ++i) r = astMul(r, a);
+                return r;
+            };
+            Node q0_2 = astSq(q0_ast);
+            Node q0_3 = astMul(q0_2, q0_ast);
+            Node mpi2 = astNum(mpi * mpi);
+            Node logArg = astDiv(astAdd(m0, astMul(astNum(2.0), q0_ast)), astNum(2.0*mpi));
+            Node dval = astSub(
+                astAdd(astMul(astMul(astNum(3.0/pi), astDiv(mpi2, q0_2)), astLog(logArg)),
+                       astDiv(m0, astMul(astNum(2.0*pi), q0_ast))),
+                astDiv(astMul(mpi2, m0), astMul(astNum(pi), q0_3)));
+
+            // h0 = (2/π)*(q0/m0)*log((m0+2q0)/(2mpi))
+            Node h0 = astMul(astNum(2.0/pi),
+                astMul(astDiv(q0_ast, m0), astLog(logArg)));
+
+            // dh0 = h0*(1/(8q0²) - 1/(2m0²)) + 1/(2π·m0²)
+            Node dh0 = astAdd(
+                astMul(h0, astSub(astDiv(astNum(1.0), astMul(astNum(8.0), q0_2)),
+                                  astDiv(astNum(1.0), astMul(astNum(2.0), astSq(m0))))),
+                astDiv(astNum(1.0), astMul(astNum(2.0*pi), astSq(m0))));
+
+            // Γ(m) = g0 * (q/q0)³ * (m0/m)
+            Node qratio = astDiv(q, q0_ast);
+            Node gam = astMul(astMul(g0, astPow(qratio, 3)), astDiv(m0, m));
+
+            // f(m) = g0 * m0²/q0³ * (q²*(hm-h0) + (m0²-m²)*q0²*dh0)
+            Node f = astMul(astMul(g0, astDiv(astSq(m0), q0_3)),
+                astAdd(astMul(astSq(q), astSub(hm, h0)),
+                       astMul(astMul(astSub(astSq(m0), astSq(m)), q0_2), dh0)));
+
+            // Num = 1 + d * g0 / m0
+            Node Num = astAdd(astNum(1.0), astDiv(astMul(dval, g0), m0));
+
+            // DenRe = m0² - m² + f, DenIm = -m0 * gam
+            Node DenRe = astAdd(astSub(astSq(m0), astSq(m)), f);
+            Node DenIm = astNeg(astMul(m0, gam));
+            Node DenSq = astAdd(astSq(DenRe), astSq(DenIm));
+
+            // F = Num / (DenRe + i*DenIm)
+            //   = Num*DenRe/DenSq + i*(-Num*DenIm/DenSq)
+            Node Fre_node = astDiv(astMul(Num, DenRe), DenSq);
+            Node Fim_node = astNeg(astDiv(astMul(Num, DenIm), DenSq));
+            Node gs = astAdd(Fre_node, astMul(Fim_node, astI()));
+
+            Node bf = Node::makeComposite(MODEL_BF, {
+                astNum((double)L), q, q0_ast, astNum(d)
+            });
+            ast = Node::makeOp(NodeType::Mul, gs, bf);
+            break;
+        }
         default:
             // Hist/Custom: 不经过此路径
             return {};
