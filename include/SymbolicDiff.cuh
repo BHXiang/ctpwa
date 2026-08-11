@@ -43,6 +43,8 @@ enum CompositeId : int {
     MODEL_BWR = 3,         // BWR(m, m0, g0, L, q, q0, d)（含内部 Bf² 链）
     MODEL_FLATTE = 4,      // Flatte(m, m0, [g_i, (ma,mb)_i]...)
     MODEL_ONE = 5,         // 1 + 0i
+    MODEL_FLATTE_RHO_RE = 6,  // Re(ρ_i): Re(csqrt(1-S/s) * sqrt(clip(1-D/s,0))) — deriv=0
+    MODEL_FLATTE_RHO_IM = 7,  // Im(ρ_i): Im(csqrt(1-S/s) * sqrt(clip(1-D/s,0))) — deriv=0
 };
 
 // AST 节点（host-only；派生规则与编译都在 host 端执行）

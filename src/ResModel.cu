@@ -182,8 +182,12 @@ Node modelDeriv(int composite_id, const Node& n, int p)
                              astMul(astMul(astNum(2.0), y), dy));
             return astAdd(qRe(x, s, s2, dx, ds), astMul(astI(), qIm(y, s, s2, dy, ds)));
         }
+        case MODEL_FLATTE_RHO_RE:
+        case MODEL_FLATTE_RHO_IM:
+            // ρ_i 仅依赖 s(=m²) 和道质量（常数），与拟合参数无关
+            return astNum(0.0);
         case MODEL_FLATTE:
-            // Phase 6: csqrt 分支导数（COP_SELECT 条件指令）
+            // 由 buildModelAST 分解为 RHO_RE/IM + 算术 → deriv 自动处理
             return astNum(0.0);
         case MODEL_ONE:
             return astNum(0.0);
@@ -263,18 +267,38 @@ std::vector<double> buildModelAST(
             break;
         }
         case ResModelType::Flatte: {
-            // F = MODEL_FLATTE(m, θ0, θ1..θ_n, ch0a,ch0b, ch1a,ch1b,...) × MODEL_BF(L, q, q0, d)
-            // args: [m, m0, g0..g_{n-1}, (ma,mb)0..(ma,mb)_{n-1}]
-            std::vector<Node> fargs;
-            fargs.push_back(Node::makeVar(CVAR_M));
-            fargs.push_back(Node::makeParam(0));  // m0
-            for (int i = 0; i < n_channels; ++i)
-                fargs.push_back(Node::makeParam(1 + i));  // g_i
+            // Flatte 分解: F = (A - iB)/D × Bf
+            // A = m0² - s + Σ g_i·Im(ρ_i),  B = -Σ g_i·Re(ρ_i),  D = A² + B²
+            // ρ_i = MODEL_FLATTE_RHO_{RE,IM}(s, ma_i, mb_i): 仅依赖 s=m² 和道质量
+            // （ρ_i 与拟合参数无关 → deriv 自动返回 0 → 链式法则正确处理）
+            Node s = astSq(Node::makeVar(CVAR_M));  // s = m²
+
+            // A = m0² - s + Σ g_i · I_i
+            Node A = astSq(Node::makeParam(0));  // m0²
+            // B = -Σ g_i · R_i（初始 0）
+            Node B = astNum(0.0);
+
             for (int i = 0; i < n_channels; ++i) {
-                fargs.push_back(Node::makeNum(channel_masses[2 * i]));
-                fargs.push_back(Node::makeNum(channel_masses[2 * i + 1]));
+                Node ma = astNum(channel_masses[2 * i]);
+                Node mb = astNum(channel_masses[2 * i + 1]);
+                Node Ri = Node::makeComposite(MODEL_FLATTE_RHO_RE,
+                    {s, ma, mb});  // Re(ρ_i) as (real, 0)
+                Node Ii = Node::makeComposite(MODEL_FLATTE_RHO_IM,
+                    {s, ma, mb});  // Im(ρ_i) as (real, 0)
+                // A += g_i * I_i
+                A = astAdd(A, astMul(Node::makeParam(1 + i), Ii));
+                // B -= g_i * R_i  (= -Σ g_i * R_i)
+                B = astSub(B, astMul(Node::makeParam(1 + i), Ri));
             }
-            Node flatte = Node::makeComposite(MODEL_FLATTE, fargs);
+            A = astSub(A, s);  // A = m0² - s + Σ g_i * I_i
+
+            Node D = astAdd(astSq(A), astSq(B));          // D = A² + B²
+            Node Fre = astDiv(A, D);                       // F_re = A/D
+            Node Fim = astNeg(astDiv(B, D));              // F_im = -B/D
+
+            // F = Fre + i*Fim = Add(Fre, Mul(Fim, astI()))
+            Node flatte = astAdd(Fre, astMul(Fim, astI()));
+
             Node bf = Node::makeComposite(MODEL_BF, {
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
