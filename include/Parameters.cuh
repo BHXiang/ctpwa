@@ -155,6 +155,19 @@ public:
     void setParamNames(const std::vector<std::string>& names) { param_names_ = names; }
     const std::vector<std::string>& paramNames() const { return param_names_; }
 
+    // ---------- gauss_constr（高斯罚项约束）----------
+    // 仅作用于 theta 参数；name = "resName_paramName"，idx = slots_ 中的 theta 下标
+    void setGaussConstr(const std::map<std::string, int>& name_to_idx,
+                        const std::map<std::string, double>& sigma,
+                        const std::map<std::string, double>& mu);
+    int nGaussConstr() const { return static_cast<int>(theta_name_to_idx_.size()); }
+    // 罚项 Σ (x-μ)²/(2σ²)（theta 为 CUDA float64 张量；返回罚值）
+    double gaussPenalty(const torch::Tensor& theta) const;
+    // 罚项梯度 (x-μ)/σ² 累加到 grad_theta（同设备）
+    void gaussPenaltyGrad(const torch::Tensor& theta, torch::Tensor& grad_theta) const;
+    // Hessian theta 对角块 += 1/σ²（theta 块行/列起点 = theta_offset）
+    void addGaussHessianDiag(torch::Tensor& hess, int theta_offset) const;
+
 private:
     void uploadCouplingData();
 
@@ -168,6 +181,11 @@ private:
     bool has_coupling_matrix_ = false;
     std::vector<std::string> param_names_;
     bool initialized_ = false;
+
+    // ---- gauss_constr 约束数据（theta 参数）----
+    std::map<std::string, int> theta_name_to_idx_;   // name → theta 下标
+    std::map<std::string, double> gauss_constr_sigma_;
+    std::map<std::string, double> gauss_constr_mu_;
 
 private:
 

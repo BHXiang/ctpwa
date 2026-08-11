@@ -131,12 +131,14 @@ enum class Q0MassDep : int {
 // 返回标准 aux 布局 [P, n_seg, 段...]（与 compileCustomExpr/evalCustomAll 一致）
 // P: 自由参数数; L/d: 块级势垒参数; channels: Flatte 道质量列表
 // md1_dep/md2_dep: q0 链中两个子粒子质量的依赖（与 AD 版 kernel 的回退规则一致）
+// has_bf: 目标节点是否有势垒因子（false 时 AST 不含 Bf 因子）
 std::vector<double> buildModelAST(
     ResModelType model_type,
     int L, double d,
     int P, int n_channels,
     const std::vector<double>& channel_masses,
     Q0MassDep md1_dep, double md1_fixed,
-    Q0MassDep md2_dep, double md2_fixed);
+    Q0MassDep md2_dep, double md2_fixed,
+    bool has_bf = true);
 
 #endif // SYMBOLIC_DIFF_CUH

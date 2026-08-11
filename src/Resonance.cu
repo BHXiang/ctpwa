@@ -433,3 +433,10 @@ std::vector<double> Resonance::getOrderedParams() const
     }
     return result;
 }
+
+// 按规范顺序下标设置单个参数值（Constraints.fix_var 用）
+void Resonance::setParam(int idx, double value)
+{
+    if (idx < 0 || idx >= (int)param_names_.size()) return;
+    params_[param_names_[idx]] = value;
+}

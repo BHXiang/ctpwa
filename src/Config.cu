@@ -113,6 +113,9 @@ ConfigParser::ConfigParser(const std::string &config_file)
         if (config["Plot"])
             parsePlotConfig(config["Plot"]);
 
+        // 势垒因子三级作用域决议（per-step > ResonanceConfig > Constraints 全局 > 默认）
+        resolveStepBF();
+
         // 用户请求的精度（auto=不检查，显式 float/double 时与 .so 比对）
         if (config["precision"])
             precision_ = config["precision"].as<std::string>();
@@ -484,7 +487,9 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             // Multi mode:   R1: [[R2, R3], [R4, R5, {p_break: true}]]
             struct IntDecay {
                 std::string d1, d2;
-                bool is_bf = true;
+                bool has_bf = true;
+                bool has_bf_explicit = false; // YAML 是否显式给出 has_bf
+                double bf_d = NAN;
                 bool p_break = false;
                 std::vector<std::vector<int>> sl_filter; // 允许的 [S, L] 分波; 空 = 全允许
             };
@@ -502,7 +507,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     id.d2 = node[1].as<std::string>();
                     if (node.size() >= 3 && node[2].IsMap()) {
                         const auto& dopts = node[2];
-                        if (dopts["is_bf"])   id.is_bf   = dopts["is_bf"].as<bool>();
+                        if (dopts["has_bf"]) {
+                            id.has_bf = dopts["has_bf"].as<bool>();
+                            id.has_bf_explicit = true;
+                        }
+                        if (dopts["bf_d"]) id.bf_d = dopts["bf_d"].as<double>();
                         if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
                         if (dopts["sl"]) {
                             // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
@@ -606,9 +615,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 std::string intermediate = ch[1].as<std::string>();
 
                 // Parse per-channel constraints (3rd element) — overrides all defaults
-                bool ch_is_bf1 = true, ch_is_bf2 = true;
+                bool ch_has_bf1 = true, ch_has_bf2 = true;
+                bool ch_has_bf1_explicit = false, ch_has_bf2_explicit = false;
+                double ch_bf_d1 = NAN, ch_bf_d2 = NAN;
                 bool ch_p_break1 = false, ch_p_break2 = false;
-                bool has_ch_is_bf = false, has_ch_p_break = false;
+                bool has_ch_p_break = false;
                 std::vector<std::vector<int>> ch_sl_filter; // 第一步 (mother) 的分波白名单
                 std::vector<std::string> ch_legend;
                 // Fall back to top-level legends list
@@ -619,13 +630,21 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     const auto& opts = ch[2];
                     if (opts["legend"])
                         ch_legend = opts["legend"].as<std::vector<std::string>>();
-                    if (opts["is_bf"]) {
-                        has_ch_is_bf = true;
-                        if (opts["is_bf"].IsSequence()) {
-                            ch_is_bf1 = opts["is_bf"][0].as<bool>();
-                            ch_is_bf2 = opts["is_bf"][1].as<bool>();
+                    if (opts["has_bf"]) {
+                        if (opts["has_bf"].IsSequence()) {
+                            ch_has_bf1 = opts["has_bf"][0].as<bool>();
+                            ch_has_bf2 = opts["has_bf"][1].as<bool>();
                         } else {
-                            ch_is_bf1 = ch_is_bf2 = opts["is_bf"].as<bool>();
+                            ch_has_bf1 = ch_has_bf2 = opts["has_bf"].as<bool>();
+                        }
+                        ch_has_bf1_explicit = ch_has_bf2_explicit = true;
+                    }
+                    if (opts["bf_d"]) {
+                        if (opts["bf_d"].IsSequence()) {
+                            ch_bf_d1 = opts["bf_d"][0].as<double>();
+                            ch_bf_d2 = opts["bf_d"][1].as<double>();
+                        } else {
+                            ch_bf_d1 = ch_bf_d2 = opts["bf_d"].as<double>();
                         }
                     }
                     if (opts["p_break"]) {
@@ -686,7 +705,9 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     DecayStep step1;
                     step1.mother = mother;
                     step1.daughters = {bachelor, intermediate};
-                    step1.is_bf = ch_is_bf1;
+                    step1.has_bf = ch_has_bf1;
+                    step1.has_bf_explicit = ch_has_bf1_explicit;
+                    step1.bf_d = ch_bf_d1;
                     step1.p_break = ch_p_break1;
                     step1.sl_filter = ch_sl_filter;
                     chain.decay_steps.push_back(step1);
@@ -714,7 +735,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     struct BFSItem {
                         std::string name;
                         bool is_first;
-                        bool bf, pb;
+                        bool has_bf, has_bf_explicit, pb;
+                        double bf_d;
                         std::vector<std::vector<int>> sl; // 该步的分波白名单
                     };
                     std::queue<BFSItem> queue;
@@ -722,17 +744,25 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     if (intermediate_decays) {
                         const IntDecay* ifm = getDecayMode(intermediate,
                             bachelor_drives_modes ? 0 : mi);
-                        bool step2_is_bf   = has_ch_is_bf   ? ch_is_bf2   : (ifm ? ifm->is_bf : true);
+                        bool step2_has_bf = ch_has_bf2_explicit ? ch_has_bf2
+                            : (ifm && ifm->has_bf_explicit ? ifm->has_bf : true);
+                        bool step2_has_bf_explicit = ch_has_bf2_explicit
+                            || (ifm && ifm->has_bf_explicit);
+                        double step2_bf_d = !std::isnan(ch_bf_d2) ? ch_bf_d2
+                            : (ifm && !std::isnan(ifm->bf_d) ? ifm->bf_d : NAN);
                         bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
-                        queue.push({intermediate, !bachelor_drives_modes, step2_is_bf, step2_p_break,
+                        queue.push({intermediate, !bachelor_drives_modes, step2_has_bf,
+                            step2_has_bf_explicit, step2_p_break, step2_bf_d,
                             ifm ? ifm->sl_filter : std::vector<std::vector<int>>{}});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
                             bachelor_drives_modes ? mi : 0);
                         queue.push({bachelor, bachelor_drives_modes,
-                            bm ? bm->is_bf : true,
+                            bm && bm->has_bf_explicit ? bm->has_bf : true,
+                            bm && bm->has_bf_explicit,
                             bm ? bm->p_break : false,
+                            (bm && !std::isnan(bm->bf_d)) ? bm->bf_d : NAN,
                             bm ? bm->sl_filter : std::vector<std::vector<int>>{}});
                     }
 
@@ -745,7 +775,9 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         DecayStep substep;
                         substep.mother = item.name;
                         substep.daughters = {mode->d1, mode->d2};
-                        substep.is_bf   = item.bf;
+                        substep.has_bf = item.has_bf;
+                        substep.has_bf_explicit = item.has_bf_explicit;
+                        substep.bf_d = item.bf_d;
                         substep.p_break = item.pb;
                         substep.sl_filter = item.sl;
                         chain.decay_steps.push_back(substep);
@@ -759,8 +791,10 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             if (int_decay_modes.count(d)) {
                                 const auto* dm = getDecayMode(d, 0);
                                 queue.push({d, false,
-                                    dm ? dm->is_bf   : true,
+                                    dm && dm->has_bf_explicit ? dm->has_bf : true,
+                                    dm && dm->has_bf_explicit,
                                     dm ? dm->p_break : false,
+                                    (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
                                     dm ? dm->sl_filter : std::vector<std::vector<int>>{}});
                             }
                         };
@@ -800,8 +834,12 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             step.daughters =
                                 decay_pair.second["daughters"]
                                     .as<std::vector<std::string>>();
-                            if (decay_pair.second["is_bf"])
-                                step.is_bf = decay_pair.second["is_bf"].as<bool>();
+                            if (decay_pair.second["has_bf"]) {
+                                step.has_bf = decay_pair.second["has_bf"].as<bool>();
+                                step.has_bf_explicit = true;
+                            }
+                            if (decay_pair.second["bf_d"])
+                                step.bf_d = decay_pair.second["bf_d"].as<double>();
                             if (decay_pair.second["p_break"])
                                 step.p_break =
                                     decay_pair.second["p_break"].as<bool>();
@@ -932,6 +970,15 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             res.free = props["free"].as<std::vector<int>>();
         }
 
+        // 势垒因子（此共振态作为中间态时）: has_bf / bf_d
+        if (props["has_bf"]) {
+            res.has_bf = props["has_bf"].as<bool>();
+            res.has_bf_explicit = true;
+        }
+        if (props["bf_d"]) {
+            res.bf_d = props["bf_d"].as<double>();
+        }
+
         // 解析free_range: 每个free参数对应的 [lower, upper]
         if (props["free_range"]) {
             for (const auto& range_node : props["free_range"]) {
@@ -940,6 +987,44 @@ void ConfigParser::parseResonances(const YAML::Node &node)
         }
 
         resonances_[name] = res;
+    }
+}
+
+void ConfigParser::resolveStepBF()
+{
+    // 三级作用域: per-step(已在解析时写入) > ResonanceConfig(母粒子) > Constraints 全局 > 默认
+    // 母粒子名 M 查找 ResonanceConfig 的规则:
+    //   1. 直接按名字找（Resonances 段以中间态名作键，如 "R_KK"）
+    //   2. 否则在该链的 resonance_chains 中找 intermediate == M 的条目，
+    //      取其第一个共振态名的配置（多共振态共享同一中间态时取第一个；
+    //      目标节点自身的 Bf 由各共振态自己的 DSL 决定，不受此限制）
+    for (auto& chain : decay_chains_) {
+        for (auto& step : chain.decay_steps) {
+            const ResonanceConfig* cfg = nullptr;
+            auto it = resonances_.find(step.mother);
+            if (it != resonances_.end()) {
+                cfg = &it->second;
+            } else {
+                for (const auto& rc : chain.resonance_chains) {
+                    if (rc.intermediate != step.mother || rc.spin_chains.empty())
+                        continue;
+                    const auto& rnames = rc.spin_chains[0].resonances;
+                    if (!rnames.empty()) {
+                        auto rit = resonances_.find(rnames[0]);
+                        if (rit != resonances_.end()) cfg = &rit->second;
+                    }
+                    break;
+                }
+            }
+            if (!step.has_bf_explicit) {
+                if (cfg && cfg->has_bf_explicit) step.has_bf = cfg->has_bf;
+                else step.has_bf = global_has_bf_;
+            }
+            if (std::isnan(step.bf_d)) {
+                if (cfg && !std::isnan(cfg->bf_d)) step.bf_d = cfg->bf_d;
+                else step.bf_d = global_bf_d_;
+            }
+        }
     }
 }
 
@@ -955,6 +1040,52 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
     // 解析全局 barrier factor d
     if (node["bf_d"]) {
         global_bf_d_ = node["bf_d"].as<double>();
+    }
+
+    // 解析全局势垒开关 has_bf（默认开启）
+    if (node["has_bf"]) {
+        global_has_bf_ = node["has_bf"].as<bool>();
+    }
+
+    // ---- 命名变量约束（theta 参数，按 "resName_paramName" 匹配）----
+    // fix_var: {rho_770_mass: 0.775, ...} — 固定参数值
+    if (node["fix_var"]) {
+        for (const auto& kv : node["fix_var"]) {
+            fix_var_[kv.first.as<std::string>()] = kv.second.as<double>();
+        }
+    }
+    // free_var: [name, ...] — 取消 fix_var 的固定
+    if (node["free_var"]) {
+        for (const auto& nm : node["free_var"]) {
+            free_var_.insert(nm.as<std::string>());
+        }
+    }
+    // var_range: {name: [lower, upper], ...} — 覆盖拟合范围
+    if (node["var_range"]) {
+        for (const auto& kv : node["var_range"]) {
+            const auto& range = kv.second;
+            if (range.IsSequence() && range.size() >= 2) {
+                var_range_[kv.first.as<std::string>()] =
+                    { range[0].as<double>(), range[1].as<double>() };
+            } else {
+                std::cerr << "Warning: var_range 项 \"" << kv.first.as<std::string>()
+                          << "\" 应为 [lower, upper]，已忽略" << std::endl;
+            }
+        }
+    }
+    // var_equal: [[n1, n2, ...], ...] — 一组参数共享（owner = 组内第一个有槽的名字）
+    if (node["var_equal"]) {
+        for (const auto& group : node["var_equal"]) {
+            std::vector<std::string> names;
+            for (const auto& nm : group) names.push_back(nm.as<std::string>());
+            if (names.size() >= 2) var_equal_.push_back(std::move(names));
+        }
+    }
+    // gauss_constr: {name: sigma, ...} — 高斯罚项 Σ(x-μ)²/(2σ²)，μ = 初始值
+    if (node["gauss_constr"]) {
+        for (const auto& kv : node["gauss_constr"]) {
+            gauss_constr_[kv.first.as<std::string>()] = kv.second.as<double>();
+        }
     }
 
     // 解析全同粒子分组: identical: [[pi01, pi02], [Ks1, Ks2]]

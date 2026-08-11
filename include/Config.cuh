@@ -2,6 +2,7 @@
 #define CONFIG_CUH
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <yaml-cpp/yaml.h>
@@ -29,6 +30,11 @@ struct ResonanceConfig {
   std::vector<int> free; // 需要拟合的参数下标; {-1}=全部; 空=不拟合
   std::vector<std::vector<double>> free_range; // 每个free参数的 [lower, upper]; 空=使用默认
   std::map<std::string, std::string> options; // 模型选项 (Hist: file/bins/range/extrapolate)
+  // 势垒因子（此共振态作为中间态时）: has_bf 是否施加；bf_d 势垒半径
+  // （NAN = 未显式设置 → 由三级作用域决议: per-step > resonance > Constraints 全局 > 默认）
+  bool has_bf = true;
+  bool has_bf_explicit = false;
+  double bf_d = NAN;
 };
 
 struct SpinChainConfig {
@@ -44,7 +50,12 @@ struct ResonanceChainConfig {
 struct DecayStep {
   std::string mother;
   std::vector<std::string> daughters;
-  bool is_bf = true;    // 是否施加势垒因子
+  // 势垒因子: has_bf 是否施加；bf_d 势垒半径（NAN = 未显式设置）。
+  // parse() 末尾 resolveStepBF 按三级作用域决议出最终值:
+  // per-step > ResonanceConfig(母粒子) > Constraints 全局 > 默认 (has_bf=true, bf_d=3.0)
+  bool has_bf = true;
+  bool has_bf_explicit = false; // YAML 是否显式给出 has_bf
+  double bf_d = NAN;
   bool p_break = false; // 是否宇称破缺（如弱衰变）
   std::vector<std::vector<int>> sl_filter; // 允许的 [S, L] 分波（S 为 2S+1）; 空 = 全允许
 };
@@ -94,10 +105,25 @@ public:
   }
   int getGlobalMaxL() const { return global_maxL_; }
   double getBfD() const { return global_bf_d_; }
+  bool getHasBf() const { return global_has_bf_; }
   // 用户请求的精度: "auto" | "float" | "double"（与 .so 编译精度比对用）
   const std::string &getPrecision() const { return precision_; }
   const std::vector<PlotConfig> &getPlotConfigs() const {
     return plot_configs_;
+  }
+
+  // ---------- 命名变量约束 (Constraints: fix_var/free_var/var_range/var_equal/gauss_constr) ----------
+  // 仅作用于 theta 参数（共振态 mass/width/r/g），按 "resName_paramName" 名字匹配
+  const std::map<std::string, double> &getFixVar() const { return fix_var_; }
+  const std::set<std::string> &getFreeVar() const { return free_var_; }
+  const std::map<std::string, std::pair<double, double>> &getVarRange() const {
+    return var_range_;
+  }
+  const std::vector<std::vector<std::string>> &getVarEqual() const {
+    return var_equal_;
+  }
+  const std::map<std::string, double> &getGaussConstr() const {
+    return gauss_constr_;
   }
 
   std::vector<std::string> getLegends() const;
@@ -113,6 +139,8 @@ private:
   void parseResonances(const YAML::Node &node);
   void parseConstraints(const YAML::Node &node);
   void parsePlotConfig(const YAML::Node &node);
+  // 势垒因子三级作用域决议: per-step > ResonanceConfig(母粒子) > Constraints 全局 > 默认
+  void resolveStepBF();
 
   std::vector<Particle> particles_;
   std::vector<DecayChainConfig> decay_chains_;
@@ -125,7 +153,15 @@ private:
   std::vector<PlotConfig> plot_configs_;
   int global_maxL_ = -1; // -1 = no limit; set via Constraints.maxL
   double global_bf_d_ = 3.0; // barrier factor d; set via Constraints.bf_d
+  bool global_has_bf_ = true; // 全局势垒开关; set via Constraints.has_bf
   std::string precision_ = "auto"; // 用户请求精度: "auto" | "float" | "double"（auto=跟随 .so 编译精度）
+
+  // ---- 命名变量约束（Constraints 下）----
+  std::map<std::string, double> fix_var_;       // name → 固定值
+  std::set<std::string> free_var_;              // 取消 fix_var 的名字
+  std::map<std::string, std::pair<double, double>> var_range_; // name → [lower, upper]
+  std::vector<std::vector<std::string>> var_equal_;  // [[n1, n2, ...], ...] 共享参数
+  std::map<std::string, double> gauss_constr_;  // name → sigma
 };
 
 #endif // CONFIG_CUH

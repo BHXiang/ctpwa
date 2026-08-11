@@ -207,7 +207,8 @@ std::vector<double> buildModelAST(
     int n_channels,                     // Flatte: 道数; 其他: 0
     const std::vector<double>& channel_masses,  // Flatte: [m_a0,m_b0, m_a1,m_b1, ...]
     Q0MassDep md1_dep, double md1_fixed,
-    Q0MassDep md2_dep, double md2_fixed)
+    Q0MassDep md2_dep, double md2_fixed,
+    bool has_bf)                        // 目标节点是否有势垒因子（false 时 AST 不含 Bf）
 {
     // q0 链辅助：把质量依赖描述转成 AST 节点
     auto massNode = [&](Q0MassDep dep, double val, int cv) -> Node {
@@ -237,7 +238,10 @@ std::vector<double> buildModelAST(
             });
             break;
         case ResModelType::BWR: {
-            // F = MODEL_BWR(m, θ0, θ1, L, q, q0, d) × MODEL_BF(L, q, q0, d)
+            // F = MODEL_BWR(m, θ0, θ1, L, q, q0, d) × [MODEL_BF(L, q, q0, d)]
+            // （has_bf=false 时不含 Bf 因子）
+            // has_bf=false 时传播子内部宽度也不含 Bf（MODEL_BWR 的 gamma 含 Bf²）
+            // → d kid 传 0.0 使 Bf≡1，与 bf_d=0.0 完全等价
             Node bwr = Node::makeComposite(MODEL_BWR, {
                 Node::makeVar(CVAR_M),
                 Node::makeParam(0),       // m0
@@ -245,25 +249,33 @@ std::vector<double> buildModelAST(
                 Node::makeNum((double)L),
                 Node::makeVar(CVAR_Q),
                 q0_ast,
-                Node::makeNum(d)
+                Node::makeNum(has_bf ? d : 0.0)
             });
-            Node bf = Node::makeComposite(MODEL_BF, {
-                Node::makeNum((double)L),
-                Node::makeVar(CVAR_Q),
-                q0_ast,
-                Node::makeNum(d)
-            });
-            ast = Node::makeOp(NodeType::Mul, bwr, bf);
+            if (has_bf) {
+                Node bf = Node::makeComposite(MODEL_BF, {
+                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_Q),
+                    q0_ast,
+                    Node::makeNum(d)
+                });
+                ast = Node::makeOp(NodeType::Mul, bwr, bf);
+            } else {
+                ast = bwr;
+            }
             break;
         }
         case ResModelType::ONE: {
-            // F = MODEL_BF(L, q, q0, d)
-            ast = Node::makeComposite(MODEL_BF, {
-                Node::makeNum((double)L),
-                Node::makeVar(CVAR_Q),
-                q0_ast,
-                Node::makeNum(d)
-            });
+            // F = [MODEL_BF(L, q, q0, d)]（has_bf=false 时 F = 1）
+            if (has_bf) {
+                ast = Node::makeComposite(MODEL_BF, {
+                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_Q),
+                    q0_ast,
+                    Node::makeNum(d)
+                });
+            } else {
+                ast = astNum(1.0);
+            }
             break;
         }
         case ResModelType::Flatte: {
@@ -299,13 +311,18 @@ std::vector<double> buildModelAST(
             // F = Fre + i*Fim = Add(Fre, Mul(Fim, astI()))
             Node flatte = astAdd(Fre, astMul(Fim, astI()));
 
-            Node bf = Node::makeComposite(MODEL_BF, {
-                Node::makeNum((double)L),
-                Node::makeVar(CVAR_Q),
-                q0_ast,
-                Node::makeNum(d)
-            });
-            ast = Node::makeOp(NodeType::Mul, flatte, bf);
+            // （has_bf=false 时不含 Bf 因子）
+            if (has_bf) {
+                Node bf = Node::makeComposite(MODEL_BF, {
+                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_Q),
+                    q0_ast,
+                    Node::makeNum(d)
+                });
+                ast = Node::makeOp(NodeType::Mul, flatte, bf);
+            } else {
+                ast = flatte;
+            }
             break;
         }
         case ResModelType::GS: {
@@ -375,10 +392,15 @@ std::vector<double> buildModelAST(
             Node Fim_node = astNeg(astDiv(astMul(Num, DenIm), DenSq));
             Node gs = astAdd(Fre_node, astMul(Fim_node, astI()));
 
-            Node bf = Node::makeComposite(MODEL_BF, {
-                astNum((double)L), q, q0_ast, astNum(d)
-            });
-            ast = Node::makeOp(NodeType::Mul, gs, bf);
+            // （has_bf=false 时不含 Bf 因子）
+            if (has_bf) {
+                Node bf = Node::makeComposite(MODEL_BF, {
+                    astNum((double)L), q, q0_ast, astNum(d)
+                });
+                ast = Node::makeOp(NodeType::Mul, gs, bf);
+            } else {
+                ast = gs;
+            }
             break;
         }
         default:

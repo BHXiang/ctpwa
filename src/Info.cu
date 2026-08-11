@@ -66,9 +66,20 @@ void DecayInfo::buildDecayChains(
                         std::vector<std::pair<double,double>> ch;
                         for (const auto& c : it->second.channels)
                             if (c.size() >= 2) ch.emplace_back(c[0], c[1]);
+                        // 势垒因子: 把该共振态作为母粒子的衰变步的解析后最终值
+                        // （三级作用域已在 Config::resolveStepBF 决议到 step）
+                        // 注入 options["d"]/options["has_bf"]，供 addBlock 构建符号微分 aux。
+                        std::map<std::string, std::string> ropts = it->second.options;
+                        for (const auto& step : chain.decay_steps) {
+                            if (step.mother == rc.intermediate) {
+                                ropts["d"] = std::to_string(step.bf_d);
+                                ropts["has_bf"] = step.has_bf ? "1" : "0";
+                                break;
+                            }
+                        }
                         rlist.emplace_back(rname, rc.intermediate, ip.spin, ip.parity,
                                            it->second.type, it->second.parameters, ch,
-                                           it->second.options);
+                                           ropts);
                         // Free theta params with readable names
                         // Custom 模型: 参数默认全部自由（params 列表即声明自由参数）
                         if (it->second.type == "custom" || it->second.type == "Custom") {
@@ -114,7 +125,8 @@ void DecayInfo::buildDecayChains(
             struct StepInfo {
                 std::string mother, d1, d2;
                 std::array<int,3> spins, parities;
-                bool id_d, is_boson, p_break, is_bf;
+                bool id_d, is_boson, p_break, has_bf;
+                double bf_d;
                 std::vector<SL> sl_list;
             };
             std::vector<StepInfo> step_infos;
@@ -144,15 +156,15 @@ void DecayInfo::buildDecayChains(
                 for (const auto& sf : step.sl_filter)
                     if (sf.size() >= 2) sl_filter.insert({ sf[0], sf[1] });
                 int maxL = global_max_l;
-                Amp2BD amp2bd(spins, parities, identical_d, is_boson, maxL, step.p_break, step.is_bf,
-                              std::move(sl_filter));
+                Amp2BD amp2bd(spins, parities, identical_d, is_boson, maxL, step.p_break, step.has_bf,
+                              step.bf_d, std::move(sl_filter));
                 cas->addDecay(amp2bd, step.mother, step.daughters[0], step.daughters[1]);
 
                 // Save step info for later registration with resonance name
                 std::vector<SL> sl_list;
                 for (const auto& sl : amp2bd.getSL()) sl_list.push_back(sl);
                 step_infos.push_back({step.mother, step.daughters[0], step.daughters[1],
-                    spins, parities, identical_d, is_boson, step.p_break, step.is_bf, sl_list});
+                    spins, parities, identical_d, is_boson, step.p_break, step.has_bf, step.bf_d, sl_list});
             }
 
             auto slcombs = cas->getSLCombinations();
@@ -249,7 +261,7 @@ void DecayInfo::buildDecayChains(
                         + "_J" + std::to_string(info.spins[0]) + "-" + std::to_string(info.spins[1]) + "-" + std::to_string(info.spins[2])
                         + "_P" + std::to_string(info.parities[0]) + "-" + std::to_string(info.parities[1]) + "-" + std::to_string(info.parities[2])
                         + (info.id_d ? (info.is_boson ? "_idB" : "_idF") : "")
-                        + (info.p_break ? "_pb" : "") + (!info.is_bf ? "_nbf" : "")
+                        + (info.p_break ? "_pb" : "") + (!info.has_bf ? "_nbf" : "")
                         + "_R" + rname_for_step;
                     auto step_label_r = [&](const std::string& nm) -> std::string {
                         for (const auto& rp : res_combos[ki])

@@ -730,6 +730,81 @@ CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
     return r;
 }
 
+// ============================================================
+// gauss_constr（高斯罚项约束）— 仅作用于 theta 参数
+// ============================================================
+
+void Parameters::setGaussConstr(const std::map<std::string, int>& name_to_idx,
+                                const std::map<std::string, double>& sigma,
+                                const std::map<std::string, double>& mu)
+{
+    theta_name_to_idx_ = name_to_idx;
+    gauss_constr_sigma_ = sigma;
+    gauss_constr_mu_ = mu;
+}
+
+// 辅助：把约束表展开为 (indices, mu, sigma) 设备张量
+static void buildGaussConstrTensors(
+    const std::map<std::string, int>& name_to_idx,
+    const std::map<std::string, double>& sigma,
+    const std::map<std::string, double>& mu,
+    const torch::Device& dev,
+    torch::Tensor& idx_t, torch::Tensor& mu_t, torch::Tensor& sig_t)
+{
+    std::vector<int64_t> idxs;
+    std::vector<double> mus, sigmas;
+    for (const auto& [name, idx] : name_to_idx) {
+        idxs.push_back(idx);
+        mus.push_back(mu.at(name));
+        sigmas.push_back(sigma.at(name));
+    }
+    idx_t = torch::tensor(idxs,
+        torch::TensorOptions().dtype(torch::kLong).device(dev));
+    mu_t = torch::tensor(mus,
+        torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+    sig_t = torch::tensor(sigmas,
+        torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+}
+
+double Parameters::gaussPenalty(const torch::Tensor& theta) const
+{
+    if (theta_name_to_idx_.empty() || theta.numel() == 0) return 0.0;
+    torch::Tensor idx_t, mu_t, sig_t;
+    buildGaussConstrTensors(theta_name_to_idx_, gauss_constr_sigma_,
+                            gauss_constr_mu_, theta.device(), idx_t, mu_t, sig_t);
+    auto diff = theta.index_select(0, idx_t) - mu_t;
+    return (diff * diff / (2.0 * sig_t * sig_t)).sum().item<double>();
+}
+
+void Parameters::gaussPenaltyGrad(const torch::Tensor& theta,
+                                  torch::Tensor& grad_theta) const
+{
+    if (theta_name_to_idx_.empty() || theta.numel() == 0) return;
+    torch::Tensor idx_t, mu_t, sig_t;
+    buildGaussConstrTensors(theta_name_to_idx_, gauss_constr_sigma_,
+                            gauss_constr_mu_, theta.device(), idx_t, mu_t, sig_t);
+    auto diff = theta.index_select(0, idx_t) - mu_t;
+    grad_theta.index_add_(0, idx_t, diff / (sig_t * sig_t));
+}
+
+void Parameters::addGaussHessianDiag(torch::Tensor& hess, int theta_offset) const
+{
+    if (theta_name_to_idx_.empty()) return;
+    auto dev = hess.device();
+    std::vector<int64_t> idxs;
+    std::vector<double> vals;
+    for (const auto& [name, idx] : theta_name_to_idx_) {
+        double sig = gauss_constr_sigma_.at(name);
+        idxs.push_back(theta_offset + idx);
+        vals.push_back(1.0 / (sig * sig));
+    }
+    auto idx_t = torch::tensor(idxs,
+        torch::TensorOptions().dtype(torch::kLong).device(dev));
+    auto val_t = torch::tensor(vals,
+        torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+    hess.diagonal(0).index_add_(0, idx_t, val_t);
+}
+
 void CouplingMatrixResult::print(std::ostream& os) const {
     os << "\n=== Coupling params ===" << std::endl;
     os << "  total: " << n_free << " free (" << n_chain_free
