@@ -2641,11 +2641,12 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             // 用 h_templates_ 判断类型（host 端）
             const auto& tmpl = h_templates_[bi];
             bool is_custom = !tmpl.empty() && tmpl[0].type == ResModelType::Custom;
-            // 内置模型（BWR/BW/Flatte 等）有符号微分 aux[] 且 Nres=1 → 同样走统一标量
-            // kernel（P4：符号微分替代 AutoDiff；BWR/ONE 的 L 依赖在 aux 段内以
-            // CVAR_L 运行时解析，无需 per-block L 路由）
-            bool has_sym_aux = !tmpl.empty() && tmpl[0].aux_size > 0
-                            && blocks_[bi].resonance_count == 1;
+            // 内置模型（BWR/BW/Flatte 等）有符号微分 aux[] → 走统一标量 kernel
+            // 检查所有共振态模板均有 aux 数据
+            bool has_sym_aux = !tmpl.empty();
+            for (const auto& t : tmpl) {
+                if (t.aux_size <= 0) { has_sym_aux = false; break; }
+            }
             if (is_custom || has_sym_aux) custom_blocks.push_back(static_cast<int>(bi));
             else ad_groups[blocks_[bi].nFree].push_back(static_cast<int>(bi));
         }
@@ -3330,9 +3331,11 @@ void AmpCalc::computeUnifiedHessian(
             // Custom 模型（参数数运行时）→ 标量 Hessian kernel，无模板上限
             bool is_custom_block = !h_templates_[bi].empty() &&
                 h_templates_[bi][0].type == ResModelType::Custom;
-            // 内置模型有符号微分 aux（Nres=1）→ 同样走标量路径（P4 统一）
-            bool has_sym_aux = !h_templates_[bi].empty() &&
-                h_templates_[bi][0].aux_size > 0 && Nres == 1;
+            // 内置模型有符号微分 aux → 走标量路径（P4 统一，含多共振态）
+            bool has_sym_aux = !h_templates_[bi].empty();
+            for (const auto& t : h_templates_[bi]) {
+                if (t.aux_size <= 0) { has_sym_aux = false; break; }
+            }
             if (is_custom_block || has_sym_aux) {
                 // 仍需要 temp buffer（stage 2 交叉项）— 下方统一分配
             } else if (Npr < 1 || Npr > 3) {
