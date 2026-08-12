@@ -1,5 +1,6 @@
 #include <ComputeNLL.cuh>
 #include <complex>
+#include <chrono>
 #include "ComplexType.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -216,18 +217,18 @@ static int tuneChunkCount(cublasHandle_t h, int nA, int nT,
                             dv, 1, &b0, dS + k * cp, 1);
             cudaDeviceSynchronize();
         }
-        cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
-        cudaEventRecord(s);
+        // 用 host 计时而非 cudaEvent：实测多 GPU (双卡) 下 cudaEventElapsedTime
+        // 在 driver 内 SIGSEGV（首次 getNLL 必现，V100/A100 均如此）。
+        // chrono 计时语义相同（循环内已有 cudaDeviceSynchronize），无 driver 事件路径。
+        auto t0 = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < 10; ++i) {
             for (int k = 0; k < nch; ++k)
                 CUBLAS_CGEMV(h, CUBLAS_OP_T, nA, cp, &a1, dA + k * colOff, nA,
                             dv, 1, &b0, dS + k * cp, 1);
             cudaDeviceSynchronize();
         }
-        cudaEventRecord(e); cudaEventSynchronize(e);
-        float ms; cudaEventElapsedTime(&ms, s, e);
-        cudaEventDestroy(s); cudaEventDestroy(e);
-        float t = ms / 10.0f;
+        auto t1 = std::chrono::high_resolution_clock::now();
+        float t = std::chrono::duration<float, std::milli>(t1 - t0).count() / 10.0f;
         if (t < best) { best = t; best_nch = nch; }
     }
     s_best_nch = best_nch;
@@ -246,30 +247,47 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
     const int nTotal = nEvents * n_polar;
     const long long strideA = (long long)n_amplitudes;  // column stride for A
 
-    // ----- 静态缓冲区和 cublas handle (只分配一次) -----
-    static ctComplex* s_d_S = nullptr;
-    static cublasHandle_t s_handle = nullptr;
-    static double* s_d_nll = nullptr;
-    static int s_alloc_n = 0, s_nchunks = 0;
-    if (s_alloc_n < nTotal || s_handle == nullptr) {
-        if (s_d_S) cudaFree(s_d_S);
-        if (s_d_nll) cudaFree(s_d_nll);
-        if (s_handle) cublasDestroy(s_handle);
-        cudaMalloc(&s_d_S, nTotal * sizeof(ctComplex));
-        cudaMalloc(&s_d_nll, sizeof(double));
-        cublasCreate(&s_handle);
-        s_alloc_n = nTotal;
-        s_nchunks = 0;  // trigger re-tune
+    // ----- 静态缓冲区和 cublas handle：按设备索引维护一套 -----
+    // 多 GPU 下每个设备必须有独立的缓冲和 cublas handle——否则第二张卡的调用
+    // 会复用 device-0 的指针/句柄 → cudaErrorIllegalAddress（实测 2×A100 必现）。
+    static std::vector<ctComplex*> s_d_S;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_nll;
+    static std::vector<int> s_alloc_n, s_nchunks;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_d_S.size() <= dev) {
+        s_d_S.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr);
+        s_d_nll.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0);
+        s_nchunks.resize(dev + 1, 0);
+    }
+    ctComplex*& dS = s_d_S[dev];
+    cublasHandle_t& h = s_handle[dev];
+    double*& dnll = s_d_nll[dev];
+    int& alloc_n = s_alloc_n[dev];
+    int& nchunks = s_nchunks[dev];
+
+    if (alloc_n < nTotal || h == nullptr) {
+        if (dS) cudaFree(dS);
+        if (dnll) cudaFree(dnll);
+        if (h) cublasDestroy(h);
+        cudaMalloc(&dS, nTotal * sizeof(ctComplex));
+        cudaMalloc(&dnll, sizeof(double));
+        cublasCreate(&h);
+        alloc_n = nTotal;
+        nchunks = 0;  // trigger re-tune
     }
 
-    // ----- Auto-tune chunk count (first call only) -----
-    if (s_nchunks == 0) {
-        s_nchunks = tuneChunkCount(s_handle, n_amplitudes, nTotal,
-                                    d_amp, d_vector, s_d_S);
+    // ----- Auto-tune chunk count (first call per device) -----
+    if (nchunks == 0) {
+        nchunks = tuneChunkCount(h, n_amplitudes, nTotal,
+                                 d_amp, d_vector, dS);
     }
 
     // ----- 第一步：S = A^T·v (cublas 分块) -----
-    const int nch = s_nchunks;
+    const int nch = nchunks;
     const int cp = nTotal / nch;
     const long long colStride = (long long)cp * n_amplitudes;  // elements to skip per chunk
     ctComplex a1 = ctMake(1, 0), b0 = ctMake(0, 0);
@@ -277,37 +295,37 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
         // 最后一块覆盖剩余尾部（nch*cp 可能 < nTotal），否则尾部元素残留
         // 上次调用的值/未初始化垃圾 → NLL 出现首次调用差异与跨调用漂移
         int cp_k = (k == nch - 1) ? (nTotal - k * cp) : cp;
-        CUBLAS_CGEMV(s_handle, CUBLAS_OP_T, n_amplitudes, cp_k, &a1,
+        CUBLAS_CGEMV(h, CUBLAS_OP_T, n_amplitudes, cp_k, &a1,
                     d_amp + k * colStride, strideA, d_vector, 1, &b0,
-                    s_d_S + k * cp, 1);
+                    dS + k * cp, 1);
     }
 
     // ----- 第二步: factor + w + NLL (float logf/div, 一次性处理全部 S) -----
-    cudaMemset(s_d_nll, 0, sizeof(double));
+    cudaMemset(dnll, 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
     computeFactorsAndWeightsKernel<<<gridBlocks, kBlockSize>>>(
-        s_d_S, s_d_nll, d_weights, nEvents, n_polar);
+        dS, dnll, d_weights, nEvents, n_polar);
 
     double raw_nll;
-    cudaMemcpy(&raw_nll, s_d_nll, sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&raw_nll, dnll, sizeof(double), cudaMemcpyDeviceToHost);
 
     if (d_w_out != nullptr) {
-        cudaMemcpy(d_w_out, s_d_S, nTotal * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_w_out, dS, nTotal * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
     }
 
     // ----- 第三步: 梯度 grad = -A·conj(w) (cublas 分块, 第一块覆盖, 后续累加) -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
-        conjugateKernel<<<gradConj, kBlockSize>>>(s_d_S, nTotal);
+        conjugateKernel<<<gradConj, kBlockSize>>>(dS, nTotal);
 
         ctComplex alpha = ctMake(-1.0f, 0.0f);
         ctComplex beta0 = ctMake(0.0f, 0.0f);
         ctComplex beta1 = ctMake(1.0f, 0.0f);
         for (int k = 0; k < nch; ++k) {
             ctComplex beta = (k == 0) ? beta0 : beta1;
-            CUBLAS_CGEMV(s_handle, CUBLAS_OP_N, n_amplitudes, cp, &alpha,
+            CUBLAS_CGEMV(h, CUBLAS_OP_N, n_amplitudes, cp, &alpha,
                         d_amp + k * colStride, strideA,
-                        s_d_S + k * cp, 1, &beta, d_grad_out, 1);
+                        dS + k * cp, 1, &beta, d_grad_out, 1);
         }
 
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
