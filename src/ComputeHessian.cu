@@ -479,8 +479,8 @@ __global__ void computeCustomHessianKernel(
     int evt_offset = 0,
     int nSigma = 1,
     const DeviceMomenta* d_mom_tab = nullptr,
-    const double* d_sign_tab = nullptr)
-{
+    const double* d_sign_tab = nullptr,
+    const double* d_jit_out_full) {  // JIT 物化 F/dF/d2F（null → 解释器）
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
     int evt_abs = evt + evt_offset;
@@ -515,14 +515,16 @@ __global__ void computeCustomHessianKernel(
     if (I_val < 1e-30) return;
     double inv_I = 1.0 / I_val;
 
-    // dS / d2S 累加（σ 求和）
+    // dS / d2S 累加（σ 求和）。
+    // d2S 只被 termC（Σ_p cwr·d2S_re − cwi·d2S_im）消费，cwr/cwi 不依赖
+    // SL/σ → 直接在 p 内层按 (j,k) 折叠成标量，避免 [16][16][32]×2 = 128KB
+    // local memory/thread（sm_120 L1 仅 ~128KB，会全部 spill 到 DRAM）。
     double dS_re[16][32], dS_im[16][32];
-    double d2S_re[16][16][32], d2S_im[16][16][32];
+    double d2S_acc_re[16 * 16], d2S_acc_im[16 * 16];
     for (int j = 0; j < Npr; ++j)
         for (int p = 0; p < nPolar; ++p) { dS_re[j][p] = 0; dS_im[j][p] = 0; }
     for (int j = 0; j < Npr; ++j)
-        for (int k = 0; k < Npr; ++k)
-            for (int p = 0; p < nPolar; ++p) { d2S_re[j][k][p] = 0; d2S_im[j][k][p] = 0; }
+        for (int k = 0; k < Npr; ++k) { d2S_acc_re[j * 16 + k] = 0; d2S_acc_im[j * 16 + k] = 0; }
 
     // 每个 SL 组合（本 block nSL 个；SL 与共振态共享，需遍历 SL 求导）
     // 注意：dS 需要 Σ_sl v_sl · dF_j · slamp（对所有 SL 求和）
@@ -568,17 +570,35 @@ __global__ void computeCustomHessianKernel(
 
                 if (is_target) {
                     if (!custom_eval) {
-                        double p1_P = pD1.P(), p1_E = pD1.E;
-                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                        double p1_phi = atan2(pD1.Py, pD1.Px);
-                        double p2_P = pD2.P(), p2_E = pD2.E;
-                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                        double p2_phi = atan2(pD2.Py, pD2.Px);
-                        evalCustomAll(aux, aux_offset, mm, qq, q0, L, node.bf_d,
-                            md1_q0, md2_q0,
-                            p1_P, p1_E, p1_ct, p1_phi,
-                            p2_P, p2_E, p2_ct, p2_phi,
-                            target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                        if (d_jit_out_full) {
+                            // JIT 物化读取（pass-1 已算 F/dF/d2F；nvals = 2+2P+2P²）
+                            const double* jb = d_jit_out_full
+                                + ((size_t)s * nEvents + evt) * nSL * (2 + 2 * P + 2 * P * P)
+                                + (size_t)sl_idx * (2 + 2 * P + 2 * P * P);
+                            Fr = jb[0]; Fi = jb[1];
+                            for (int j = 0; j < P; ++j) {
+                                dFr[j] = jb[2 + 2 * j];
+                                dFi[j] = jb[2 + 2 * j + 1];
+                            }
+                            for (int j = 0; j < P; ++j)
+                                for (int k = 0; k < P; ++k) {
+                                    int b = 2 + 2 * P + 2 * (j * P + k);
+                                    d2Fr[j * P + k] = jb[b];
+                                    d2Fi[j * P + k] = jb[b + 1];
+                                }
+                        } else {
+                            double p1_P = pD1.P(), p1_E = pD1.E;
+                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                            double p1_phi = atan2(pD1.Py, pD1.Px);
+                            double p2_P = pD2.P(), p2_E = pD2.E;
+                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                            double p2_phi = atan2(pD2.Py, pD2.Px);
+                            evalCustomAll(aux, aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1_q0, md2_q0,
+                                p1_P, p1_E, p1_ct, p1_phi,
+                                p2_P, p2_E, p2_ct, p2_phi,
+                                target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                        }
                         custom_eval = true;
                     }
                 } else if (node.has_bf) {
@@ -627,12 +647,18 @@ __global__ void computeCustomHessianKernel(
                     dS_re[j][p] += sg * (dF_t[pj] * t_re - dF_ti[pj] * t_im);
                     dS_im[j][p] += sg * (dF_t[pj] * t_im + dF_ti[pj] * t_re);
                 }
+                // termC 标量折叠：cwr/cwi 与 SL/σ 无关，p 内层直接缩放累加
+                // （与原 Σ_p cwr·d2S_re − cwi·d2S_im 数学等价；double 累加顺序
+                // 略变，1e-16 级差异）
+                double cwr_p = Sr[p] * inv_I, cwi_p = -Si[p] * inv_I;
                 for (int j = 0; j < Npr; ++j) {
                     int pj = pm ? pm[j] : j;
                     for (int k = 0; k < Npr; ++k) {
                         int pk = pm ? pm[k] : k;
-                        d2S_re[j][k][p] += sg * (d2F_t[pj * P + pk] * t_re - d2F_ti[pj * P + pk] * t_im);
-                        d2S_im[j][k][p] += sg * (d2F_t[pj * P + pk] * t_im + d2F_ti[pj * P + pk] * t_re);
+                        double a = d2F_t[pj * P + pk] * t_re - d2F_ti[pj * P + pk] * t_im;
+                        double b = d2F_t[pj * P + pk] * t_im + d2F_ti[pj * P + pk] * t_re;
+                        d2S_acc_re[j * 16 + k] += sg * (cwr_p * a - cwi_p * b);
+                        d2S_acc_im[j * 16 + k] += sg * (cwr_p * b + cwi_p * a);
                     }
                 }
             }
@@ -670,12 +696,11 @@ __global__ void computeCustomHessianKernel(
             int gk = d_global_idx[k];
             if (gk < 0) continue;
             double hjk = g[j] * g[k];  // Term A
-            double termB = 0.0, termC = 0.0;
+            double termB = 0.0;
             for (int p = 0; p < nPolar; ++p) {
                 termB += dS_re[k][p] * dS_re[j][p] + dS_im[k][p] * dS_im[j][p];
-                double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;
-                termC += cwr * d2S_re[j][k][p] - cwi * d2S_im[j][k][p];
             }
+            double termC = d2S_acc_re[j * 16 + k];  // 已在 SL×σ×p 循环内折叠
             termB *= -2.0 * inv_I;
             termC *= -2.0;
             hjk += termB + termC;

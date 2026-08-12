@@ -410,7 +410,7 @@ __device__ void MasslessTrans(thrust::complex<double>* trans, LorentzVector P,
     LorentzVector p, int dim,
     thrust::complex<double>* shared_buf)
 {
-    int matrix_size = dim * dim;
+    // int matrix_size = dim * dim;
 
     // Initialize to identity
     for (int i = 0; i < dim; i++) {

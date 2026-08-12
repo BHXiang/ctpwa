@@ -418,6 +418,31 @@ void AmpCasDecay::addParticleIfNotExists(const std::string& name, int spin, int 
     }
 }
 
+// host 侧衰变节点（索引/质量/势垒因子已决议）—— 与 computeSLAmps 中
+// 上传 device DecayNode 的构造逻辑一致（JIT 计划构建用）
+std::vector<DecayNode> AmpCasDecay::getHostDecayNodes() const
+{
+    std::vector<DecayNode> host_decayNodes;
+    for (const auto& node : decayChain_)
+    {
+        DecayNode indexed_node;
+        indexed_node.mother_idx = particleToIndex_.at(node.mother);
+        indexed_node.daug1_idx = particleToIndex_.at(node.daug1);
+        indexed_node.daug2_idx = particleToIndex_.at(node.daug2);
+
+        indexed_node.mass[0] = particleMap_.at(node.mother).mass;
+        indexed_node.mass[1] = particleMap_.at(node.daug1).mass;
+        indexed_node.mass[2] = particleMap_.at(node.daug2).mass;
+
+        // 势垒因子（三级作用域决议后的最终值，随 DecayNode 进入内核）
+        indexed_node.has_bf = node.amp.getHasBf();
+        indexed_node.bf_d = node.amp.getBfD();
+
+        host_decayNodes.push_back(indexed_node);
+    }
+    return host_decayNodes;
+}
+
 bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
     Q0MassDep& md1_dep, double& md1_fixed,
     Q0MassDep& md2_dep, double& md2_fixed) const
@@ -671,24 +696,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         nSLCombs_ = slCombinations.size();
 
         // 准备使用索引的衰变节点
-        std::vector<DecayNode> host_decayNodes;
-        for (const auto& node : decayChain_)
-        {
-            DecayNode indexed_node;
-            indexed_node.mother_idx = particleToIndex_[node.mother];
-            indexed_node.daug1_idx = particleToIndex_[node.daug1];
-            indexed_node.daug2_idx = particleToIndex_[node.daug2];
-
-            indexed_node.mass[0] = particleMap_[node.mother].mass;
-            indexed_node.mass[1] = particleMap_[node.daug1].mass;
-            indexed_node.mass[2] = particleMap_[node.daug2].mass;
-
-            // 势垒因子（三级作用域决议后的最终值，随 DecayNode 进入内核）
-            indexed_node.has_bf = node.amp.getHasBf();
-            indexed_node.bf_d = node.amp.getBfD();
-
-            host_decayNodes.push_back(indexed_node);
-        }
+        std::vector<DecayNode> host_decayNodes = getHostDecayNodes();
 
         // 准备衰变链信息
         std::vector<int> host_dj, host_dj1, host_dj2;
@@ -1685,17 +1693,31 @@ __global__ void computeCustomAmpsKernel(
                             interpEval(aux + target_res.aux_offset, mm,
                                        Fr, Fi, dFr, dFi, P);
                         } else {
-                            double p1_P = pD1.P(), p1_E = pD1.E;
-                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                            double p1_phi = atan2(pD1.Py, pD1.Px);
-                            double p2_P = pD2.P(), p2_E = pD2.E;
-                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                            double p2_phi = atan2(pD2.Py, pD2.Px);
-                            evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
-                                md1_q0, md2_q0,
-                                p1_P, p1_E, p1_ct, p1_phi,
-                                p2_P, p2_E, p2_ct, p2_phi,
-                                target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                            // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P，同流顺序保证）
+                            int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;
+                            if (B.d_jit_out && joff >= 0) {
+                                const double* jb = B.d_jit_out + joff
+                                    + ((size_t)s * B.nEvents + event_idx) * B.nSL * (2 + 2 * P)
+                                    + (size_t)sl_idx * (2 + 2 * P);
+                                Fr = jb[0]; Fi = jb[1];
+                                for (int j = 0; j < P; ++j) {
+                                    dFr[j] = jb[2 + 2 * j];
+                                    dFi[j] = jb[2 + 2 * j + 1];
+                                }
+                            } else {
+                                double p1_P = pD1.P(), p1_E = pD1.E;
+                                double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                                double p1_phi = atan2(pD1.Py, pD1.Px);
+                                double p2_P = pD2.P(), p2_E = pD2.E;
+                                double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                                double p2_phi = atan2(pD2.Py, pD2.Px);
+                                evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                    md1_q0, md2_q0,
+                                    p1_P, p1_E, p1_ct, p1_phi,
+                                    p2_P, p2_E, p2_ct, p2_phi,
+                                    target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi,
+                                    /*compute_2nd=*/false);
+                            }
                         }
                         custom_eval = true;
                     }
@@ -1794,17 +1816,31 @@ __global__ void computeCustomAmpsKernel(
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
                     } else {
-                        double p1_P = pD1.P(), p1_E = pD1.E;
-                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                        double p1_phi = atan2(pD1.Py, pD1.Px);
-                        double p2_P = pD2.P(), p2_E = pD2.E;
-                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                        double p2_phi = atan2(pD2.Py, pD2.Px);
-                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
-                            md1_q0, md2_q0,
-                            p1_P, p1_E, p1_ct, p1_phi,
-                            p2_P, p2_E, p2_ct, p2_phi,
-                            rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp);
+                        // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P_r）
+                        int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;
+                        if (B.d_jit_out && joff >= 0) {
+                            const double* jb = B.d_jit_out + joff
+                                + ((size_t)s * B.nEvents + event_idx) * B.nSL * (2 + 2 * P_r)
+                                + (size_t)sl_idx * (2 + 2 * P_r);
+                            Fr = jb[0]; Fi = jb[1];
+                            for (int j = 0; j < P_r; ++j) {
+                                dFr[j] = jb[2 + 2 * j];
+                                dFi[j] = jb[2 + 2 * j + 1];
+                            }
+                        } else {
+                            double p1_P = pD1.P(), p1_E = pD1.E;
+                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                            double p1_phi = atan2(pD1.Py, pD1.Px);
+                            double p2_P = pD2.P(), p2_E = pD2.E;
+                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                            double p2_phi = atan2(pD2.Py, pD2.Px);
+                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1_q0, md2_q0,
+                                p1_P, p1_E, p1_ct, p1_phi,
+                                p2_P, p2_E, p2_ct, p2_phi,
+                                rp, P_r, Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp,
+                                /*compute_2nd=*/false);
+                        }
                     }
 
                     double den = Fr * Fr + Fi * Fi;
@@ -1919,11 +1955,16 @@ __global__ void updateResonanceParamsKernel(
 AmpCalc::~AmpCalc()
 {
     for (auto& block : blocks_) {
+        jitDestroy(block.jit);   // 释放 JIT 物化 buffer（grad/full/slice）
+    }
+    for (auto& block : blocks_) {
         for (size_t gpu = 0; gpu < block.d_resonances.size(); ++gpu) {
             cudaSetDevice(static_cast<int>(gpu));
             if (block.d_resonances[gpu]) cudaFree(block.d_resonances[gpu]);
-            if (block.d_all_params[gpu]) cudaFree(block.d_all_params[gpu]);
-            if (block.d_all_channels[gpu]) cudaFree(block.d_all_channels[gpu]);
+            if (gpu < block.d_all_params.size() && block.d_all_params[gpu])
+                cudaFree(block.d_all_params[gpu]);
+            if (gpu < block.d_all_channels.size() && block.d_all_channels[gpu])
+                cudaFree(block.d_all_channels[gpu]);
             if (block.d_T.size() > gpu && block.d_T[gpu]) cudaFree(block.d_T[gpu]);
             if (block.d_dF.size() > gpu && block.d_dF[gpu]) cudaFree(block.d_dF[gpu]);
             if (block.d_res_idx_.size() > gpu && block.d_res_idx_[gpu]) cudaFree(block.d_res_idx_[gpu]);
@@ -1933,15 +1974,17 @@ AmpCalc::~AmpCalc()
             if (block.d_global_idx_.size() > gpu && block.d_global_idx_[gpu]) cudaFree(block.d_global_idx_[gpu]);
         }
     }
-    // 跨块持久化缓冲（每 GPU 一份）
+    // 跨块持久化缓冲（每 GPU 一份）。各 vector 懒分配于不同入口
+    // （reComputeAmps / computeResonanceGradient / hessian 路径），
+    // size 可能不同（如仅调 getHessian 时 d_grad_per_gpu_ 为空）→ 逐项检查
     size_t n_gpu_persist = d_params_per_gpu_.size();
     for (size_t gpu = 0; gpu < n_gpu_persist; ++gpu) {
         cudaSetDevice(static_cast<int>(gpu));
         if (d_params_per_gpu_[gpu]) cudaFree(d_params_per_gpu_[gpu]);
-        if (d_grad_per_gpu_[gpu]) cudaFree(d_grad_per_gpu_[gpu]);
-        if (d_ev_off_cache_[gpu]) cudaFree(d_ev_off_cache_[gpu]);
-        if (d_amp_off_cache_[gpu]) cudaFree(d_amp_off_cache_[gpu]);
-        if (d_ad_desc_[gpu]) cudaFree(d_ad_desc_[gpu]);
+        if (gpu < d_grad_per_gpu_.size() && d_grad_per_gpu_[gpu]) cudaFree(d_grad_per_gpu_[gpu]);
+        if (gpu < d_ev_off_cache_.size() && d_ev_off_cache_[gpu]) cudaFree(d_ev_off_cache_[gpu]);
+        if (gpu < d_amp_off_cache_.size() && d_amp_off_cache_[gpu]) cudaFree(d_amp_off_cache_[gpu]);
+        if (gpu < d_ad_desc_.size() && d_ad_desc_[gpu]) cudaFree(d_ad_desc_[gpu]);
     }
     // cas_list_ 由 shared_ptr 自动释放
 }
@@ -2447,6 +2490,56 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             custom_blocks.push_back(static_cast<int>(bi));
         }
 
+        // ---- JIT 计划构建（每块一次，懒；失败 → 该块回退解释器）----
+        for (int bi : custom_blocks) {
+            auto& block = blocks_[bi];
+            if (block.jit.built) continue;
+            block.jit.built = true;
+            if (!jitEnabled()) continue;
+            // 模板按 block 索引（cas 可被多 block 共享，但模板每 block 一份）
+            const auto& h_res = h_templates_[bi];
+            const auto& h_ch = h_channel_templates_[bi];
+            auto& cas = cas_list_[block.cas_idx];
+            std::vector<DecayNode> h_nodes = cas->getHostDecayNodes();
+            std::vector<JitNodeSpec> specs;
+            std::vector<std::vector<double>> aux_list;
+            int hessian_target = -1;
+            for (int ni = 0; ni < (int)h_nodes.size(); ++ni) {
+                const DecayNode& n = h_nodes[ni];
+                if (n.mass[0] > 0) continue;   // 母粒子固定质量 → 非共振态节点
+                int mr = -1;
+                for (int r = 0; r < (int)h_res.size(); ++r)
+                    if (h_res[r].particle_idx == n.mother_idx) { mr = r; break; }
+                if (mr < 0) continue;
+                const DeviceResonance& dr = h_res[mr];
+                // 排除：Interp（查表不走字节码）、无 aux、param_count 0/超限
+                // （param_count=0 时内核 P_r≥1 与 nvals=2 布局不匹配 → 保持解释器）
+                if (dr.type == ResModelType::Interp || dr.aux_size <= 0 ||
+                    dr.param_count < 1 || dr.param_count > 16)
+                    continue;
+                if (hessian_target < 0 && mr == 0) hessian_target = (int)specs.size();
+                JitNodeSpec sp;
+                sp.node_idx = ni;
+                sp.mother_idx = n.mother_idx;
+                sp.daug1_idx = n.daug1_idx;
+                sp.daug2_idx = n.daug2_idx;
+                sp.mass0 = n.mass[0];
+                sp.mass1 = n.mass[1];
+                sp.mass2 = n.mass[2];
+                sp.bf_d = n.bf_d;
+                sp.param_offset = dr.param_offset;
+                sp.param_count = dr.param_count;
+                specs.push_back(sp);
+                aux_list.emplace_back(h_ch.begin() + dr.aux_offset,
+                                      h_ch.begin() + dr.aux_offset + dr.aux_size);
+            }
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] block %d (bi=%d): custom nodes=%zu specs=%zu\n",
+                        bi, bi, h_nodes.size(), specs.size());
+            if (!specs.empty())
+                jitCompileBlock(block.jit, specs, aux_list, hessian_target);
+        }
+
         // 确保 d_dF / d_param_map 已分配（懒分配持久化）
         for (int bi : custom_blocks) {
             auto& block = blocks_[bi];
@@ -2510,9 +2603,42 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 d.nPolar = static_cast<int>(n_polar);
                 d.sl_start = sl_start;
                 d.site = block.site;
+                // JIT 读端字段：默认解释器（JIT 循环按需覆盖）
+                d.d_jit_out = nullptr;
+                d.d_jit_slice = nullptr;
                 h_desc.push_back(d);
                 sl_start += d.nSL;
                 max_evt = std::max(max_evt, d.nEvents);
+            }
+            // ---- JIT pass-1 物化（每块每 GPU；同流顺序保证在统一 kernel 前完成）----
+            for (size_t ci = 0; ci < custom_blocks.size(); ++ci) {
+                auto& block = blocks_[custom_blocks[ci]];
+                auto& dd = h_desc[ci];
+                if (!block.jit.enabled) continue;
+                auto& cas = cas_list_[block.cas_idx];
+                // 粒子 → param_offset 表（无参数 -1；q0 链子粒子质量用）
+                std::vector<int> rpo(256, -1);
+                const auto& h_res = h_templates_[custom_blocks[ci]];
+                for (const auto& dr : h_res) {
+                    if (dr.particle_idx < 0 || dr.particle_idx >= 256) continue;
+                    if (dr.param_count > 0) rpo[dr.particle_idx] = dr.param_offset;
+                }
+                if (jitPrepareGrad(block.jit, gpu, cas->getMomenta()[gpu],
+                                   cas->getMomentaTab()[gpu], block.d_all_params[gpu],
+                                   rpo.data(), cas->getDeviceSLCombs()[gpu],
+                                   cas->getDecayChainSize(),
+                                   static_cast<int>(cas->getNEventsVec()[gpu]),
+                                   static_cast<int>(cas->getNSLCombs()),
+                                   cas->getNSigma())) {
+                    jitLaunchGrad(block.jit, gpu);
+                    if (getenv("CTPWA_JIT_DEBUG"))
+                        fprintf(stderr, "[ctpwa] grad prep+launch ok (gpu %d)\n", gpu);
+                } else if (getenv("CTPWA_JIT_DEBUG"))
+                    fprintf(stderr, "[ctpwa] grad prep FAILED (gpu %d)\n", gpu);
+                // pass-2 读端字段（prep 失败 → null → 解释器回退）
+                bool gready = (int)block.jit.grad_ready.size() > gpu && block.jit.grad_ready[gpu];
+                dd.d_jit_out = gready ? block.jit.grad_buf[gpu] : nullptr;
+                dd.d_jit_slice = gready ? block.jit.grad_slice[gpu] : nullptr;
             }
             int nblocks = static_cast<int>(h_desc.size());
             cudaMemcpy(d_ad_desc_[gpu], h_desc.data(), nblocks * sizeof(ADBlockDesc),
@@ -2846,6 +2972,9 @@ void AmpCalc::computeUnifiedHessian(
     bool has_offset = (t_offset.size() == (size_t)n_gpu);
     constexpr int kBlockSize = 256;
 
+    bool hprof = getenv("CTPWA_PROF") != nullptr;
+    auto uhT0 = std::chrono::high_resolution_clock::now();
+
     int primary_dev = 0; cudaGetDevice(&primary_dev);  // capture caller's device
     int hess_sz = hess_ld * hess_ld;
 
@@ -2972,6 +3101,11 @@ void AmpCalc::computeUnifiedHessian(
                 if (t.aux_size <= 0) { has_sym_aux = false; break; }
             }
             if (is_custom_block || has_sym_aux) {
+                // Npr==0：无自由参数（conjugate 块的 Npr 已覆盖为 owner 的值，
+                // 仍为 0 说明 owner 也无参数）→ 全量事件扫描纯浪费
+                // （唯一输出 phsp I 与块无关，同 d_S 任何块算都相同，
+                // 移交给后续 first_free_block）。stage 2-4 用 bt.d_g==nullptr 跳过。
+                if (Npr == 0) continue;
                 // 仍需要 temp buffer（stage 2 交叉项）— 下方统一分配
             } else if (Npr < 1 || Npr > 3) {
                 continue;
@@ -3029,12 +3163,17 @@ void AmpCalc::computeUnifiedHessian(
             // phsp 梯度/Hessian（d_pg_g, d_phA_g）通过 owner slot 累加。
             double* d_pI_ptr = (first_free_block && !is_conjugate) ? d_pI_g : nullptr;
 
+            auto t_blk0 = std::chrono::high_resolution_clock::now();
+
             if (is_custom_block || has_sym_aux) {
                 // d_param_map 懒上传（getHessian 可能先于 reComputeAmps 调用；
-                // conjugate 块用 owner 的 free_param_idx）
+                // conjugate 块用 owner 的 free_param_idx）。
+                // 注意: size 检查必须先于 [gpu] 索引——nFree==0 的块（耦合与
+                // 共振态参数全部固定）从未在 reComputeAmps 中分配过 d_param_map_，
+                // 此时 vector 为空，直接索引触发 std::vector 断言（fit.py 崩溃根因）
+                if (!blk.d_param_map_.size()) blk.d_param_map_.assign(n_gpu, nullptr);
                 const int* d_pmap = blk.d_param_map_[gpu];
                 if (!d_pmap && Npr > 0) {
-                    if (!blk.d_param_map_.size()) blk.d_param_map_.assign(n_gpu, nullptr);
                     const std::vector<int>& pm_host = is_conjugate
                         ? blocks_[ow_bi].free_param_idx : blk.free_param_idx;
                     int pm_n = std::min(Npr, (int)pm_host.size());
@@ -3042,6 +3181,24 @@ void AmpCalc::computeUnifiedHessian(
                     cudaMemcpy(blk.d_param_map_[gpu], pm_host.data(),
                                pm_n * sizeof(int), cudaMemcpyHostToDevice);
                     d_pmap = blk.d_param_map_[gpu];
+                }
+                // ---- JIT full pass-1（物化目标节点 F/dF/d2F；失败 → 解释器）----
+                const double* jit_full = nullptr;
+                if (blk.jit.enabled) {
+                    std::vector<int> rpo(256, -1);
+                    const auto& h_res = h_templates_[bi];
+                    for (const auto& dr : h_res) {
+                        if (dr.particle_idx < 0 || dr.particle_idx >= 256) continue;
+                        if (dr.param_count > 0) rpo[dr.particle_idx] = dr.param_offset;
+                    }
+                    if (jitPrepareFull(blk.jit, gpu, cas->getMomenta()[gpu],
+                                       cas->getMomentaTab()[gpu],
+                                       blk.d_all_params[gpu], rpo.data(),
+                                       cas->getDeviceSLCombs()[gpu], dsz,
+                                       nEv, evt_off, nSL, nSigma)) {
+                        jitLaunchFull(blk.jit, gpu);
+                        jit_full = blk.jit.full_buf[gpu];
+                    }
                 }
                 // Custom / 符号微分标量路径（P 运行时无上限）
                 computeCustomHessianKernel<<<grid, kBlockSize>>>(
@@ -3054,14 +3211,43 @@ void AmpCalc::computeUnifiedHessian(
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g, evt_off,
-                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu]);
+                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu],
+                    jit_full);
                 cudaDeviceSynchronize();
+                if (getenv("CTPWA_JIT_DEBUG")) {
+                    cudaError_t e = cudaGetLastError();
+                    if (e != cudaSuccess)
+                        fprintf(stderr, "[ctpwa] hessian kernel error: %s\n", cudaGetErrorString(e));
+                }
                 if (!is_conjugate) first_free_block = false;
+                if (hprof) {
+                    auto t_blk1 = std::chrono::high_resolution_clock::now();
+                    printf("[PROF] UH gpu=%d blk=%zu Npr=%d Nres=%d custom=%d symaux=%d jit=%d conj=%d: %.2f ms\n",
+                        gpu, bi, Npr, Nres, (int)is_custom_block, (int)has_sym_aux,
+                        (int)blk.jit.enabled, (int)is_conjugate,
+                        std::chrono::duration<double, std::milli>(t_blk1 - t_blk0).count());
+                    fflush(stdout);
+                }
                 continue;   // 跳过模板分派
+            }
+            if (hprof) {
+                auto t_blk1 = std::chrono::high_resolution_clock::now();
+                printf("[PROF] UH gpu=%d blk=%zu Npr=%d Nres=%d template-path: %.2f ms\n",
+                    gpu, bi, Npr, Nres,
+                    std::chrono::duration<double, std::milli>(t_blk1 - t_blk0).count());
+                fflush(stdout);
             }
         }
 
+        if (hprof) {
+            auto uhT1 = std::chrono::high_resolution_clock::now();
+            printf("[PROF] UH gpu=%d total-blk-loop: %.2f ms (nEv=%d)\n", gpu,
+                std::chrono::duration<double, std::milli>(uhT1 - uhT0).count(), nEv);
+            fflush(stdout);
+        }
+
         // ===== Stage 2: cross-block Hessian =====
+        auto t_s2 = std::chrono::high_resolution_clock::now();
         for (size_t bi = 0; bi < blocks_.size(); ++bi) {
             auto& btA = temps_per_gpu[gpu][bi];
             if (!btA.d_g) continue;
@@ -3082,8 +3268,16 @@ void AmpCalc::computeUnifiedHessian(
             }
         }
 
+        if (hprof) {
+            auto t_s2e = std::chrono::high_resolution_clock::now();
+            printf("[PROF] UH gpu=%d stage2-cross: %.2f ms\n", gpu,
+                std::chrono::duration<double, std::milli>(t_s2e - t_s2).count());
+            fflush(stdout);
+        }
+
         // ===== Stage 3: Per-block mixed Hessian (vθ same-block) =====
         // ===== Stage 4: Cross-block mixed Hessian (vθ cross terms) =====
+        auto t_s3 = std::chrono::high_resolution_clock::now();
         if (d_mixed_out) {
             for (size_t bi = 0; bi < blocks_.size(); ++bi) {
                 auto& bt = temps_per_gpu[gpu][bi];
@@ -3144,6 +3338,13 @@ void AmpCalc::computeUnifiedHessian(
                     cudaDeviceSynchronize();
                 }
             }
+        }
+
+        if (hprof) {
+            auto t_s3e = std::chrono::high_resolution_clock::now();
+            printf("[PROF] UH gpu=%d stage3-4-mixed: %.2f ms\n", gpu,
+                std::chrono::duration<double, std::milli>(t_s3e - t_s3).count());
+            fflush(stdout);
         }
 
         // Free temp buffers

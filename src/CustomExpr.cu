@@ -735,7 +735,8 @@ __device__ void evalCustomAll(
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,
-    double* d2Fr, double* d2Fi)
+    double* d2Fr, double* d2Fi,
+    bool compute_2nd)
 {
     int seg_off = aux_offset + 2;
     double out[2];
@@ -754,6 +755,7 @@ __device__ void evalCustomAll(
         seg_off += 1 + 3 * n_instr;
     }
     // 二阶段（段序 j≤k，对称填充）
+    if (compute_2nd)
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) {
             n_instr = (int)aux[seg_off];

@@ -98,12 +98,16 @@ Constraints:
 Resonances:
   # ---------- BWR (相对论 BW, 默认模型) ----------
   phi1020:
-    J: 1; P: -1; model: BWR
+    J: 1
+    P: -1
+    model: BWR
     parameters: [1.0195, 0.0045]          # [mass, width]
     tex: ["\\phi(1020)"]
 
   rho1700:
-    J: 1; P: -1; model: BWR
+    J: 1
+    P: -1
+    model: BWR
     parameters: [1.72, 0.25]
     free: [0, 1]                          # 放开拟合
     free_range: [[1.6, 1.8], [0.1, 0.5]] # 拟合范围
@@ -111,7 +115,9 @@ Resonances:
 
   # ---------- BW (非相对论 BW, 无势垒因子) ----------
   # K1_1410:
-  #   J: 1; P: -1; model: BW
+  #   J: 1
+  #   P: -1
+  #   model: BW
   #   parameters: [1.414, 0.232]
   #   free: [0, 1]
   #   tex: ["K_{1}(1410)"]
@@ -119,7 +125,9 @@ Resonances:
   # ---------- Flatte (耦合道, 近阈共振态) ----------
   # f0_980 耦合到 ππ 和 KK, 参数 [mass, g_ππ, g_KK]
   f0_980:
-    J: 0; P: +1; model: Flatte
+    J: 0
+    P: +1
+    model: Flatte
     parameters: [0.99, 0.2, 0.4]               # [m0, g_pipi, g_KK]
     free: [0, 1, 2]
     channels: [[0.1396, 0.1396], [0.4937, 0.4937]]
@@ -127,7 +135,9 @@ Resonances:
 
   # ---------- GS (Gounaris-Sakurai, ρ→ππ P 波) ----------
   rho_770:
-    J: 1; P: -1; model: GS
+    J: 1
+    P: -1
+    model: GS
     parameters: [0.775, 0.149]                  # [mass, width]
     free: [0, 1]
     channels: [[0.1396, 0.1396]]               # 道质量 [m_π⁺, m_π⁻]
@@ -135,12 +145,16 @@ Resonances:
 
   # ---------- ONE (纯势垒因子, 无共振态传播子) ----------
   # K1_1410:
-  #   J: 1; P: -1; model: ONE
+  #   J: 1
+  #   P: -1
+  #   model: ONE
   #   parameters: []
 
   # ---------- Interp (统一插值模型: hist/linear/spline) ----------
   # bg_shape:
-  #   J: 1; P: -1; model: Interp
+  #   J: 1
+  #   P: -1
+  #   model: Interp
   #   parameters: []                          # 无自由参数
   #   options:
   #     file: "./data/shape.dat"              # 两列: m, value
@@ -155,15 +169,20 @@ Resonances:
   #
   # 示例: BWR 变体, 用 |p1| 代替 q
   # my_res:
-  #   J: 1; P: -1; model: Custom
+  #   J: 1
+  #   P: -1
+  #   model: Custom
   #   parameters: [1.5, 0.12]                # p0=mass, p1=width
+  #   params: [p0, p1]
   #   free: [0, 1]
   #   expression: "p0^2/(p0^2 - m^2 - i*p0*p1*(p1p/q0)*(p0/m)*(p1p^2+q0^2)/q0^2)"
   #   tex: ["MyRes"]
 
   # BWR 使用 Custom DSL 等价写法 (g0=1, φ=0 时 ≡ 内置 BW):
   # bw_custom:
-  #   J: 1; P: -1; model: Custom
+  #   J: 1
+  #   P: -1
+  #   model: Custom
   #   parameters: [1.66, 0.125]
   #   free: [0, 1]
   #   expression: "p0^2/(p0^2 - m^2 - i*p0*p1)"
