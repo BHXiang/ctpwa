@@ -117,6 +117,20 @@ root_flags = get_root_flags()
 cuda_gencode_flags = get_cuda_gencode_flags()
 
 # 定义扩展模块
+# JIT 运行时 NVRTC 用 CUDA 13.2（12.9 ptxas 编译超长依赖链源码卡死/OOM，
+# 13.2 正常）。全路径链接 → SONAME=libnvrtc.so.13，运行需 LD_LIBRARY_PATH
+# 含该 13.2 lib64 目录（见 tests/job_tests.sh）。找不到 13.2 时回退 -lnvrtc。
+def find_nvrtc13_link_args():
+    for base in ("/usr/local/cuda-13.2", "/usr/local/cuda-13", "/usr/local/cuda"):
+        libnvrtc = os.path.join(base, "lib64", "libnvrtc.so")
+        if os.path.exists(libnvrtc):
+            return [libnvrtc]
+    return ["-lnvrtc"]
+
+
+nvrtc_link_args = find_nvrtc13_link_args()
+
+
 extension = CUDAExtension(
     name="ctpwa",
     sources=[
@@ -156,8 +170,12 @@ extension = CUDAExtension(
         *root_flags["libraries"],  # ROOT 库
         "cudart",
         "cublas",
-        "nvrtc",   # JITCustom（NVRTC 运行时编译自定义节点字节码）
         "cuda",    # JITCustom（驱动 API: cuModuleLoadData/cuLaunchKernel 等）
+        # 注意: nvrtc 不在此列表 —— 优先全路径链接 CUDA 13.2 的 libnvrtc
+        # （见下方 nvrtc_link_args）。CUDA 12.9 的 nvrtc/ptxas 对超长依赖链
+        # 源码（BWR d²F 段展开 ~4MB）编译卡死/内存爆炸（实测），13.2 正常。
+        # 13.2 libnvrtc 只依赖系统库，不引入 libcudart.so.13，与 torch cu126
+        # 无冲突。找不到 13.2 时回退 -lnvrtc。
     ],
     extra_compile_args={
         "cxx": [
@@ -192,6 +210,7 @@ extension = CUDAExtension(
     },
     extra_link_args=[
         "-Wl,--no-as-needed",  # 确保链接所有需要的库
+        *nvrtc_link_args,
     ],
 )
 
