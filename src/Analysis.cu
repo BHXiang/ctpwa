@@ -19,7 +19,6 @@
 #include <ComputeResults.cuh>
 #include <Config.cuh>
 #include <Figure.cuh>
-#include <AutoDiff.cuh>
 #include <ComputeHessian.cuh>
 #include <Info.cuh>
 #include <Parameters.cuh>
