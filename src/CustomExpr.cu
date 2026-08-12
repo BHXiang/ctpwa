@@ -289,6 +289,35 @@ class Parser {
         return parsePrimary();
     }
 
+    // 解析括号内参数表达式列表: '(' expr (',' expr)* ')'
+    std::vector<Node> parseArgList()
+    {
+        if (peek().type != Token::LParen)
+            throw std::runtime_error("CustomExpr: function needs (");
+        next();
+        std::vector<Node> args;
+        if (peek().type == Token::RParen) { next(); return args; }
+        while (true) {
+            args.push_back(parseExpr());
+            if (peek().type == Token::Comma) { next(); continue; }
+            break;
+        }
+        if (peek().type != Token::RParen)
+            throw std::runtime_error("CustomExpr: missing )");
+        next();
+        return args;
+    }
+
+    // q0 复合节点：m0 = 第一个参数（与内核运行时 m0_q0 = all_params[param_offset]
+    // 一致）；无参数时回退 1.0。md1/md2 为运行时子粒子质量（导数 0）。
+    Node q0Node()
+    {
+        return Node::makeComposite(MODEL_BREAKUP_Q0, {
+            params_.empty() ? Node::makeNum(1.0) : Node::makeParam(0),
+            Node::makeVar(CVAR_MD1),
+            Node::makeVar(CVAR_MD2)});
+    }
+
     Node parsePrimary()
     {
         const Token& t = peek();
@@ -311,7 +340,13 @@ class Parser {
             // 变量
             if (t.str == "m") return Node::makeVar(CVAR_M);
             if (t.str == "q") return Node::makeVar(CVAR_Q);
-            if (t.str == "q0") return Node::makeVar(CVAR_Q0);
+            if (t.str == "q0" && peek().type != Token::LParen)
+                // q0 变量 = breakup(θ_0, md1, md2)：标称质量取第一个参数
+                // （与内核运行时 m0_q0 = all_params[param_offset] 一致），
+                // 因此 ∂q0/∂θ_0 ≠ 0 —— 用 MODEL_BREAKUP_Q0 复合节点追踪
+                // 导数，而非当作常数变量（旧行为导数缺失 ∂F/∂q0·∂q0/∂θ_0）。
+                // q0(...) 带括号时是函数调用（见下方模型函数分支）
+                return q0Node();
             if (t.str == "L") return Node::makeVar(CVAR_L);
             if (t.str == "d") return Node::makeVar(CVAR_D);
             if (t.str == "p1p") return Node::makeVar(CVAR_P1P);
@@ -341,6 +376,78 @@ class Parser {
                     throw std::runtime_error("CustomExpr: missing )");
                 next();
                 return Node::makeFunc(fit->second, arg);
+            }
+            // 模型函数（多参数）：BW / BWR / Bf / q0 / Flatte
+            // 约定：质量/宽度/耦合常数传参数（p0, p1, ...），
+            // m/q/q0/L/d 由包装内部补全，语义与内置模型完全一致
+            if (t.str == "BW" || t.str == "BWR" || t.str == "Bf" ||
+                t.str == "Flatte" ||
+                (t.str == "q0" && peek().type == Token::LParen)) {
+                std::vector<Node> args = parseArgList();
+                if (t.str == "BW") {
+                    // BW(m, m0, w0)：包装成 BW(m0, w0)，m 自动补全
+                    if (args.size() != 2)
+                        throw std::runtime_error(
+                            "CustomExpr: BW(m0, w0) needs exactly 2 args");
+                    return Node::makeComposite(MODEL_BW,
+                        {Node::makeVar(CVAR_M), args[0], args[1]});
+                }
+                if (t.str == "BWR") {
+                    // BWR(m, m0, g0, L, q, q0, d)：包装成 BWR(m0, g0[, L, d])
+                    // L/d 缺省时与内置模型默认一致（L=1, d=3.0）；
+                    // L/d 必须是字面量（modelDeriv 按 (int)num 取整）
+                    if (args.size() < 2 || args.size() > 4)
+                        throw std::runtime_error(
+                            "CustomExpr: BWR(m0, g0[, L, d]) needs 2~4 args");
+                    if (args.size() >= 3 && args[2].type != NodeType::Num)
+                        throw std::runtime_error(
+                            "CustomExpr: BWR L must be a literal (e.g. 1)");
+                    if (args.size() >= 4 && args[3].type != NodeType::Num)
+                        throw std::runtime_error(
+                            "CustomExpr: BWR d must be a literal (e.g. 3.0)");
+                    double Lv = (args.size() >= 3) ? args[2].num : 1.0;
+                    double dv = (args.size() >= 4) ? args[3].num : 3.0;
+                    return Node::makeComposite(MODEL_BWR, {
+                        Node::makeVar(CVAR_M), args[0], args[1],
+                        Node::makeNum(Lv), Node::makeVar(CVAR_Q), q0Node(),
+                        Node::makeNum(dv)});
+                }
+                if (t.str == "Bf") {
+                    // Bf(L, q, q0, d)：L 必须是字面量
+                    if (args.size() != 4)
+                        throw std::runtime_error(
+                            "CustomExpr: Bf(L, q, q0, d) needs exactly 4 args");
+                    if (args[0].type != NodeType::Num)
+                        throw std::runtime_error(
+                            "CustomExpr: Bf L must be a literal (e.g. 1)");
+                    return Node::makeComposite(MODEL_BF, args);
+                }
+                if (t.str == "q0") {
+                    // q0(x) → breakup(x, md1, md2)；q0(x, md1, md2) → 显式
+                    if (args.size() == 1)
+                        return Node::makeComposite(MODEL_BREAKUP_Q0,
+                            {args[0], Node::makeVar(CVAR_MD1),
+                             Node::makeVar(CVAR_MD2)});
+                    if (args.size() == 3)
+                        return Node::makeComposite(MODEL_BREAKUP_Q0, args);
+                    throw std::runtime_error(
+                        "CustomExpr: q0(x) or q0(x, md1, md2) expected");
+                }
+                // Flatte(m0, g0..g_{n-1}, (ma,mb)0..) = 1 + 3n 个参数
+                // 展开为 AST（MODEL_FLATTE 复合节点的 modelDeriv 为 0，
+                // 无法从 DSL 使用，须经 buildFlatteAST 展开成可微的树）
+                if (t.str == "Flatte") {
+                    if (args.size() < 4 || (args.size() - 1) % 3 != 0)
+                        throw std::runtime_error(
+                            "CustomExpr: Flatte(m0, g..., (ma,mb)...) needs "
+                            "1+3n args (n>=1)");
+                    int n_ch = (int)(args.size() - 1) / 3;
+                    std::vector<Node> gs(args.begin() + 1,
+                                         args.begin() + 1 + n_ch);
+                    std::vector<Node> chs(args.begin() + 1 + n_ch, args.end());
+                    return buildFlatteAST(Node::makeVar(CVAR_M), args[0],
+                                          gs, chs);
+                }
             }
             // 参数
             auto pit = params_.find(t.str);
@@ -497,6 +604,35 @@ Node simplify(Node n)
         default: break;
     }
     return n;
+}
+
+// ============================================================================
+// Flatte 传播子 AST 展开（全局 API，见 SymbolicDiff.cuh）
+// 与 buildModelAST 的 Flatte 分支同一数学；DSL Flatte() 函数共用。
+// ============================================================================
+
+Node buildFlatteAST(const Node& m, const Node& m0,
+                    const std::vector<Node>& gs,
+                    const std::vector<Node>& chs)
+{
+    // F = (A − iB)/D
+    // A = m0² - m² + Σ g_i·Im(ρ_i),  B = -Σ g_i·Re(ρ_i),  D = A² + B²
+    // ρ_i = MODEL_FLATTE_RHO_{RE,IM}(s, ma_i, mb_i)：仅依赖 s=m² 和道质量
+    // （导数 0 → 链式法则自动处理）
+    Node s = astSq(m);                       // s = m²
+    Node A = astSq(m0);                      // A = m0²
+    Node B = astNum(0.0);                    // B = -Σ g_i·R_i（初始 0）
+    for (size_t i = 0; i < gs.size(); ++i) {
+        Node Ri = Node::makeComposite(MODEL_FLATTE_RHO_RE,
+            {s, chs[2 * i], chs[2 * i + 1]});
+        Node Ii = Node::makeComposite(MODEL_FLATTE_RHO_IM,
+            {s, chs[2 * i], chs[2 * i + 1]});
+        A = astAdd(A, astMul(gs[i], Ii));    // A += g_i·I_i
+        B = astSub(B, astMul(gs[i], Ri));    // B -= g_i·R_i
+    }
+    A = astSub(A, s);                        // A = m0² - s + Σ g_i·I_i
+    Node D = astAdd(astSq(A), astSq(B));     // D = A² + B²
+    return astAdd(astDiv(A, D), astMul(astNeg(astDiv(B, D)), astI()));
 }
 
 // ============================================================================
