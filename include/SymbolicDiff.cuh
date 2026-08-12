@@ -11,7 +11,7 @@
 // src/Resonance.cu 的 buildModelAST）共享。
 //
 // 所有函数均为 host 端（config 加载时一次性执行），不进入 GPU 编译路径。
-// 语义约定（与 AutoDiff 一致）:
+// 语义约定:
 //   - m/q/q0/L/d（运动学变量, NodeType::Var）视为常数, 导数 0
 //   - 参数 θ_k（NodeType::Param）导数为 δ_kp（参数始终 push 为纯实数）
 //   - 复数域普通链式法则（非 Wirtinger）

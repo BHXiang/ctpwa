@@ -557,7 +557,7 @@ __global__ void computeCustomHessianKernel(
                     ? ((target.param_count > 0) ? target_rp[0] : 1.0)
                     : ((node.mass[0] > 0) ? node.mass[0] : 1.0);
                 // 子粒子是目标共振态（无固定质量）→ 用其 m0 参数
-                // （与 computeAmpsMergedKernel 一致；否则回退到事件质量）
+                // （否则回退到事件质量）
                 double md1_q0 = (node.mass[1] > 0) ? node.mass[1]
                     : ((node.daug1_idx == target.particle_idx && target.param_count > 0)
                            ? target_rp[0] : md1);

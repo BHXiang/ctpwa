@@ -2,7 +2,6 @@
 #define AMPGEN_CUH
 
 #include <Amplitude.cuh>
-#include <AutoDiff.cuh>
 #include <Config.cuh>
 #include <ResModel.cuh>
 #include <Resonance.cuh>
@@ -198,16 +197,16 @@ public:
     }
 
     // 查询粒子 mother_idx 的衰变节点子粒子质量依赖（host）。
-    // 规则与 AD 版 kernel 的 q0 回退一致:
-    //   固定质量(config) → FixedMass; 子粒子=target(共振态,无固定质量) → M0Param;
-    //   否则(事件质量) → EventMass。
+    // 规则: 固定质量(config) → FixedMass; 子粒子=target(共振态,无固定质量) → M0Param;
+    //       否则(事件质量) → EventMass。
     // 返回 false 若该粒子无衰变节点。
     bool getDaughterMassDep(int mother_idx, int target_idx,
         Q0MassDep& md1_dep, double& md1_fixed,
         Q0MassDep& md2_dep, double& md2_fixed) const;
 };
 
-// 合并 AD 振幅 kernel 的每 block 描述（设备端；一次启动处理多个 block）
+// 符号微分统一 kernel 的每 block 描述（设备端；一次启动处理多个 block）
+// （结构名 ADBlockDesc 为历史遗留，内容已是 DSL aux 元数据）
 struct ADBlockDesc {
     const DeviceMomenta* d_momenta;
     const SL* d_slComb;
@@ -246,7 +245,7 @@ public:
         std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
         std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
-        std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（AD kernel 输出）
+        std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（符号微分 aux 输出）
         int resonance_count;
         std::vector<int> res_dF_offset_;               // per-resonance: d_dF_tab local free index offset
         std::vector<int> res_dF_count_;                // per-resonance: number of free params
@@ -258,7 +257,7 @@ public:
         std::vector<int*> d_res_idx_;                 // 每 GPU：本块 slot → 共振态索引（updateResonanceParams 用）
         std::vector<int*> d_param_idx_;               // 每 GPU：本块 slot → params[] 下标
         std::vector<int*> d_global_offset_;           // 每 GPU：本块 slot → 全局 slot 下标
-        std::vector<int*> d_param_map_;               // 每 GPU：free_param_idx 设备副本（AD kernel 用）
+        std::vector<int*> d_param_map_;               // 每 GPU：free_param_idx 设备副本（符号微分 kernel 用）
         std::vector<int*> d_global_idx_;              // 每 GPU：free_global_idx 设备副本（梯度累加用）
     };
 
@@ -375,7 +374,7 @@ private:
     std::vector<std::vector<int>> cached_amp_off_;    // 每 GPU 上次上传的 amp_offsets 副本
     std::vector<int*> d_ev_off_cache_;                // 每 GPU 设备端 event_offsets（懒分配）
     std::vector<int*> d_amp_off_cache_;               // 每 GPU 设备端 amp_offsets（懒分配）
-    // 合并 AD kernel 的 block 描述缓冲（每 GPU 一份，懒分配）
+    // 合并符号微分 kernel 的 block 描述缓冲（每 GPU 一份，懒分配）
     std::vector<ADBlockDesc*> d_ad_desc_;             // 每 GPU：desc 数组
     int d_ad_desc_cap_ = 0;                           // 每 GPU 已分配容量（block 数）
 };
@@ -412,16 +411,8 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const int* amp_offsets, const int* event_offsets,
     int num_amp_offsets, int n_amplitudes, int site);
 
-// 合并 AD kernel：一次启动处理多个同 Nfree 的 block
-template <int Nfree>
-__global__ void computeAmpsMergedKernel(
-    ctComplex* amplitudes,
-    const ADBlockDesc* desc, int nblocks, int nSL_total,
-    const int* amp_offsets, const int* event_offsets, int num_offsets,
-    int n_amplitudes);
-
 // 共振态参数梯度 kernel：对 block 的 Nfree 个自由参数计算 ∂NLL/∂θ
-// （d_dF 由 reComputeAmps 的 AD kernel 预计算；本 kernel 纯读取）
+// （d_dF 由 reComputeAmps 的 computeCustomAmpsKernel 预计算；本 kernel 纯读取）
 template <int Nfree>
 __global__ void resonanceGradientKernel(
     const ctComplex* d_w,                  // [nEvents × nPolar] w = S/I

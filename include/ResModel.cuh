@@ -5,16 +5,12 @@
 #include <thrust/complex.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <type_traits>
 
-#include <AutoDiff.cuh>
 #include <Resonance.cuh>
 #include <CustomExpr.cuh>  // evalCustomSeg（Custom case 需要）
 
 // ============================================================================
-// ResResult<T>: 传播子返回类型萃取
-// T = double              → thrust::complex<double>
-// T = Var<double, N, WH>  → ComplexVar<double, N, WH>
+// ResResult<T>: 传播子返回类型萃取（仅 double 实例化，符号微分时代遗留模板）
 // ============================================================================
 template <typename T>
 struct ResResult {
@@ -22,35 +18,6 @@ struct ResResult {
     __host__ __device__
     static type make(T re, T im) { return type(re, im); }
 };
-
-// 特化：Var 类型 → ComplexVar
-template <typename T, int N, bool WH>
-struct ResResult<Var<T, N, WH>> {
-    using type = ComplexVar<T, N, WH>;
-    __host__ __device__
-    static type make(const Var<T, N, WH>& re, const Var<T, N, WH>& im) {
-        return type(re, im);
-    }
-};
-
-// ============================================================================
-// 辅助：Var/标量统一的条件判断
-// ============================================================================
-template <typename T>
-__host__ __device__ bool val_ge_zero(const T& x) {
-    if constexpr (std::is_arithmetic_v<T>) return x >= 0.0;
-    else return x.val >= 0.0;
-}
-template <typename T>
-__host__ __device__ bool val_gt_zero(const T& x) {
-    if constexpr (std::is_arithmetic_v<T>) return x > 0.0;
-    else return x.val > 0.0;
-}
-
-// Var 的模板参数 N 萃取（Custom DSL 组装 ComplexVar 用）
-template <typename V> struct VarN;
-template <typename T, int N, bool WH>
-struct VarN<Var<T, N, WH>> { static constexpr int value = N; };
 
 // ============================================================================
 // 模板化传播子函数声明
@@ -76,7 +43,7 @@ __host__ __device__ auto Flatte(T m, T m0,
 // 统一共振态因子计算（__device__，模板化 scalar type）
 // ============================================================================
 
-// 计算带 AD 的 breakup momentum q0（host/device 通用，模板内 is_arithmetic 分支）
+// 计算 breakup momentum q0（host/device 通用，模板仅 double 实例化）
 template <typename T>
 __host__ __device__ T computeQ0AD(T m0, T md1, T md2);
 
@@ -125,13 +92,8 @@ __host__ __device__ T computeQ0AD(T m0, T md1, T md2)
     T d_md = md1 - md2;
     T m0sq = m0 * m0;
     T q0sq = (m0sq - s_md * s_md) * (m0sq - d_md * d_md) / (T(4.0) * m0sq);
-    if constexpr (std::is_arithmetic_v<T>) {
-        if (q0sq < 0.0) q0sq = 0.0;
-        return T(std::sqrt(q0sq));
-    } else {
-        q0sq.val = q0sq.val < 0.0 ? 0.0 : q0sq.val;
-        return sqrt(q0sq);
-    }
+    if (q0sq < 0.0) q0sq = 0.0;
+    return T(std::sqrt(q0sq));
 }
 
 // 统一共振态因子计算
@@ -154,17 +116,9 @@ __device__ auto computeNodeFactor(
             // 势垒因子门控: has_bf=false 时传播子不含 Bf
             if (has_bf) {
                 auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
-                if constexpr (std::is_arithmetic_v<T>) {
-                    return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
-                } else {
-                    return ResResult<T>::make(bw.real * bf, bw.imag * bf);
-                }
+                return ResResult<T>::make(bw.real() * bf, bw.imag() * bf);
             } else {
-                if constexpr (std::is_arithmetic_v<T>) {
-                    return ResResult<T>::make(bw.real(), bw.imag());
-                } else {
-                    return ResResult<T>::make(bw.real, bw.imag);
-                }
+                return ResResult<T>::make(bw.real(), bw.imag());
             }
         }
         case ResModelType::BW: {
@@ -188,40 +142,25 @@ __device__ auto computeNodeFactor(
             // 势垒因子门控: has_bf=false 时 Flatte 不含 Bf
             if (has_bf) {
                 auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
-                if constexpr (std::is_arithmetic_v<T>) {
-                    return ResResult<T>::make(fl.real() * bf, fl.imag() * bf);
-                } else {
-                    return ResResult<T>::make(fl.real * bf, fl.imag * bf);
-                }
+                return ResResult<T>::make(fl.real() * bf, fl.imag() * bf);
             } else {
-                if constexpr (std::is_arithmetic_v<T>) {
-                    return ResResult<T>::make(fl.real(), fl.imag());
-                } else {
-                    return ResResult<T>::make(fl.real, fl.imag);
-                }
+                return ResResult<T>::make(fl.real(), fl.imag());
             }
         }
         case ResModelType::Hist: {
-            double mval;
-            if constexpr (std::is_arithmetic_v<T>) mval = (double)mm;
-            else mval = (double)mm.val;
+            double mval = (double)mm;
             double f = lookupHistTable(mval, aux, aux_offset);
             return ResResult<T>::make(T(f), T(0.0));
         }
         case ResModelType::Custom: {
-            double mval, qval, q0val;
-            if constexpr (std::is_arithmetic_v<T>) {
-                mval = (double)mm; qval = (double)q_ad; q0val = (double)q0_ad;
-            } else {
-                mval = mm.val; qval = q_ad.val; q0val = q0_ad.val;
-            }
+            // DSL 字节码求值（值段 F；∂F/∂θ 由符号微分 aux 在
+            // computeCustomAmpsKernel / resonanceGradientKernelRuntime 中计算）
+            double mval = (double)mm, qval = (double)q_ad, q0val = (double)q0_ad;
             int P = (int)aux[aux_offset];
             int seg_off = aux_offset + 2;
             double pvals[3];
-            for (int i = 0; i < param_count && i < 3; ++i) {
-                if constexpr (std::is_arithmetic_v<T>) pvals[i] = (double)params[i];
-                else pvals[i] = params[i].val;
-            }
+            for (int i = 0; i < param_count && i < 3; ++i)
+                pvals[i] = (double)params[i];
             double F_re = 0, F_im = 0;
             {
                 int n_instr = (int)aux[seg_off];
@@ -231,37 +170,7 @@ __device__ auto computeNodeFactor(
                 F_re = out[0]; F_im = out[1];
                 seg_off += 1 + 3 * n_instr;
             }
-            if constexpr (std::is_arithmetic_v<T>) {
-                return ResResult<T>::make(T(F_re), T(F_im));
-            } else {
-                using VarT = T;
-                constexpr int N = VarN<T>::value;
-                VarT re_v(F_re), im_v(F_im);
-                for (int j = 0; j < P && j < N; ++j) {
-                    int n_instr = (int)aux[seg_off];
-                    double out[2];
-                    evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
-                        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, pvals, out);
-                    re_v.grad[j] = out[0];
-                    im_v.grad[j] = out[1];
-                    seg_off += 1 + 3 * n_instr;
-                }
-                for (int j = 0; j < P && j < N; ++j)
-                    for (int k = j; k < P && k < N; ++k) {
-                        int n_instr = (int)aux[seg_off];
-                        double out[2];
-                        evalCustomSeg(aux + seg_off + 1, n_instr, mval, qval, q0val, L, bf_d,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, pvals, out);
-                        re_v.hess[j][k] = out[0];
-                        im_v.hess[j][k] = out[1];
-                        if (j != k) {
-                            re_v.hess[k][j] = out[0];
-                            im_v.hess[k][j] = out[1];
-                        }
-                        seg_off += 1 + 3 * n_instr;
-                    }
-                return ResResult<T>::make(re_v, im_v);
-            }
+            return ResResult<T>::make(T(F_re), T(F_im));
         }
         default:
             return ResResult<T>::make(T(1.0), T(0.0));
@@ -322,7 +231,7 @@ __host__ __device__ auto BW(T& m, T& m0, T& gamma0)
 
 template <typename T>
 __host__ __device__ void csqrt_real_t(T x, T& out_re, T& out_im) {
-    if (val_ge_zero(x)) {
+    if (x >= 0.0) {
         out_re = sqrt(x);
         out_im = 0.0;
     } else {
@@ -350,7 +259,7 @@ __host__ __device__ auto Flatte(T m, T m0,
         T f1_re, f1_im;
         csqrt_real_t(f1_sq, f1_re, f1_im);
         T f2_sq = 1.0 - T(diff * diff) / s;
-        T factor2 = val_gt_zero(f2_sq) ? sqrt(f2_sq) : T(0.0);
+        T factor2 = (f2_sq > 0.0) ? sqrt(f2_sq) : T(0.0);
         T rho_re = f1_re * factor2;
         T rho_imag = f1_im * factor2;
         i_term_real = i_term_real + g[i] * rho_re;
