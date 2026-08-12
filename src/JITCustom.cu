@@ -90,7 +90,10 @@ struct JitArgs {
 };
 
 // q(m, m1, m2)（与 AmpGen.cu 的 breakup_momentum 逐位一致）
-__device__ __forceinline__ double jitBreakup(double m, double m1, double m2) {
+// 注意: 普通 __device__（非 __forceinline__）—— BWR 类模型 d²F 段展开会
+// 生成数千次 jitQ0/jitBf/jitBreakup 调用，强制内联使单函数体膨胀到 ~8 万行，
+// ptxas 编译卡死/OOM（sm_80 实测）。不内联后 sm_80 编译 ~1 分钟通过。
+__device__ double jitBreakup(double m, double m1, double m2) {
     double q_sq = (m*m - (m1+m2)*(m1+m2)) * (m*m - (m1-m2)*(m1-m2));
     if (q_sq <= 0.0) return 0.0;
     return sqrt(q_sq) / (2.0 * m);
@@ -98,7 +101,8 @@ __device__ __forceinline__ double jitBreakup(double m, double m1, double m2) {
 
 // 势垒因子 Bf（ResModel.cuh Bf<double> 原文；pow 与模板版同样落到
 // pow(double,double)，主库与 NVRTC 均未开 fast_math → 逐位一致）
-__device__ __forceinline__ double jitBf(int L, double q, double q0, double d) {
+// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
+__device__ double jitBf(int L, double q, double q0, double d) {
     double z = q * d;
     double z0 = q0 * d;
     switch (L) {
@@ -127,7 +131,8 @@ __device__ __forceinline__ double jitBf(int L, double q, double q0, double d) {
 }
 
 // q0(m0, md1, md2)（computeQ0AD<double> 原文）
-__device__ __forceinline__ double jitQ0(double m0, double md1, double md2) {
+// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
+__device__ double jitQ0(double m0, double md1, double md2) {
     double s_md = md1 + md2;
     double d_md = md1 - md2;
     double m0sq = m0 * m0;
@@ -138,8 +143,8 @@ __device__ __forceinline__ double jitQ0(double m0, double md1, double md2) {
 
 // 子粒子 q0 链质量（与内核一致：固定质量优先；否则查共振态首个参数；
 // 负值/无参数回退事件质量 — R>1 分支语义，R==1 除病态负参数外等价）
-__device__ __forceinline__ double jitDaugMass(const JitArgs& A, int daug,
-                                              double fixed, double kin) {
+__device__ double jitDaugMass(const JitArgs& A, int daug,
+                              double fixed, double kin) {
     double md = fixed;
     if (md <= 0) {
         int off = (A.res_param_off && daug >= 0 && daug < 256)
@@ -151,9 +156,10 @@ __device__ __forceinline__ double jitDaugMass(const JitArgs& A, int daug,
 }
 
 // Flatte（ResModel.cuh Flatte<double> 原文；ch 为 (ma,mb) 通道质量对）
-__device__ __forceinline__ void jitFlatte(double m, double m0, int n_ch,
-                                          const double* g, const double* ch,
-                                          double& re, double& im) {
+// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
+__device__ void jitFlatte(double m, double m0, int n_ch,
+                          const double* g, const double* ch,
+                          double& re, double& im) {
     double s = m * m;
     double real_part = m0 * m0 - s;
     double i_term_real = 0.0;
@@ -517,8 +523,73 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
     int n_need = 1 + P + (full ? (int)pairs.size() : 0);
     if (n_seg != 1 + P + (int)pairs.size() || n_need > n_seg) return false;
 
+    // 段公共环境（主函数计算，段函数形参传入）
+    const char* common_args =
+        "const JitArgs& A, const JitNodeFlat& F, int L, double Ld,"
+        " double mm, double qq, double md1, double md2,"
+        " double m0_q0, double md1_q0, double md2_q0, double q0,"
+        " double p1_P, double p1_E, double p1_ct, double p1_phi,"
+        " double p2_P, double p2_E, double p2_ct, double p2_phi,"
+        " const double* params, double* out";
+
+    // 每段一个独立 __device__ 函数（普通函数，非 __forceinline__：防止被内联
+    // 回主函数）。BWR 类模型 d²F 段符号展开可达 2.6 万条指令 → 单函数
+    // 8 万行无分支代码，ptxas 对超长单函数编译卡死（实测 sm_80 上
+    // nvrtc 12.9/13.2 均 OOM/超时；拆段后 sm_80 数秒编过）。
+    std::ostringstream segs;
+    int seg_off = 2;
+    if (getenv("CTPWA_JIT_DEBUG")) {
+        fprintf(stderr, "[ctpwa] genNodeFunction node=%d full=%d P=%d n_seg=%d:",
+                node_id, (int)full, P, n_seg);
+        for (int s = 0; s < n_seg; ++s) {
+            int ni = (int)aux[seg_off];
+            fprintf(stderr, " seg%d=%d", s, ni);
+            seg_off += 1 + 3 * ni;
+        }
+        fprintf(stderr, "\n");
+        seg_off = 2;   // 复位，正式循环重新走
+    }
+    for (int s = 0; s < n_need; ++s) {
+        int n_instr = (int)aux[seg_off];
+        if (n_instr < 0) return false;
+        seg_off += 1 + 3 * n_instr;   // 先前进（后续段独立）
+        GenCtx g;
+        g.lines.clear();
+        g.depth = 0;   // 临时变量计数 g.t 跨段单调递增（段间避免重名声明）
+        g.fail = false;
+        // 段数据从 n_instr 之后开始（与解释器 aux + seg_off + 1 一致；seg_off 已前进）
+        if (!genSegment(g, &aux[seg_off - 3 * n_instr], n_instr, P)) return false;
+        std::string re, im;
+        if (!g.stk.empty()) { re = g.stk.back().re; im = g.stk.back().im; }
+        else { re = "0.0"; im = "0.0"; }
+        // 段函数体
+        segs << "// seg " << s
+             << (s == 0 ? ": F" : (s <= P ? ": dF[" + std::to_string(s - 1) + "]"
+                                           : ": d2F[" + std::to_string(pairs[s - (P + 1)].first) + "][" +
+                                                 std::to_string(pairs[s - (P + 1)].second) + "]"))
+             << "\n";
+        segs << "__device__ void ctpwa_seg_" << node_id << "_" << s
+             << (full ? "_full" : "_grad") << "(" << common_args << ")\n{\n";
+        for (const auto& ln : g.lines) segs << "    " << ln << "\n";
+        // 输出位置
+        if (s == 0) {
+            segs << "    out[0] = " << re << "; out[1] = " << im << ";\n";
+        } else if (s <= P) {
+            segs << "    out[" << (2 + 2 * (s - 1)) << "] = " << re
+                 << "; out[" << (2 + 2 * (s - 1) + 1) << "] = " << im << ";\n";
+        } else {
+            auto [j, k] = pairs[s - (P + 1)];
+            int b = 2 + 2 * P + 2 * (j * P + k);
+            int bT = 2 + 2 * P + 2 * (k * P + j);
+            segs << "    out[" << b << "] = " << re << "; out[" << (b + 1) << "] = " << im << ";\n";
+            segs << "    out[" << bT << "] = " << re << "; out[" << (bT + 1) << "] = " << im << ";\n";
+        }
+        segs << "}\n";
+    }
+
+    // 主函数：公共变量计算 + 依次调用段函数（普通函数，不 forceinline）
     std::ostringstream o;
-    o << "__device__ __forceinline__ void ctpwa_jit_node_" << node_id
+    o << "__device__ void ctpwa_jit_node_" << node_id
       << (full ? "_full" : "_grad")
       << "(JitArgs A, const DeviceMomenta* dm, int evt, int sl, double* out)\n{\n";
     o << "    const JitNodeFlat& F = A.nodes[" << node_id << "];\n";
@@ -541,42 +612,14 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
     o << "    double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;\n";
     o << "    double p2_phi = atan2(pD2.Py, pD2.Px);\n";
     o << "    const double* params = A.all_params + F.param_offset;\n";
-
-    int seg_off = 2;
-    GenCtx g;
     for (int s = 0; s < n_need; ++s) {
-        int n_instr = (int)aux[seg_off];
-        if (n_instr < 0) return false;
-        seg_off += 1 + 3 * n_instr;   // 先前进（后续段独立）
-        g.lines.clear();
-        g.depth = 0;   // 临时变量计数 g.t 跨段单调递增（段间避免重名声明）
-        g.fail = false;
-        // 段数据从 n_instr 之后开始（与解释器 aux + seg_off + 1 一致；seg_off 已前进）
-        if (!genSegment(g, &aux[seg_off - 3 * n_instr], n_instr, P)) return false;
-        std::string re, im;
-        if (!g.stk.empty()) { re = g.stk.back().re; im = g.stk.back().im; }
-        else { re = "0.0"; im = "0.0"; }
-        // 输出位置
-        if (s == 0) {
-            o << "    // seg 0: F\n";
-            for (const auto& ln : g.lines) o << ln << "\n";
-            o << "    out[0] = " << re << "; out[1] = " << im << ";\n";
-        } else if (s <= P) {
-            o << "    // seg " << s << ": dF[" << (s - 1) << "]\n";
-            for (const auto& ln : g.lines) o << ln << "\n";
-            o << "    out[" << (2 + 2 * (s - 1)) << "] = " << re
-              << "; out[" << (2 + 2 * (s - 1) + 1) << "] = " << im << ";\n";
-        } else {
-            auto [j, k] = pairs[s - (P + 1)];
-            int b = 2 + 2 * P + 2 * (j * P + k);
-            int bT = 2 + 2 * P + 2 * (k * P + j);
-            o << "    // seg " << s << ": d2F[" << j << "][" << k << "]\n";
-            for (const auto& ln : g.lines) o << ln << "\n";
-            o << "    out[" << b << "] = " << re << "; out[" << (b + 1) << "] = " << im << ";\n";
-            o << "    out[" << bT << "] = " << re << "; out[" << (bT + 1) << "] = " << im << ";\n";
-        }
+        o << "    ctpwa_seg_" << node_id << "_" << s
+          << (full ? "_full" : "_grad")
+          << "(A, F, L, Ld, mm, qq, md1, md2, m0_q0, md1_q0, md2_q0, q0,"
+             " p1_P, p1_E, p1_ct, p1_phi, p2_P, p2_E, p2_ct, p2_phi, params, out);\n";
     }
     o << "}\n";
+    src += segs.str();
     src += o.str();
     return true;
 }
@@ -811,7 +854,15 @@ bool jitCompileBlock(JitBlockState& st,
     std::string key = cacheKey(aux_list, st.hessian_target, jitArch());
     auto& cache = jitCache();
     if (cache.find(key) == cache.end()) {
+        clock_t t0 = clock();
         std::string src = buildSource(aux_list, st.hessian_target);
+        if (getenv("CTPWA_JIT_DEBUG"))
+            fprintf(stderr, "[ctpwa] buildSource: %.2fs, src=%zu B\n",
+                    (double)(clock() - t0) / CLOCKS_PER_SEC, src.size());
+        if (getenv("CTPWA_JIT_DUMP_SRC")) {   // 编译前 dump，卡住也能拿到源码
+            FILE* df = fopen("/hpcfs/bes/gpupwa/bhxiang/pwatest/ctpwa/tests/jit_real_src.cu", "w");
+            if (df) { fwrite(src.data(), 1, src.size(), df); fclose(df); }
+        }
         if (src.empty()) return false;
         auto bin = std::make_shared<JitBinary>();
         std::string err;
