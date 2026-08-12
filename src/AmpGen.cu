@@ -133,44 +133,9 @@ AmpCasDecay::AmpCasDecay(const std::vector<Particle>& particles)
 
 AmpCasDecay::~AmpCasDecay()
 {
-    for (size_t i = 0; i < d_slamp_tab_.size(); ++i)
-    {
-        cudaSetDevice(static_cast<int>(i));
-        if (d_slamp_tab_[i])
-            cudaFree(d_slamp_tab_[i]);
-        if (d_sign_tab_[i])
-            cudaFree(d_sign_tab_[i]);
-        if (d_mom_tab_[i])
-            cudaFree(d_mom_tab_[i]);
-        if (d_momenta_[i])
-            cudaFree(d_momenta_[i]);
-        if (d_decayNodes_[i])
-            cudaFree(d_decayNodes_[i]);
-        if (d_slCombination_[i])
-            cudaFree(d_slCombination_[i]);
-    }
-    for (size_t i = 0; i < d_polarization_map_.size(); ++i)
-    {
-        cudaSetDevice(static_cast<int>(i));
-        if (d_polarization_map_[i])
-            cudaFree(d_polarization_map_[i]);
-    }
-    // σ≥1 的重建动量（σ=0 即 d_momenta_，上面已释放）
-    for (size_t m = 1; m < d_mom_sigma_.size(); ++m)
-    {
-        for (size_t i = 0; i < d_mom_sigma_[m].size(); ++i)
-        {
-            cudaSetDevice(static_cast<int>(i));
-            if (d_mom_sigma_[m][i])
-            {
-                DeviceMomenta h;
-                cudaMemcpy(&h, d_mom_sigma_[m][i], sizeof(DeviceMomenta),
-                           cudaMemcpyDeviceToHost);
-                cudaFree(h.momenta);
-                cudaFree(d_mom_sigma_[m][i]);
-            }
-        }
-    }
+    // 同 AmpCalc::~AmpCalc：退出 GC 阶段析构时 torch 已销毁 CUDA 上下文，
+    // 裸 cudaFree/cudaMemcpy 会段错误。CUDA 上下文销毁自动回收显存。
+    (void)d_slamp_tab_;
 }
 
 void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const std::string& daug1, const std::string& daug2)
@@ -1918,31 +1883,11 @@ __global__ void updateResonanceParamsKernel(
 
 AmpCalc::~AmpCalc()
 {
-    for (auto& block : blocks_) {
-        for (size_t gpu = 0; gpu < block.d_resonances.size(); ++gpu) {
-            cudaSetDevice(static_cast<int>(gpu));
-            if (block.d_resonances[gpu]) cudaFree(block.d_resonances[gpu]);
-            if (block.d_all_params[gpu]) cudaFree(block.d_all_params[gpu]);
-            if (block.d_all_channels[gpu]) cudaFree(block.d_all_channels[gpu]);
-            if (block.d_T.size() > gpu && block.d_T[gpu]) cudaFree(block.d_T[gpu]);
-            if (block.d_dF.size() > gpu && block.d_dF[gpu]) cudaFree(block.d_dF[gpu]);
-            if (block.d_res_idx_.size() > gpu && block.d_res_idx_[gpu]) cudaFree(block.d_res_idx_[gpu]);
-            if (block.d_param_idx_.size() > gpu && block.d_param_idx_[gpu]) cudaFree(block.d_param_idx_[gpu]);
-            if (block.d_global_offset_.size() > gpu && block.d_global_offset_[gpu]) cudaFree(block.d_global_offset_[gpu]);
-            if (block.d_param_map_.size() > gpu && block.d_param_map_[gpu]) cudaFree(block.d_param_map_[gpu]);
-            if (block.d_global_idx_.size() > gpu && block.d_global_idx_[gpu]) cudaFree(block.d_global_idx_[gpu]);
-        }
-    }
-    // 跨块持久化缓冲（每 GPU 一份）
-    size_t n_gpu_persist = d_params_per_gpu_.size();
-    for (size_t gpu = 0; gpu < n_gpu_persist; ++gpu) {
-        cudaSetDevice(static_cast<int>(gpu));
-        if (d_params_per_gpu_[gpu]) cudaFree(d_params_per_gpu_[gpu]);
-        if (d_grad_per_gpu_[gpu]) cudaFree(d_grad_per_gpu_[gpu]);
-        if (d_ev_off_cache_[gpu]) cudaFree(d_ev_off_cache_[gpu]);
-        if (d_amp_off_cache_[gpu]) cudaFree(d_amp_off_cache_[gpu]);
-        if (d_ad_desc_[gpu]) cudaFree(d_ad_desc_[gpu]);
-    }
+    // 不在此释放 GPU 内存：pybind11 对象通常在进程退出时的 GC 阶段析构，
+    // 此时 torch 已销毁 CUDA 上下文，裸 cudaFree/cudaSetDevice 会段错误
+    // （实测 "*** Break *** segmentation violation" in ~AmpCalc，rc=139）。
+    // CUDA 上下文销毁时显存自动回收，无需手动释放。
+    // 若需长进程内及时释放，应提供显式 release() API。
     // cas_list_ 由 shared_ptr 自动释放
 }
 
@@ -2289,11 +2234,16 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             int n_amplitudes,
                             const std::vector<std::vector<int>>& event_offsets,
                             const std::vector<std::vector<int>>& amp_offsets,
-                            size_t n_polar)
+                            size_t n_polar,
+                            int primary_dev)
 {
     int n_gpu = static_cast<int>(d_amplitudes.size());
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
+
+    // primary = d_params 所在设备（调用方显式传入）。
+    // 不能在此 cudaGetDevice——torch 的 .to() 会把运行时当前设备切走，
+    // 用当前设备做广播源会读到错误内存（双卡下 theta 变零 → BF 除零 → NaN）。
 
     // 1. 把 d_params 广播到所有 GPU（缓冲持久化，仅首次分配）
     if (d_params_per_gpu_.size() != (size_t)n_gpu) {
@@ -2302,9 +2252,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaSetDevice(gpu);
             cudaMalloc(&d_params_per_gpu_[gpu], n_free * sizeof(double));
         }
+        // 恢复 primary，保持函数内后续逻辑的当前设备语义一致
+        cudaSetDevice(primary_dev);
     }
-    int primary_dev = 0;
-    cudaGetDevice(&primary_dev);
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == primary_dev) {
             cudaSetDevice(primary_dev);
@@ -2474,6 +2424,10 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (d_ad_desc_[g]) cudaFree(d_ad_desc_[g]);
                 cudaMalloc(&d_ad_desc_[g], n_custom * sizeof(ADBlockDesc));
             }
+            // 恢复外层循环的当前设备！否则嵌套循环后 current device 停在最后一个
+            // 设备上，gpu=0 的 cudaMemcpy / kernel 启动都会在错误上下文执行，
+            // 跨设备读 desc → cudaErrorIllegalAddress（实测 2×A100 首次 getNLL 必现）
+            cudaSetDevice(gpu);
             d_ad_desc_cap_ = n_custom;
         }
 

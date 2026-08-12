@@ -782,7 +782,8 @@ public:
             auto t0_reamp = std::chrono::high_resolution_clock::now();
             amp_calc->reComputeAmps(d_all_amplitudes_list,
                 reinterpret_cast<const double*>(theta.data_ptr()),
-                n_amplitudes_, events_offsets_list, amp_offsets_list, n_polar_);
+                n_amplitudes_, events_offsets_list, amp_offsets_list, n_polar_,
+                primary_dev);
             cudaDeviceSynchronize();
             auto t1_reamp = std::chrono::high_resolution_clock::now();
 
@@ -1373,18 +1374,10 @@ public:
     // 析构函数，用于释放 CUDA 内存
     ~analysis()
     {
-        if (!d_all_amplitudes_.empty())
-        {
-            // 释放每个GPU的振幅内存
-            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                if (d_all_amplitudes_[gpu] != nullptr) {
-                    cudaSetDevice(gpu);
-                    cudaFree(d_all_amplitudes_[gpu]);
-                }
-            }
-            cudaSetDevice(0);
-            d_all_amplitudes_.clear();
-        }
+        // 同 AmpCalc::~AmpCalc：不在析构里释放 GPU 内存——pybind11 对象
+        // 在进程退出 GC 阶段析构时 torch 已销毁 CUDA 上下文，裸 cudaFree
+        // 会段错误（实测 rc=139）。CUDA 上下文销毁自动回收显存。
+        d_all_amplitudes_.clear();
     }
 
     bool isValid() const { return initialized_; }
@@ -1489,7 +1482,8 @@ public:
                 auto theta = params.slice(0, 2 * ncf, params.size(0));
                 amp_calc_.reComputeAmps(d_all_amplitudes_,
                     reinterpret_cast<const double*>(theta.data_ptr()),
-                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+                    dev.index());
             }
         } else {
             TORCH_CHECK(params.dtype() == TORCH_COMPLEX, "params must be complex128 in legacy mode");
@@ -2586,7 +2580,8 @@ public:
         if (nt > 0 && theta.numel() > 0) {
             amp_calc_.reComputeAmps(d_all_amplitudes_,
                 reinterpret_cast<const double*>(theta.data_ptr()),
-                n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+                n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+                dev.index());
         }
 
         bool hprof = getenv("CTPWA_PROF") != nullptr;
@@ -2999,9 +2994,15 @@ public:
                     cudaSetDevice(gpu);
                     ctComplex* d_g_gpu;
                     cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
+                    // d_v_ext 在主 GPU，需每 GPU 副本——跨设备传入 computeFactorNLL
+                    // 的 cublas gemv 会非法访问（实测 2×A100 getHessian 必现）
+                    ctComplex* d_v_gpu;
+                    cudaMalloc(&d_v_gpu, na * sizeof(ctComplex));
+                    cudaMemcpyPeer(d_v_gpu, gpu, d_v_ext, primary_dev, na * sizeof(ctComplex));
                     const double* d_w_data = (gpu < (int)data_weights_.size()) ? data_weights_[gpu] : nullptr;
                     computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][1],
-                        d_v_ext, d_g_gpu, nEv, n_polar_, na, d_w_data, nullptr);
+                        d_v_gpu, d_g_gpu, nEv, n_polar_, na, d_w_data, nullptr);
+                    cudaFree(d_v_gpu);
                     // Convert ctComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
                     std::vector<ctComplex> h_g_tmp(na);
                     cudaMemcpy(h_g_tmp.data(), d_g_gpu, na * sizeof(ctComplex), cudaMemcpyDeviceToHost);
@@ -3036,8 +3037,13 @@ public:
                         int grid = (nEv + 255) / 256;
                         negateWeightsKernel<<<grid, 256>>>(d_neg_w, bkg_weights_[gpu], nEv);
                     }
+                    // 同 data：v 每 GPU 副本（d_v_ext 在主 GPU，跨设备 gemv 非法访问）
+                    ctComplex* d_v_gpu;
+                    cudaMalloc(&d_v_gpu, na * sizeof(ctComplex));
+                    cudaMemcpyPeer(d_v_gpu, gpu, d_v_ext, primary_dev, na * sizeof(ctComplex));
                     computeFactorNLL(d_all_amplitudes_[gpu] + amp_offsets_[gpu][2],
-                        d_v_ext, d_g_gpu, nEv, n_polar_, na, d_neg_w, nullptr);
+                        d_v_gpu, d_g_gpu, nEv, n_polar_, na, d_neg_w, nullptr);
+                    cudaFree(d_v_gpu);
                     if (d_neg_w) cudaFree(d_neg_w);
                     // Convert ctComplex [Re,Im,Re,Im,...] → double [Re...,Im...] layout
                     std::vector<ctComplex> h_g_tmp(na);
@@ -3140,6 +3146,47 @@ public:
         // Constraints.gauss_constr: 罚项 Hessian 对角 1/σ²（θ 块起点 = n2）
         if (params_.nGaussConstr() > 0)
             params_.addGaussHessianDiag(hessian, n2);
+
+        // vv / θθ 对角块强制对称化：两块的数学形式必须对称（Gram 矩阵 / ∂²/∂θ²），
+        // 但双卡路径是"每 GPU 先累积再归并"，与单卡顺序累积的浮点路径不同，
+        // 会引入 ~1e-7~1e-6 的不对称（实测 9.9e-7，压测试容差 1e-6）。
+        // (H+H^T)/2 消除浮点噪声，不改变物理。vθ/θv 块本来就是转置复制，无需处理。
+        {
+            if (n2 > 0) {
+                std::vector<double> h_vv((size_t)n2 * n2);
+                cudaMemcpy(h_vv.data(), hessian.data_ptr<double>(),
+                           (size_t)n2 * n2 * sizeof(double), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < n2; ++i)
+                    for (int j = i + 1; j < n2; ++j) {
+                        double m = 0.5 * (h_vv[(size_t)i * n2 + j] + h_vv[(size_t)j * n2 + i]);
+                        h_vv[(size_t)i * n2 + j] = m; h_vv[(size_t)j * n2 + i] = m;
+                    }
+                cudaMemcpy(hessian.data_ptr<double>(), h_vv.data(),
+                           (size_t)n2 * n2 * sizeof(double), cudaMemcpyHostToDevice);
+            }
+            int nt = total - n2;
+            if (nt > 0) {
+                std::vector<double> h_th((size_t)nt * nt);
+                for (int i = 0; i < nt; ++i)
+                    cudaMemcpy(h_th.data() + (size_t)i * nt,
+                               hessian.data_ptr<double>() + (size_t)(n2 + i) * total + n2,
+                               (size_t)nt * sizeof(double), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < nt; ++i)
+                    for (int j = i + 1; j < nt; ++j) {
+                        double m = 0.5 * (h_th[(size_t)i * nt + j] + h_th[(size_t)j * nt + i]);
+                        h_th[(size_t)i * nt + j] = m; h_th[(size_t)j * nt + i] = m;
+                    }
+                for (int i = 0; i < nt; ++i)
+                    cudaMemcpy(hessian.data_ptr<double>() + (size_t)(n2 + i) * total + n2,
+                               h_th.data() + (size_t)i * nt,
+                               (size_t)nt * sizeof(double), cudaMemcpyHostToDevice);
+            }
+        }
+
+        // 恢复主 GPU 为当前设备：内部 per-GPU 循环会把它留在最后一个设备，
+        // 导致后续 torch.device('cuda')（index=None → 当前设备）的 tensor 落在
+        // 非主 GPU，触发 getNLL/getHessian 的 params 位置检查（测试套件实测）。
+        cudaSetDevice(primary_dev_);
 
         if (hprof) {
             auto hTend = std::chrono::high_resolution_clock::now();
@@ -3711,7 +3758,8 @@ public:
 
         amp_calc_.reComputeAmps(d_all_amplitudes_,
             reinterpret_cast<const double*>(params.data_ptr()),
-            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_);
+            n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+            params.device().index());
     }
 
     torch::Tensor getFreeResParams() const

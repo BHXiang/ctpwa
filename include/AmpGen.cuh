@@ -294,12 +294,15 @@ public:
     void applyVarEqual(const std::vector<std::vector<std::string>>& var_equal_groups);
 
     // 用新参数重算所有振幅
+    // params_dev: d_params 所在设备（调用方的主 GPU）。不能依赖运行时当前设备——
+    // torch 的 .to(cuda:1) 等操作会把它切走，导致广播从错误设备读取（双卡 NaN 根因）。
     void reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                        const double* d_params,             // GPU [nFreeResParams]
                        int n_amplitudes,
                        const std::vector<std::vector<int>>& event_offsets,
                        const std::vector<std::vector<int>>& amp_offsets,
-                       size_t n_polar);
+                       size_t n_polar,
+                       int params_dev);
 
     // 预计算有效耦合 T_{r,e,p} = Σ_i v_i * sl_i （对每个 block）
     // 必须在 computeResonanceGradient 之前调用，且在耦合向量 v 改变后重新调用
