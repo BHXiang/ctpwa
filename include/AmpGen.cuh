@@ -19,6 +19,7 @@
 #include <thrust/host_vector.h>
 #include <unordered_map>
 #include <vector>
+#include <JITCustom.cuh>
 
 // 自旋-轨道组合结构体
 struct SL {
@@ -203,6 +204,10 @@ public:
     bool getDaughterMassDep(int mother_idx, int target_idx,
         Q0MassDep& md1_dep, double& md1_fixed,
         Q0MassDep& md2_dep, double& md2_fixed) const;
+
+    // host 侧衰变节点（索引/质量/势垒因子已决议）—— JIT 计划构建用
+    // （与 computeSLAmps 中上传 device DecayNode 的构造逻辑一致）
+    std::vector<DecayNode> getHostDecayNodes() const;
 };
 
 // 符号微分统一 kernel 的每 block 描述（设备端；一次启动处理多个 block）
@@ -217,6 +222,8 @@ struct ADBlockDesc {
     const DecayNode* d_decayNodes;
     const int* d_param_map;      // [Nfree]: 自由参数下标
     ctComplex* d_dF_tab;         // 输出 ∂F/∂θ [nSigma × nEvents*nSL*Nfree]（σ=0 行=恒等）
+    const double* d_jit_out;     // JIT 物化 buffer（F/dF，[slice][s][evt][sl][2+2P]；null → 解释器）
+    const int* d_jit_slice;      // [decayChain_size] 节点 → slice double 偏移（-1 → 解释器）
     // 全同粒子置换拓扑（coset）
     int nSigma;                  // 置换项数（含恒等）
     const DeviceMomenta* d_mom_tab;  // [nSigma] DeviceMomenta 数组（σ 拓扑的重建动量）
@@ -259,6 +266,8 @@ public:
         std::vector<int*> d_global_offset_;           // 每 GPU：本块 slot → 全局 slot 下标
         std::vector<int*> d_param_map_;               // 每 GPU：free_param_idx 设备副本（符号微分 kernel 用）
         std::vector<int*> d_global_idx_;              // 每 GPU：free_global_idx 设备副本（梯度累加用）
+        // ---- JIT（NVRTC 字节码→原生代码物化；失败回退解释器）----
+        JitBlockState jit;
     };
 
     // 参数槽：一个自由参数 → 对应哪个 block 的哪个共振态的哪个 params 下标

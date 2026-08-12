@@ -100,6 +100,7 @@ __host__ __device__ inline int customSegOffset(const double* aux, int s)
 
 // 全段解释器（src/CustomExpr.cu）：值段 + P 个一阶段 + P(P+1)/2 个二阶段
 // 布局与 evalCustomSeg 相同；d2 按 j≤k 段序读取，对称填充 d2[k][j]=d2[j][k]
+// compute_2nd=false（梯度路径）时跳过二阶段，d2Fr/d2Fi 不写（调用方不得读）
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
@@ -109,7 +110,8 @@ __device__ void evalCustomAll(
     const double* params, int P,
     double& Fr, double& Fi,
     double* dFr, double* dFi,
-    double* d2Fr, double* d2Fi);
+    double* d2Fr, double* d2Fi,
+    bool compute_2nd = true);
 
 // host 端编译入口（src/CustomExpr.cu）
 // expr: 表达式字符串; params: 参数名列表

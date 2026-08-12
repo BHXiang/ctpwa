@@ -1198,8 +1198,8 @@ public:
             // std::cerr << "WARNING: phsp_factor invalid (" << phsp_factor << "), clamping to 1e-30" << std::endl;
             phsp_factor = 1e-30;
         }
-        // printf("PY_NLL data_nll=%.10f phsp_factor=%.10f totalData=%d bkg_integral=%.6f\n",
-        //     total_data_nll, phsp_factor, totalDataEvents, bkg_integral_);
+        if (getenv("CTPWA_PROF")) printf("PY_NLL data_nll=%.10f bkg_nll=%.10f phsp_factor=%.10f totalData=%d totalBkg=%d bkg_integral=%.6f\n",
+            total_data_nll, total_bkg_nll, phsp_factor, totalDataEvents, totalBkgEvents, bkg_integral_);
 
         double loss = total_data_nll - total_bkg_nll + (totalDataWeight - bkg_integral_) * log(phsp_factor);
         // Constraints.gauss_constr: 罚项 Σ(x-μ)²/(2σ²)
@@ -2846,9 +2846,16 @@ public:
             {
                 std::vector<int> n_data_ev(n_gpu, 0), data_off(n_gpu, 0);
                 for (int g = 0; g < n_gpu; ++g) { n_data_ev[g] = events_[g][1]; data_off[g] = events_[g][0]; }
+                auto uT0 = std::chrono::high_resolution_clock::now();
                 amp_calc_.computeUnifiedHessian(n_data_ev, d_hess, P, data_off, 1.0,
                     d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, data_weights_,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
+                if (hprof) {
+                    auto uT1 = std::chrono::high_resolution_clock::now();
+                    printf("[PROF] UH-call data: %.2f ms\n",
+                        std::chrono::duration<double, std::milli>(uT1 - uT0).count());
+                    fflush(stdout);
+                }
             }
 
             // Bkg
@@ -2870,9 +2877,16 @@ public:
                     neg_bkg_weights.push_back(d_neg);
                 }
                 cudaSetDevice(primary_dev);
+                auto uT0 = std::chrono::high_resolution_clock::now();
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -1.0,
                     d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, neg_bkg_weights,
                     nullptr, nullptr, nullptr, d_mixed, nullptr, nullptr);
+                if (hprof) {
+                    auto uT1 = std::chrono::high_resolution_clock::now();
+                    printf("[PROF] UH-call bkg: %.2f ms\n",
+                        std::chrono::duration<double, std::milli>(uT1 - uT0).count());
+                    fflush(stdout);
+                }
                 for (int g = 0; g < n_gpu; ++g) { if (neg_bkg_weights[g]) { cudaSetDevice(g); cudaFree(neg_bkg_weights[g]); } }
                 cudaSetDevice(primary_dev);
             }
@@ -2885,9 +2899,16 @@ public:
                 cudaMemset(d_pI, 0, sizeof(double)); cudaMemset(d_pg, 0, P*sizeof(double)); cudaMemset(d_phA, 0, P*P*sizeof(double));
                 std::vector<int> n_phsp_ev(n_gpu,0), phsp_off(n_gpu,0);
                 for (int g=0; g<n_gpu; ++g) { n_phsp_ev[g]=events_[g][0]; phsp_off[g]=0; }
+                auto uT0 = std::chrono::high_resolution_clock::now();
                 amp_calc_.computeUnifiedHessian(n_phsp_ev, d_hess, P, phsp_off, 0.0,
                     d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, {},
                     d_pI, d_pg, d_phA, d_mixed, d_phsp_mixed_sum, d_phsp_mixed_t3);
+                if (hprof) {
+                    auto uT1 = std::chrono::high_resolution_clock::now();
+                    printf("[PROF] UH-call phsp: %.2f ms\n",
+                        std::chrono::duration<double, std::milli>(uT1 - uT0).count());
+                    fflush(stdout);
+                }
                 double h_pI; cudaMemcpy(&h_pI, d_pI, sizeof(double), cudaMemcpyDeviceToHost);
                 phsp_h_pg = new double[P];
                 cudaMemcpy(phsp_h_pg, d_pg, P*sizeof(double), cudaMemcpyDeviceToHost);

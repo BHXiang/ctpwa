@@ -274,7 +274,10 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
     const long long colStride = (long long)cp * n_amplitudes;  // elements to skip per chunk
     ctComplex a1 = ctMake(1, 0), b0 = ctMake(0, 0);
     for (int k = 0; k < nch; ++k) {
-        CUBLAS_CGEMV(s_handle, CUBLAS_OP_T, n_amplitudes, cp, &a1,
+        // 最后一块覆盖剩余尾部（nch*cp 可能 < nTotal），否则尾部元素残留
+        // 上次调用的值/未初始化垃圾 → NLL 出现首次调用差异与跨调用漂移
+        int cp_k = (k == nch - 1) ? (nTotal - k * cp) : cp;
+        CUBLAS_CGEMV(s_handle, CUBLAS_OP_T, n_amplitudes, cp_k, &a1,
                     d_amp + k * colStride, strideA, d_vector, 1, &b0,
                     s_d_S + k * cp, 1);
     }

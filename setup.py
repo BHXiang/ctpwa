@@ -130,6 +130,7 @@ extension = CUDAExtension(
         "src/Figure.cu",
         "src/Parameters.cu",
         "src/CustomExpr.cu",
+        "src/JITCustom.cu",
     ],
     include_dirs=[
         os.path.join(project_dir, "include"),
@@ -155,6 +156,8 @@ extension = CUDAExtension(
         *root_flags["libraries"],  # ROOT 库
         "cudart",
         "cublas",
+        "nvrtc",   # JITCustom（NVRTC 运行时编译自定义节点字节码）
+        "cuda",    # JITCustom（驱动 API: cuModuleLoadData/cuLaunchKernel 等）
     ],
     extra_compile_args={
         "cxx": [
