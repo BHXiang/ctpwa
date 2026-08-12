@@ -915,7 +915,10 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
         res.P = props["P"].as<int>();
         res.type = props["model"].as<std::string>();
-        if (props["parameters"])
+        // 参数值: paramValues（新规范名）或 parameters（旧名，兼容）
+        if (props["paramValues"])
+            res.parameters = props["paramValues"].as<std::vector<double>>();
+        else if (props["parameters"])
             res.parameters = props["parameters"].as<std::vector<double>>();
 
         // 模型选项（Hist: file/bins/range/extrapolate）
@@ -931,9 +934,12 @@ void ConfigParser::parseResonances(const YAML::Node &node)
             res.options["range"] = s;
         }
         if (props["extrapolate"]) res.options["extrapolate"] = props["extrapolate"].as<std::string>();
-        // Custom 模型: params(参数名列表) 和 expr(表达式)
-        if (props["params"]) {
-            auto pl = props["params"].as<std::vector<std::string>>();
+        // Custom 模型: paramNames(参数名列表) 和 expr(表达式)
+        // （旧名 params 兼容）
+        YAML::Node pnames = props["paramNames"] ? props["paramNames"]
+                                                : props["params"];
+        if (pnames) {
+            auto pl = pnames.as<std::vector<std::string>>();
             std::string s;
             for (size_t i = 0; i < pl.size(); ++i) {
                 if (i) s += ",";

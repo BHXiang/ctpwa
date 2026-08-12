@@ -279,37 +279,16 @@ std::vector<double> buildModelAST(
             break;
         }
         case ResModelType::Flatte: {
-            // Flatte 分解: F = (A - iB)/D × Bf
-            // A = m0² - s + Σ g_i·Im(ρ_i),  B = -Σ g_i·Re(ρ_i),  D = A² + B²
-            // ρ_i = MODEL_FLATTE_RHO_{RE,IM}(s, ma_i, mb_i): 仅依赖 s=m² 和道质量
-            // （ρ_i 与拟合参数无关 → deriv 自动返回 0 → 链式法则正确处理）
-            Node s = astSq(Node::makeVar(CVAR_M));  // s = m²
-
-            // A = m0² - s + Σ g_i · I_i
-            Node A = astSq(Node::makeParam(0));  // m0²
-            // B = -Σ g_i · R_i（初始 0）
-            Node B = astNum(0.0);
-
+            // Flatte 分解: F = (A - iB)/D × Bf（展开见 buildFlatteAST，
+            // ρ_i 仅依赖 s=m² 和道质量 → 导数 0 → 链式法则自动处理）
+            std::vector<Node> gs, chs;
             for (int i = 0; i < n_channels; ++i) {
-                Node ma = astNum(channel_masses[2 * i]);
-                Node mb = astNum(channel_masses[2 * i + 1]);
-                Node Ri = Node::makeComposite(MODEL_FLATTE_RHO_RE,
-                    {s, ma, mb});  // Re(ρ_i) as (real, 0)
-                Node Ii = Node::makeComposite(MODEL_FLATTE_RHO_IM,
-                    {s, ma, mb});  // Im(ρ_i) as (real, 0)
-                // A += g_i * I_i
-                A = astAdd(A, astMul(Node::makeParam(1 + i), Ii));
-                // B -= g_i * R_i  (= -Σ g_i * R_i)
-                B = astSub(B, astMul(Node::makeParam(1 + i), Ri));
+                gs.push_back(Node::makeParam(1 + i));
+                chs.push_back(astNum(channel_masses[2 * i]));
+                chs.push_back(astNum(channel_masses[2 * i + 1]));
             }
-            A = astSub(A, s);  // A = m0² - s + Σ g_i * I_i
-
-            Node D = astAdd(astSq(A), astSq(B));          // D = A² + B²
-            Node Fre = astDiv(A, D);                       // F_re = A/D
-            Node Fim = astNeg(astDiv(B, D));              // F_im = -B/D
-
-            // F = Fre + i*Fim = Add(Fre, Mul(Fim, astI()))
-            Node flatte = astAdd(Fre, astMul(Fim, astI()));
+            Node flatte = buildFlatteAST(Node::makeVar(CVAR_M),
+                                         Node::makeParam(0), gs, chs);
 
             // （has_bf=false 时不含 Bf 因子）
             if (has_bf) {
