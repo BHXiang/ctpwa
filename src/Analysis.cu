@@ -4741,14 +4741,12 @@ private:
                         for (size_t ri = 0; ri < resonance.size(); ++ri) {
                             const auto& res = resonance[ri];
                             auto it = config_res.find(res.getName());
-                            // Custom 模型: 参数默认全部自由（params 列表即声明自由参数）
-                            bool is_custom = (it != config_res.end()) &&
-                                (it->second.type == "custom" || it->second.type == "Custom");
-                            if (it != config_res.end() && (is_custom || !it->second.free.empty()))
+                            // 参数自由度统一语义（所有模型一致）：resonance 未显式声明
+                            // free 就不拟合；free: [-1] 表示全部拟合。Custom 模型不再特例。
+                            if (it != config_res.end() && !it->second.free.empty())
                             {
                                 std::vector<int> free_idx;
-                                if (is_custom ||
-                                    (it->second.free.size() == 1 && it->second.free[0] == -1)) {
+                                if (it->second.free.size() == 1 && it->second.free[0] == -1) {
                                     for (int pi = 0; pi < (int)res.getOrderedParamNames().size(); ++pi)
                                         free_idx.push_back(pi);
                                 } else {
@@ -4767,9 +4765,7 @@ private:
                                     }
                                 }
                                 all_free.push_back(std::move(free_idx));
-                                all_free_ranges.push_back(is_custom
-                                    ? std::vector<std::vector<double>>{}
-                                    : it->second.free_range);
+                                all_free_ranges.push_back(it->second.free_range);
                             }
                             else
                             {
