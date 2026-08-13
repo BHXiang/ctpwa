@@ -245,6 +245,9 @@ __host__ __device__ auto Flatte(T m, T m0,
     int n_channels, const T* g, const double* channel_masses)
     -> typename ResResult<T>::type
 {
+    // tf-pwa FlatteC 约定: D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，qᵢ/m = ρᵢ/2
+    // （ρᵢ = 2q/m 为下方 f1·f2）→ 虚部项 = (m0/2)·Σ gᵢ·ρᵢ。
+    // 耦合常数 gᵢ 含义与 tf-pwa FlatteC 一致（宽度 ∝ m0·gᵢ）。
     T s = m * m;
     T real_part = m0 * m0 - s;
     T imag_part = 0.0;
@@ -262,8 +265,9 @@ __host__ __device__ auto Flatte(T m, T m0,
         T factor2 = (f2_sq > 0.0) ? sqrt(f2_sq) : T(0.0);
         T rho_re = f1_re * factor2;
         T rho_imag = f1_im * factor2;
-        i_term_real = i_term_real + g[i] * rho_re;
-        i_term_imag = i_term_imag + g[i] * rho_imag;
+        T gw = (m0 / T(2.0)) * g[i];           // FlatteC 宽度项系数
+        i_term_real = i_term_real + gw * rho_re;
+        i_term_imag = i_term_imag + gw * rho_imag;
     }
     T den_re = real_part + i_term_imag;
     T den_im = T(0.0) - i_term_real;

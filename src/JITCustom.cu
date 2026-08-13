@@ -161,6 +161,7 @@ __device__ __noinline__ double jitDaugMass(const JitArgs& A, int daug,
 }
 
 // Flatte（ResModel.cuh Flatte<double> 原文；ch 为 (ma,mb) 通道质量对）
+// tf-pwa FlatteC 约定: D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，虚部系数 = g_i·m0/2
 // 显式 __noinline__：见 jitBreakup 注释（防内联膨胀）
 __device__ __noinline__ void jitFlatte(double m, double m0, int n_ch,
                           const double* g, const double* ch,
@@ -182,8 +183,9 @@ __device__ __noinline__ void jitFlatte(double m, double m0, int n_ch,
         double factor2 = (f2_sq > 0.0) ? sqrt(f2_sq) : 0.0;
         double rho_re = f1_re * factor2;
         double rho_im = f1_im * factor2;
-        i_term_real = i_term_real + g[i] * rho_re;
-        i_term_imag = i_term_imag + g[i] * rho_im;
+        double gw = (m0 / 2.0) * g[i];       // FlatteC 宽度项系数
+        i_term_real = i_term_real + gw * rho_re;
+        i_term_imag = i_term_imag + gw * rho_im;
     }
     double den_re = real_part + i_term_imag;
     double den_im = 0.0 - i_term_real;

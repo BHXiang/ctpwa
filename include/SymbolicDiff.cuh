@@ -128,8 +128,9 @@ enum class Q0MassDep : int {
 };
 
 // Flatte 传播子 AST 展开：F = (A − iB)/D（不含 Bf 因子；调用方按需乘）
-//   A = m0² - m² + Σ g_i·Im(ρ_i),  B = -Σ g_i·Re(ρ_i),  D = A² + B²
+//   A = m0² - m² + Σ (g_i·m0/2)·Im(ρ_i),  B = -Σ (g_i·m0/2)·Re(ρ_i),  D = A² + B²
 //   ρ_i = MODEL_FLATTE_RHO_{RE,IM}(s, ma_i, mb_i)（导数 0，自动处理）
+// tf-pwa FlatteC 约定: D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，qᵢ/m = ρᵢ/2
 // 供 Custom DSL（Flatte() 函数）与 buildModelAST（Flatte 分支）共用。
 Node buildFlatteAST(const Node& m, const Node& m0,
                     const std::vector<Node>& gs,
