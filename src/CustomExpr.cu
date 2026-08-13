@@ -619,16 +619,20 @@ Node buildFlatteAST(const Node& m, const Node& m0,
     // A = m0² - m² + Σ g_i·Im(ρ_i),  B = -Σ g_i·Re(ρ_i),  D = A² + B²
     // ρ_i = MODEL_FLATTE_RHO_{RE,IM}(s, ma_i, mb_i)：仅依赖 s=m² 和道质量
     // （导数 0 → 链式法则自动处理）
+    // tf-pwa FlatteC 约定（与 ResModel.cuh Flatte<T> 一致）:
+    // D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，qᵢ/m = ρᵢ/2 → 虚部系数 = g_i·m0/2
     Node s = astSq(m);                       // s = m²
     Node A = astSq(m0);                      // A = m0²
     Node B = astNum(0.0);                    // B = -Σ g_i·R_i（初始 0）
+    Node half_m0 = astMul(m0, astNum(0.5));  // FlatteC: m0/2
     for (size_t i = 0; i < gs.size(); ++i) {
         Node Ri = Node::makeComposite(MODEL_FLATTE_RHO_RE,
             {s, chs[2 * i], chs[2 * i + 1]});
         Node Ii = Node::makeComposite(MODEL_FLATTE_RHO_IM,
             {s, chs[2 * i], chs[2 * i + 1]});
-        A = astAdd(A, astMul(gs[i], Ii));    // A += g_i·I_i
-        B = astSub(B, astMul(gs[i], Ri));    // B -= g_i·R_i
+        Node gw = astMul(gs[i], half_m0);    // FlatteC 宽度项系数 g_i·m0/2
+        A = astAdd(A, astMul(gw, Ii));       // A += (g_i·m0/2)·I_i
+        B = astSub(B, astMul(gw, Ri));       // B -= (g_i·m0/2)·R_i
     }
     A = astSub(A, s);                        // A = m0² - s + Σ g_i·I_i
     Node D = astAdd(astSq(A), astSq(B));     // D = A² + B²
