@@ -22,10 +22,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
 #include <map>
+#include <sys/stat.h>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -90,10 +94,11 @@ struct JitArgs {
 };
 
 // q(m, m1, m2)（与 AmpGen.cu 的 breakup_momentum 逐位一致）
-// 注意: 普通 __device__（非 __forceinline__）—— BWR 类模型 d²F 段展开会
-// 生成数千次 jitQ0/jitBf/jitBreakup 调用，强制内联使单函数体膨胀到 ~8 万行，
-// ptxas 编译卡死/OOM（sm_80 实测）。不内联后 sm_80 编译 ~1 分钟通过。
-__device__ double jitBreakup(double m, double m1, double m2) {
+// 注意: 显式 __noinline__ —— BWR 类模型 d²F 段展开会生成数千次
+// jitQ0/jitBf/jitBreakup 调用，若内联会使单函数体膨胀到 ~8 万行，
+// LLVM/NVPTX 编译卡死（12.9/13.2 全 arch 实测）。__noinline__ 把
+// 「实测不内联」变成「保证不内联」，防止未来编译器版本回归。
+__device__ __noinline__ double jitBreakup(double m, double m1, double m2) {
     double q_sq = (m*m - (m1+m2)*(m1+m2)) * (m*m - (m1-m2)*(m1-m2));
     if (q_sq <= 0.0) return 0.0;
     return sqrt(q_sq) / (2.0 * m);
@@ -101,8 +106,8 @@ __device__ double jitBreakup(double m, double m1, double m2) {
 
 // 势垒因子 Bf（ResModel.cuh Bf<double> 原文；pow 与模板版同样落到
 // pow(double,double)，主库与 NVRTC 均未开 fast_math → 逐位一致）
-// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
-__device__ double jitBf(int L, double q, double q0, double d) {
+// 显式 __noinline__：见 jitBreakup 注释（防内联膨胀）
+__device__ __noinline__ double jitBf(int L, double q, double q0, double d) {
     double z = q * d;
     double z0 = q0 * d;
     switch (L) {
@@ -131,8 +136,8 @@ __device__ double jitBf(int L, double q, double q0, double d) {
 }
 
 // q0(m0, md1, md2)（computeQ0AD<double> 原文）
-// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
-__device__ double jitQ0(double m0, double md1, double md2) {
+// 显式 __noinline__：见 jitBreakup 注释（防内联膨胀）
+__device__ __noinline__ double jitQ0(double m0, double md1, double md2) {
     double s_md = md1 + md2;
     double d_md = md1 - md2;
     double m0sq = m0 * m0;
@@ -143,8 +148,8 @@ __device__ double jitQ0(double m0, double md1, double md2) {
 
 // 子粒子 q0 链质量（与内核一致：固定质量优先；否则查共振态首个参数；
 // 负值/无参数回退事件质量 — R>1 分支语义，R==1 除病态负参数外等价）
-__device__ double jitDaugMass(const JitArgs& A, int daug,
-                              double fixed, double kin) {
+__device__ __noinline__ double jitDaugMass(const JitArgs& A, int daug,
+                                           double fixed, double kin) {
     double md = fixed;
     if (md <= 0) {
         int off = (A.res_param_off && daug >= 0 && daug < 256)
@@ -156,8 +161,8 @@ __device__ double jitDaugMass(const JitArgs& A, int daug,
 }
 
 // Flatte（ResModel.cuh Flatte<double> 原文；ch 为 (ma,mb) 通道质量对）
-// 普通 __device__：见 jitBreakup 注释（防内联膨胀）
-__device__ void jitFlatte(double m, double m0, int n_ch,
+// 显式 __noinline__：见 jitBreakup 注释（防内联膨胀）
+__device__ __noinline__ void jitFlatte(double m, double m0, int n_ch,
                           const double* g, const double* ch,
                           double& re, double& im) {
     double s = m * m;
@@ -568,7 +573,7 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
                                            : ": d2F[" + std::to_string(pairs[s - (P + 1)].first) + "][" +
                                                  std::to_string(pairs[s - (P + 1)].second) + "]"))
              << "\n";
-        segs << "__device__ void ctpwa_seg_" << node_id << "_" << s
+        segs << "__device__ __noinline__ void ctpwa_seg_" << node_id << "_" << s
              << (full ? "_full" : "_grad") << "(" << common_args << ")\n{\n";
         for (const auto& ln : g.lines) segs << "    " << ln << "\n";
         // 输出位置
@@ -782,6 +787,51 @@ static bool compileToBinary(const std::string& src, JitBinary& out, std::string&
     return false;
 }
 
+// 编译看门狗：NVRTC 编译放进独立线程，超过 CTPWA_JIT_TIMEOUT 秒（默认 300）
+// 放弃等待并报告失败（→ 整块回退解释器）。编译线程无法强杀，会继续占 CPU
+// 直至完成自然退出（shared_ptr 持有状态，无悬挂引用）；这只把「挂死」变成
+// 「可控降级」——若未来模型的分割粒度仍触发编译器病态行为，程序照常运行。
+static bool compileToBinaryTimeout(const std::string& src, JitBinary& out,
+                                   std::string& err)
+{
+    int timeout_s = 300;
+    if (const char* e = getenv("CTPWA_JIT_TIMEOUT")) timeout_s = atoi(e);
+    if (timeout_s <= 0) return compileToBinary(src, out, err);
+
+    struct CompileState {
+        std::string src;
+        bool ok = false;
+        std::string err;
+        JitBinary bin;
+        std::atomic<bool> done{false};
+    };
+    auto st = std::make_shared<CompileState>();
+    st->src = src;
+    std::thread t([st] {
+        st->ok = compileToBinary(st->src, st->bin, st->err);
+        st->done = true;
+    });
+    const int step_ms = 100;
+    int waited = 0;   // 毫秒
+    // 注意：上限必须与 waited 同单位（毫秒）。写 timeout_s*1000/step_ms 会把
+    // 超时缩小 step_ms 倍（曾实测 30s 配置 0.3s 就误触发）。
+    while (!st->done && waited < timeout_s * 1000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
+        waited += step_ms;
+    }
+    if (!st->done) {
+        t.detach();   // 线程持有 st（shared_ptr），结束后自清理
+        err = "JIT 编译超时（> " + std::to_string(timeout_s) + "s，CTPWA_JIT_TIMEOUT 可调）";
+        if (getenv("CTPWA_JIT_DEBUG"))
+            fprintf(stderr, "[ctpwa] %s\n", err.c_str());
+        return false;
+    }
+    t.join();
+    if (!st->ok) { err = st->err; return false; }
+    out = std::move(st->bin);
+    return true;
+}
+
 // 在当前 context（= 当前 device 的 primary context）加载模块，取内核句柄
 static bool loadModuleForGpu(const std::string& key, CUfunction& f_grad,
                              CUfunction& f_full)
@@ -851,24 +901,67 @@ bool jitCompileBlock(JitBlockState& st,
         }
     }
     // 探测编译（含 arch；CUBIN 缓存按 key 复用）。失败 → 整块解释器。
-    std::string key = cacheKey(aux_list, st.hessian_target, jitArch());
+    std::string arch = jitArch();
+    std::string key = cacheKey(aux_list, st.hessian_target, arch);
     auto& cache = jitCache();
     if (cache.find(key) == cache.end()) {
-        clock_t t0 = clock();
-        std::string src = buildSource(aux_list, st.hessian_target);
-        if (getenv("CTPWA_JIT_DEBUG"))
-            fprintf(stderr, "[ctpwa] buildSource: %.2fs, src=%zu B\n",
-                    (double)(clock() - t0) / CLOCKS_PER_SEC, src.size());
-        if (getenv("CTPWA_JIT_DUMP_SRC")) {   // 编译前 dump，卡住也能拿到源码
-            FILE* df = fopen("/hpcfs/bes/gpupwa/bhxiang/pwatest/ctpwa/tests/jit_real_src.cu", "w");
-            if (df) { fwrite(src.data(), 1, src.size(), df); fclose(df); }
+        // 磁盘缓存（跨进程复用）：$CTPWA_JIT_CACHE_DIR 或 ~/.cache/ctpwa_jit/<arch>/
+        // 文件 <key hash>.cubin/.ptx。编译一次（30-80s），之后进程秒级加载。
+        std::string hash = key.substr(key.find('|') + 1);
+        std::string dir;
+        if (const char* cd = getenv("CTPWA_JIT_CACHE_DIR")) dir = cd;
+        else dir = std::string(getenv("HOME") ? getenv("HOME") : "/tmp") +
+                  "/.cache/ctpwa_jit";
+        dir += "/" + arch;
+        std::shared_ptr<JitBinary> bin;
+        for (const char* ext : {".cubin", ".ptx"}) {
+            std::string path = dir + "/" + hash + ext;
+            FILE* f = fopen(path.c_str(), "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+                bin = std::make_shared<JitBinary>();
+                bin->data.resize((size_t)n);
+                if (n > 0 && fread(bin->data.data(), 1, (size_t)n, f) != (size_t)n) {
+                    bin.reset();   // 读失败按未命中处理
+                }
+                bin->is_ptx = (strcmp(ext, ".ptx") == 0);
+                fclose(f);
+                if (bin && getenv("CTPWA_JIT_DEBUG"))
+                    fprintf(stderr, "[ctpwa] JIT 磁盘缓存命中: %s\n", path.c_str());
+                break;
+            }
         }
-        if (src.empty()) return false;
-        auto bin = std::make_shared<JitBinary>();
-        std::string err;
-        if (!compileToBinary(src, *bin, err)) {
-            fprintf(stderr, "[ctpwa] JIT 编译失败，该块回退解释器: %s\n", err.c_str());
-            return false;
+        if (!bin) {
+            clock_t t0 = clock();
+            std::string src = buildSource(aux_list, st.hessian_target);
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] buildSource: %.2fs, src=%zu B\n",
+                        (double)(clock() - t0) / CLOCKS_PER_SEC, src.size());
+            if (const char* dp = getenv("CTPWA_JIT_DUMP_SRC")) {   // 编译前 dump，卡住也能拿到源码
+                FILE* df = fopen(dp, "w");
+                if (df) { fwrite(src.data(), 1, src.size(), df); fclose(df); }
+            }
+            if (src.empty()) return false;
+            bin = std::make_shared<JitBinary>();
+            std::string err;
+            if (!compileToBinaryTimeout(src, *bin, err)) {
+                fprintf(stderr, "[ctpwa] JIT 编译失败，该块回退解释器: %s\n", err.c_str());
+                return false;
+            }
+            // 写盘缓存
+            const char* ext = bin->is_ptx ? ".ptx" : ".cubin";
+            std::string path = dir + "/" + hash + ext;
+            size_t pos = 0;
+            while ((pos = path.find('/', pos)) != std::string::npos) {
+                std::string sub = path.substr(0, pos);
+                if (!sub.empty()) mkdir(sub.c_str(), 0755);
+                ++pos;
+            }
+            mkdir(dir.c_str(), 0755);
+            FILE* wf = fopen(path.c_str(), "wb");
+            if (wf) { fwrite(bin->data.data(), 1, bin->data.size(), wf); fclose(wf); }
+            else if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] JIT 缓存写入失败: %s\n", path.c_str());
         }
         cache.emplace(key, bin);
     }
