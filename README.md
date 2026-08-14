@@ -70,33 +70,29 @@ H = ana.getHessian(params)                  # 全 Hessian（含耦合+共振态�
 config.yml 最小示例：
 
 ```yaml
+# 经典道 J/ψ → π⁺π⁻π⁰：中间态 ρ(770) → π⁺π⁻（π⁰ 为旁观粒子）
 Particles:
-  Jpsi: {J: 1, P: -1, mass: 3.0969}
-  Kp:   {J: 0, P: -1, mass: 0.4937}
-  Km:   {J: 0, P: -1, mass: 0.4937}
-  eta:  {J: 0, P: -1, mass: 0.5478}
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  pip:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^+']}
+  pim:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^-']}
+  pi0:  {J: 0, P: -1, mass: 0.13495, tex: ['\\pi^0']}
 
 Data:
-  order: [Kp, Km, eta]
+  order: [pip, pim, pi0]
   data: [ROOT, "file/data.root", TTree, TBranch1, TBranch2, ...]
   phsp: [ROOT, "file/phsp.root", TTree, TBranch1, TBranch2, ...]
   bkg:  [ROOT, "file/bkg.root", TTree, TBranch1, TBranch2, ...]
-  bkg_weights: [0.8]
+  bkg_weights: [0.8] # [dat, "*.dat"]
 
 DecayChains:
   chain1:
-    Jpsi: [[eta, R_KK], [Kp, R_Keta], [Km, R_Keta]]
-    R_KK: [Kp, Km]
+    Jpsi: [[pi0, R_pipi]]
+    R_pipi: [pip, pim]
     intermediates:
-      R_KK:  [[J: 1, P: -1]: [phi1680]]
-      R_Keta:[[J: 1, P: -1]: [K1_1410]]
+      R_pipi: [[J: 1, P: -1]: [rho770]]
 
 Resonances:
-  phi1680: {J: 1, P: -1, model: BWR, parameters: [1.66, 0.125], free: [0, 1]}
-  K1_1410: {J: 1, P: -1, model: BWR, parameters: [1.402, 0.149], free: [0, 1]}
-
-Constraints:
-  trans: [[R_Keta_0, R_Keta_1]: -1]
+  rho770: {J: 1, P: -1, model: BWR, parameters: [0.775, 0.149], free: [0, 1]}
 ```
 
 ## Python API
@@ -188,33 +184,29 @@ H = ana.getHessian(params)
 Minimal config.yml:
 
 ```yaml
+# Classic J/psi -> pi+ pi- pi0: intermediate rho(770) -> pi+ pi- (pi0 as bachelor)
 Particles:
-  Jpsi: {J: 1, P: -1, mass: 3.0969}
-  Kp:   {J: 0, P: -1, mass: 0.4937}
-  Km:   {J: 0, P: -1, mass: 0.4937}
-  eta:  {J: 0, P: -1, mass: 0.5478}
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  pip:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^+']}
+  pim:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^-']}
+  pi0:  {J: 0, P: -1, mass: 0.13495, tex: ['\\pi^0']}
 
 Data:
-  order: [Kp, Km, eta]
+  order: [pip, pim, pi0]
   data: [ROOT, "file/data.root", TTree, TBranch1, TBranch2, ...]
   phsp: [ROOT, "file/phsp.root", TTree, TBranch1, TBranch2, ...]
   bkg:  [ROOT, "file/bkg.root", TTree, TBranch1, TBranch2, ...]
-  bkg_weights: [0.8]
+  bkg_weights: [0.8] # [dat, "*.dat"]
 
 DecayChains:
   chain1:
-    Jpsi: [[eta, R_KK], [Kp, R_Keta], [Km, R_Keta]]
-    R_KK: [Kp, Km]
+    Jpsi: [[pi0, R_pipi]]
+    R_pipi: [pip, pim]
     intermediates:
-      R_KK:  [[J: 1, P: -1]: [phi1680]]
-      R_Keta:[[J: 1, P: -1]: [K1_1410]]
+      R_pipi: [[J: 1, P: -1]: [rho770]]
 
 Resonances:
-  phi1680: {J: 1, P: -1, model: BWR, parameters: [1.66, 0.125], free: [0, 1]}
-  K1_1410: {J: 1, P: -1, model: BWR, parameters: [1.402, 0.149], free: [0, 1]}
-
-Constraints:
-  trans: [[R_Keta_0, R_Keta_1]: -1]
+  rho770: {J: 1, P: -1, model: BWR, parameters: [0.775, 0.149], free: [0, 1]}
 ```
 
 ## Python API
