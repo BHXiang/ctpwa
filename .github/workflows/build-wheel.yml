@@ -82,15 +82,16 @@ jobs:
 
       # ---- 3. 构建 wheel（容器 glibc 2.34 → manylinux_2_34 标签）----
       - name: Build wheel
-        shell: bash -euxo pipefail {0}
         env:
           CUDA_HOME: /usr/local/cuda-12.9
           ROOTSYS: /opt/conda/envs/build
-          PATH: /opt/conda/envs/build/bin:$PATH
           # 无 GPU runner 上 torch 检测不到架构 → 显式指定（空格分隔）
           # 7.0 = V100, 12.0 = RTX 50 系（Blackwell）
           TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0"
         run: |
+          # PATH 必须在 bash 内展开（workflow env 的 $PATH 是字面量，
+          # 会污染 runner 的 shell 查找 → exec: bash not found）
+          export PATH=/opt/conda/envs/build/bin:$PATH
           # 手动改 manylinux 标签（只改 WHEEL 元数据和文件名，不碰 ELF）
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
