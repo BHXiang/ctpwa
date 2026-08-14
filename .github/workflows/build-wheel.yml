@@ -114,7 +114,25 @@ jobs:
           auditwheel show wheelhouse/ctpwa-*.whl
           ls -lh wheelhouse/
 
-      # ---- 4. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
+      # ---- 4. 上传产物到 artifact（供 publish job 下载）----
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctpwa-wheel
+          path: wheelhouse/
+
+  # 发布 job: 必须用原生 runner——gh-action-pypi-publish 是 Docker action，
+  # 容器 job 里无法运行（实测 create-docker-action.py 找不到）。
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ctpwa-wheel
+          path: wheelhouse/
+
+      # ---- 5. 上传 wheel 到 PyPI（secrets.PYPI_API_TOKEN）----
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
