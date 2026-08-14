@@ -147,6 +147,7 @@ extension = CUDAExtension(
     library_dirs=[
         root_flags["libdir"],  # ROOT 库目录
         os.path.join(cuda_dir, "lib64"),
+        os.path.join(cuda_dir, "lib64", "stubs"),  # 无驱动编译环境（CI/容器）链接 -lcuda 用；运行时加载系统驱动库
         # Conda 库目录（如果存在）
         *([os.path.join(conda_prefix, "lib")] if conda_prefix else []),
         # Torch 库目录
