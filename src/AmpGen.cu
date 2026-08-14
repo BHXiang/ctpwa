@@ -302,43 +302,44 @@ void AmpCasDecay::buildPermTopologies()
             auto c = canonical(perm);
             if (seen.insert(c).second) reps.push_back(c);
         } while (std::next_permutation(perm.begin(), perm.end()));
-        for (const auto& sb : subs) std::cerr << " " << sb.name;
-        std::cerr << "  stab_pairs=" << stab_pairs.size() << "  reps:";
-        for (const auto& r : reps) {
-            std::cerr << " [";
-            for (int x : r) std::cerr << x;
-            std::cerr << "]";
-        }
-        std::cerr << std::endl;
 
-        // 每组生成自己的 σ≥1 重建动量映射 + 符号
+        // 每组生成自己的 σ≥1 重建动量映射 + 符号。
+        // tf-pwa 约定：全同粒子振幅和 = Σ_σ A(x_σ)，对全置换群求和（不做陪集约化）。
+        // 因此陪集代表元 r 要乘上全部稳定子元素 s（r∘s），得到全群元素；
+        // 稳定子元素（如 f 链的 Ks1↔Ks2 交换）必须计入——它给出 A_f(x) 的加倍项。
         std::vector<std::map<std::string, int>> group_maps;
         std::vector<double> group_signs;
+        std::set<std::vector<int>> seen_group;
         for (const auto& rep : reps) {
-            if (rep == id_perm) continue;  // 恒等（含纯稳定子项）
-            // 符号：费米子 sgn(rep)（逆序数奇偶），玻色子 +1
-            double sg = 1.0;
-            if (!is_boson) {
-                int inv = 0;
-                for (int i = 0; i < n; ++i)
-                    for (int j = i + 1; j < n; ++j)
-                        if (rep[i] > rep[j]) ++inv;
-                sg = (inv % 2 == 0) ? 1.0 : -1.0;
-            }
-            // 重建动量映射：位置 i 的子树内容换成成员 rep[i] 的子树（路径对应）。
-            // 映射语义（与 convertToDeviceMomenta 一致）：mapping[name] = 动量新槽位。
-            // 必须覆盖全部粒子（恒等底 + 组内交换）——convertToDeviceMomenta 用 map 尺寸分配数组
-            std::map<std::string, int> pmap = particleToIndex_;
-            for (int i = 0; i < n; ++i) {
-                int j = rep[i];  // 成员 subs[j] 的内容移到位置 i
-                for (const auto& [path, name] : subs[i].paths) {
-                    auto it = subs[j].paths.find(path);
-                    if (it == subs[j].paths.end()) continue;  // 已校验一致，不会发生
-                    pmap[it->second] = particleToIndex_[name];
+            for (const auto& st : stab_elts) {
+                std::vector<int> g(n);
+                for (int i = 0; i < n; ++i) g[i] = rep[st[i]];
+                if (g == id_perm) continue;  // 纯恒等 = σ=0，已在 h_signs_[0]
+                if (!seen_group.insert(g).second) continue;  // 全群元素去重
+                // 符号：费米子 sgn(g)（逆序数奇偶），玻色子 +1
+                double sg = 1.0;
+                if (!is_boson) {
+                    int inv = 0;
+                    for (int i = 0; i < n; ++i)
+                        for (int j = i + 1; j < n; ++j)
+                            if (g[i] > g[j]) ++inv;
+                    sg = (inv % 2 == 0) ? 1.0 : -1.0;
                 }
+                // 重建动量映射：位置 i 的子树内容换成成员 g[i] 的子树（路径对应）。
+                // 映射语义（与 convertToDeviceMomenta 一致）：mapping[name] = 动量新槽位。
+                // 必须覆盖全部粒子（恒等底 + 组内交换）——convertToDeviceMomenta 用 map 尺寸分配数组
+                std::map<std::string, int> pmap = particleToIndex_;
+                for (int i = 0; i < n; ++i) {
+                    int j = g[i];  // 成员 subs[j] 的内容移到位置 i
+                    for (const auto& [path, name] : subs[i].paths) {
+                        auto it = subs[j].paths.find(path);
+                        if (it == subs[j].paths.end()) continue;  // 已校验一致，不会发生
+                        pmap[it->second] = particleToIndex_[name];
+                    }
+                }
+                group_maps.push_back(pmap);
+                group_signs.push_back(sg);
             }
-            group_maps.push_back(pmap);
-            group_signs.push_back(sg);
         }
 
         // 与已有组叠加（多组笛卡尔积；槽位不相交）
@@ -363,9 +364,17 @@ void AmpCasDecay::buildPermTopologies()
             for (auto sg : new_signs) h_signs_.push_back(sg);
         }
 
-        std::cout << "  Identical group (" << (is_boson ? "boson" : "fermion")
-                  << "): " << n << " members (" << group_maps.size()
-                  << " permutation topologies)" << std::endl;
+        // 仅当存在非平凡陪集（reps.size()>1，成员交换产生新拓扑）时输出；
+        // 纯稳定子组（如 f0→Ks Ks 的兄弟交换，仅一个陪集）视为不交换，不打印。
+        // （注意：纯稳定子组的换位项仍会叠加进 h_perm_maps_ 参与求和——tf-pwa 约定
+        //   Σ_σ 对全置换群求和，A(x) 加倍项必须保留，这里只控制输出。）
+        if (reps.size() <= 1) continue;
+        std::cout << "Identical group (" << (is_boson ? "boson" : "fermion") << "): [";
+        for (size_t i = 0; i < subs.size(); ++i) {
+            if (i) std::cout << ", ";
+            std::cout << subs[i].name;
+        }
+        std::cout << "] in chain " << chain_name_ << std::endl;
     }
 
     if (h_signs_.size() > 33)
@@ -402,10 +411,26 @@ std::vector<DecayNode> AmpCasDecay::getHostDecayNodes() const
         // 势垒因子（三级作用域决议后的最终值，随 DecayNode 进入内核）
         indexed_node.has_bf = node.amp.getHasBf();
         indexed_node.bf_d = node.amp.getBfD();
+        // 宽度约定 Lmin = 该节点 SL 列表的最小 L（BWR Γ 与波无关，恒用最低 L）
+        indexed_node.l_min = getNodeLMin(node.mother);
 
         host_decayNodes.push_back(indexed_node);
     }
     return host_decayNodes;
+}
+
+// 宽度约定: Lmin = decay 顶点 SL 列表的最小 L（K1_1400: (0,2)→0 等）
+int AmpCasDecay::getNodeLMin(const std::string& mother_name) const
+{
+    for (const auto& node : decayChain_) {
+        if (node.mother != mother_name) continue;
+        int Lmin = -1;
+        for (const auto& sl : node.amp.getSL()) {
+            if (Lmin < 0 || sl.L < Lmin) Lmin = sl.L;
+        }
+        return (Lmin < 0) ? 0 : Lmin;
+    }
+    return 0;
 }
 
 bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
@@ -972,42 +997,24 @@ __global__ void computeSLAmpKernel(
             LorentzVector pDaug1 = d_momenta->getMomentum(start_events + eventIdx, node.daug1_idx);
             LorentzVector pDaug2 = d_momenta->getMomentum(start_events + eventIdx, node.daug2_idx);
 
-            // // 打印四动量
-            // printf("Event %d, SL %d, Node %d: pDaug1 = (%f, %f, %f, %f), pDaug2 = (% f, % f, % f, % f)\n",
-            //     eventIdx, slIdx, nodeIdx,
-            //     pDaug1.E, pDaug1.Px, pDaug1.Py, pDaug1.Pz,
-            //     pDaug2.E, pDaug2.Px, pDaug2.Py, pDaug2.Pz);
-
             // node振幅
             size_t amp_size = dim_j * dim_j1 * dim_j2;
             thrust::complex<double>* node_amp = &event_buffer[buffer_used];
             buffer_used += amp_size;
 
-            // 计算振幅
-            pwa_amp(node_amp, pDaug1, dim_j1, pDaug2, dim_j2, dim_j, sl.S, sl.L, &event_buffer[buffer_used]);
-
-            // // if (eventIdx == 0 && slIdx == 0) {
-            // for (int i = 0; i < dim_j; i++)
-            //     for (int j = 0; j < dim_j1; j++)
-            //         for (int k = 0; k < dim_j2; k++) {
-            //             int idx = i * dim_j1 * dim_j2 + j * dim_j2 + k;
-            //             printf("Node %d: Amp[%d,%d,%d] = (%f, %f)\n",
-            //                 nodeIdx, i, j, k,
-            //                 node_amp[idx].real(), node_amp[idx].imag());
-            //         }
-            // // }
+            // 计算振幅（协变张量约定）
+            pwa_amp(node_amp, pDaug1, dim_j1, pDaug2, dim_j2, dim_j, sl.S, sl.L,
+                    &event_buffer[buffer_used]);
 
             int total_amp_size = dim_j * dim_j1 * dim_j2;
             int trans1_size = dim_j1 * dim_j1;
             int trans2_size = dim_j2 * dim_j2;
             int max_dim = max(dim_j1, dim_j2);
             int massive_shared_size = 2 * max_dim * max_dim;
-            // int massive_shared_size = max(2 * trans1_size, 2 * trans2_size);
 
             buffer_used += 2 * total_amp_size + trans1_size + trans2_size +
                 massive_shared_size;
 
-            // int nodeAmpShape[3] = {2 * dj + 1, 2 * dj1 + 1, 2 * dj2 + 1};
             int nodeAmpShape[3] = { dim_j, dim_j1, dim_j2 };
             int nodeAmpRank = 3;
 
@@ -1107,14 +1114,8 @@ __global__ void computeSLAmpKernel(
             ampLabels[ampLabelCount] = node.daug2_idx;
             ampLabelCount += 1; // -1 + 2 = +1
 
-            // printf("Event %d, Node %d: Contraction completed. New rank:
-            // %d\n",eventIdx, nodeIdx, currentAmpRank);
         }
 
-        // d_amp按
-        // thrust::complex<double>* event_final_amp =
-        //     &d_amp[slIdx * num_events * num_polar +
-        //     (start_events + eventIdx) * num_polar];
         // 按极化 mask 选取张量索引写入（Strategy B: kernel 内筛选）
         if (d_polarization_map != nullptr) {
             for (int i = 0; i < num_polar; ++i) {
@@ -1129,9 +1130,6 @@ __global__ void computeSLAmpKernel(
                 d_amp[idx] = currentAmp[i];
             }
         }
-
-        // printf("Event %d: Final amplitude size: %d\n", eventIdx,
-        // finalAmpSize);
     }
 }
 
@@ -1398,7 +1396,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         }
 
         double q0 = std::sqrt((mass_mother * mass_mother - std::pow(mass_daug1 + mass_daug2, 2)) * (mass_mother * mass_mother - std::pow(mass_daug1 - mass_daug2, 2))) / 2 / mass_mother;
-         
+
         // printf("mother mass = %f, daug1 mass = %f, daug2 mass = %f, q0 = %f\n",
         //     mass_mother, mass_daug1, mass_daug2, q0);
         // // 打印qq
@@ -1423,7 +1421,10 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
             const double* p = d_all_params + current_res.param_offset;
             const double* ch = (current_res.type == ResModelType::Flatte)
                 ? d_all_channels + current_res.channel_offset : nullptr;
-            resAmp *= computeNodeFactor<double>(sl.L, mm, qq, q0,
+            // 宽度约定 Lmin: BWR Γ(L) 与波无关，恒用节点 SL 列表的最小 L；
+            // 顶点 Bf 仍用逐波 sl.L
+            int width_L = node.l_min;
+            resAmp *= computeNodeFactor<double>(sl.L, width_L, mm, qq, q0,
                 p, current_res.param_count, current_res.type,
                 ch, current_res.n_channels,
                 d_all_channels, current_res.aux_offset, node.bf_d, node.has_bf);

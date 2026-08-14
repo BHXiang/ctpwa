@@ -47,6 +47,8 @@ struct DecayNode {
     // 势垒因子（三级作用域决议后的最终值）: has_bf 是否施加；bf_d 势垒半径
     bool has_bf = true;
     double bf_d = 3.0;
+    // 该节点 SL 列表的最小 L（tf 宽度约定 Lmin: BWR 宽度 Γ 与波无关，恒用最低 L）
+    int l_min = 0;
 };
 
 // 工具函数声明 (定义在 AmpGen.cu)
@@ -134,6 +136,7 @@ private:
 
     std::map<std::string, int> particleToIndex_;
     std::vector<DecayNodeHost> decayChain_;
+    std::string chain_name_;  // 所属衰变链名（config.yml 顶层 key，如 decay1）
     std::map<std::string, ParticleInfo> particleMap_;
     std::vector<std::string> particleNames_;
 
@@ -158,6 +161,7 @@ public:
     // int computeNPolarizations(const std::map<std::string, std::vector<LorentzVector>>& finalMomenta);
     void setNPolarizations(const int nPolarizations) { nPolarizations_ = nPolarizations; }
     void setNPolarizationsTotal(const int nTotal) { nPolarizations_total_ = nTotal; }
+    void setChainName(const std::string& name) { chain_name_ = name; }
     void setPolarizationMap(const std::vector<int>& map);
     // 全同粒子组：(成员名, is_boson)；computeSLAmps 时生成置换拓扑（coset）
     void setIdenticalGroups(const std::vector<std::pair<std::vector<std::string>, bool>>& groups);
@@ -172,6 +176,9 @@ public:
         const int n_amplitudes,
         const std::vector<std::vector<int>>& event_offsets,
         const std::vector<std::vector<int>>& amp_offsets);
+
+    // 衰变顶点 SL 列表的最小 L（tf 宽度约定 Lmin；未找到返回 0）
+    int getNodeLMin(const std::string& mother_name) const;
 
     // Getter函数
     size_t getNSLCombs() const { return nSLCombs_; }

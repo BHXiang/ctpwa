@@ -479,27 +479,6 @@ std::vector<double*> readWeightsFromFile(const std::vector<std::string>& fileinf
         offset += n_weights;
     }
 
-    // trace: verify weights on device
-    // {
-    //     const char* mode = (fileinfo.size() == 1) ? "const" : fileType.c_str();
-    //     printf("[TRACE] readWeightsFromFile mode=%s total_events=%d n_gpus=%zu\n",
-    //            mode, total_weights, d_weights_ptrs.size());
-    //     for (size_t i = 0; i < d_weights_ptrs.size(); ++i) {
-    //         if (d_weights_ptrs[i] != nullptr && events_per_gpu[i] > 0) {
-    //             cudaSetDevice(i);
-    //             int n = events_per_gpu[i];
-    //             int k = std::min(n, 8);
-    //             std::vector<double> h(k);
-    //             cudaMemcpy(h.data(), d_weights_ptrs[i], k * sizeof(double), cudaMemcpyDeviceToHost);
-    //             double sum = 0;
-    //             printf("[TRACE]   readW GPU%zu (n=%d): ", i, n);
-    //             for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
-    //             if (n > k) printf("...");
-    //             printf("|sum|=%.4f\n", sum);
-    //         }
-    //     }
-    // }
-
     return d_weights_ptrs;
 }
 
@@ -600,30 +579,6 @@ std::vector<std::map<std::string, std::vector<LorentzVector>>> mergeMaps(
 }
 
 //////////////////////////////////////////////////////////////
-/// Trace helpers — print first N values from device arrays
-///////////////////////////////////////////////////////////////
-static void traceDouble(const char* tag, const double* d, int n, int show = 8) {
-    if (n <= 0) return;
-    int k = std::min(n, show);
-    std::vector<double> h(k);
-    cudaMemcpy(h.data(), d, k * sizeof(double), cudaMemcpyDeviceToHost);
-    printf("[TRACE] %s (%d total): ", tag, n);
-    for (int i = 0; i < k; ++i) printf("%.4f ", h[i]);
-    if (n > k) printf("...");
-    double sum = 0; for (int i = 0; i < k; ++i) sum += std::abs(h[i]);
-    printf(" |sum|=% .4f\n", sum);
-}
-static void traceComplex(const char* tag, const ctComplex* d, int n, int show = 5) {
-    if (n <= 0) return;
-    int k = std::min(n, show);
-    std::vector<ctComplex> h(k);
-    cudaMemcpy(h.data(), d, k * sizeof(ctComplex), cudaMemcpyDeviceToHost);
-    printf("[TRACE] %s (%d total): ", tag, n);
-    for (int i = 0; i < k; ++i) printf("(%.4f%+.4fj) ", h[i].x, h[i].y);
-    if (n > k) printf("...");
-    double sum = 0; for (int i = 0; i < k; ++i) sum += std::sqrt(h[i].x*h[i].x + h[i].y*h[i].y);
-    printf(" |sum|=% .4f\n", sum);
-}
 // Replace ROOT-unsafe chars in object names
 static std::string sanitizeROOTName(const std::string& s) {
     // → is UTF-8 \xE2\x86\x92 (3 bytes), iterate as bytes
@@ -643,31 +598,6 @@ static std::string sanitizeROOTName(const std::string& s) {
     }
     return r;
 }
-
-static void traceTensor(const char* tag, const torch::Tensor& t, int show = 8) {
-    if (t.numel() == 0) { printf("[TRACE] %s: empty\n", tag); return; }
-    auto cpu = t.cpu();
-    int n = cpu.numel();
-    int k = std::min(n, show);
-    printf("[TRACE] %s (%d total): ", tag, n);
-    if (cpu.is_complex()) {
-        auto acc = cpu.accessor<c10::complex<float>, 1>();
-        double sum = 0;
-        for (int i = 0; i < k; ++i) {
-            printf("(%.4f%+.4fj) ", acc[i].real_, acc[i].imag_);
-            sum += std::sqrt(acc[i].real_*acc[i].real_ + acc[i].imag_*acc[i].imag_);
-        }
-        if (n > k) printf("...");
-        printf(" |sum|=% .4f\n", sum);
-    } else {
-        auto acc = cpu.accessor<double, 1>();
-        double sum = 0;
-        for (int i = 0; i < k; ++i) { printf("%.4f ", acc[i]); sum += std::abs(acc[i]); }
-        if (n > k) printf("...");
-        printf(" |sum|=% .4f\n", sum);
-    }
-}
-
 
 //////////////////////////////////////////////////////////////
 /// Hessian fast-path switch: CTPWA_HESS_FAST=0 → legacy CGEMM path
@@ -726,8 +656,6 @@ public:
                 torch::TensorOptions().dtype(torch::kFloat64).device(params_tensor.device()));
             params_mgr->extendCouplingParams(
                 params_tensor.data_ptr<double>(), ext.data_ptr<double>(), ncf, nt);
-        //    traceDouble("2.extended[Re_v]", ext.data_ptr<double>(), na);
-        //    traceDouble("2.extended[Im_v]", ext.data_ptr<double>() + na, na);
 
             // Save original params for backward gradient transform
             ctx->saved_data["original_params"] = params_tensor;
@@ -740,16 +668,6 @@ public:
             std::tie(vector, theta) = params_mgr->splitParams(params_tensor);
         }
 
-    //     // [3] inside forward
-    //    printf("\n[TRACE] ===== FORWARD: NLLFunction =====\n");
-    //    traceTensor("3.vector(complex)", vector);
-    //     if (theta.numel() > 0) {
-    //         auto th_cpu = theta.cpu(); auto th = th_cpu.accessor<double, 1>();
-    //         printf("[TRACE] 3.theta (%ld): ", theta.numel());
-    //         for (int i = 0; i < std::min((int)theta.numel(), 4); ++i) printf("%.4f ", th[i]);
-    //         printf("\n");
-    //     }
-
         int num_gpus = d_all_amplitudes_list.size();
         TORCH_CHECK(num_gpus > 0, "No GPUs provided");
         TORCH_CHECK(vector.is_cuda(), "params must be on CUDA");
@@ -758,10 +676,6 @@ public:
         torch::Tensor extended_vector = params_mgr->extendVector(vector, vector.device());
         int extended_n_gls = extended_vector.numel();
         const int primary_dev = vector.get_device();
-
-    //     // [4] after extendVector (identity when coupling matrix active)
-    //    printf("[TRACE] 4.extendVector: vector(%d) → extended(%d)\n", (int)vector.numel(), extended_n_gls);
-    //    traceTensor("4.extended:vector", extended_vector);
 
         // 2. 将extended_vector分发到每个GPU（实际拷贝）
         std::vector<torch::Tensor> extended_vec_per_gpu;
@@ -895,15 +809,26 @@ public:
             computeQuadraticForm(d_phsp_matrix_, d_vec_conj, d_P_vec,
                 d_phsp_r, d_phsp_i, n_amplitudes_);
         }
-        ctPhspReal phsp_r, phsp_i;
-        cudaMemcpy(&phsp_r, d_phsp_r, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&phsp_i, d_phsp_i, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
         cudaFree(d_phsp_r);
         cudaFree(d_phsp_i);
-        double phsp_factor = static_cast<double>(phsp_r);
+        // phsp_factor = mean f: Σ f_ev 用 double 累加（float32 phsp 矩阵求和在
+        // 50 万事件上有 ~1e-4 相对系统偏差 → NLL 与 tf-pwa (float64) 差 ~2.4）
+        double phsp_sum = 0.0;
+        int total_phsp_evts = 0;
+        for (int gpu = 0; gpu < num_gpus; ++gpu) {
+            int nP = events_list[gpu][0];
+            if (nP == 0) continue;
+            cudaSetDevice(gpu);
+            const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
+                extended_vec_per_gpu[gpu].data_ptr());
+            phsp_sum += computePhspMeanSum(d_all_amplitudes_list[gpu], d_v_gpu,
+                                           nP, n_polar_, n_amplitudes_);
+            total_phsp_evts += nP;
+        }
+        double phsp_factor = (total_phsp_evts > 0) ? phsp_sum / total_phsp_evts : 0.0;
+        cudaSetDevice(primary_dev);
         tF4 = std::chrono::high_resolution_clock::now();  // phsp_factor D2H 完成
 
-        // std::cout << "PHSP factor: " << phsp_factor << std::endl;
         // //输出 d_P_vec 检查
         // std::vector<ctComplex> h_P_vec(n_amplitudes_);
         // cudaMemcpy(h_P_vec.data(), d_P_vec, n_amplitudes_ * sizeof(ctComplex),
@@ -1207,9 +1132,6 @@ public:
         // （NaN 情况下由下方 loss_reset 逻辑一并处理）
         if (params_mgr->nGaussConstr() > 0 && n_free_res > 0 && theta.numel() > 0)
             loss += params_mgr->gaussPenalty(theta);
-        // std::cout << "Data NLL: " << total_data_nll << ", Bkg NLL: " << total_bkg_nll
-        //           << ", PHSP factor: " << phsp_factor
-        //           << ", Total loss: " << loss << std::endl;
         bool loss_reset = false;
         if (isnan(loss) || isinf(loss)) {
             // std::cerr << "WARNING: loss is " << (isnan(loss) ? "NaN" : "Inf") << ", resetting to 1e30" << std::endl;
@@ -1283,28 +1205,14 @@ public:
             int na = cm.n_amps;
             int ncf = cm.n_free;
 
-        //    printf("\n[TRACE] ===== BACKWARD: NLLFunction =====\n");
-        //    printf("[TRACE] na=%d ncf=%d nt=%d\n", na, ncf, nt);
-
-        //     // [5] grad_v: Wirtinger ∂L/∂v* (ctComplex [na])
-        //    traceComplex("5.grad_v(∂L/∂v*)", reinterpret_cast<ctComplex*>(global_extended_grad.data_ptr()), na);
-        //     // [5b] grad_theta
-        //     if (nt > 0 && grad_theta.numel() > 0)
-        //        traceDouble("5.grad_theta", grad_theta.data_ptr<double>(), nt, 4);
-
             auto original_params = ctx->saved_data["original_params"].toTensor();
             const double* d_p = original_params.data_ptr<double>();
-
-        //     // [6] current coupling params p and computed v
-        //    traceDouble("6.params[Re_p]", d_p, ncf);
-        //    traceDouble("6.params[Im_p]", d_p + ncf, ncf);
 
             // Current v values for gradient transform
             auto v_buf = torch::empty({na}, torch::TensorOptions()
                 .dtype(TORCH_COMPLEX).device(global_extended_grad.device()));
             ctComplex* d_v = reinterpret_cast<ctComplex*>(v_buf.data_ptr());
             params_mgr->applyCouplingMatrix(d_p, d_v);
-//            traceComplex("7.v_ext(from p)", d_v, na);
 
             // Gradient w.r.t coupling params [2*ncf] in [Re_p, Im_p] format
             auto grad_p = torch::empty({2 * ncf},
@@ -1313,20 +1221,9 @@ public:
             ctComplex* d_grad_v = reinterpret_cast<ctComplex*>(global_extended_grad.data_ptr());
             params_mgr->transformCouplingGradient(d_grad_v, d_v, d_p, d_grad_p);
 
-        //     // [8] gradient w.r.t p: [Re(∂L/∂p), Im(∂L/∂p)]
-        //    traceDouble("8.grad_p[Re]", d_grad_p, ncf);
-        //    traceDouble("8.grad_p[Im]", d_grad_p + ncf, ncf);
-
             grad_params = (nt > 0 && grad_theta.numel() > 0)
                 ? torch::cat({grad_p, grad_theta})
                 : grad_p;
-
-        //     // [9] final grad_params [Re_p, Im_p, θ]
-        //    printf("[TRACE] 9.final grad_params (%ld):\n", grad_params.numel());
-        //    traceDouble("9.grad[Re_p]", grad_params.data_ptr<double>(), ncf);
-        //    traceDouble("9.grad[Im_p]", grad_params.data_ptr<double>() + ncf, ncf);
-        //     if (nt > 0)
-        //        traceDouble("9.grad[theta]", grad_params.data_ptr<double>() + 2*ncf, nt, 4);
         } else {
             // Legacy mode: collapseVectorGrad + real/imag extraction
             torch::Tensor grad_vec = params_mgr->collapseVectorGrad(global_extended_grad, nv);
@@ -1390,17 +1287,6 @@ public:
             "params 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
             "当前在 cuda:" + std::to_string(params.device().index()) + "。"
             "跨 GPU 归一化缓冲 (d_phsp_matrix_) 固定在主 GPU 上");
-        //     const auto& cm = params_.couplingMatrix();
-        //     int ncf = cm.n_free;
-        //     int na  = cm.n_amps;
-        //     int nt  = static_cast<int>(params.size(0)) - 2 * ncf;
-
-        //    printf("\n[TRACE] ===== FORWARD: getNLL =====\n");
-        //    printf("[TRACE] ncf=%d na=%d nt=%d\n", ncf, na, nt);
-        //    traceDouble("1.input[Re_p]", params.data_ptr<double>(), ncf);
-        //    traceDouble("1.input[Im_p]", params.data_ptr<double>() + ncf, ncf);
-        //    if (nt > 0) traceDouble("1.input[theta]", params.data_ptr<double>() + 2*ncf, nt, 4);
-        // }
 
         return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
             d_phsp_matrix_, events_, events_offsets_, amp_offsets_,
@@ -2063,24 +1949,6 @@ public:
         // if (N_bkg > 0 && !bkg_weights_.empty() && bkg_weights_[0] != nullptr)
         if (N_bkg > 0)
         {
-            // // trace: verify bkg weights before filling histograms
-            // printf("[TRACE] writeResult hbkg: N_bkg=%d, bkg_weights_.size()=%zu, bkg_integral=%.6f\n",
-            //        N_bkg, bkg_weights_.size(), h_bkg_integral);
-            // for (size_t i = 0; i < bkg_weights_.size(); ++i) {
-            //     if (events_[i][2] > 0 && bkg_weights_[i] != nullptr) {
-            //         cudaSetDevice(i);
-            //         int n = events_[i][2];
-            //         int k = std::min(n, 8);
-            //         std::vector<double> h(k);
-            //         cudaMemcpy(h.data(), bkg_weights_[i], k * sizeof(double), cudaMemcpyDeviceToHost);
-            //         double sum = 0;
-            //         printf("[TRACE]   hbkg_w GPU%zu (n=%d): ", i, n);
-            //         for (int j = 0; j < k; ++j) { printf("%.4f ", h[j]); sum += std::abs(h[j]); }
-            //         if (n > k) printf("...");
-            //         printf("|sum|=%.4f\n", sum);
-            //     }
-            // }
-
             std::vector<TH1F*> masshist_bkg;
             for (const auto& histConfig : masshist)
             {
@@ -4468,22 +4336,6 @@ private:
 
             params_.setCouplingMatrix(id);
 
-            // // trace: verify trans folding in vspace mode
-            // printf("[TRACE] vspace coupling matrix: %d amplitudes → %d free "
-            //        "(%d chain + %d step), needs_split=%d\n",
-            //        id.n_amps, id.n_free, id.n_chain_free, id.n_step_free,
-            //        needs_split ? 1 : 0);
-            // int n_folded = 0;
-            // for (int ai = 0; ai < n_amplitudes_; ++ai) {
-            //     if (std::abs(id.amp_chain_ratio[ai] - 1.0) > 1e-10) {
-            //         n_folded++;
-            //         if (n_folded <= 5)
-            //             printf("[TRACE]   folded amp[%d] ratio=%.1f → chain %d\n",
-            //                    ai, id.amp_chain_ratio[ai], id.amp_chain[ai]);
-            //     }
-            // }
-            // printf("[TRACE]   %d folded amplitudes (trans constraint active)\n", n_folded);
-
             // 只保留非折叠振幅的名字，按 free param index 排序
             std::map<int, std::string> free_idx_to_name;
             for (int ai = 0; ai < n_amplitudes_; ++ai) {
@@ -4601,6 +4453,7 @@ private:
             for (auto comb : intermediate_combs)
             {
                 auto cas = std::make_shared<AmpCasDecay>(particles_);
+                cas->setChainName(chain.name);
                 cas->setNPolarizations(n_polar_);
                 cas->setNPolarizationsTotal(n_polar_total_);
                 cas->setPolarizationMap(polarization_map_);
