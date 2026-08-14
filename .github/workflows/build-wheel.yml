@@ -40,11 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- 0. 基础工具: git/curl/gcc（容器精简，编译前补齐）----
+      # ---- 0. 基础工具: git/gcc（容器精简，编译前补齐）----
+      # 注意: 不装 curl——almalinux:9 内置 curl-minimal（与完整 curl 包互斥），
+      #        curl 命令由 curl-minimal 提供，后续步骤直接用。
       - name: Install base tools
         run: |
-          dnf install -y -q git curl gcc-c++
+          dnf install -y -q git gcc-c++
           gcc --version | head -1
+          curl --version | head -1
 
       # ---- 1. CUDA 12.9 toolkit（NVIDIA rhel9 repo，nvcc + runtime headers）----
       # sm_70（V100）需要 CUDA 12.x（13.x 移除 Volta）；sm_120 需 >= 12.8 → 12.9 全设备覆盖
