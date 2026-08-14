@@ -72,10 +72,10 @@ config.yml 最小示例：
 ```yaml
 # 经典道 J/ψ → π⁺π⁻π⁰：中间态 ρ(770) → π⁺π⁻（π⁰ 为旁观粒子）
 Particles:
-  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
-  pip:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^+']}
-  pim:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^-']}
-  pi0:  {J: 0, P: -1, mass: 0.13495, tex: ['\\pi^0']}
+  Jpsi: {J: 1, P: -1, mass: 3.0969}
+  pip:  {J: 0, P: -1, mass: 0.13975}
+  pim:  {J: 0, P: -1, mass: 0.13975}
+  pi0:  {J: 0, P: -1, mass: 0.13495}
 
 Data:
   order: [pip, pim, pi0]
@@ -186,10 +186,10 @@ Minimal config.yml:
 ```yaml
 # Classic J/psi -> pi+ pi- pi0: intermediate rho(770) -> pi+ pi- (pi0 as bachelor)
 Particles:
-  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
-  pip:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^+']}
-  pim:  {J: 0, P: -1, mass: 0.13975, tex: ['\\pi^-']}
-  pi0:  {J: 0, P: -1, mass: 0.13495, tex: ['\\pi^0']}
+  Jpsi: {J: 1, P: -1, mass: 3.0969}
+  pip:  {J: 0, P: -1, mass: 0.13975}
+  pim:  {J: 0, P: -1, mass: 0.13975}
+  pi0:  {J: 0, P: -1, mass: 0.13495}
 
 Data:
   order: [pip, pim, pi0]
