@@ -60,6 +60,9 @@ jobs:
           /usr/local/cuda-12.9/bin/nvcc --list-gpu-arch | grep -E "compute_70|compute_80|compute_120"
 
       # ---- 2. miniconda: Python 3.12 + ROOT + yaml-cpp(0.9.0) + torch(cu126) ----
+      # 用 conda-forge 单独建 build env（--override-channels 排除 defaults 源）：
+      # miniconda base 默认混 defaults 源，与 conda-forge 的 root 依赖链
+      # （libxml2/icu 等）solve 冲突。一次 create 统一 solve 更稳。
       # yaml-cpp 走 conda-forge 0.9.0（SONAME .so.0.9），与本地开发环境一致；
       # 若用系统包（AlmaLinux 9 的 yaml-cpp 是 0.7.0，SONAME .so.0.7）产物会分裂。
       - name: Install miniconda and deps
@@ -67,20 +70,22 @@ jobs:
           curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
             -o /tmp/miniconda.sh
           bash /tmp/miniconda.sh -b -p /opt/conda
-          /opt/conda/bin/conda install -y -q -p /opt/conda python=3.12
-          /opt/conda/bin/conda install -y -q -c conda-forge -p /opt/conda root yaml-cpp=0.9.0
-          /opt/conda/bin/pip install -q "torch==2.12.0+cu126" \
+          /opt/conda/bin/conda create -y -q -p /opt/conda/envs/build \
+            --override-channels -c conda-forge \
+            python=3.12 root yaml-cpp=0.9.0
+          /opt/conda/envs/build/bin/pip install -q "torch==2.12.0+cu126" \
             --index-url https://download.pytorch.org/whl/cu126
-          /opt/conda/bin/pip install -q auditwheel
-          /opt/conda/bin/python -c "import torch; print('torch', torch.__version__)"
+          /opt/conda/envs/build/bin/pip install -q auditwheel
+          /opt/conda/envs/build/bin/python -c "import torch; print('torch', torch.__version__)"
+          /opt/conda/envs/build/bin/root-config --version
 
       # ---- 3. 构建 wheel（容器 glibc 2.34 → manylinux_2_34 标签）----
       - name: Build wheel
         shell: bash -euxo pipefail {0}
         env:
           CUDA_HOME: /usr/local/cuda-12.9
-          ROOTSYS: /opt/conda
-          PATH: /opt/conda/bin:$PATH
+          ROOTSYS: /opt/conda/envs/build
+          PATH: /opt/conda/envs/build/bin:$PATH
           # 无 GPU runner 上 torch 检测不到架构 → 显式指定（空格分隔）
           # 7.0 = V100, 12.0 = RTX 50 系（Blackwell）
           TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0"
