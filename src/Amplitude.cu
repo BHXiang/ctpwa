@@ -635,8 +635,11 @@ __device__ void pwa_amp(thrust::complex<double> *amp, LorentzVector p1,
     }
 
     // 7. 复制回全局内存
+    // 振幅 ×10 缩放：防 float32 中振幅量级过小（~1e-6 → |A|²~1e-12）导致
+    // phsp 矩阵 cgemm 求和 / Hessian 对消的绝对舍入误差放大。
+    // 数学上 NLL 是 scale-invariant（权重差≈0），×10 不改变 NLL 真值，只提升浮点精度。
     for (int i = 0; i < total_amp_size; i++) {
-        amp[i] = shared_amp[i] * 10.0; // 最终结果乘以10作为示例缩放
+        amp[i] = shared_amp[i] * 10.0;
     }
 }
 

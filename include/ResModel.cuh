@@ -97,9 +97,11 @@ __host__ __device__ T computeQ0AD(T m0, T md1, T md2)
 }
 
 // 统一共振态因子计算
+// L: 顶点 Bf 的逐波轨道角动量（Bf(L, q, q0, d)）
+// Lmin: BWR 宽度 Γ 的 L（该节点 SL 列表的最小 L）
 template <typename T>
 __device__ auto computeNodeFactor(
-    int L, T mm, T q_ad, T q0_ad,
+    int L, int Lmin, T mm, T q_ad, T q0_ad,
     const T* params, int param_count,
     ResModelType model_type,
     const double* channels, int n_channels,
@@ -112,7 +114,8 @@ __device__ auto computeNodeFactor(
             T m0 = params[0], g0 = params[1];
             // has_bf=false 时传播子内部宽度也不含 Bf（BWR 的 gamma 含 Bf²）
             // → 传 d=0.0 使 Bf≡1，与 bf_d=0.0 完全等价
-            auto bw = BWR<T>(mm, m0, g0, L, q_ad, q0_ad, has_bf ? bf_d : 0.0);
+            // 宽度 L 用 Lmin，顶点 Bf 用逐波 L
+            auto bw = BWR<T>(mm, m0, g0, Lmin, q_ad, q0_ad, has_bf ? bf_d : 0.0);
             // 势垒因子门控: has_bf=false 时传播子不含 Bf
             if (has_bf) {
                 auto bf = Bf<T>(L, q_ad, q0_ad, bf_d);
@@ -245,9 +248,9 @@ __host__ __device__ auto Flatte(T m, T m0,
     int n_channels, const T* g, const double* channel_masses)
     -> typename ResResult<T>::type
 {
-    // tf-pwa FlatteC 约定: D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，qᵢ/m = ρᵢ/2
+    // D = m0² - m² - i·m0·Σ gᵢ·(qᵢ/m)，qᵢ/m = ρᵢ/2
     // （ρᵢ = 2q/m 为下方 f1·f2）→ 虚部项 = (m0/2)·Σ gᵢ·ρᵢ。
-    // 耦合常数 gᵢ 含义与 tf-pwa FlatteC 一致（宽度 ∝ m0·gᵢ）。
+    // 耦合常数 gᵢ 含义（宽度 ∝ m0·gᵢ）。
     T s = m * m;
     T real_part = m0 * m0 - s;
     T imag_part = 0.0;

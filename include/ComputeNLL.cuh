@@ -32,6 +32,10 @@ void conjugateComplexArray(ctComplex* data, int N);
 // 向量axpy: y[i] += alpha * x[i], n较小(<~200)，单block完成
 void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n);
 
+// 返回 Σ_ev f_ev = Σ |A·v|²（double 累加）——phsp 均值的高精度来源
+double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
+    int nEvents, int n_polar, int n_amplitudes);
+
 // 自定义核计算二次型 v^H·M·v，同时输出d_P_vec = M * v
 // M: n×n Hermitian矩阵(行主序), v: n维向量(已共轭), n: 维度(<~200)
 void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,

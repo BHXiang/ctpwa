@@ -236,6 +236,77 @@ static int tuneChunkCount(cublasHandle_t h, int nA, int nT,
 }
 
 // -----------------------------------------------------------------------------
+// phsp 均值: Σ_ev f_ev 用 double 累加。
+// 直接用 S = A^T·v (cublas cgemv) + 逐事件 |S|²，绕开 float32 phsp 矩阵求和
+// （50 万事件 float32 累加有 ~1e-4 相对系统偏差，导致 ln(mean f) 与
+// tf-pwa (float64) 差 ~2.4e-4 → NLL 差 ~2.4）
+// -----------------------------------------------------------------------------
+__global__ void computePhspMeanKernel(
+    const ctComplex* __restrict__ d_S,   // S = A^T·v [nEvents × n_polar]
+    double* __restrict__ d_sum,          // Σ f_ev（double 累加）
+    int nEvents, int n_polar)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ double s_f_partial[kBlockSize];
+    double my_f = 0.0;
+    if (evt < nEvents) {
+        const ctComplex* S_evt = d_S + evt * n_polar;
+        const ctFloat2* S_f2 = reinterpret_cast<const ctFloat2*>(S_evt);
+        double factor = 0.0;
+#pragma unroll
+        for (int p = 0; p < n_polar; ++p) {
+            ctFloat2 s = S_f2[p];
+            factor += (double)s.x * s.x + (double)s.y * s.y;
+        }
+        my_f = factor;
+    }
+    s_f_partial[threadIdx.x] = my_f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) s_f_partial[threadIdx.x] += s_f_partial[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(d_sum, s_f_partial[0]);
+}
+
+double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
+    int nEvents, int n_polar, int n_amplitudes)
+{
+    const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;
+    static std::vector<ctComplex*> s_dS;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_sum;
+    static std::vector<int> s_alloc_n;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_dS.size() <= dev) {
+        s_dS.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr);
+        s_d_sum.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < nTotal || s_handle[dev] == nullptr) {
+        if (s_dS[dev]) cudaFree(s_dS[dev]);
+        if (s_d_sum[dev]) cudaFree(s_d_sum[dev]);
+        if (s_handle[dev]) cublasDestroy(s_handle[dev]);
+        cudaMalloc(&s_dS[dev], nTotal * sizeof(ctComplex));
+        cudaMalloc(&s_d_sum[dev], sizeof(double));
+        cublasCreate(&s_handle[dev]);
+        s_alloc_n[dev] = nTotal;
+    }
+    ctComplex a1 = ctMake(1, 0), b0 = ctMake(0, 0);
+    CUBLAS_CGEMV(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal, &a1,
+                 d_amp, strideA, d_vector, 1, &b0, s_dS[dev], 1);
+    cudaMemset(s_d_sum[dev], 0, sizeof(double));
+    int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
+    computePhspMeanKernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    double h_sum = 0.0;
+    cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
+    return h_sum;
+}
+
+// -----------------------------------------------------------------------------
 // 主函数: 计算 NLL + 梯度 (cublas 分块 + float logf/div)
 // -----------------------------------------------------------------------------
 double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,

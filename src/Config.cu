@@ -495,7 +495,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 bool has_bf = true;
                 bool has_bf_explicit = false; // YAML 是否显式给出 has_bf
                 double bf_d = NAN;
-                bool bf_sl = false; // tf 逐 SL 约定（bf_sl: true）: 顶点 Bf 逐 SL 在 kernel 侧乘
                 bool p_break = false;
                 std::vector<std::vector<int>> sl_filter; // 允许的 [S, L] 分波; 空 = 全允许
             };
@@ -518,7 +517,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             id.has_bf_explicit = true;
                         }
                         if (dopts["bf_d"]) id.bf_d = dopts["bf_d"].as<double>();
-                        if (dopts["bf_sl"]) id.bf_sl = dopts["bf_sl"].as<bool>();
                         if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
                         if (dopts["sl"]) {
                             // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
@@ -627,7 +625,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 double ch_bf_d1 = NAN, ch_bf_d2 = NAN;
                 bool ch_p_break1 = false, ch_p_break2 = false;
                 bool has_ch_p_break = false;
-                bool ch_bf_sl1 = false, ch_bf_sl2 = false;
                 std::vector<std::vector<int>> ch_sl_filter; // 第一步 (mother) 的分波白名单
                 std::vector<std::string> ch_legend;
                 // Fall back to top-level legends list
@@ -662,14 +659,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             ch_p_break2 = opts["p_break"][1].as<bool>();
                         } else {
                             ch_p_break1 = ch_p_break2 = opts["p_break"].as<bool>();
-                        }
-                    }
-                    if (opts["bf_sl"]) {
-                        if (opts["bf_sl"].IsSequence()) {
-                            ch_bf_sl1 = opts["bf_sl"][0].as<bool>();
-                            ch_bf_sl2 = opts["bf_sl"][1].as<bool>();
-                        } else {
-                            ch_bf_sl1 = ch_bf_sl2 = opts["bf_sl"].as<bool>();
                         }
                     }
                     if (opts["sl"]) {
@@ -724,7 +713,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     step1.has_bf = ch_has_bf1;
                     step1.has_bf_explicit = ch_has_bf1_explicit;
                     step1.bf_d = ch_bf_d1;
-                    step1.bf_sl = ch_bf_sl1;
                     step1.p_break = ch_p_break1;
                     step1.sl_filter = ch_sl_filter;
                     chain.decay_steps.push_back(step1);
@@ -754,7 +742,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         bool is_first;
                         bool has_bf, has_bf_explicit, pb;
                         double bf_d;
-                        bool bf_sl;
                         std::vector<std::vector<int>> sl; // 该步的分波白名单
                     };
                     std::queue<BFSItem> queue;
@@ -769,25 +756,18 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         double step2_bf_d = !std::isnan(ch_bf_d2) ? ch_bf_d2
                             : (ifm && !std::isnan(ifm->bf_d) ? ifm->bf_d : NAN);
                         bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
-                        // bf_sl 与显式 has_bf 互斥: 显式 has_bf 覆盖 bf_sl
-                        bool step2_bf_sl = ch_has_bf2_explicit ? false
-                            : (ifm && ifm->bf_sl);
                         queue.push({intermediate, !bachelor_drives_modes, step2_has_bf,
                             step2_has_bf_explicit, step2_p_break, step2_bf_d,
-                            step2_bf_sl,
                             ifm ? ifm->sl_filter : std::vector<std::vector<int>>{}});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
                             bachelor_drives_modes ? mi : 0);
-                        bool bm_bf_sl = (bm && bm->bf_sl);
-                        if (bm && bm->has_bf_explicit) bm_bf_sl = false;
                         queue.push({bachelor, bachelor_drives_modes,
                             bm && bm->has_bf_explicit ? bm->has_bf : true,
                             bm && bm->has_bf_explicit,
                             bm ? bm->p_break : false,
                             (bm && !std::isnan(bm->bf_d)) ? bm->bf_d : NAN,
-                            bm_bf_sl,
                             bm ? bm->sl_filter : std::vector<std::vector<int>>{}});
                     }
 
@@ -803,7 +783,6 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         substep.has_bf = item.has_bf;
                         substep.has_bf_explicit = item.has_bf_explicit;
                         substep.bf_d = item.bf_d;
-                        substep.bf_sl = item.bf_sl;
                         substep.p_break = item.pb;
                         substep.sl_filter = item.sl;
                         chain.decay_steps.push_back(substep);
@@ -816,14 +795,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         auto enqueue = [&](const std::string& d) {
                             if (int_decay_modes.count(d)) {
                                 const auto* dm = getDecayMode(d, 0);
-                                bool dm_bf_sl = (dm && dm->bf_sl);
-                                if (dm && dm->has_bf_explicit) dm_bf_sl = false;
                                 queue.push({d, false,
                                     dm && dm->has_bf_explicit ? dm->has_bf : true,
                                     dm && dm->has_bf_explicit,
                                     dm ? dm->p_break : false,
                                     (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
-                                    dm_bf_sl,
                                     dm ? dm->sl_filter : std::vector<std::vector<int>>{}});
                             }
                         };
