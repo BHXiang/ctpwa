@@ -40,15 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- 0. 基础工具: git/gcc/ninja（容器精简，编译前补齐）----
+      # ---- 0. 基础工具: git/gcc（容器精简，编译前补齐）----
       # 注意: 不装 curl——almalinux:9 内置 curl-minimal（与完整 curl 包互斥），
       #        curl 命令由 curl-minimal 提供，后续步骤直接用。
-      # ninja: torch cpp_extension 在 dlink=True 时强制要求（缺了会直接 abort）。
+      # ninja 用 conda 装（AlmaLinux 9 默认 repo 无 ninja-build，需 EPEL）。
       - name: Install base tools
         run: |
-          dnf install -y -q git gcc-c++ ninja-build
+          dnf install -y -q git gcc-c++
           gcc --version | head -1
-          ninja --version
           curl --version | head -1
 
       # ---- 1. CUDA 12.9 toolkit（NVIDIA rhel9 repo，nvcc + runtime headers）----
@@ -73,9 +72,10 @@ jobs:
           curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
             -o /tmp/miniconda.sh
           bash /tmp/miniconda.sh -b -p /opt/conda
+          # ninja: torch cpp_extension 在 dlink=True 时强制要求（缺了会直接 abort）
           /opt/conda/bin/conda create -y -q -p /opt/conda/envs/build \
             --override-channels -c conda-forge \
-            python=3.12 root yaml-cpp=0.8.0
+            python=3.12 root yaml-cpp=0.8.0 ninja
           /opt/conda/envs/build/bin/pip install -q "torch==2.12.0+cu126" \
             --index-url https://download.pytorch.org/whl/cu126
           /opt/conda/envs/build/bin/pip install -q auditwheel
