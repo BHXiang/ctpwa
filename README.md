@@ -17,10 +17,10 @@
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Linux x86_64 | glibc ≥ 2.34 | Ubuntu 22.04+ / Debian 12+ |
-| NVIDIA GPU | sm_75 及以上 | RTX 20/30/40/50 系、A100/H100 |
-| CUDA Toolkit | 13.2 | 运行时需对应驱动 |
-| PyTorch | 2.12+（cu132） | 与系统 CUDA 版本匹配 |
+| Linux x86_64 | glibc ≥ 2.34 | AlmaLinux 9.8 / RHEL 9 / Ubuntu 22.04+ |
+| NVIDIA GPU | sm_70 及以上 | V100、A100、RTX 20~50 系、H100 |
+| CUDA Toolkit | 12.9 | 运行时需对应驱动（sm_120 需 driver ≥ 570） |
+| PyTorch | 2.12+（cu126） | 官方 legacy 构建（仅 download.pytorch.org） |
 | ROOT | 6.26+ | 读取 .root 数据（`source thisroot.sh`） |
 | yaml-cpp | 0.9 | config 解析 |
 
@@ -30,14 +30,14 @@
 
 ```bash
 # 系统依赖
-conda install yaml-cpp 
+conda install yaml-cpp=0.9
 # ROOT：下载/编译后 source thisroot.sh
-# CUDA：安装与 GPU 匹配的驱动 + CUDA 13.2 runtime
+# CUDA：安装与 GPU 匹配的驱动 + CUDA 12.9 runtime
 
-# PyTorch（必须与 CUDA 匹配）
-pip install torch==2.12.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+# PyTorch（cu126 是保留 sm_70/V100 支持的 legacy 构建，必须用官方源）
+pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 
-# CTPWA（manylinux wheel，内置 sm_75~sm_120）
+# CTPWA（manylinux_2_34 wheel，内置 sm_70~sm_120）
 pip install ctpwa
 ```
 
@@ -48,6 +48,9 @@ git clone git@github.com:BHXiang/CTPWA.git
 cd CTPWA
 pip install -e . --no-build-isolation
 ```
+
+> 注意：sm_70（V100）需要 CUDA 12.x 工具链——CUDA 13.x 已移除 Volta 架构，
+> 编译/使用请用 CUDA 12.9 及配套 torch cu126。
 
 ## 快速开始
 
@@ -134,10 +137,10 @@ covariant-tensor formalism, computed in parallel on GPUs with CUDA.
 
 | Dependency | Version | Notes |
 |---|---|---|
-| Linux x86_64 | glibc ≥ 2.34 | Ubuntu 22.04+ / Debian 12+ |
-| NVIDIA GPU | sm_75+ | RTX 20/30/40/50, A100/H100 |
-| CUDA Toolkit | 13.2 | needed to compile; matching driver at runtime |
-| PyTorch | 2.12+ (cu132) | must match system CUDA |
+| Linux x86_64 | glibc ≥ 2.34 | AlmaLinux 9.8 / RHEL 9 / Ubuntu 22.04+ |
+| NVIDIA GPU | sm_70+ | V100, A100, RTX 20-50, H100 |
+| CUDA Toolkit | 12.9 | needed to compile; matching driver at runtime (sm_120 needs driver ≥ 570) |
+| PyTorch | 2.12+ (cu126) | official legacy build (download.pytorch.org only) |
 | ROOT | 6.26+ | for reading .root data (`source thisroot.sh`) |
 | yaml-cpp | 0.9 | config parsing |
 
@@ -147,11 +150,12 @@ covariant-tensor formalism, computed in parallel on GPUs with CUDA.
 
 ```bash
 # system deps
-conda install yaml-cpp
+conda install yaml-cpp=0.9
 # ROOT: install and `source thisroot.sh`
-# CUDA: driver + CUDA 13.2 runtime
+# CUDA: driver + CUDA 12.9 runtime
 
-pip install torch==2.12.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+# cu126 is the legacy build keeping sm_70/V100 support; official index only
+pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 pip install ctpwa
 ```
 

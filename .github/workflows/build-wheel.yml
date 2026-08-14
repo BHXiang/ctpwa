@@ -1,20 +1,25 @@
 # GitHub Actions: manylinux_2_34 wheel 构建 + 发布
 #
 # 触发方式:
-#   1. 打 tag:  git tag v0.3.0 && git push origin v0.3.0
+#   1. 打 tag:  git tag v0.4.0 && git push origin v0.4.0
 #   2. 手动:   Actions 页面 → build-wheel → Run workflow
 #
 # 产物:
-#   - manylinux_2_34_x86_64 wheel（含 sm_70~sm_120 共 7 个 SASS 变体）
+#   - manylinux_2_34_x86_64 wheel（含 sm_70~sm_120 共 8 个 SASS 变体）
 #   - 上传到 PyPI（需配置 secret: PYPI_API_TOKEN）
 #
 # 安装（目标机器）:
-#   # 系统依赖: CUDA 13.2 runtime、ROOT(6.26+)、yaml-cpp
-#   pip install torch==2.12.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+#   # 系统依赖: CUDA 12.9 runtime、ROOT(6.26+)、yaml-cpp(0.9.x)
+#   pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 #   pip install ctpwa
 #
-# 注意: manylinux_2_34 要求目标系统 glibc >= 2.34（Ubuntu 22.04+ / Debian 12+）。
+# 注意: 构建在 almalinux:9 容器（glibc 2.34）中进行——manylinux 标签必须 <=
+#       构建环境的最低 glibc 符号版本，产物才能标 manylinux_2_34。覆盖:
+#       AlmaLinux 9.8 / RHEL 9 / Rocky 9（glibc 2.34）以及 Ubuntu 22.04+（2.35）。
 #       ROOT 库不打包，目标机器需 source thisroot.sh 且 ROOT >= 6.26（SONAME 兼容）。
+#       sm_70（V100）需 CUDA 12.x 工具链（13.x 已移除 Volta）；sm_120（RTX 50 系）
+#       需 driver >= 570。cu126 是 PyTorch 官方保留旧架构的 legacy 构建，仅存在于
+#       download.pytorch.org（PyPI 没有）。
 
 name: build-wheel
 
@@ -25,76 +30,79 @@ on:
 
 jobs:
   build:
-    # 直接用 ubuntu-22.04 runner（glibc 2.35）编译，产物符号 <= 2.35，
-    # auditwheel 打 manylinux_2_35 标签（要求目标系统 glibc >= 2.35）。
-    # 之前尝试 manylinux_2_34 容器，但该镜像是 RHEL 系（无 apt/dpkg）。
+    # almalinux:9（glibc 2.34）容器中构建，产物符号 <= 2.34 → manylinux_2_34 合法。
+    # 不用 auditwheel repair（patchelf 重写 ELF 会破坏 .nv_fatbin 加载），
+    # 只手动改 WHEEL 元数据标签，最后用 auditwheel show 验证符号版本。
     runs-on: ubuntu-22.04
+    container:
+      image: almalinux:9
 
     steps:
       - uses: actions/checkout@v4
-      # Ubuntu 22.04 apt 无 ROOT 包（jammy universe 移除了 ROOT）→ conda-forge 安装
-      - uses: conda-incubator/setup-miniconda@v3
-        with:
-          python-version: "3.12"
-          auto-update-conda: false
 
-      # ---- 1. CUDA 13.2 toolkit（nvcc + runtime headers）----
-      - name: Install CUDA 13.2 toolkit
+      # ---- 0. 基础工具: git/curl/gcc（容器精简，编译前补齐）----
+      - name: Install base tools
         run: |
-          set -x
-          curl -sSL -o /tmp/cuda-keyring.deb \
-            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-          ls -l /tmp/cuda-keyring.deb
-          sudo dpkg -i /tmp/cuda-keyring.deb
-          sudo apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq \
-            cuda-toolkit-13-2 libyaml-cpp-dev
-          /usr/local/cuda-13.2/bin/nvcc --version | tail -1
+          dnf install -y -q git curl gcc-c++
+          gcc --version | head -1
 
-      # ---- 2. ROOT（conda-forge root 6.28+）----
-      - name: Install ROOT
-        shell: bash -l {0}
+      # ---- 1. CUDA 12.9 toolkit（NVIDIA rhel9 repo，nvcc + runtime headers）----
+      # sm_70（V100）需要 CUDA 12.x（13.x 移除 Volta）；sm_120 需 >= 12.8 → 12.9 全设备覆盖
+      - name: Install CUDA 12.9 toolkit
         run: |
-          conda install -y -q -c conda-forge root
-          root-config --version
+          curl -sSL -o /etc/yum.repos.d/cuda-rhel9.repo \
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+          dnf install -y -q cuda-toolkit-12-9
+          /usr/local/cuda-12.9/bin/nvcc --version | tail -1
+          /usr/local/cuda-12.9/bin/nvcc --list-gpu-arch | grep -E "compute_70|compute_80|compute_120"
 
-      # ---- 3. torch（cu132，与系统 CUDA 13.2 匹配；conda env 内 pip 安装）----
-      - name: Install torch
-        shell: bash -l {0}
+      # ---- 2. miniconda: Python 3.12 + ROOT + yaml-cpp(0.9.0) + torch(cu126) ----
+      # yaml-cpp 走 conda-forge 0.9.0（SONAME .so.0.9），与本地开发环境一致；
+      # 若用系统包（AlmaLinux 9 的 yaml-cpp 是 0.7.0，SONAME .so.0.7）产物会分裂。
+      - name: Install miniconda and deps
         run: |
-          pip install "torch==2.12.0+cu132" --index-url https://download.pytorch.org/whl/cu132
+          curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+            -o /tmp/miniconda.sh
+          bash /tmp/miniconda.sh -b -p /opt/conda
+          /opt/conda/bin/conda install -y -q -p /opt/conda python=3.12
+          /opt/conda/bin/conda install -y -q -c conda-forge -p /opt/conda root yaml-cpp=0.9.0
+          /opt/conda/bin/pip install -q "torch==2.12.0+cu126" \
+            --index-url https://download.pytorch.org/whl/cu126
+          /opt/conda/bin/pip install -q auditwheel
+          /opt/conda/bin/python -c "import torch; print('torch', torch.__version__)"
 
-      # ---- 4. 构建 wheel（镜像内 glibc 2.34 → manylinux_2_34 合法）----
+      # ---- 3. 构建 wheel（容器 glibc 2.34 → manylinux_2_34 标签）----
       - name: Build wheel
-        shell: bash -l {0}
+        shell: bash -euxo pipefail {0}
         env:
-          CUDA_HOME: /usr/local/cuda-13.2
-          ROOTSYS: $CONDA_PREFIX
+          CUDA_HOME: /usr/local/cuda-12.9
+          ROOTSYS: /opt/conda
+          PATH: /opt/conda/bin:$PATH
           # 无 GPU runner 上 torch 检测不到架构 → 显式指定（空格分隔）
-          TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+          # 7.0 = V100, 12.0 = RTX 50 系（Blackwell）
+          TORCH_CUDA_ARCH_LIST: "7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0"
         run: |
-          # 不用 auditwheel repair：它用 patchelf 重写 ELF 会破坏 .nv_fatbin 的
-          # 加载（内容完好、cuobjdump 可读，但 driver 报 device kernel image is
-          # invalid——A100 上实测确认）。改为 bdist_wheel 后手动改 manylinux 标签
-          # （只改 WHEEL 元数据和文件名，不碰 ELF）。
+          # 手动改 manylinux 标签（只改 WHEEL 元数据和文件名，不碰 ELF）
           python setup.py bdist_wheel
           WHEEL=$(ls -1 dist/ctpwa-*.whl | head -1)
           python - <<PYEOF
           import zipfile, os
           src = "$WHEEL"
-          dst = src.replace("linux_x86_64", "manylinux_2_35_x86_64")
+          dst = src.replace("linux_x86_64", "manylinux_2_34_x86_64")
           with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
               for item in zin.infolist():
                   data = zin.read(item.filename)
                   if item.filename.endswith("WHEEL"):
-                      data = data.replace(b"linux_x86_64", b"manylinux_2_35_x86_64")
+                      data = data.replace(b"linux_x86_64", b"manylinux_2_34_x86_64")
                   zout.writestr(item, data)
           os.remove(src)
           PYEOF
           mkdir -p wheelhouse && mv dist/ctpwa-*.whl wheelhouse/
+          # 验证: 产物最低 glibc 符号版本必须是 2.34（manylinux_2_34 合法性的依据）
+          auditwheel show wheelhouse/ctpwa-*.whl
           ls -lh wheelhouse/
 
-      # ---- 5. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
+      # ---- 4. 上传 wheel + sdist 到 PyPI（secrets.PYPI_API_TOKEN）----
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
