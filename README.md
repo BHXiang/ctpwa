@@ -22,7 +22,7 @@
 | CUDA Toolkit | 12.9 | 运行时需对应驱动（sm_120 需 driver ≥ 570） |
 | PyTorch | 2.12+（cu126） | 官方 legacy 构建（仅 download.pytorch.org） |
 | ROOT | 6.26+ | 读取 .root 数据（`source thisroot.sh`） |
-| yaml-cpp | 0.9 | config 解析 |
+| yaml-cpp | 0.8+ | config 解析（conda-forge 最新 0.8.0；0.9.0 仅 defaults 源） |
 
 ## 安装
 
@@ -30,7 +30,7 @@
 
 ```bash
 # 系统依赖
-conda install yaml-cpp=0.9
+conda install -c conda-forge yaml-cpp=0.8
 # ROOT：下载/编译后 source thisroot.sh
 # CUDA：安装与 GPU 匹配的驱动 + CUDA 12.9 runtime
 
@@ -142,7 +142,7 @@ covariant-tensor formalism, computed in parallel on GPUs with CUDA.
 | CUDA Toolkit | 12.9 | needed to compile; matching driver at runtime (sm_120 needs driver ≥ 570) |
 | PyTorch | 2.12+ (cu126) | official legacy build (download.pytorch.org only) |
 | ROOT | 6.26+ | for reading .root data (`source thisroot.sh`) |
-| yaml-cpp | 0.9 | config parsing |
+| yaml-cpp | 0.8+ | config parsing (conda-forge latest 0.8.0; 0.9.0 is defaults-only) |
 
 ## Installation
 
@@ -150,7 +150,7 @@ covariant-tensor formalism, computed in parallel on GPUs with CUDA.
 
 ```bash
 # system deps
-conda install yaml-cpp=0.9
+conda install -c conda-forge yaml-cpp=0.8
 # ROOT: install and `source thisroot.sh`
 # CUDA: driver + CUDA 12.9 runtime
 

@@ -59,12 +59,13 @@ jobs:
           /usr/local/cuda-12.9/bin/nvcc --version | tail -1
           /usr/local/cuda-12.9/bin/nvcc --list-gpu-arch | grep -E "compute_70|compute_80|compute_120"
 
-      # ---- 2. miniconda: Python 3.12 + ROOT + yaml-cpp(0.9.0) + torch(cu126) ----
+      # ---- 2. miniconda: Python 3.12 + ROOT + yaml-cpp(0.8.0) + torch(cu126) ----
       # 用 conda-forge 单独建 build env（--override-channels 排除 defaults 源）：
       # miniconda base 默认混 defaults 源，与 conda-forge 的 root 依赖链
       # （libxml2/icu 等）solve 冲突。一次 create 统一 solve 更稳。
-      # yaml-cpp 走 conda-forge 0.9.0（SONAME .so.0.9），与本地开发环境一致；
-      # 若用系统包（AlmaLinux 9 的 yaml-cpp 是 0.7.0，SONAME .so.0.7）产物会分裂。
+      # yaml-cpp 用 conda-forge 0.8.0（SONAME .so.0.8，conda-forge 最新稳定版；
+      # 0.9.0 仅 defaults 源有，混源会再引入 solve 冲突）。ctpwa 只用基础 API，
+      # 0.8/0.9 均兼容。注意: 目标机器 yaml-cpp 需 0.8+（dnf 的 0.7 是 .so.0.7 不兼容）。
       - name: Install miniconda and deps
         run: |
           curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
@@ -72,7 +73,7 @@ jobs:
           bash /tmp/miniconda.sh -b -p /opt/conda
           /opt/conda/bin/conda create -y -q -p /opt/conda/envs/build \
             --override-channels -c conda-forge \
-            python=3.12 root yaml-cpp=0.9.0
+            python=3.12 root yaml-cpp=0.8.0
           /opt/conda/envs/build/bin/pip install -q "torch==2.12.0+cu126" \
             --index-url https://download.pytorch.org/whl/cu126
           /opt/conda/envs/build/bin/pip install -q auditwheel
