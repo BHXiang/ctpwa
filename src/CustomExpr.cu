@@ -552,6 +552,173 @@ Node deriv(const Node& n, int p)
     return Node::makeNum(0.0);
 }
 
+// ============================================================================
+// 符号二阶微分 ∂²n/∂θ_p∂θ_q（结构性规则，避免 deriv(deriv()) 的 AST 爆炸）
+// ============================================================================
+
+Node deriv2(const Node& n, int p, int q)
+{
+    switch (n.type) {
+        case NodeType::Num:
+        case NodeType::Var:
+        case NodeType::Param:
+            return Node::makeNum(0.0);
+        case NodeType::Add:
+            return Node::makeOp(NodeType::Add,
+                deriv2(n.kids[0], p, q), deriv2(n.kids[1], p, q));
+        case NodeType::Sub:
+            return Node::makeOp(NodeType::Sub,
+                deriv2(n.kids[0], p, q), deriv2(n.kids[1], p, q));
+        case NodeType::Neg:
+            return Node::makeUnary(NodeType::Neg, deriv2(n.kids[0], p, q));
+        case NodeType::Mul: {
+            // d²(ab) = d²a·b + (da_p·db_q + da_q·db_p) + a·d²b
+            //（一阶导项必须用 p、q 两个方向：da_p·db_q + da_q·db_p，
+            //  仅 da_p·db_p 只对对角 p==q 成立）
+            Node a = n.kids[0], b = n.kids[1];
+            Node ap = deriv(a, p), aq = deriv(a, q);
+            Node bp = deriv(b, p), bq = deriv(b, q);
+            return Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Add,
+                    Node::makeOp(NodeType::Mul, deriv2(a, p, q), b),
+                    Node::makeOp(NodeType::Add,
+                        Node::makeOp(NodeType::Mul, ap, bq),
+                        Node::makeOp(NodeType::Mul, aq, bp))),
+                Node::makeOp(NodeType::Mul, a, deriv2(b, p, q)));
+        }
+        case NodeType::Div: {
+            // d²(a/b) = d²a/b − (da_p·db_q + da_q·db_p)/b²
+            //           + 2a·db_p·db_q/b³ − a·d²b/b²
+            Node a = n.kids[0], b = n.kids[1];
+            Node ap = deriv(a, p), aq = deriv(a, q);
+            Node bp = deriv(b, p), bq = deriv(b, q);
+            Node b2 = astSq(b);
+            return Node::makeOp(NodeType::Sub,
+                Node::makeOp(NodeType::Add,
+                    Node::makeOp(NodeType::Sub,
+                        Node::makeOp(NodeType::Div, deriv2(a, p, q), b),
+                        Node::makeOp(NodeType::Div,
+                            Node::makeOp(NodeType::Add,
+                                Node::makeOp(NodeType::Mul, ap, bq),
+                                Node::makeOp(NodeType::Mul, aq, bp)),
+                            b2)),
+                    Node::makeOp(NodeType::Div,
+                        Node::makeOp(NodeType::Mul,
+                            Node::makeOp(NodeType::Mul, a,
+                                Node::makeOp(NodeType::Mul, bp, bq)),
+                            Node::makeNum(2.0)),
+                        Node::makeOp(NodeType::Mul, b2, b))),
+                Node::makeOp(NodeType::Div,
+                    Node::makeOp(NodeType::Mul, a, deriv2(b, p, q)), b2));
+        }
+        case NodeType::Pow: {
+            // d²(a^b) = n·(L_p·L_q + L_pq)，对数微分（L_p/L_q 为 p/q 方向
+            // 对数导数 L = db·log a + b·da/a；L_pq 为其 p,q 二阶混合导数）：
+            //   L_p = db_p·log a + b·da_p/a
+            //   L_q = db_q·log a + b·da_q/a
+            //   L_pq = d²b·log a + (db_p·da_q + db_q·da_p)/a
+            //          + b·d²a/a − b·da_p·da_q/a²
+            Node a = n.kids[0], b = n.kids[1];
+            Node ap = deriv(a, p), aq = deriv(a, q);
+            Node bp = deriv(b, p), bq = deriv(b, q);
+            Node loga = Node::makeFunc(CFUNC_LOG, a);
+            Node Lp = Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Mul, bp, loga),
+                Node::makeOp(NodeType::Mul, b, Node::makeOp(NodeType::Div, ap, a)));
+            Node Lq = Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Mul, bq, loga),
+                Node::makeOp(NodeType::Mul, b, Node::makeOp(NodeType::Div, aq, a)));
+            Node Lpq = Node::makeOp(NodeType::Add,
+                Node::makeOp(NodeType::Mul, deriv2(b, p, q), loga),
+                Node::makeOp(NodeType::Sub,
+                    Node::makeOp(NodeType::Add,
+                        Node::makeOp(NodeType::Div,
+                            Node::makeOp(NodeType::Add,
+                                Node::makeOp(NodeType::Mul, bp, aq),
+                                Node::makeOp(NodeType::Mul, bq, ap)), a),
+                        Node::makeOp(NodeType::Div,
+                            Node::makeOp(NodeType::Mul, b, deriv2(a, p, q)), a)),
+                    Node::makeOp(NodeType::Div,
+                        Node::makeOp(NodeType::Mul, b,
+                            Node::makeOp(NodeType::Mul, ap, aq)),
+                        astSq(a))));
+            return Node::makeOp(NodeType::Mul, n,
+                Node::makeOp(NodeType::Add, astMul(Lp, Lq), Lpq));
+        }
+        case NodeType::Func: {
+            Node a = n.kids[0];
+            Node ap = deriv(a, p), aq = deriv(a, q);
+            Node d2a = deriv2(a, p, q);
+            switch (n.func_id) {
+                case CFUNC_EXP:
+                    // d²e^a = e^a·(d²a + da_p·da_q)
+                    return Node::makeOp(NodeType::Mul, n,
+                        Node::makeOp(NodeType::Add, d2a, astMul(ap, aq)));
+                case CFUNC_LOG:
+                    // d²log a = d²a/a − da_p·da_q/a²
+                    return Node::makeOp(NodeType::Sub,
+                        Node::makeOp(NodeType::Div, d2a, a),
+                        Node::makeOp(NodeType::Div, astMul(ap, aq), astSq(a)));
+                case CFUNC_SIN: {
+                    // d²sin a = cos a·d²a − sin a·da_p·da_q
+                    Node cosn = Node::makeFunc(CFUNC_COS, a);
+                    return Node::makeOp(NodeType::Sub,
+                        Node::makeOp(NodeType::Mul, cosn, d2a),
+                        Node::makeOp(NodeType::Mul, n, astMul(ap, aq)));
+                }
+                case CFUNC_COS: {
+                    // d²cos a = −sin a·d²a − cos a·da_p·da_q
+                    Node sinn = Node::makeFunc(CFUNC_SIN, a);
+                    return Node::makeOp(NodeType::Sub,
+                        Node::makeUnary(NodeType::Neg,
+                            Node::makeOp(NodeType::Mul, sinn, d2a)),
+                        Node::makeOp(NodeType::Mul, n, astMul(ap, aq)));
+                }
+                case CFUNC_SQRT:
+                case CFUNC_CSQRT:
+                    // d²√a = d²a/(2√a) − da_p·da_q/(4·a·√a)
+                    return Node::makeOp(NodeType::Sub,
+                        Node::makeOp(NodeType::Div, d2a,
+                            Node::makeOp(NodeType::Mul, Node::makeNum(2.0), n)),
+                        Node::makeOp(NodeType::Div, astMul(ap, aq),
+                            Node::makeOp(NodeType::Mul,
+                                Node::makeOp(NodeType::Mul,
+                                    Node::makeNum(4.0), a), n)));
+                case CFUNC_ABS: {
+                    // d²|z| = [Re(conj·d²z) + Re(conj(da_p)·da_q)]/|z|
+                    //         − Re(conj·da_p)·Re(conj·da_q)/|z|³
+                    Node conjz = Node::makeFunc(CFUNC_CONJ, a);
+                    Node tp = Node::makeFunc(CFUNC_RE,
+                        Node::makeOp(NodeType::Mul, conjz, ap));
+                    Node tq = Node::makeFunc(CFUNC_RE,
+                        Node::makeOp(NodeType::Mul, conjz, aq));
+                    Node dzsq = Node::makeFunc(CFUNC_RE,
+                        Node::makeOp(NodeType::Mul,
+                            Node::makeFunc(CFUNC_CONJ, ap), aq));
+                    Node d2term = Node::makeFunc(CFUNC_RE,
+                        Node::makeOp(NodeType::Mul, conjz, d2a));
+                    return Node::makeOp(NodeType::Sub,
+                        Node::makeOp(NodeType::Div,
+                            Node::makeOp(NodeType::Add, d2term, dzsq), n),
+                        Node::makeOp(NodeType::Div, astMul(tp, tq),
+                            Node::makeOp(NodeType::Mul, astSq(n), n)));
+                }
+                case CFUNC_RE:
+                    return Node::makeFunc(CFUNC_RE, d2a);
+                case CFUNC_IM:
+                    return Node::makeFunc(CFUNC_IM, d2a);
+                case CFUNC_CONJ:
+                    return Node::makeFunc(CFUNC_CONJ, d2a);
+            }
+            return Node::makeNum(0.0);
+        }
+        case NodeType::Composite:
+            // 模型注册表（src/ResModel.cu）: 重建定义表达式 + 结构性二阶导
+            return modelDeriv2(n.composite_id, n, p, q);
+    }
+    return Node::makeNum(0.0);
+}
+
 // 化简: 0±x → x, x±0 → x, 0*x → 0, x*1 → x, 1*x → x, 0/x → 0, x/1 → x,
 //       x^1 → x, 1^x → 1, 0^x → 0, -( -x ) → x, 数值折叠
 bool isZero(const Node& n) { return n.type == NodeType::Num && n.num == 0.0; }
@@ -934,7 +1101,9 @@ std::vector<double> compileCustomExpr(
         segs.push_back(simplify(deriv(root, j)));
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k)
-            segs.push_back(simplify(deriv(deriv(root, j), k)));
+            // 直接二阶微分（对一阶导展开式再微分会让 AST 爆炸：
+            // 实测 BWR d²F 段 2.6 万指令 → deriv2 结构规则后数百指令）
+            segs.push_back(simplify(deriv2(root, j, k)));
 
     // 布局: [P, n_seg, seg...]
     std::vector<double> aux;

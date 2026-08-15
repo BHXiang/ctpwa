@@ -197,6 +197,142 @@ Node modelDeriv(int composite_id, const Node& n, int p)
 }
 
 // ============================================================================
+// 模型注册表二阶导：∂²C/∂θ_p∂θ_q
+//
+// 实现策略：用复合节点的子节点重建其定义表达式，再对重建树做 deriv2()
+// 结构性二阶微分。重建树里嵌套的复合节点（BWR 的 Bf、q0 的 breakup 链）
+// 经 deriv2 → modelDeriv2 递归，逐层紧凑展开——相比「对一阶导展开式
+// 再微分」（deriv(deriv())）不会二次膨胀（实测 BWR d²F 段 26306 → 数百指令）。
+// ============================================================================
+
+Node modelDeriv2(int composite_id, const Node& n, int p, int q)
+{
+    switch (composite_id) {
+        case MODEL_BREAKUP_Q0: {
+            // args: [m0, m1, m2]; q0 = sqrt(A·B)/(2m0),
+            // A = m0²-(m1+m2)², B = m0²-(m1-m2)²
+            Node m0 = n.kids[0], m1 = n.kids[1], m2 = n.kids[2];
+            Node s = astAdd(m1, m2), dd = astSub(m1, m2);
+            Node A = astSub(astSq(m0), astSq(s));
+            Node B = astSub(astSq(m0), astSq(dd));
+            Node q0def = astDiv(Node::makeFunc(CFUNC_SQRT, astMul(A, B)),
+                                astMul(astNum(2.0), m0));
+            return deriv2(q0def, p, q);
+        }
+        case MODEL_BF: {
+            // args: [L, q, q0, d]; Bf = sqrt(N_L(q0·d)/N_L(q·d))
+            Node qarg = n.kids[1], q0 = n.kids[2], d = n.kids[3];
+            Node z = astMul(qarg, d), z0 = astMul(q0, d);
+            Node bfdef = Node::makeFunc(CFUNC_SQRT,
+                astDiv(bfPoly((int)n.kids[0].num, z0), bfPoly((int)n.kids[0].num, z)));
+            return deriv2(bfdef, p, q);
+        }
+        case MODEL_BW:
+        case MODEL_BWR: {
+            // args: BW [m, m0, g0]; BWR [m, m0, g0, L, q, q0, d]
+            // F = x/s + i·y/s; x = m0²-m², s = x²+y²
+            //   BW:  y = m0·g0
+            //   BWR: y = m0·γ, γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²
+            // 二阶导闭式（对数微分 + 二阶商法则模板）：
+            //   d²(x/s) = x''/s − x·s''/s² − (x'_p·s'_q + x'_q·s'_p)/s²
+            //             + 2·x·s'_p·s'_q/s³
+            // 交叉项（p≠q）必须用 p、q 两个方向的组合（x'_p·s'_q + x'_q·s'_p，
+            // s'_p·s'_q），不能只用 p 方向——那仅对对角段（p==q）成立。
+            // 与 modelDeriv 一阶规则同风格（dγ = γ·U 对数微分），
+            // d²γ = γ·(U_p·U_q + U_pq)——避免 deriv(deriv()) 的二次膨胀。
+            bool is_bwr = (composite_id == MODEL_BWR);
+            Node m = n.kids[0], m0 = n.kids[1], g0 = n.kids[2];
+            Node m0p = deriv(m0, p), m0q = deriv(m0, q);
+            Node g0p = deriv(g0, p), g0q = deriv(g0, q);
+            Node gamma, dgp, dgq, d2gamma;
+            if (is_bwr) {
+                int L = (int)n.kids[3].num;
+                Node qarg = n.kids[4], q0 = n.kids[5], d = n.kids[6];
+                Node BfN = Node::makeComposite(MODEL_BF, {n.kids[3], qarg, q0, d});
+                Node q0p = deriv(q0, p), q0q = deriv(q0, q);
+                Node d2q0 = deriv2(q0, p, q);
+                Node Bfp = modelDeriv(MODEL_BF, BfN, p);
+                Node Bfq = modelDeriv(MODEL_BF, BfN, q);
+                Node d2Bf = modelDeriv2(MODEL_BF, BfN, p, q);
+                Node pw = Node::makeOp(NodeType::Pow, astDiv(qarg, q0),
+                                       astNum(2.0 * L + 1));
+                gamma = astMul(astMul(astMul(g0, pw), astDiv(m0, m)), astSq(BfN));
+                // U_p = dγ/γ 的 p 方向 = dg0/g0 + dm0/m0 − (2L+1)·dq0/q0 + 2·dBf/Bf
+                //（q、m 为 Var，导数 0）；U_q 同理换 q 方向
+                auto logDeriv = [&](const Node& dg, const Node& dm,
+                                    const Node& dq, const Node& db) {
+                    return astAdd(astSub(astAdd(astDiv(dg, g0), astDiv(dm, m0)),
+                                         astMul(astNum(2.0 * L + 1), astDiv(dq, q0))),
+                                  astMul(astNum(2.0), astDiv(db, BfN)));
+                };
+                Node Up = logDeriv(g0p, m0p, q0p, Bfp);
+                Node Uq = logDeriv(g0q, m0q, q0q, Bfq);
+                // U_pq = −dg0_p·dg0_q/g0² − dm0_p·dm0_q/m0²
+                //        + (2L+1)(dq0_p·dq0_q/q0² − d²q0/q0)
+                //        + 2·(d²Bf/Bf − dBf_p·dBf_q/Bf²)
+                Node Upq = astAdd(astAdd(astNeg(astDiv(astMul(g0p, g0q), astSq(g0))),
+                                         astNeg(astDiv(astMul(m0p, m0q), astSq(m0)))),
+                                  astAdd(astMul(astNum(2.0 * L + 1),
+                                                astSub(astDiv(astMul(q0p, q0q), astSq(q0)),
+                                                       astDiv(d2q0, q0))),
+                                         astMul(astNum(2.0),
+                                                astSub(astDiv(d2Bf, BfN),
+                                                       astDiv(astMul(Bfp, Bfq), astSq(BfN))))));
+                dgp = astMul(gamma, Up);
+                dgq = astMul(gamma, Uq);
+                d2gamma = astMul(gamma, astAdd(astMul(Up, Uq), Upq));
+            } else {
+                gamma = g0;   // BW: y = m0·g0（复用下方 d2y 公式，dγ=dg, d²γ=0）
+                dgp = g0p;
+                dgq = g0q;
+                d2gamma = astNum(0.0);
+            }
+            Node x = astSub(astSq(m0), astSq(m));
+            Node y = astMul(m0, gamma);
+            Node s = astAdd(astSq(x), astSq(y));
+            Node s2 = astSq(s), s3 = astMul(s2, s);
+            // x = m0² − m²: x'_p = 2·m0·m0'_p, x'' = 2·m0'_p·m0'_q（m0 为 Param，二阶 0）
+            Node xp = astMul(astMul(astNum(2.0), m0), m0p);
+            Node xq = astMul(astMul(astNum(2.0), m0), m0q);
+            Node d2x = astMul(astNum(2.0), astMul(m0p, m0q));
+            // y = m0·γ: y'_p = m0'_p·γ + m0·γ'_p
+            Node yp = astAdd(astMul(m0p, gamma), astMul(m0, dgp));
+            Node yq = astAdd(astMul(m0q, gamma), astMul(m0, dgq));
+            Node d2y = astAdd(astAdd(astMul(m0p, dgq), astMul(m0q, dgp)),
+                              astMul(m0, d2gamma));
+            // s = x² + y²: s'_p = 2x·x'_p + 2y·y'_p
+            Node sp = astAdd(astMul(astMul(astNum(2.0), x), xp),
+                             astMul(astMul(astNum(2.0), y), yp));
+            Node sq = astAdd(astMul(astMul(astNum(2.0), x), xq),
+                             astMul(astMul(astNum(2.0), y), yq));
+            Node d2s = astAdd(astAdd(astMul(astNum(2.0), astMul(xp, xq)),
+                                     astMul(astMul(astNum(2.0), x), d2x)),
+                              astAdd(astMul(astNum(2.0), astMul(yp, yq)),
+                                     astMul(astMul(astNum(2.0), y), d2y)));
+            // 商法则最后一项是 +2x·s_p·s_q/s³（注意不是减号；减号会导致
+            // θθ Hessian 块完全错误——旧手写实现带入，曾用 FD 交叉验证发现）
+            Node d2re = astSub(astSub(astAdd(astDiv(d2x, s),
+                                             astDiv(astMul(astMul(astNum(2.0), x), astMul(sp, sq)), s3)),
+                                      astDiv(astMul(x, d2s), s2)),
+                               astDiv(astAdd(astMul(xp, sq), astMul(xq, sp)), s2));
+            Node d2im = astSub(astSub(astAdd(astDiv(d2y, s),
+                                             astDiv(astMul(astMul(astNum(2.0), y), astMul(sp, sq)), s3)),
+                                      astDiv(astMul(y, d2s), s2)),
+                               astDiv(astAdd(astMul(yp, sq), astMul(yq, sp)), s2));
+            return astAdd(d2re, astMul(astI(), d2im));
+        }
+        case MODEL_FLATTE_RHO_RE:
+        case MODEL_FLATTE_RHO_IM:
+        case MODEL_FLATTE:
+        case MODEL_ONE:
+            // 无参数依赖（或已在 AST 层分解）→ 二阶导为 0
+            return astNum(0.0);
+        default:
+            return astNum(0.0);
+    }
+}
+
+// ============================================================================
 // buildModelAST: 程序化构建内置模型的符号微分 AST → aux[]（替代 computeNodeFactor<Var>）
 // ============================================================================
 
@@ -394,7 +530,8 @@ std::vector<double> buildModelAST(
         segs.push_back(simplify(deriv(ast, j)));            // 段 1..P: ∂F/∂θ_j
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k)
-            segs.push_back(simplify(deriv(deriv(ast, j), k))); // ∂²F/∂θ_j∂θ_k
+            // 直接二阶微分（deriv(deriv()) 会二次膨胀，BWR d²F 段实测 2.6 万指令）
+            segs.push_back(simplify(deriv2(ast, j, k))); // ∂²F/∂θ_j∂θ_k
 
     // 布局: [P, n_seg, 段...]（与 compileCustomExpr / evalCustomAll 一致）
     std::vector<double> aux;

@@ -96,6 +96,11 @@ inline Node astI() { return Node::makeFunc(CFUNC_CSQRT, Node::makeNum(-1.0)); } 
 // 符号微分: ∂n/∂θ_p。Composite 节点按注册表规则展开（见 src/CustomExpr.cu）
 Node deriv(const Node& n, int p);
 
+// 符号二阶微分: ∂²n/∂θ_p∂θ_q。结构性规则直接对 n 的表达式结构做二阶导
+// （不是 deriv(deriv(...)) 的再微分——那会把一阶导展开式二次膨胀，
+// 实测 BWR d²F 段膨胀到 2.6 万指令）。Composite 节点委托 modelDeriv2。
+Node deriv2(const Node& n, int p, int q);
+
 // 代数化简: 0±x→x, x*1→x, x^1→x, 数值折叠, Neg 折叠；Composite 原样穿越
 Node simplify(Node n);
 
@@ -110,6 +115,12 @@ void compileNode(const Node& n, std::vector<double>& seg);
 // 模型导数规则以 AST 模板表达（∂C/∂arg_k 展开为代数式/嵌套 Composite），
 // 链式法则所需的其他复合节点导数通过 deriv() 递归。
 Node modelDeriv(int composite_id, const Node& n, int p);
+
+// 复合节点 ∂²n/∂θ_p∂θ_q 的符号二阶导数。实现策略（见 src/ResModel.cu）：
+// 用复合节点的子节点重建其定义表达式，再对重建树做 deriv2() 结构性微分
+// （含一阶导闭式与嵌套复合节点的 modelDeriv2 递归）——避免对一阶导展开式
+// 再微分导致的 AST 爆炸。无参数依赖的复合节点返回 0。
+Node modelDeriv2(int composite_id, const Node& n, int p, int q);
 
 // ============================================================================
 // 内置模型符号微分（host，替代 computeNodeFactor<Var>）
