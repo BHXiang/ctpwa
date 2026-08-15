@@ -70,6 +70,8 @@ enum CustomOp : int {
     COP_NEG = 10,
     COP_CALL = 11,      // arg0 = CustomFuncId
     COP_MODEL = 12,     // arg0 = CompositeId（一元）；pow 用 COP_POW
+    COP_STORE = 13,     // arg0 = 槽位 0..63：非破坏性复制栈顶到临时槽（不弹栈）
+    COP_LOAD = 14,      // arg0 = 槽位：把临时槽的值压栈
 };
 
 // 设备端解释器（定义在 src/CustomExpr.cu，ResModel.cu 调用）
