@@ -85,9 +85,9 @@ Constraints:
   trans:
     - [R_Keta_0, R_Keta_1]: -1   # Kη 两个道共享参数，互为相反数
   # identical:                     # 全同粒子组（自动 Bose/Fermi 对称化）
-  #   - [pi0, pi0]: true
+  #   - [Ks1, Ks2]                 # Ks1/Ks2 是全同粒子组
   # maxL: 4                        # 全局轨道角动量上限
-  bf_d: 3.0                        # 势垒半径 (GeV⁻¹)
+  # bf_d: 3.0                        # 势垒半径 (GeV⁻¹)
   # chains:                        # 链过滤器: 只跑名中包含子串的衰变链
   #   - decay1                     #   内联列表
   # chains: "chains_to_fit.txt"    #   或外部文件（每行一个子串, # 注释）
@@ -187,6 +187,7 @@ Resonances:
   #   P: -1
   #   model: Custom
   #   paramValues: [1.66, 0.125]
+  #   paramNames: [p0, p1]
   #   free: [0, 1]
   #   expression: "p0^2/(p0^2 - m^2 - i*p0*p1)"
   #   tex: ["BW", "(custom)"]
@@ -197,8 +198,9 @@ Resonances:
   #   P: -1
   #   model: Custom
   #   paramValues: [1.66, 0.125]
+  #   paramNames: [p0, p1]
   #   free: [0, 1]
-  #   expression: "BWR(p0, p1, 1, 3.0) * Bf(1, q, q0, 3.0)"
+  #   expression: "BWR(p0, p1, 1, 3.0) * Bf(1, q, q0(m), 3.0)"
   #   tex: ["BWR", "(custom)"]
 
 # ---- 输出绘图 ----
