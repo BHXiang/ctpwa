@@ -276,6 +276,8 @@ static const char* varName(int id)
 static bool genSegment(GenCtx& g, const double* instrs, int n_instr, int P)
 {
     g.stk.clear();
+    // CSE 槽位（COP_STORE/COP_LOAD）：段内命名临时变量表
+    std::vector<std::pair<std::string, std::string>> cse_slots;
     for (int i = 0; i < n_instr; ++i) {
         int op = (int)instrs[3 * i];
         double a0 = instrs[3 * i + 1];
@@ -302,6 +304,23 @@ static bool genSegment(GenCtx& g, const double* instrs, int n_instr, int P)
             case COP_PUSH_PI:
                 pushVal(g, "3.14159265358979323846", "0.0");
                 break;
+            case COP_STORE: {
+                // 非破坏性：栈顶固化为命名临时变量并登记槽位（编译期 CSE）
+                int k = (int)a0;
+                if (g.stk.empty()) { g.fail = true; return false; }
+                auto& v = g.stk.back();
+                materialize(g, v);
+                if (k >= (int)cse_slots.size()) cse_slots.resize(k + 1);
+                cse_slots[k] = {v.re, v.im};
+                break;
+            }
+            case COP_LOAD: {
+                // 复用槽位中的命名临时变量
+                int k = (int)a0;
+                if (k < 0 || k >= (int)cse_slots.size()) { g.fail = true; return false; }
+                pushVal(g, cse_slots[k].first, cse_slots[k].second);
+                break;
+            }
             case COP_ADD: { auto b = popVal(g); auto a = popVal(g);
                 pushTemp(g, "(" + a.re + " + " + b.re + ")", "(" + a.im + " + " + b.im + ")"); break; }
             case COP_SUB: { auto b = popVal(g); auto a = popVal(g);

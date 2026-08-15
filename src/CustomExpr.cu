@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -810,31 +811,123 @@ Node buildFlatteAST(const Node& m, const Node& m0,
 // 字节码编译（AST → 指令段，全局 API，见 SymbolicDiff.cuh）
 // ============================================================================
 
-void compileNode(const Node& n, std::vector<double>& seg)
+// ============================================================================
+// 编译期公共子表达式消除（CSE）
+//
+// deriv2/modelDeriv2 输出的 AST 是纯表达式树，共享子表达式在树中重复出现
+// （无共享指针，每次引用整棵复制）。直线字节码里重复求值这些子树是 d²F
+// 段膨胀的主因（BWR d²F 实测 1.5 万+ 指令）。做法：
+//   - 结构相同且足够大（≥ kMinCse 节点）的子树只编译一次，结尾发
+//     COP_STORE（非破坏性复制栈顶到槽位，不扰动操作数栈）；
+//   - 后续出现处直接发 COP_LOAD 压栈复用。
+// 段内槽位有限（解释器 tre/tim 容量 64），耗尽后自动退化为重算。
+// ============================================================================
+
+namespace {
+
+constexpr int kMinCse = 4;       // 小于该节点数的子树不 CSE（省 STORE/LOAD 开销）
+constexpr int kMaxCseSlots = 63; // 与 evalCustomSeg 的 kSlots=64 对应（留 1 余量）
+
+int nodeCount(const Node& n)
+{
+    int c = 1;
+    for (const auto& k : n.kids) c += nodeCount(k);
+    return c;
+}
+
+// 结构哈希（FNV-1a 双混合，防碰撞误复用）
+uint64_t nodeHashMix(const Node& n, uint64_t seed)
+{
+    uint64_t h = seed;
+    auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    mix((uint64_t)n.type);
+    {
+        uint64_t bits;
+        memcpy(&bits, &n.num, sizeof(bits));
+        mix(bits);
+    }
+    mix((uint64_t)n.var_id);
+    mix((uint64_t)n.param_id);
+    mix((uint64_t)n.func_id);
+    mix((uint64_t)n.composite_id);
+    for (const auto& k : n.kids) h = nodeHashMix(k, h);
+    return h;
+}
+
+struct CseState {
+    std::map<uint64_t, int> seen;   // 双哈希混合值 → 槽位
+    int next_slot = 0;
+};
+
+void compileNodeRec(const Node& n, std::vector<double>& seg, CseState& cs)
 {
     auto emit = [&](double op, double a0, double a1) {
         seg.push_back(op); seg.push_back(a0); seg.push_back(a1);
     };
-    switch (n.type) {
-        case NodeType::Num: emit(COP_PUSH_NUM, n.num, 0); return;
-        case NodeType::Var: emit(COP_PUSH_VAR, n.var_id, 0); return;
-        case NodeType::Param: emit(COP_PUSH_PARAM, n.param_id, 0); return;
-        case NodeType::Add: compileNode(n.kids[0], seg); compileNode(n.kids[1], seg); emit(COP_ADD, 0, 0); return;
-        case NodeType::Sub: compileNode(n.kids[0], seg); compileNode(n.kids[1], seg); emit(COP_SUB, 0, 0); return;
-        case NodeType::Mul: compileNode(n.kids[0], seg); compileNode(n.kids[1], seg); emit(COP_MUL, 0, 0); return;
-        case NodeType::Div: compileNode(n.kids[0], seg); compileNode(n.kids[1], seg); emit(COP_DIV, 0, 0); return;
-        case NodeType::Pow: compileNode(n.kids[0], seg); compileNode(n.kids[1], seg); emit(COP_POW, 0, 0); return;
-        case NodeType::Neg: compileNode(n.kids[0], seg); emit(COP_NEG, 0, 0); return;
-        case NodeType::Func:
-            compileNode(n.kids[0], seg);
-            emit(COP_CALL, n.func_id, 0);
+
+    // 叶子直接编译（单条指令，CSE 无收益）
+    if (n.type == NodeType::Num || n.type == NodeType::Var ||
+        n.type == NodeType::Param) {
+        if (n.type == NodeType::Num) emit(COP_PUSH_NUM, n.num, 0);
+        else if (n.type == NodeType::Var) emit(COP_PUSH_VAR, n.var_id, 0);
+        else emit(COP_PUSH_PARAM, n.param_id, 0);
+        return;
+    }
+
+    // 足够大的子树：先查 CSE 表
+    uint64_t h = 0;
+    bool cse_candidate = (nodeCount(n) >= kMinCse) && cs.next_slot < kMaxCseSlots;
+    if (cse_candidate) {
+        h = nodeHashMix(n, 0xcbf29ce484222325ULL) ^ nodeHashMix(n, 0x9e3779b97f4a7c15ULL);
+        auto it = cs.seen.find(h);
+        if (it != cs.seen.end()) {
+            emit(COP_LOAD, it->second, 0);   // 复用已有槽位
             return;
+        }
+    }
+
+    switch (n.type) {
+        case NodeType::Add: compileNodeRec(n.kids[0], seg, cs); compileNodeRec(n.kids[1], seg, cs); emit(COP_ADD, 0, 0); break;
+        case NodeType::Sub: compileNodeRec(n.kids[0], seg, cs); compileNodeRec(n.kids[1], seg, cs); emit(COP_SUB, 0, 0); break;
+        case NodeType::Mul: compileNodeRec(n.kids[0], seg, cs); compileNodeRec(n.kids[1], seg, cs); emit(COP_MUL, 0, 0); break;
+        case NodeType::Div: compileNodeRec(n.kids[0], seg, cs); compileNodeRec(n.kids[1], seg, cs); emit(COP_DIV, 0, 0); break;
+        case NodeType::Pow: compileNodeRec(n.kids[0], seg, cs); compileNodeRec(n.kids[1], seg, cs); emit(COP_POW, 0, 0); break;
+        case NodeType::Neg: compileNodeRec(n.kids[0], seg, cs); emit(COP_NEG, 0, 0); break;
+        case NodeType::Func:
+            compileNodeRec(n.kids[0], seg, cs);
+            emit(COP_CALL, n.func_id, 0);
+            break;
         case NodeType::Composite:
             // 参数按注册表顺序入栈: 先编译 kids[0]（第一个参数先入）
-            for (const auto& k : n.kids) compileNode(k, seg);
+            for (const auto& k : n.kids) compileNodeRec(k, seg, cs);
             emit(COP_MODEL, n.composite_id, 0);
-            return;
+            break;
+        default:
+            emit(COP_PUSH_NUM, 0.0, 0);
+            break;
     }
+
+    // 非破坏性登记：栈顶值复制进槽位，后续 COP_LOAD 复用。
+    // 注意：必须在递归完成后再检查槽位上限——cse_candidate 在递归前
+    // 求值，子节点递归期间 next_slot 会继续增长（BWR d²F 段实测会越过
+    // 63 到 88+），递归前检查会发出越界槽位，解释器 kSlots=64 直接 OOB
+    // 写崩溃（JIT genSegment 会 resize 所以不受影响）。
+    if (cse_candidate && cs.next_slot < kMaxCseSlots) {
+        emit(COP_STORE, cs.next_slot, 0);
+        cs.seen[h] = cs.next_slot;
+        ++cs.next_slot;
+    }
+}
+
+}  // namespace
+
+void compileNode(const Node& n, std::vector<double>& seg)
+{
+    CseState cs;
+    compileNodeRec(n, seg, cs);
 }
 
 // ============================================================================
@@ -853,6 +946,9 @@ __device__ void evalCustomSeg(
     constexpr int kStack = 32;
     double sre[kStack], sim[kStack];
     int sp = 0;
+    // CSE 临时槽（COP_STORE/COP_LOAD，编译期公共子表达式消除）
+    constexpr int kSlots = 64;
+    double tre[kSlots], tim[kSlots];
     const double* pc = seg;
 
     auto push = [&](double re, double im) {
@@ -894,6 +990,21 @@ __device__ void evalCustomSeg(
             case COP_PUSH_PARAM: push(params[(int)a0], 0.0); break;
             case COP_PUSH_I: push(0.0, 1.0); break;
             case COP_PUSH_PI: push(3.14159265358979323846, 0.0); break;
+            case COP_STORE: {
+                // 非破坏性：栈顶复制进槽位（后续 COP_LOAD 复用）
+                int sk = (int)a0;
+                if (sk < 0 || sk >= kSlots) break;   // 防御：编译器保证 < kMaxCseSlots
+                if (sp <= 0) break;
+                tre[sk] = sre[sp - 1];
+                tim[sk] = sim[sp - 1];
+                break;
+            }
+            case COP_LOAD: {
+                int k = (int)a0;
+                if (k < 0 || k >= kSlots) break;     // 防御：编译器保证 < kMaxCseSlots
+                push(tre[k], tim[k]);
+                break;
+            }
             case COP_ADD: { double br, bi, ar, ai; pop(br, bi); pop(ar, ai); push(ar + br, ai + bi); break; }
             case COP_SUB: { double br, bi, ar, ai; pop(br, bi); pop(ar, ai); push(ar - br, ai - bi); break; }
             case COP_MUL: { double br, bi, ar, ai; pop(br, bi); pop(ar, ai); push(ar * br - ai * bi, ar * bi + ai * br); break; }
