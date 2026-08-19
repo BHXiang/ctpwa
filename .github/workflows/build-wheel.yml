@@ -9,7 +9,7 @@
 #   - 上传到 PyPI（需配置 secret: PYPI_API_TOKEN）
 #
 # 安装（目标机器）:
-#   # 系统依赖: CUDA 12.9 runtime、ROOT(6.26+)、yaml-cpp(0.9.x)
+#   # 系统依赖: CUDA 12.9 runtime、ROOT(6.26+)；yaml-cpp 已静态打包进 wheel，无需安装
 #   pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 #   pip install ctpwa
 #
@@ -40,15 +40,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- 0. 基础工具: git/gcc（容器精简，编译前补齐）----
+      # ---- 0. 基础工具: git/gcc/cmake（容器精简，编译前补齐）----
       # 注意: 不装 curl——almalinux:9 内置 curl-minimal（与完整 curl 包互斥），
       #        curl 命令由 curl-minimal 提供，后续步骤直接用。
       # ninja 用 conda 装（AlmaLinux 9 默认 repo 无 ninja-build，需 EPEL）。
       - name: Install base tools
         run: |
-          dnf install -y -q git gcc-c++
+          dnf install -y -q git gcc-c++ cmake
           gcc --version | head -1
           curl --version | head -1
+          cmake --version | head -1
+
+      # ---- 0b. 版本一致性: tag 名必须等于 setup.py 版本（防 400 重传）----
+      - name: Check version matches tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(grep -oP 'version="\K[^"]+' setup.py | head -1)
+          if [ "$TAG" != "$VER" ]; then
+            echo "ERROR: tag $TAG != setup.py version $VER —— 同步 setup.py 版本号后重打 tag"
+            exit 1
+          fi
+          echo "version $VER matches tag ✓"
 
       # ---- 1. CUDA 12.9 toolkit（NVIDIA rhel9 repo，nvcc + runtime headers）----
       # sm_70（V100）需要 CUDA 12.x（13.x 移除 Volta）；sm_120 需 >= 12.8 → 12.9 全设备覆盖
@@ -60,13 +72,10 @@ jobs:
           /usr/local/cuda-12.9/bin/nvcc --version | tail -1
           /usr/local/cuda-12.9/bin/nvcc --list-gpu-arch | grep -E "compute_70|compute_80|compute_120"
 
-      # ---- 2. miniconda: Python 3.12 + ROOT + yaml-cpp(0.8.0) + torch(cu126) ----
+      # ---- 2. miniconda: Python 3.12 + ROOT + torch(cu126) ----
       # 用 conda-forge 单独建 build env（--override-channels 排除 defaults 源）：
       # miniconda base 默认混 defaults 源，与 conda-forge 的 root 依赖链
       # （libxml2/icu 等）solve 冲突。一次 create 统一 solve 更稳。
-      # yaml-cpp 用 conda-forge 0.8.0（SONAME .so.0.8，conda-forge 最新稳定版；
-      # 0.9.0 仅 defaults 源有，混源会再引入 solve 冲突）。ctpwa 只用基础 API，
-      # 0.8/0.9 均兼容。注意: 目标机器 yaml-cpp 需 0.8+（dnf 的 0.7 是 .so.0.7 不兼容）。
       - name: Install miniconda and deps
         run: |
           curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
@@ -75,12 +84,32 @@ jobs:
           # ninja: torch cpp_extension 在 dlink=True 时强制要求（缺了会直接 abort）
           /opt/conda/bin/conda create -y -q -p /opt/conda/envs/build \
             --override-channels -c conda-forge \
-            python=3.12 root yaml-cpp=0.8.0 ninja
+            python=3.12 root ninja
           /opt/conda/envs/build/bin/pip install -q "torch==2.12.0+cu126" \
             --index-url https://download.pytorch.org/whl/cu126
           /opt/conda/envs/build/bin/pip install -q auditwheel
           /opt/conda/envs/build/bin/python -c "import torch; print('torch', torch.__version__)"
           /opt/conda/envs/build/bin/root-config --version
+
+      # ---- 2b. yaml-cpp 0.8.0 源码静态编译 → /usr/local ----
+      # 静态链接进 ctpwa.so（setup.py 的 library_dirs 末尾 /usr/local/lib 兜底），
+      # wheel 自包含 yaml-cpp，目标机器无需安装（与本地 conda 动态链接不冲突——
+      # 本机 conda 的 libyaml-cpp.so 优先命中）。ROOT/CUDA runtime/torch 太大，
+      # 仍由目标机器环境提供。
+      - name: Build static yaml-cpp
+        run: |
+          curl -sSL https://github.com/jbeder/yaml-cpp/archive/refs/tags/0.8.0.tar.gz \
+            -o /tmp/yaml-cpp.tar.gz
+          tar xzf /tmp/yaml-cpp.tar.gz -C /tmp
+          cmake -S /tmp/yaml-cpp-0.8.0 -B /tmp/yaml-build \
+            -DYAML_BUILD_SHARED_LIBS=OFF \
+            -DYAML_CPP_BUILD_TESTS=OFF \
+            -DYAML_CPP_BUILD_TOOLS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build /tmp/yaml-build -j"$(nproc)"
+          cmake --install /tmp/yaml-build
+          ls -l /usr/local/lib/libyaml-cpp.a
 
       # ---- 3. 构建 wheel（容器 glibc 2.34 → manylinux_2_34 标签）----
       - name: Build wheel

@@ -143,6 +143,8 @@ extension = CUDAExtension(
         os.path.join(cuda_dir, "include"),
         # Conda 头文件（如果存在）
         *([os.path.join(conda_prefix, "include")] if conda_prefix else []),
+        # CI 静态 yaml-cpp 安装位置（本地无此目录，无害）
+        "/usr/local/include",
     ],
     library_dirs=[
         root_flags["libdir"],  # ROOT 库目录
@@ -156,6 +158,9 @@ extension = CUDAExtension(
             if conda_prefix
             else []
         ),
+        # CI 静态 yaml-cpp 位置（libyaml-cpp.a；放最后——本地 conda 的动态
+        # libyaml-cpp.so 优先，本地行为不变；CI 无 conda yaml-cpp 时静态兜底）
+        "/usr/local/lib",
     ],
     libraries=[
         "yaml-cpp",
@@ -210,7 +215,7 @@ except Exception:
 
 setup(
     name="ctpwa",
-    version="0.3.2",
+    version="0.3.3",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
     long_description=_long_desc,
