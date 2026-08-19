@@ -106,7 +106,8 @@ jobs:
             -DYAML_CPP_BUILD_TESTS=OFF \
             -DYAML_CPP_BUILD_TOOLS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local
+            -DCMAKE_INSTALL_PREFIX=/usr/local \
+            -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build /tmp/yaml-build -j"$(nproc)"
           cmake --install /tmp/yaml-build
           ls -l /usr/local/lib/libyaml-cpp.a
