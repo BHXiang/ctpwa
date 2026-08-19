@@ -413,8 +413,10 @@ __global__ void addSLAmpsKernel(
     const thrust::complex<double>* d_add,
     int total_size, double sign);
 
+// nPolar 分块实验变体（CHUNK=0 全量 / CHUNK>0 分块，CTPWA_POL_MODE 分派）
+template<int CHUNK, int MAXPOL>
 __global__ void
-computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
+computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
@@ -428,7 +430,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_amp_offsets, int n_amplitudes, int site);
+    int num_amp_offsets, int n_amplitudes, int site, int k_start);
 
 // 共振态参数梯度 kernel：对 block 的 Nfree 个自由参数计算 ∂NLL/∂θ
 // （d_dF 由 reComputeAmps 的 computeCustomAmpsKernel 预计算；本 kernel 纯读取）
