@@ -43,6 +43,18 @@
 
 //////////////////////////////////////////////
 ////////////////////////////////////////
+// 诊断辅助：2J+1 记号 -> "J^P" 字符串（如 "3/2+"）
+static std::string jpLabel(int two_j_plus_1, int parity)
+{
+    int two_j = two_j_plus_1 - 1;
+    std::string j;
+    if (two_j % 2 == 0)
+        j = std::to_string(two_j / 2);
+    else
+        j = std::to_string(two_j) + "/2";
+    return j + (parity > 0 ? "+" : "-");
+}
+
 std::map<std::string, std::vector<LorentzVector>> readMomentaFromDat(
     const std::vector<std::string>& fileinfo,
     const std::vector<std::string>& particleNames,
@@ -4517,12 +4529,37 @@ private:
                     for (const auto& sf : step.sl_filter)
                         if (sf.size() >= 2) sl_filter.insert({ sf[0], sf[1] });
                     int maxL2 = config_parser_.getGlobalMaxL();
-                    cas->addDecay(Amp2BD(spins, parities, identical_daughters2, is_boson2, maxL2,
-                                        step.p_break, step.has_bf, step.bf_d, std::move(sl_filter)),
-                        step.mother, step.daughters[0], step.daughters[1]);
+                    Amp2BD amp2bd(spins, parities, identical_daughters2, is_boson2, maxL2,
+                                  step.p_break, step.has_bf, step.bf_d, std::move(sl_filter));
+                    // 零-SL 诊断：该步无任何合法 (S,L) 分波时振幅恒为零。
+                    // 原因通常是 [J,P] 物理禁戒（角动量/宇称不守恒）、全同粒子
+                    // 选择定则排除、L > maxL，或 sl 白名单过滤掉了全部波。
+                    if (amp2bd.getSL().empty()) {
+                        std::cerr << "Warning: chain \"" << chain.name << "\" step "
+                                  << step.mother << "[" << jpLabel(spins[0], parities[0])
+                                  << "] -> " << step.daughters[0] << "["
+                                  << jpLabel(spins[1], parities[1]) << "] + "
+                                  << step.daughters[1] << "["
+                                  << jpLabel(spins[2], parities[2]) << "]"
+                                  << " has no valid (S,L) waves"
+                                  << " (maxL=" << maxL2
+                                  << (step.sl_filter.empty() ? "" : ", sl whitelist active")
+                                  << "): amplitude will be identically zero. "
+                                  << "Remove this [J,P] group or relax the constraints."
+                                  << std::endl;
+                    }
+                    cas->addDecay(std::move(amp2bd), step.mother, step.daughters[0], step.daughters[1]);
                 }
 
                 auto slcombs = cas->getSLCombinations();
+                // 链级诊断：任一步零-SL 都会使整条链的 SL 组合（笛卡尔积）为空，
+                // 链内所有共振态振幅恒为零——这是比单步更严重的静默失败。
+                if (slcombs.empty()) {
+                    std::cerr << "Warning: chain \"" << chain.name << "\" has NO valid (S,L) wave "
+                                 "combinations across its decay steps: all amplitudes of this "
+                                 "chain will be identically zero. Check the per-step warnings above."
+                              << std::endl;
+                }
 
                 std::vector<std::vector<Resonance>> resonance_combinations = {
                     {} };
