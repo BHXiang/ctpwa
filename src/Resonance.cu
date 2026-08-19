@@ -74,7 +74,9 @@ class GSModel : public ResonanceModel
 };
 
 // Interp: 统一插值模型（hist/linear/spline）。无固定参数。
-// aux = [method, N, x_min, dx, y_0...y_{N-1}] (等距 bin)
+// 数据文件每行 3 列: x, Re, Im
+// aux = [method, N, x_min, dx, re_0...re_{N-1}, im_0...im_{N-1}] (等距 bin)
+//       [-(method+1), N, x_0..x_{N-1}, re_0..re_{N-1}, im_0..im_{N-1}] (非等距)
 class InterpModel : public ResonanceModel
 {
   public:
@@ -91,14 +93,14 @@ class InterpModel : public ResonanceModel
             if (it->second == "hist") method = 0;
             else if (it->second == "spline") method = 2;
         }
-        // 读取数据文件
+        // 读取数据文件（3 列: x, Re, Im）
         it = opts.find("file");
         if (it == opts.end()) return {};  // no file → empty
         std::ifstream f(it->second);
         if (!f) return {};
-        std::vector<double> x, y;
-        double a, b;
-        while (f >> a >> b) { x.push_back(a); y.push_back(b); }
+        std::vector<double> x, re, im;
+        double a, b, c;
+        while (f >> a >> b >> c) { x.push_back(a); re.push_back(b); im.push_back(c); }
         if (x.size() < 2) return {};
         // 检查是否等距
         double dx = x[1] - x[0];
@@ -112,12 +114,14 @@ class InterpModel : public ResonanceModel
             aux.push_back((double)x.size()); // N
             aux.push_back(x[0]);             // x_min
             aux.push_back(dx);               // dx
-            aux.insert(aux.end(), y.begin(), y.end());
+            aux.insert(aux.end(), re.begin(), re.end());
+            aux.insert(aux.end(), im.begin(), im.end());
         } else {
             aux.push_back((double)-(method+1)); // negative = non-uniform
             aux.push_back((double)x.size());
             aux.insert(aux.end(), x.begin(), x.end());
-            aux.insert(aux.end(), y.begin(), y.end());
+            aux.insert(aux.end(), re.begin(), re.end());
+            aux.insert(aux.end(), im.begin(), im.end());
         }
         return aux;
     }
