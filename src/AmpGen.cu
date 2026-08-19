@@ -9,6 +9,26 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
+// ============================================================
+// nPolar 分派（CTPWA_POL_MODE 调试覆盖）:
+//   auto（默认）：按 nPolar 选最小满足的 A 档位（256/512/1024）；
+//        > 1024 → B16 分块 fallback（正确性等价，速度略慢）
+//    1 = A256   2 = A512   3 = A1024   4 = B8   5 = B16
+// 实验结论（pol81/pol243，修复 slamp 竞态后重测）：
+//   - A 全量最快：B8 慢 1.2–5.3×，B16 慢 1.2–2.1×（分块重算 F 因子 + 多 launch）
+//   - A1024 栈 8KB/线程 spill，比 A256 慢 ~1.75× → 按 nPolar 分档选最小档
+//   - 三路径 NLL 逐位一致（nPolar 间独立已验证）；分块保留作极端长链降级
+// ============================================================
+static int polMode()
+{
+    static int mode = -2;
+    if (mode == -2) {
+        const char* e = getenv("CTPWA_POL_MODE");
+        mode = e ? atoi(e) : 0;  // 0 = auto
+    }
+    return mode;
+}
+
 // Amp2BD 类实现
 Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
     bool identical_daughters, bool is_boson, int maxL, bool p_break, bool has_bf,
@@ -700,8 +720,29 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         }
 
         // 分配 SL 振幅 tab（nSigma 行：σ=0 恒等 + 置换拓扑）
+        // 显存硬检查（初始化时执行，per-GPU 按分摊后事件数）：
+        // nPolar/链长大时 slamp 表是最易爆的 buffer，提前明确报错
+        // （Analysis::checkCapacity 的预检拿不到 nSigma，这里是精确值）
         size_t slamp_row = (size_t)nEvents_[i] * nPolarizations_ * nSLCombs_;
-        cudaMalloc(&d_slamp_tab_[i], (size_t)nSigma * slamp_row * sizeof(thrust::complex<double>));
+        size_t slamp_bytes = (size_t)nSigma * slamp_row * sizeof(thrust::complex<double>);
+        {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            if (slamp_bytes > free_b) {
+                std::cerr << "ERROR: 显存不足——GPU " << i << " 的 slamp 表需要 "
+                          << slamp_bytes / 1e6 << " MiB，仅剩 " << free_b / 1e6
+                          << " MiB（nSL=" << nSLCombs_ << " nEv=" << nEvents_[i]
+                          << " nPol=" << nPolarizations_ << " nSigma=" << nSigma
+                          << "）。请减少事件数、缩短衰变链或使用多 GPU 分摊。" << std::endl;
+                throw std::runtime_error("slamp table exceeds device memory");
+            }
+        }
+        cudaError_t err = cudaMalloc(&d_slamp_tab_[i], slamp_bytes);
+        if (err != cudaSuccess) {
+            std::cerr << "ERROR: slamp 表分配失败: " << cudaGetErrorString(err)
+                      << "（需要 " << slamp_bytes / 1e6 << " MiB）" << std::endl;
+            throw std::runtime_error("slamp table allocation failed");
+        }
         if (nSigma > 1) {
             cudaMalloc(&d_sign_tab_[i], (size_t)nSigma * sizeof(double));
             cudaMemcpy(d_sign_tab_[i], h_signs_.data(),
@@ -751,27 +792,68 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 h_polarization_map_.size() * sizeof(int), cudaMemcpyHostToDevice);
         }
 
-        // 预计算振幅偏移量
-        int amp_size = 0;
-        for (size_t i = 0; i < decayChain_.size(); ++i)
+        // 精确模拟 computeSLAmpKernel 设备端 buffer_used 记账，得到每 sl scratch 用量。
+        // 每节点: node_amp(dj*dj1*dj2) + pwa_amp 暂存(2*total + trans1 + trans2 + massive_shared)；
+        // 每节点(ni>0): 缩并输出 Π(outputShape)，outputShape = 现形状去掉母粒子维 + [dj1, dj2]。
+        // buffer_used 在 kernel 内每 sl 重置，故每事件只需一份每 sl 用量（不乘 nSLCombs_）。
+        std::vector<int> h_labels;
+        std::vector<int> h_shapes;
+        size_t scratch_per_sl = 0;
+        for (size_t ni = 0; ni < decayChain_.size(); ++ni)
         {
-            int dim_j = host_dj[i];
-            int dim_j1 = host_dj1[i];
-            int dim_j2 = host_dj2[i];
+            const DecayNode& node = host_decayNodes[ni];
+            int dim_j = host_dj[ni];
+            int dim_j1 = host_dj1[ni];
+            int dim_j2 = host_dj2[ni];
 
-            int total_amp_size = dim_j * dim_j1 * dim_j2;
-            int trans1_size = dim_j1 * dim_j1;
-            int trans2_size = dim_j2 * dim_j2;
+            size_t amp_size = (size_t)dim_j * dim_j1 * dim_j2;
             int max_dim = max(dim_j1, dim_j2);
-            int massive_shared_size = 2 * max_dim * max_dim;
+            size_t transient = 2 * amp_size + (size_t)dim_j1 * dim_j1 +
+                (size_t)dim_j2 * dim_j2 + 2 * (size_t)max_dim * max_dim;
+            scratch_per_sl += amp_size + transient;
 
-            size_t total_size = 2 * total_amp_size + trans1_size + trans2_size + massive_shared_size;
+            if (ni == 0)
+            {
+                h_labels = { node.mother_idx, node.daug1_idx, node.daug2_idx };
+                h_shapes = { dim_j, dim_j1, dim_j2 };
+                continue;
+            }
 
-            amp_size += 2 * dim_j * dim_j1 * dim_j2 + total_size;
+            int contractIndex = -1;
+            for (int j = 0; j < (int)h_labels.size(); ++j)
+            {
+                if (h_labels[j] == node.mother_idx) { contractIndex = j; break; }
+            }
+            if (contractIndex < 0)
+            {
+                std::cerr << "Error: Mother particle not found in labels" << std::endl;
+                break;
+            }
+
+            size_t out = 1;
+            for (int j = 0; j < (int)h_shapes.size(); ++j)
+                if (j != contractIndex) out *= h_shapes[j];
+            out *= (size_t)dim_j1 * dim_j2;
+            scratch_per_sl += out;
+
+            h_labels.erase(h_labels.begin() + contractIndex);
+            h_shapes.erase(h_shapes.begin() + contractIndex);
+            h_labels.push_back(node.daug1_idx);
+            h_shapes.push_back(dim_j1);
+            h_labels.push_back(node.daug2_idx);
+            h_shapes.push_back(dim_j2);
         }
 
+        // 批次大小按 scratch 显存上界（每批 ≤ 2GB），默认 100 万事件/批
         int batch_size = 1000000;
-        int sharedMemSize = 3000 * sizeof(thrust::complex<double>);
+        {
+            size_t per_batch = (size_t)batch_size * scratch_per_sl *
+                sizeof(thrust::complex<double>);
+            size_t cap = ((size_t)2 << 30);
+            if (per_batch > cap)
+                batch_size = max(1, (int)(cap /
+                    (scratch_per_sl * sizeof(thrust::complex<double>))));
+        }
         int blockSize = 256;
         int numBlocks = (nEvents_[i] + blockSize - 1) / blockSize;
 
@@ -793,11 +875,11 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 }
 
                 thrust::complex<double>* d_amp_buffer;
-                cudaMalloc(&d_amp_buffer, n_events * nSLCombs_ * amp_size * sizeof(thrust::complex<double>));
-                computeSLAmpKernel << <numBlocks, blockSize, sharedMemSize >> > (
+                cudaMalloc(&d_amp_buffer, n_events * scratch_per_sl * sizeof(thrust::complex<double>));
+                computeSLAmpKernel << <numBlocks, blockSize >> > (
                     target, d_amp_buffer, dm, d_decayNodes_[i], d_dimj, d_dimj1,
                     d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
-                    decayChain_.size(), amp_size* nSLCombs_, n_events, start,
+                    decayChain_.size(), (int)scratch_per_sl, n_events, start,
                     d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
                     nPolarizations_total_);
 
@@ -962,16 +1044,16 @@ __global__ void computeSLAmpKernel(
         return;
     }
 
-    extern __shared__ thrust::complex<double> shared_buf[];
-
     // 为当前事件分配缓冲区
     thrust::complex<double>* event_buffer =
         &d_amp_buffer[eventIdx * buffer_size_per_event];
-    int buffer_used = 0;
 
     for (int slIdx = 0; slIdx < num_sl; ++slIdx)
     {
-        // 重置buffer
+        // 重置 buffer：scratch 每 sl 独立复用（上一 sl 的数据在 slamp 写完后不再需要），
+        // 故 buffer_used 必须在 sl 循环内重置，否则跨 sl 累积越界写下一事件
+        int buffer_used = 0;
+
         // 存储当前振幅的标签（粒子index）
         int ampLabels[20]; // 假设最多20个粒子标签
         int ampLabelCount = 0;
@@ -1229,30 +1311,64 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaFree(d_event_offsets);
             continue;
         }
-        // 调用核函数计算振幅
-        computeAmpsKernel << <gridDim, blockDim >> >
-            (d_amplitudes[i],       // 输出振幅
-                d_momenta_[i],         // 四动量数据
-                d_slCombination_[i],   // SL组合
-                d_slamp_tab_[i],       // SL振幅 tab（σ=0 行=恒等）
-                getNSigma(),           // 置换拓扑数
-                d_mom_tab_[i],         // σ 动量数组
-                d_sign_tab_[i],        // 符号
-                d_resonances,       // 共振态数组
-                resonance_count,    // 共振态数量
-                d_all_params,       // flat 自由参数
-                d_all_channels,     // flat channel masses
-                d_decayNodes_[i],      // 衰变链信息
-                decayChain_.size(), // 衰变链长度
-                nEvents_[i],           // 事件数
-                nSLCombs_,          // SL组合数
-                nPolarizations_,    // 极化态数
-                d_amp_offsets,      // 振幅偏移量
-                d_event_offsets,    // 事件偏移量
-                num_offsets,        // 偏移量数量
-                n_amplitudes,       // 振幅数量
-                site                // 位置
-                );
+        // 调用核函数计算振幅（nPolar 分派见 polMode）
+        int nPol_here = (int)nPolarizations_;
+        int m = polMode();
+        if (m == 0) {  // auto：选最小满足的 A 档位，>1024 降级 B16
+            m = 1;
+            if (nPol_here > 256) m = 2;
+            if (nPol_here > 512) m = 3;
+            if (nPol_here > 1024) m = 5;
+        }
+        switch (m) {
+        case 2:
+            computeAmpsKernelT<0, 512><<<gridDim, blockDim>>>(
+                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                d_resonances, resonance_count, d_all_params, d_all_channels,
+                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                n_amplitudes, site, 0);
+            break;
+        case 3:
+            computeAmpsKernelT<0, 1024><<<gridDim, blockDim>>>(
+                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                d_resonances, resonance_count, d_all_params, d_all_channels,
+                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                n_amplitudes, site, 0);
+            break;
+        case 4:
+            for (int k0 = 0; k0 < nPol_here; k0 += 8)
+                computeAmpsKernelT<8, 8><<<gridDim, blockDim>>>(
+                    d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    d_resonances, resonance_count, d_all_params, d_all_channels,
+                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                    n_amplitudes, site, k0);
+            break;
+        case 5:
+            for (int k0 = 0; k0 < nPol_here; k0 += 16)
+                computeAmpsKernelT<16, 16><<<gridDim, blockDim>>>(
+                    d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    d_resonances, resonance_count, d_all_params, d_all_channels,
+                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                    n_amplitudes, site, k0);
+            break;
+        default:  // 1 = A256：全量单 launch
+            computeAmpsKernelT<0, 256><<<gridDim, blockDim>>>(
+                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                d_resonances, resonance_count, d_all_params, d_all_channels,
+                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                n_amplitudes, site, 0);
+            break;
+        }
 
         cudaDeviceSynchronize();
 
@@ -1273,8 +1389,10 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     }
 }
 
+// nPolar 分块实验变体（与 computeCustomAmpsKernelT 同语义；CTPWA_POL_MODE 分派）
+template<int CHUNK, int MAXPOL>
 __global__ void
-computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
+computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
@@ -1288,7 +1406,7 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     const DecayNode* decayChain,           // 衰变链信息
     int decayChain_size, int nEvents, int nSLComb, int nPolar,
     const int* amp_offsets, const int* event_offsets,
-    int num_offsets, int n_amplitudes, int site)
+    int num_offsets, int n_amplitudes, int site, int k_start)
 {
     // int event_idx = threadIdx.x * blockDim.x + threadIdx.x;
     int sl_idx = blockIdx.x;
@@ -1317,10 +1435,20 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     // 全同粒子置换求和：A = Σ_σ sgn(σ) · resAmp(σ) · slamp(σ)
     // （resAmp 随 σ 变化：置换改变了中间态不变质量 → F 因子必须参与求和）
     size_t slamp_row = (size_t)nSLComb * nPolar * nEvents;
-    const int MAX_POL = 32;
-    if (nPolar > MAX_POL) { printf("computeAmpsKernel: nPolar=%d > %d\n", nPolar, MAX_POL); return; }
+    const int MAX_POL = MAXPOL;
+    if (CHUNK == 0 && nPolar > MAX_POL) {
+        // auto 分派保证不触发；触发即档位选择错误（调试覆盖 CTPWA_POL_MODE）
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            printf("[ctpwa] computeAmpsKernel: nPolar=%d > MAXPOL=%d —— 档位选择错误\n",
+                   nPolar, MAX_POL);
+        return;
+    }
+    // 分块区间 [k0, k1)：CHUNK=0 → 全部；CHUNK>0 → 本 launch 的子区间
+    int k0 = k_start;
+    int k1 = (CHUNK > 0) ? ((k_start + CHUNK < nPolar) ? k_start + CHUNK : nPolar)
+                         : nPolar;
     ctResAmp A_tot[MAX_POL];
-    for (int k = 0; k < nPolar; ++k) A_tot[k] = ctResAmp(0.0, 0.0);
+    for (int k = k0; k < k1; ++k) A_tot[k - k0] = ctResAmp(0.0, 0.0);
 
     for (int s = 0; s < nSigma; ++s)
     {
@@ -1432,17 +1560,17 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
     }
 
     // 计算极化相关的振幅（σ 内累加；amp_idx 在循环外统一计算）
-    for (int k = 0; k < nPolar; ++k)
+    for (int k = k0; k < k1; ++k)
     {
         int idx = sl_idx * nPolar * nEvents + event_idx * nPolar + k;
 
         ctResAmp temp = resAmp * slamps[idx];
-        A_tot[k] += sg * temp;
+        A_tot[k - k0] += sg * temp;
     }
     }  // σ 循环结束
 
-    // 输出对称化振幅
-    for (int k = 0; k < nPolar; ++k)
+    // 输出对称化振幅（分块模式: 只写本 launch 负责的 [k0, k1)）
+    for (int k = k0; k < k1; ++k)
     {
         int idx = sl_idx * nPolar * nEvents + event_idx * nPolar + k;
         int amp_idx = 0;
@@ -1454,14 +1582,33 @@ computeAmpsKernel(ctComplex* amplitudes,                 // 输出振幅
         {
             return;
         }
-        amplitudes[amp_idx] = ctMake(A_tot[k].real(), A_tot[k].imag());
+        amplitudes[amp_idx] = ctMake(A_tot[k - k0].real(), A_tot[k - k0].imag());
     }
 }
 
 // ============================================================
-// 统一插值求值（Interp 模型：hist / linear / spline）
-// aux 格式: [method, N, x_min, dx, y_0..y_{N-1}] (等距)
-//            [-(method+1), N, x_0..x_{N-1}, y_0..y_{N-1}] (非等距)
+// 单列插值（hist=0 / linear=1 / spline=2, Catmull-Rom）
+__device__ double interp1d(const double* y, int i, double frac, int method, int N)
+{
+    switch (method) {
+    case 0: return y[i];                                        // hist
+    case 1: return y[i] + (y[i+1] - y[i]) * frac;               // linear
+    case 2: {                                                   // spline
+        double y0 = (i > 0) ? y[i-1] : y[i] - (y[i+1]-y[i]);
+        double y1 = y[i], y2 = y[i+1];
+        double y3 = (i+2 < N) ? y[i+2] : y[i+1] + (y[i+1]-y[i]);
+        double f2 = frac * frac, f3 = f2 * frac;
+        return 0.5 * ((2*y1) + (-y0 + y2) * frac +
+                      (2*y0 - 5*y1 + 4*y2 - y3) * f2 +
+                      (-y0 + 3*y1 - 3*y2 + y3) * f3);
+    }
+    default: return y[i];
+    }
+}
+
+// 统一插值求值（Interp 模型：hist / linear / spline，复数）
+// aux 格式: [method, N, x_min, dx, re_0..re_{N-1}, im_0..im_{N-1}] (等距)
+//           [-(method+1), N, x_0..x_{N-1}, re_0..re_{N-1}, im_0..im_{N-1}] (非等距)
 // ============================================================
 __device__ void interpEval(const double* tab, double x,
     double& Fr, double& Fi, double* dFr, double* dFi, int P)
@@ -1471,34 +1618,22 @@ __device__ void interpEval(const double* tab, double x,
     int N = (int)tab[1];
 
     int i; double frac;
+    const double* re; const double* im;
     if (hdr >= 0) {
         // 等距 bin
         double xmin = tab[2], dx = tab[3];
-        const double* y = tab + 4;
+        re = tab + 4;
+        im = tab + 4 + N;
         double pos = (x - xmin) / dx;
         i = (int)pos;
         if (i < 0) { i = 0; frac = 0.0; }
         else if (i >= N - 1) { i = N - 2; frac = 1.0; }
         else { frac = pos - (double)i; }
-        switch (method) {
-        case 0: Fr = y[i]; break;                          // hist
-        case 1: Fr = y[i] + (y[i+1] - y[i]) * frac; break; // linear
-        case 2: {                                          // spline (Catmull-Rom)
-            double y0 = (i > 0) ? y[i-1] : y[i] - (y[i+1]-y[i]);
-            double y1 = y[i], y2 = y[i+1];
-            double y3 = (i+2 < N) ? y[i+2] : y[i+1] + (y[i+1]-y[i]);
-            double f2 = frac * frac, f3 = f2 * frac;
-            Fr = 0.5 * ((2*y1) + (-y0 + y2) * frac +
-                        (2*y0 - 5*y1 + 4*y2 - y3) * f2 +
-                        (-y0 + 3*y1 - 3*y2 + y3) * f3);
-            break;
-        }
-        default: Fr = y[i]; break;
-        }
     } else {
         // 非等距点：二分查找
         const double* xv = tab + 2;
-        const double* yv = tab + 2 + N;
+        re = tab + 2 + N;
+        im = tab + 2 + 2 * N;
         int lo = 0, hi = N - 1;
         while (lo < hi - 1) {
             int mid = (lo + hi) / 2;
@@ -1508,14 +1643,11 @@ __device__ void interpEval(const double* tab, double x,
         if (i < 0) { i = 0; frac = 0.0; }
         else if (i >= N - 1) { i = N - 2; frac = 1.0; }
         else { frac = (x - xv[i]) / (xv[i+1] - xv[i]); }
-        switch (method) {
-        case 0: Fr = yv[i]; break;
-        case 1: Fr = yv[i] + (yv[i+1] - yv[i]) * frac; break;
-        default: Fr = yv[i]; break;  // spline for non-uniform not yet implemented
-        }
+        if (method == 2) method = 0;  // 非均匀 spline 未实现 → 回退 hist
     }
-    Fi = 0.0;
-    // 梯度：bin 高度为拟合参数时（极少见）
+    Fr = interp1d(re, i, frac, method, N);
+    Fi = interp1d(im, i, frac, method, N);
+    // 梯度：bin 高度为拟合参数时（极少见；Interp 无自由参数 → 正常为 0）
     for (int j = 0; j < P && j < 16; ++j) dFr[j] = dFi[j] = 0.0;
     if (P > 0 && method < 2) {
         if (hdr >= 0 && i < P)
@@ -1569,11 +1701,18 @@ __device__ double dlnBf_dq0(int L, double q0, double bf_d)
     return 0.5 * dn0 / n0 * bf_d;
 }
 
-__global__ void computeCustomAmpsKernel(
+// nPolar 分派 kernel 变体（见 polMode）:
+//   CHUNK == 0: 一次 launch 算全部 nPolar（A 变体；MAXPOL = 栈数组大小，
+//                nPolar > MAXPOL 时 guard 报错返回 —— auto 分派保证不触发）
+//   CHUNK  > 0: 每次 launch 只算 [k_start, k_start+CHUNK) 的 polar（B 变体）。
+//               输出按全局 k 覆盖写，无跨 launch 依赖；F 因子每 launch 重算，
+//               开销即实验量化的分块代价（B8/B16 均慢于 A）。
+template<int CHUNK, int MAXPOL>
+__global__ void computeCustomAmpsKernelT(
     ctComplex* amplitudes,
     const ADBlockDesc* desc, int nblocks, int nSL_total,
     const int* amp_offsets, const int* event_offsets, int num_offsets,
-    int n_amplitudes)
+    int n_amplitudes, int k_start)
 {
     int slg = blockIdx.x;
     int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
@@ -1603,9 +1742,20 @@ __global__ void computeCustomAmpsKernel(
     if (Nfree > 64) Nfree = 64;
 
     size_t slamp_row = (size_t)B.nSL * B.nPolar * B.nEvents;
-    const int MAX_POL = 32;
+    const int MAX_POL = MAXPOL;
+    if (CHUNK == 0 && B.nPolar > MAX_POL) {
+        // auto 分派保证不触发；触发即档位选择错误（调试覆盖 CTPWA_POL_MODE）
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            printf("[ctpwa] computeCustomAmpsKernel: nPolar=%d > MAXPOL=%d —— 档位选择错误\n",
+                   B.nPolar, MAX_POL);
+        return;
+    }
+    // 分块区间 [k0, k1)：CHUNK=0 → 全部；CHUNK>0 → 本 launch 的子区间
+    int k0 = k_start;
+    int k1 = (CHUNK > 0) ? ((k_start + CHUNK < B.nPolar) ? k_start + CHUNK : B.nPolar)
+                         : B.nPolar;
     double R_re[MAX_POL], R_im[MAX_POL];
-    for (int k = 0; k < B.nPolar; ++k) { R_re[k] = 0.0; R_im[k] = 0.0; }
+    for (int k = k0; k < k1; ++k) { R_re[k - k0] = 0.0; R_im[k - k0] = 0.0; }
 
     for (int s = 0; s < B.nSigma; ++s) {
         const DeviceMomenta* dm = (s == 0 || !B.d_mom_tab) ? B.d_momenta : &B.d_mom_tab[s];
@@ -1713,11 +1863,11 @@ __global__ void computeCustomAmpsKernel(
                 }
             }
 
-            for (int k = 0; k < B.nPolar; ++k) {
+            for (int k = k0; k < k1; ++k) {
                 size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
                 auto sl_amp = slam[idx];
-                R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
-                R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+                R_re[k - k0] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
+                R_im[k - k0] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
             }
         } else {
         // ================================================================
@@ -1855,24 +2005,24 @@ __global__ void computeCustomAmpsKernel(
                 }
             }
 
-            for (int k = 0; k < B.nPolar; ++k) {
+            for (int k = k0; k < k1; ++k) {
                 size_t idx = (size_t)sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
                 auto sl_amp = slam[idx];
-                R_re[k] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
-                R_im[k] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
+                R_re[k - k0] += sg * (Ftr * sl_amp.real() - Fti * sl_amp.imag());
+                R_im[k - k0] += sg * (Ftr * sl_amp.imag() + Fti * sl_amp.real());
             }
         }
     }
 
-    // 输出振幅
-    for (int k = 0; k < B.nPolar; ++k) {
+    // 输出振幅（分块模式: 只写本 launch 负责的 [k0, k1)）
+    for (int k = k0; k < k1; ++k) {
         int idx = sl_idx * B.nPolar * B.nEvents + event_idx * B.nPolar + k;
         if (offset_idx < num_offsets) {
             int nEv_seg = event_offsets[offset_idx + 1] - event_offsets[offset_idx];
             int amp_idx = amp_offsets[offset_idx]
                         + (event_idx - event_offsets[offset_idx]) * n_amplitudes * B.nPolar
                         + k * n_amplitudes + sl_idx + B.site;
-            amplitudes[amp_idx] = ctMake(R_re[k], R_im[k]);
+            amplitudes[amp_idx] = ctMake(R_re[k - k0], R_im[k - k0]);
         }
         (void)idx;
     }
@@ -2595,9 +2745,45 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                        cudaMemcpyHostToDevice);
             dim3 gridC(static_cast<unsigned int>(sl_start),
                        (static_cast<unsigned int>(max_evt) + 255) / 256);
-            computeCustomAmpsKernel<<<gridC, blockSize>>>(
-                d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes);
+            // 档位选择用各 block 的最大 nPolar（防御 block 间不一致；正常全局一致）
+            int nPol_first = 0;
+            for (const auto& d : h_desc) nPol_first = max(nPol_first, d.nPolar);
+            int m = polMode();
+            if (m == 0) {  // auto：选最小满足的 A 档位，>1024 降级 B16
+                m = 1;
+                if (nPol_first > 256) m = 2;
+                if (nPol_first > 512) m = 3;
+                if (nPol_first > 1024) m = 5;
+            }
+            switch (m) {
+            case 2:
+                computeCustomAmpsKernelT<0, 512><<<gridC, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                break;
+            case 3:
+                computeCustomAmpsKernelT<0, 1024><<<gridC, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                break;
+            case 4:
+                for (int k0 = 0; k0 < nPol_first; k0 += 8)
+                    computeCustomAmpsKernelT<8, 8><<<gridC, blockSize>>>(
+                        d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
+                break;
+            case 5:
+                for (int k0 = 0; k0 < nPol_first; k0 += 16)
+                    computeCustomAmpsKernelT<16, 16><<<gridC, blockSize>>>(
+                        d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
+                break;
+            default:  // 1 = A256：全量单 launch
+                computeCustomAmpsKernelT<0, 256><<<gridC, blockSize>>>(
+                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
+                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                break;
+            }
         }
 
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，

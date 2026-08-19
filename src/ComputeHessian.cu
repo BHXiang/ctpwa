@@ -419,7 +419,9 @@ __global__ void computeSfromAmpsKernel(
     int evt = blockIdx.x * blockDim.x + threadIdx.x;
     if (evt >= nEvents) return;
 
-    double Sr[32] = { 0 }, Si[32] = { 0 };
+    // S 全量存全局输出（nPolar 无上限，不用栈数组）；I 与 term3 消费
+    // 读回同一线程刚写出的 d_S_re/d_S_im（同地址，L2/寄存器命中）
+    double I_val = 0.0;
     for (int p = 0; p < nPolar; ++p) {
         double sre = 0.0, sim = 0.0;
         for (int a = 0; a < n_amp; ++a) {
@@ -428,13 +430,10 @@ __global__ void computeSfromAmpsKernel(
             sre += (double)v_a.x * (double)amp_ap.x - (double)v_a.y * (double)amp_ap.y;
             sim += (double)v_a.x * (double)amp_ap.y + (double)v_a.y * (double)amp_ap.x;
         }
-        Sr[p] = sre;
-        Si[p] = sim;
         d_S_re[evt * nPolar + p] = sre;
         d_S_im[evt * nPolar + p] = sim;
+        I_val += sre * sre + sim * sim;
     }
-    double I_val = 0.0;
-    for (int p = 0; p < nPolar; ++p) I_val += Sr[p] * Sr[p] + Si[p] * Si[p];
     d_I[evt] = I_val;
 
     // Accumulate term3 = conj(S) * amp_a for phsp mixed Hessian
@@ -444,8 +443,10 @@ __global__ void computeSfromAmpsKernel(
             for (int p = 0; p < nPolar; ++p) {
                 ctComplex amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
                 double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
-                t3_re += Sr[p] * ar + Si[p] * ai;
-                t3_im += Sr[p] * ai - Si[p] * ar;
+                double Sr = d_S_re[evt * nPolar + p];
+                double Si = d_S_im[evt * nPolar + p];
+                t3_re += Sr * ar + Si * ai;
+                t3_im += Sr * ai - Si * ar;
             }
             atomicAdd(&d_phsp_t3_re[a], t3_re);
             atomicAdd(&d_phsp_t3_im[a], t3_im);
@@ -502,29 +503,40 @@ __global__ void computeCustomHessianKernel(
     double dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
 
     // 读取 full S 和 I（pre-pass）
-    double Sr[32], Si[32];
+    // d_S_re/d_S_im 是段内布局（每段 nEv·nPol 独立分配，见
+    // computeUnifiedHessian 的 cudaMalloc），用段内 evt 索引（与模板版
+    // hessianStage1Kernel 522 行一致）；evt_abs 会越界（data/bkg 段）。
     double I_val = 0.0;
     for (int p = 0; p < nPolar; ++p) {
-        // d_S_re/d_S_im 是段内布局（每段 nEv·nPol 独立分配，见
-        // computeUnifiedHessian 的 cudaMalloc），用段内 evt 索引（与模板版
-        // hessianStage1Kernel 522 行一致）；evt_abs 会越界（data/bkg 段）。
-        Sr[p] = d_S_re_full[evt * nPolar + p];
-        Si[p] = d_S_im_full[evt * nPolar + p];
-        I_val += Sr[p] * Sr[p] + Si[p] * Si[p];
+        double Sr = d_S_re_full[evt * nPolar + p];
+        double Si = d_S_im_full[evt * nPolar + p];
+        I_val += Sr * Sr + Si * Si;
     }
     if (I_val < 1e-30) return;
     double inv_I = 1.0 / I_val;
 
     // dS / d2S 累加（σ 求和）。
+    // nPolar 无上限：dS[j][p] 需跨 SL/σ 累加，故按 PCHUNK 外层分块，栈数组
+    // 只存 [16][PCHUNK]；g/termB 用跨 chunk 小累加器。
     // d2S 只被 termC（Σ_p cwr·d2S_re − cwi·d2S_im）消费，cwr/cwi 不依赖
-    // SL/σ → 直接在 p 内层按 (j,k) 折叠成标量，避免 [16][16][32]×2 = 128KB
-    // local memory/thread（sm_120 L1 仅 ~128KB，会全部 spill 到 DRAM）。
-    double dS_re[16][32], dS_im[16][32];
+    // SL/σ → 直接在 p 内层按 (j,k) 折叠成标量。
+    const int PCHUNK = 128;
+    double g_acc[16], termB_acc[16 * 16];
     double d2S_acc_re[16 * 16], d2S_acc_im[16 * 16];
+    for (int j = 0; j < Npr; ++j) g_acc[j] = 0.0;
     for (int j = 0; j < Npr; ++j)
-        for (int p = 0; p < nPolar; ++p) { dS_re[j][p] = 0; dS_im[j][p] = 0; }
-    for (int j = 0; j < Npr; ++j)
-        for (int k = 0; k < Npr; ++k) { d2S_acc_re[j * 16 + k] = 0; d2S_acc_im[j * 16 + k] = 0; }
+        for (int k = 0; k < Npr; ++k) {
+            termB_acc[j * 16 + k] = 0.0;
+            d2S_acc_re[j * 16 + k] = 0.0;
+            d2S_acc_im[j * 16 + k] = 0.0;
+        }
+
+    for (int pc = 0; pc < nPolar; pc += PCHUNK) {
+        int plo = pc;
+        int phi = (pc + PCHUNK < nPolar) ? pc + PCHUNK : nPolar;
+        double dS_re[16][PCHUNK], dS_im[16][PCHUNK];
+        for (int j = 0; j < Npr; ++j)
+            for (int p = plo; p < phi; ++p) { dS_re[j][p - plo] = 0; dS_im[j][p - plo] = 0; }
 
     // 每个 SL 组合（本 block nSL 个；SL 与共振态共享，需遍历 SL 求导）
     // 注意：dS 需要 Σ_sl v_sl · dF_j · slamp（对所有 SL 求和）
@@ -621,8 +633,8 @@ __global__ void computeCustomHessianKernel(
                     d2F_ti[j * P + k] = Or * d2Fi[j * P + k] + Oi * d2Fr[j * P + k];
                 }
 
-            // dF 输出（mixed Hessian 用）: [nSigma × nEv*nSL*Npr]
-            if (d_dF_re_out) {
+            // dF 输出（mixed Hessian 用）: [nSigma × nEv*nSL*Npr]；与 p 无关，仅首 chunk 写
+            if (pc == 0 && d_dF_re_out) {
                 size_t row = (size_t)s * ((size_t)nEvents * nSL * Npr);
                 size_t base = row + (size_t)evt * nSL * Npr + sl_idx * Npr;
                 for (int j = 0; j < Npr; ++j) {
@@ -634,7 +646,7 @@ __global__ void computeCustomHessianKernel(
 
             // dS[j][p] = Σ_sl v_sl · dF_j · slamp_sl
             // d2S[j][k][p] = Σ_sl v_sl · d2F_jk · slamp_sl
-            for (int p = 0; p < nPolar; ++p) {
+            for (int p = plo; p < phi; ++p) {
                 // slamp 全局布局：用全局事件索引 evt_abs 和全局行距 nTotal
                 // （与模板版 618 行 sl_amp 索引一致）
                 size_t idx = (size_t)sl_idx * nTotal + evt_abs * nPolar + p;
@@ -644,13 +656,14 @@ __global__ void computeCustomHessianKernel(
                 double t_im = (double)vv.x * sl_amp.imag() + (double)vv.y * sl_amp.real();
                 for (int j = 0; j < Npr; ++j) {
                     int pj = pm ? pm[j] : j;
-                    dS_re[j][p] += sg * (dF_t[pj] * t_re - dF_ti[pj] * t_im);
-                    dS_im[j][p] += sg * (dF_t[pj] * t_im + dF_ti[pj] * t_re);
+                    dS_re[j][p - plo] += sg * (dF_t[pj] * t_re - dF_ti[pj] * t_im);
+                    dS_im[j][p - plo] += sg * (dF_t[pj] * t_im + dF_ti[pj] * t_re);
                 }
                 // termC 标量折叠：cwr/cwi 与 SL/σ 无关，p 内层直接缩放累加
                 // （与原 Σ_p cwr·d2S_re − cwi·d2S_im 数学等价；double 累加顺序
                 // 略变，1e-16 级差异）
-                double cwr_p = Sr[p] * inv_I, cwi_p = -Si[p] * inv_I;
+                double cwr_p = d_S_re_full[evt * nPolar + p] * inv_I;
+                double cwi_p = -d_S_im_full[evt * nPolar + p] * inv_I;
                 for (int j = 0; j < Npr; ++j) {
                     int pj = pm ? pm[j] : j;
                     for (int k = 0; k < Npr; ++k) {
@@ -665,28 +678,41 @@ __global__ void computeCustomHessianKernel(
         }
     }
 
-    // g[j] = -2·Σ_p (cwr·dS_re − cwi·dS_im)
-    double g[16];
-    for (int j = 0; j < Npr; ++j) {
-        double acc = 0.0;
-        for (int p = 0; p < nPolar; ++p) {
-            double cwr = Sr[p] * inv_I, cwi = -Si[p] * inv_I;
-            acc += cwr * dS_re[j][p] - cwi * dS_im[j][p];
+        // chunk 消费：g / termB / dS 输出（跨 chunk 累加）
+        for (int j = 0; j < Npr; ++j) {
+            double acc = 0.0;
+            for (int p = plo; p < phi; ++p) {
+                double cwr = d_S_re_full[evt * nPolar + p] * inv_I;
+                double cwi = -d_S_im_full[evt * nPolar + p] * inv_I;
+                acc += cwr * dS_re[j][p - plo] - cwi * dS_im[j][p - plo];
+            }
+            g_acc[j] += acc;
         }
-        g[j] = -2.0 * acc;
+        for (int j = 0; j < Npr; ++j)
+            for (int k = 0; k < Npr; ++k) {
+                double b = 0.0;
+                for (int p = plo; p < phi; ++p)
+                    b += dS_re[k][p - plo] * dS_re[j][p - plo] +
+                         dS_im[k][p - plo] * dS_im[j][p - plo];
+                termB_acc[j * 16 + k] += b;
+            }
+        for (int j = 0; j < Npr; ++j)
+            for (int p = plo; p < phi; ++p) {
+                int idx = evt * Npr * nPolar + j * nPolar + p;
+                d_dS_re_out[idx] = dS_re[j][p - plo];
+                d_dS_im_out[idx] = dS_im[j][p - plo];
+            }
     }
 
-    // 输出 g / dS（供 cross-block stage 2）
+    // g[j] = -2·Σ_p (cwr·dS_re − cwi·dS_im)
+    double g[16];
+    for (int j = 0; j < Npr; ++j) g[j] = -2.0 * g_acc[j];
+
+    // 输出 g（供 cross-block stage 2）
     for (int j = 0; j < Npr; ++j) {
         int gj = d_global_idx[j];
         if (gj >= 0) d_g_out[evt * Npr + j] = g[j];
     }
-    for (int j = 0; j < Npr; ++j)
-        for (int p = 0; p < nPolar; ++p) {
-            int idx = evt * Npr * nPolar + j * nPolar + p;
-            d_dS_re_out[idx] = dS_re[j][p];
-            d_dS_im_out[idx] = dS_im[j][p];
-        }
 
     // 同块 Hessian：Term A + B + C（j,k 同 Custom 模型）
     for (int j = 0; j < Npr; ++j) {
@@ -696,10 +722,7 @@ __global__ void computeCustomHessianKernel(
             int gk = d_global_idx[k];
             if (gk < 0) continue;
             double hjk = g[j] * g[k];  // Term A
-            double termB = 0.0;
-            for (int p = 0; p < nPolar; ++p) {
-                termB += dS_re[k][p] * dS_re[j][p] + dS_im[k][p] * dS_im[j][p];
-            }
+            double termB = termB_acc[j * 16 + k];  // 已在 chunk 循环内累加
             double termC = d2S_acc_re[j * 16 + k];  // 已在 SL×σ×p 循环内折叠
             termB *= -2.0 * inv_I;
             termC *= -2.0;
