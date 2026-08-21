@@ -18,6 +18,54 @@
 
 namespace {
 
+// ============================================================================
+// 运行期 lnBf 对数导数黑盒（顶点 Bf 的 L 为 CVAR_L 运行时逐波 L 时使用；
+// 系数与 ResModel.cuh 的 Bf / AmpGen.cu dlnBf_dq0 完全一致，L ≤ 6）
+//   l_q    = ∂lnBf/∂q   = -0.5·d·N'(z)/N(z),      z = q·d
+//   l_q0   = ∂lnBf/∂q0  = +0.5·d·N'(z0)/N0(z0),   z0 = q0·d
+//   l_qq   = ∂²lnBf/∂q²  = -0.5·d²·(N''/N - (N'/N)²)
+//   l_q0q0 = ∂²lnBf/∂q0² = +0.5·d²·(N''/N - (N'/N)²)（z0 处）
+// ============================================================================
+__device__ __host__ inline void bfLogDerivs(int L, double q, double q0, double d,
+                                            double& lq, double& lq0,
+                                            double& lqq, double& lq0q0)
+{
+    // N(z), N'(z), N''(z) 多项式（Blatt-Weisskopf 角动量势垒因子）
+    auto poly = [&](double w, double& nw, double& dnw, double& ddnw) {
+        double w2 = w * w;
+        switch (L) {
+        case 0: nw = 1.0; dnw = 0.0; ddnw = 0.0; break;
+        case 1: nw = 1.0 + w2; dnw = 2.0 * w; ddnw = 2.0; break;
+        case 2: nw = 9.0 + w2 * (3.0 + w2); dnw = w * (6.0 + 4.0 * w2);
+                ddnw = 6.0 + 12.0 * w2; break;
+        case 3: nw = 225.0 + w2 * (45.0 + w2 * (6.0 + w2));
+                dnw = w * (90.0 + w2 * (24.0 + 6.0 * w2));
+                ddnw = 90.0 + w2 * (72.0 + 30.0 * w2); break;
+        case 4: nw = 11025.0 + w2 * (1575.0 + w2 * (135.0 + w2 * (10.0 + w2)));
+                dnw = w * (3150.0 + w2 * (540.0 + w2 * (60.0 + 8.0 * w2)));
+                ddnw = 3150.0 + w2 * (1620.0 + w2 * (300.0 + 56.0 * w2)); break;
+        case 5: nw = 893025.0 + w2 * (99225.0 + w2 * (6300.0 + w2 * (315.0 + w2 * (15.0 + w2))));
+                dnw = w * (198450.0 + w2 * (25200.0 + w2 * (1890.0 + w2 * (120.0 + 10.0 * w2))));
+                ddnw = 198450.0 + w2 * (75600.0 + w2 * (9450.0 + w2 * (840.0 + 90.0 * w2))); break;
+        case 6: nw = 540326025.0 + w2 * (6185025.0 + w2 * (363825.0 + w2 * (17325.0 + w2 * (630.0 + w2 * (21.0 + w2)))));
+                dnw = w * (12370050.0 + w2 * (1455300.0 + w2 * (103950.0 + w2 * (5040.0 + w2 * (210.0 + 12.0 * w2)))));
+                ddnw = 12370050.0 + w2 * (4365900.0 + w2 * (519750.0 + w2 * (35280.0 + w2 * (1890.0 + 132.0 * w2)))); break;
+        default: nw = 1.0; dnw = 0.0; ddnw = 0.0; break;
+        }
+    };
+    double nz, dnz, ddnz, nz0, dnz0, ddnz0;
+    poly(q * d, nz, dnz, ddnz);
+    poly(q0 * d, nz0, dnz0, ddnz0);
+    double r1 = (nz > 0.0) ? dnz / nz : 0.0;
+    double r2 = (nz0 > 0.0) ? dnz0 / nz0 : 0.0;
+    double e1 = (nz > 0.0) ? ddnz / nz : 0.0;
+    double e2 = (nz0 > 0.0) ? ddnz0 / nz0 : 0.0;
+    lq = -0.5 * d * r1;
+    lq0 = 0.5 * d * r2;
+    lqq = -0.5 * d * d * (e1 - r1 * r1);
+    lq0q0 = 0.5 * d * d * (e2 - r2 * r2);
+}
+
 struct C {
     double re, im;
     C(double r = 0.0, double i = 0.0) : re(r), im(i) {}
@@ -115,7 +163,21 @@ C evalNode(const Node& n, double m, double q, double q0, int L, double d,
                 }
                 case MODEL_BF: {  // [L, q, q0, d]
                     double qv = ev(n.kids[1]).re, q0v = ev(n.kids[2]).re, dv = ev(n.kids[3]).re;
-                    return {Bf<double>((int)n.kids[0].num, qv, q0v, dv), 0.0};
+                    double Lv = ev(n.kids[0]).re;  // Num 或 Var(CVAR_L)
+                    return {Bf<double>((int)Lv, qv, q0v, dv), 0.0};
+                }
+                case MODEL_BF_DLNQ:
+                case MODEL_BF_DLNQ0:
+                case MODEL_BF_D2LNQQ:
+                case MODEL_BF_D2LNQ0Q0: {  // [L, q, q0, d] → lnBf 对数导数（实数）
+                    double qv = ev(n.kids[1]).re, q0v = ev(n.kids[2]).re, dv = ev(n.kids[3]).re;
+                    double Lv = ev(n.kids[0]).re;  // Var(CVAR_L) 或 Num
+                    double lq, lq0, lqq, lq0q0;
+                    bfLogDerivs((int)Lv, qv, q0v, dv, lq, lq0, lqq, lq0q0);
+                    double r = (n.composite_id == MODEL_BF_DLNQ) ? lq :
+                               (n.composite_id == MODEL_BF_DLNQ0) ? lq0 :
+                               (n.composite_id == MODEL_BF_D2LNQQ) ? lqq : lq0q0;
+                    return {r, 0.0};
                 }
                 case MODEL_BW: {  // [m, m0, g0]
                     double mv = ev(n.kids[0]).re, m0v = ev(n.kids[1]).re, g0v = ev(n.kids[2]).re;
@@ -1044,6 +1106,20 @@ __device__ void evalCustomSeg(
                         double dv, q0v, qv, Lv, _t;
                         pop(dv, _t); pop(q0v, _t); pop(qv, _t); pop(Lv, _t);
                         push(Bf<double>((int)Lv, qv, q0v, dv), 0.0);
+                        break;
+                    }
+                    case MODEL_BF_DLNQ:
+                    case MODEL_BF_DLNQ0:
+                    case MODEL_BF_D2LNQQ:
+                    case MODEL_BF_D2LNQ0Q0: {  // [L, q, q0, d] → lnBf 对数导数（实数）
+                        double dv, q0v, qv, Lv, _t;
+                        pop(dv, _t); pop(q0v, _t); pop(qv, _t); pop(Lv, _t);
+                        double lq, lq0, lqq, lq0q0;
+                        bfLogDerivs((int)Lv, qv, q0v, dv, lq, lq0, lqq, lq0q0);
+                        double r = ((int)a0 == MODEL_BF_DLNQ) ? lq :
+                                   ((int)a0 == MODEL_BF_DLNQ0) ? lq0 :
+                                   ((int)a0 == MODEL_BF_D2LNQQ) ? lqq : lq0q0;
+                        push(r, 0.0);
                         break;
                     }
                     case MODEL_BW: {  // [m, m0, g0]

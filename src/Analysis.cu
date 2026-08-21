@@ -2254,21 +2254,43 @@ public:
 
     // ---- 内部 Hessian 计算 ----
 
+    // 自由耦合参数 p (complex [n_free]) → 扩展振幅 v (complex [n_amps])
+    // 乘法链耦合矩阵（trans 共享 / step 参数）时用 applyCouplingMatrix 映射；
+    // 无耦合矩阵时 n_free == n_amps，恒等返回。
+    // 注意: 不能用 params_.extendVector —— 它只处理 legacy 约束组，
+    // 乘法链（hasCouplingMatrix）下是恒等，会把 p 误当振幅。
+    // 布局: applyCouplingMatrix 期望 grouped 排列 [re0..re_{n-1}, im0..im_{n-1}]
+    // （与 getNLL forward 的 params_tensor 一致），view_as_real 给的是
+    // interleaved [re0,im0,re1,im1,...]，必须先转置。
+    torch::Tensor freeParamsToAmplitudes(const torch::Tensor& p_vec) {
+        if (!params_.hasCouplingMatrix()) return p_vec;
+        const auto& cm = params_.couplingMatrix();
+        torch::Device dev = p_vec.device();
+        torch::Tensor v_ext = torch::empty({cm.n_amps},
+            torch::TensorOptions().dtype(TORCH_COMPLEX).device(dev));
+        torch::Tensor p64 = torch::view_as_real(p_vec).t().reshape({-1})
+                                .to(torch::kFloat64).contiguous();
+        params_.applyCouplingMatrix(p64.data_ptr<double>(),
+            reinterpret_cast<ctComplex*>(v_ext.data_ptr()));
+        return v_ext;
+    }
+
+    // 耦合参数 Hessian [2n × 2n]（被 getBranchFractions 调用）
+    // 输入: 自由耦合 p（complex [n_free]）；内部先映射为振幅 v 再对 v 求 Hessian。
     torch::Tensor computeCouplingHessian(torch::Tensor& vector)
     {
-        // 耦合参数 Hessian [2n × 2n]（被 getBranchFractions 调用）
-
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be complex128");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
         TORCH_CHECK(vector.device().index() == primary_dev_,
             "vector 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
             "当前在 cuda:" + std::to_string(vector.device().index()) + "。"
             "跨 GPU 归一化缓冲 (d_phsp_matrix_) 固定在主 GPU 上");
 
-        const int n = vector.numel();
+        // 自由耦合 p → 振幅 v（乘法链映射；无耦合矩阵时恒等）
+        torch::Tensor extended_vector = freeParamsToAmplitudes(vector);
+        const int n = extended_vector.numel();  // = n_amps
         torch::Device dev = vector.device();
-        torch::Tensor extended_vector = params_.extendVector(vector, dev);
         torch::Tensor extended_vector_conj = extended_vector.conj();
         const ctComplex* d_vec = reinterpret_cast<const ctComplex*>(extended_vector.data_ptr());
         const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
@@ -2793,8 +2815,13 @@ public:
                 cudaFree(d_pI); cudaFree(d_pg); cudaFree(d_phA);
                 double A = data_total_weight_ - bkg_integral_;
                 int npt=0; for(int g=0;g<n_gpu;++g) npt+=events_[g][0];
-                double pf=h_pI/npt, c1=A/(pf*npt), c2=-A/(pf*pf*npt*npt);
-                for(int j=0;j<P;++j) for(int k=0;k<P;++k) h_dh[j*P+k] += c1*h_ph[j*P+k] + c2*phsp_h_pg[j]*phsp_h_pg[k];
+                // 所有块被跳过时（无自由参数块）h_pI=0 → pf=0 → c1/c2=inf，
+                // 0·inf = NaN；此时 h_ph/pg 全 0，跳过该修正即可
+                double pf = (npt > 0) ? h_pI/npt : 0.0;
+                if (pf > 0.0) {
+                    double c1=A/(pf*npt), c2=-A/(pf*pf*npt*npt);
+                    for(int j=0;j<P;++j) for(int k=0;k<P;++k) h_dh[j*P+k] += c1*h_ph[j*P+k] + c2*phsp_h_pg[j]*phsp_h_pg[k];
+                }
                 cudaMemcpy(d_hess, h_dh.data(), P*P*sizeof(double), cudaMemcpyHostToDevice);
                 phsp_pf=pf; phsp_A=A; phsp_np=npt;
             }
@@ -2809,10 +2836,12 @@ public:
                     cudaMemcpy(h_sum.data(), d_phsp_mixed_sum, 2*n_amplitudes_*P*sizeof(double), cudaMemcpyDeviceToHost);
                     cudaMemcpy(h_t3.data(), d_phsp_mixed_t3, 2*n_amplitudes_*sizeof(double), cudaMemcpyDeviceToHost);
                     cudaFree(d_phsp_mixed_sum); cudaFree(d_phsp_mixed_t3);
-                    double c1m=2.0*phsp_A/(phsp_pf*phsp_np), c2m=2.0*phsp_A/(phsp_pf*phsp_pf*phsp_np*phsp_np);
-                    for(int a=0;a<n_amplitudes_;++a) for(int j=0;j<P;++j) {
-                        h_mixed[a*P+j] += c1m*h_sum[a*P+j] + c2m*h_t3[a]*phsp_h_pg[j];
-                        h_mixed[(n_amplitudes_+a)*P+j] += -c1m*h_sum[(n_amplitudes_+a)*P+j] - c2m*h_t3[n_amplitudes_+a]*phsp_h_pg[j];
+                    if (phsp_pf > 0.0) {
+                        double c1m=2.0*phsp_A/(phsp_pf*phsp_np), c2m=2.0*phsp_A/(phsp_pf*phsp_pf*phsp_np*phsp_np);
+                        for(int a=0;a<n_amplitudes_;++a) for(int j=0;j<P;++j) {
+                            h_mixed[a*P+j] += c1m*h_sum[a*P+j] + c2m*h_t3[a]*phsp_h_pg[j];
+                            h_mixed[(n_amplitudes_+a)*P+j] += -c1m*h_sum[(n_amplitudes_+a)*P+j] - c2m*h_t3[n_amplitudes_+a]*phsp_h_pg[j];
+                        }
                     }
                     delete[] phsp_h_pg;
                 }
@@ -3312,7 +3341,10 @@ public:
         const auto& data_files = config_parser_.getDataFiles();
         TORCH_CHECK(data_files.count("phsp_truth") > 0, "No phsp_truth in config");
 
-        const int n = vector.numel();
+        // 自由耦合 p → 扩展振幅 v（乘法链映射；无耦合矩阵时恒等）。
+        // 所有积分 / Hessian / Jacobian 均在 v 空间进行（与 getNLL/getHessian 一致）。
+        torch::Tensor ev_center = freeParamsToAmplitudes(vector);
+        const int n = ev_center.numel();  // = n_amps（自由方向数，非 vector.numel()）
         const int n2 = 2 * n;
         const int npartials = nSLvectors_.size();
         torch::Device dev = vector.device();
@@ -3321,21 +3353,18 @@ public:
         double dataIntegral = data_total_weight_ - bkg_integral_;
 
         // ===== Phsp integrals + perturbed vectors (once) =====
-        torch::Tensor ev_center = params_.extendVector(vector, dev);
         std::vector<double> phsp_partial(npartials);
         computePhspIntegrals(ev_center, phsp_partial, npartials);
 
-        // Pre-compute all perturbed vectors for Jacobian
-        torch::Tensor v_real = torch::view_as_real(vector).flatten().clone();
+        // Pre-compute all perturbed vectors for Jacobian (v 空间扰动)
+        torch::Tensor v_real = torch::view_as_real(ev_center).flatten().clone();
         const double eps = 5e-6;
         std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
         for (int j = 0; j < n2; ++j) {
             auto vp = v_real.clone(); vp[j] += eps;
             auto vm = v_real.clone(); vm[j] -= eps;
-            auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
-            auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
-            ev_perturbed_p[j] = params_.extendVector(cvp, dev);
-            ev_perturbed_m[j] = params_.extendVector(cvm, dev);
+            ev_perturbed_p[j] = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
+            ev_perturbed_m[j] = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
         }
 
         // ===== Truth integrals (center + Jacobian perturbations) =====
@@ -3356,17 +3385,26 @@ public:
             truth_c_scattering.data(), bf_center.data(), npartials, dataIntegral);
 
         // ===== Errors: BF_error = sqrt(diag(J @ H^{-1} @ J^T)) =====
+        // 注意: 固定参考参数 (v0 实部 index 0 / v0 虚部 index n) 方向在 Hessian
+        // 中是数值零特征值，直接检查正定性会失败 → 先 mask 掉再求逆（与 fit.py 一致）
         std::vector<double> bf_errors(npartials, 0.0);
         torch::Tensor hessian = computeCouplingHessian(vector);
         if (hessian.numel() > 0 && hessian.size(0) == n2) {
-            auto eig = torch::linalg_eigvalsh(hessian);
+            std::vector<int64_t> free_idx;
+            for (int j = 0; j < n2; ++j)
+                if (j != 0 && j != n) free_idx.push_back(j);
+            const int n_free = (int)free_idx.size();
+            auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
+            torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
+            auto eig = torch::linalg_eigvalsh(H_free);
             if (eig[0].item<double>() > 1e-8) {
-                torch::Tensor cov = torch::linalg_inv(hessian).cpu();
-                std::vector<double> h_cov(n2 * n2);
-                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n2 * n2 * sizeof(double));
+                torch::Tensor cov = torch::linalg_inv(H_free).cpu();
+                std::vector<double> h_cov(n_free * n_free);
+                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n_free * n_free * sizeof(double));
 
-                std::vector<double> J(npartials * n2, 0.0);
-                for (int j = 0; j < n2; ++j) {
+                std::vector<double> J(npartials * n_free, 0.0);
+                for (int fj = 0; fj < n_free; ++fj) {
+                    const int j = free_idx[fj];
                     std::vector<double> bf_p(npartials), bf_m(npartials);
                     computeBFfromIntegrals(phsp_partial.data(),
                         truth_p_partial.data() + j * npartials,
@@ -3377,10 +3415,10 @@ public:
                         truth_m_scattering.data() + j * npartials * npartials,
                         bf_m.data(), npartials, dataIntegral);
                     for (int i = 0; i < npartials; ++i)
-                        J[i * n2 + j] = (bf_p[i] - bf_m[i]) / (2.0 * eps);
+                        J[i * n_free + fj] = (bf_p[i] - bf_m[i]) / (2.0 * eps);
                 }
 
-                computeBFErrors(J.data(), h_cov.data(), bf_errors.data(), npartials, n2);
+                computeBFErrors(J.data(), h_cov.data(), bf_errors.data(), npartials, n_free);
             }
         }
         // 返回 n×2: [center, error]
@@ -3404,23 +3442,22 @@ public:
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
 
-        const int n = vector.numel();
+        // 自由耦合 p → 扩展振幅 v（乘法链映射），积分/Jacobian 在 v 空间进行
+        torch::Tensor ev_center = freeParamsToAmplitudes(vector);
+        const int n = ev_center.numel();
         const int n2 = 2 * n;
         const int npartials = nSLvectors_.size();
         torch::Device dev = vector.device();
 
-        // Perturbed vectors for Jacobian
-        torch::Tensor ev_center = params_.extendVector(vector, dev);
-        torch::Tensor v_real = torch::view_as_real(vector).flatten().clone();
+        // Perturbed vectors for Jacobian (v 空间扰动)
+        torch::Tensor v_real = torch::view_as_real(ev_center).flatten().clone();
         const double eps = 5e-6;
         std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
         for (int j = 0; j < n2; ++j) {
             auto vp = v_real.clone(); vp[j] += eps;
             auto vm = v_real.clone(); vm[j] -= eps;
-            auto cvp = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
-            auto cvm = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
-            ev_perturbed_p[j] = params_.extendVector(cvp, dev);
-            ev_perturbed_m[j] = params_.extendVector(cvm, dev);
+            ev_perturbed_p[j] = torch::view_as_complex(vp.view({ -1, 2 })).contiguous();
+            ev_perturbed_m[j] = torch::view_as_complex(vm.view({ -1, 2 })).contiguous();
         }
 
         // Truth integrals (center + Jacobian); only partial integrals needed
@@ -3446,17 +3483,25 @@ public:
 
         // ===== Errors: FF_error = sqrt(diag(J_FF @ H^{-1} @ J_FF^T)) =====
         // J_FF[i][j] = (FF_p[i] - FF_m[i]) / (2·eps)
+        // 固定参考参数方向同上: mask 掉再检查正定性/求逆
         std::vector<double> ff_errors(npartials, 0.0);
         torch::Tensor hessian = computeCouplingHessian(vector);
         if (hessian.numel() > 0 && hessian.size(0) == n2) {
-            auto eig = torch::linalg_eigvalsh(hessian);
+            std::vector<int64_t> free_idx;
+            for (int j = 0; j < n2; ++j)
+                if (j != 0 && j != n) free_idx.push_back(j);
+            const int n_free = (int)free_idx.size();
+            auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
+            torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
+            auto eig = torch::linalg_eigvalsh(H_free);
             if (eig[0].item<double>() > 1e-8) {
-                torch::Tensor cov = torch::linalg_inv(hessian).cpu();
-                std::vector<double> h_cov(n2 * n2);
-                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n2 * n2 * sizeof(double));
+                torch::Tensor cov = torch::linalg_inv(H_free).cpu();
+                std::vector<double> h_cov(n_free * n_free);
+                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n_free * n_free * sizeof(double));
 
-                std::vector<double> J(npartials * n2, 0.0);
-                for (int j = 0; j < n2; ++j) {
+                std::vector<double> J(npartials * n_free, 0.0);
+                for (int fj = 0; fj < n_free; ++fj) {
+                    const int j = free_idx[fj];
                     double tot_p = 0.0, tot_m = 0.0;
                     for (int i = 0; i < npartials; ++i) {
                         tot_p += truth_p_partial[j * npartials + i];
@@ -3467,11 +3512,11 @@ public:
                     for (int i = 0; i < npartials; ++i) {
                         double ff_p = truth_p_partial[j * npartials + i] / tot_p;
                         double ff_m = truth_m_partial[j * npartials + i] / tot_m;
-                        J[i * n2 + j] = (ff_p - ff_m) / (2.0 * eps);
+                        J[i * n_free + fj] = (ff_p - ff_m) / (2.0 * eps);
                     }
                 }
 
-                computeBFErrors(J.data(), h_cov.data(), ff_errors.data(), npartials, n2);
+                computeBFErrors(J.data(), h_cov.data(), ff_errors.data(), npartials, n_free);
             }
         }
         // 返回 n×2: [center, error]
@@ -4670,6 +4715,16 @@ private:
                                     if (lit != chain_resonances.end()
                                         && ci < (int)lit->second.size()
                                         && ri < lit->second[ci].size()) {
+                                        // linked 链任意 comb 存在同名共振 → 不在此 skip：
+                                        // 交由 addBlock 的同 rname 全局共享按名字精确配对
+                                        // （顺序无关；位置对应在顺序打乱时会错配广播）
+                                        bool has_same = false;
+                                        for (const auto& per_ci : lit->second)
+                                            for (const auto& n : per_ci)
+                                                if (n == res.getName()) { has_same = true; break; }
+                                        if (has_same) break;
+                                        // 不同名（历史 trans 语义，如 N1720p/N1720m）：
+                                        // 按位置对应（要求 trans 链接链结构镜像、顺序一致）
                                         const auto& owner_name = lit->second[ci][ri];
                                         skip_slots_for.insert(res.getName());
                                         if (res.getName() != owner_name)

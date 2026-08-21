@@ -110,6 +110,22 @@ Node modelDeriv(int composite_id, const Node& n, int p)
             // ∂Bf/∂q0 =  d·Bf·N'(z0) / (2N(z0))
             // ∂Bf/∂d  = (q/d)·∂Bf/∂q + (q0/d)·∂Bf/∂q0
             Node q = n.kids[1], q0 = n.kids[2], d = n.kids[3];
+            if (n.kids[0].type == NodeType::Var) {
+                // L 为 CVAR_L（buildModelAST 顶点 Bf: 内核运行时逐波 L）:
+                // 编译期无法展开 bfPoly → 用运行期对数导数黑盒
+                // ∂lnBf/∂q  = l_q = MODEL_BF_DLNQ, ∂lnBf/∂q0 = l_q0 = MODEL_BF_DLNQ0
+                Node lq = Node::makeComposite(MODEL_BF_DLNQ, n.kids);
+                Node lq0 = Node::makeComposite(MODEL_BF_DLNQ0, n.kids);
+                Node dBf_dq = astMul(n, lq);
+                Node dBf_dq0 = astMul(n, lq0);
+                // ∂Bf/∂d = (q/d)·Bf·l_q + (q0/d)·Bf·l_q0
+                Node dBf_dd = astAdd(
+                    astMul(astMul(dBf_dq, q), astDiv(astNum(1.0), d)),
+                    astMul(astMul(dBf_dq0, q0), astDiv(astNum(1.0), d)));
+                return astAdd(astAdd(astMul(dBf_dq, deriv(q, p)),
+                                     astMul(dBf_dq0, deriv(q0, p))),
+                              astMul(dBf_dd, deriv(d, p)));
+            }
             int L = (int)n.kids[0].num;
             Node z = astMul(q, d), z0 = astMul(q0, d);
             Node Nz = bfPoly(L, z), Nz0 = bfPoly(L, z0);
@@ -222,6 +238,28 @@ Node modelDeriv2(int composite_id, const Node& n, int p, int q)
         case MODEL_BF: {
             // args: [L, q, q0, d]; Bf = sqrt(N_L(q0·d)/N_L(q·d))
             Node qarg = n.kids[1], q0 = n.kids[2], d = n.kids[3];
+            if (n.kids[0].type == NodeType::Var) {
+                // L 为 CVAR_L（运行时逐波）→ 运行期对数导数黑盒:
+                // d²Bf/dp·dq = Bf·[Σ_v l_v·v''_pq + Σ_{v,w}(l_v·l_w + l_vw)·v'_p·w'_q]
+                // v,w ∈ {q, q0}; d 为 Num 常量；l_qq0 = ∂²lnBf/∂q∂q0 = 0
+                Node BfN = n;
+                Node lq = Node::makeComposite(MODEL_BF_DLNQ, n.kids);
+                Node lq0 = Node::makeComposite(MODEL_BF_DLNQ0, n.kids);
+                Node lqq = Node::makeComposite(MODEL_BF_D2LNQQ, n.kids);
+                Node lq0q0 = Node::makeComposite(MODEL_BF_D2LNQ0Q0, n.kids);
+                Node qp = deriv(qarg, p), qq = deriv(qarg, q);
+                Node q0p = deriv(q0, p), q0q = deriv(q0, q);
+                Node qppq = deriv2(qarg, p, q), q0ppq = deriv2(q0, p, q);
+                Node d2 = astAdd(astMul(lq, qppq), astMul(lq0, q0ppq));
+                // q 方向: (l_q² + l_qq)·q'_p·q'_q（q=CVAR_Q → 该项简化为 0）
+                d2 = astAdd(d2, astMul(astAdd(astSq(lq), lqq), astMul(qp, qq)));
+                // q0 方向: (l_q0² + l_q0q0)·q0'_p·q0'_q
+                d2 = astAdd(d2, astMul(astAdd(astSq(lq0), lq0q0), astMul(q0p, q0q)));
+                // 交叉项: l_q·l_q0·(q'_p·q0'_q + q0'_p·q'_q)
+                d2 = astAdd(d2, astMul(astMul(lq, lq0),
+                                       astAdd(astMul(qp, q0q), astMul(q0p, qq))));
+                return astMul(BfN, d2);
+            }
             Node z = astMul(qarg, d), z0 = astMul(q0, d);
             Node bfdef = Node::makeFunc(CFUNC_SQRT,
                 astDiv(bfPoly((int)n.kids[0].num, z0), bfPoly((int)n.kids[0].num, z)));
@@ -338,7 +376,7 @@ Node modelDeriv2(int composite_id, const Node& n, int p, int q)
 
 std::vector<double> buildModelAST(
     ResModelType model_type,
-    int L, double d,
+    int L, int Lmin, double d,
     int P,                              // 自由参数数
     int n_channels,                     // Flatte: 道数; 其他: 0
     const std::vector<double>& channel_masses,  // Flatte: [m_a0,m_b0, m_a1,m_b1, ...]
@@ -374,22 +412,24 @@ std::vector<double> buildModelAST(
             });
             break;
         case ResModelType::BWR: {
-            // F = MODEL_BWR(m, θ0, θ1, L, q, q0, d) × [MODEL_BF(L, q, q0, d)]
+            // F = MODEL_BWR(m, θ0, θ1, Lmin, q, q0, d) × [MODEL_BF(L_runtime, q, q0, d)]
             // （has_bf=false 时不含 Bf 因子）
             // has_bf=false 时传播子内部宽度也不含 Bf（MODEL_BWR 的 gamma 含 Bf²）
             // → d kid 传 0.0 使 Bf≡1，与 bf_d=0.0 完全等价
+            // 宽度约定与 computeNodeFactor 一致: BWR Γ(Lmin) 与波无关恒用节点
+            // SL 列表最小 L（烘焙）; 顶点 Bf 用 CVAR_L（内核运行时逐波 sl.L）
             Node bwr = Node::makeComposite(MODEL_BWR, {
                 Node::makeVar(CVAR_M),
                 Node::makeParam(0),       // m0
                 Node::makeParam(1),       // g0
-                Node::makeNum((double)L),
+                Node::makeNum((double)Lmin),
                 Node::makeVar(CVAR_Q),
                 q0_ast,
                 Node::makeNum(has_bf ? d : 0.0)
             });
             if (has_bf) {
                 Node bf = Node::makeComposite(MODEL_BF, {
-                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_L),
                     Node::makeVar(CVAR_Q),
                     q0_ast,
                     Node::makeNum(d)
@@ -401,10 +441,11 @@ std::vector<double> buildModelAST(
             break;
         }
         case ResModelType::ONE: {
-            // F = [MODEL_BF(L, q, q0, d)]（has_bf=false 时 F = 1）
+            // F = [MODEL_BF(L_runtime, q, q0, d)]（has_bf=false 时 F = 1）
+            // 顶点 Bf 用 CVAR_L: 与 computeNodeFactor 的 Bf(sl.L, ...) 逐波一致
             if (has_bf) {
                 ast = Node::makeComposite(MODEL_BF, {
-                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_L),
                     Node::makeVar(CVAR_Q),
                     q0_ast,
                     Node::makeNum(d)
@@ -426,10 +467,10 @@ std::vector<double> buildModelAST(
             Node flatte = buildFlatteAST(Node::makeVar(CVAR_M),
                                          Node::makeParam(0), gs, chs);
 
-            // （has_bf=false 时不含 Bf 因子）
+            // （has_bf=false 时不含 Bf 因子）; 顶点 Bf L 用运行时逐波（CVAR_L）
             if (has_bf) {
                 Node bf = Node::makeComposite(MODEL_BF, {
-                    Node::makeNum((double)L),
+                    Node::makeVar(CVAR_L),
                     Node::makeVar(CVAR_Q),
                     q0_ast,
                     Node::makeNum(d)
@@ -507,10 +548,10 @@ std::vector<double> buildModelAST(
             Node Fim_node = astNeg(astDiv(astMul(Num, DenIm), DenSq));
             Node gs = astAdd(Fre_node, astMul(Fim_node, astI()));
 
-            // （has_bf=false 时不含 Bf 因子）
+            // （has_bf=false 时不含 Bf 因子）; 顶点 Bf L 用运行时逐波（CVAR_L）
             if (has_bf) {
                 Node bf = Node::makeComposite(MODEL_BF, {
-                    astNum((double)L), q, q0_ast, astNum(d)
+                    Node::makeVar(CVAR_L), q, q0_ast, astNum(d)
                 });
                 ast = Node::makeOp(NodeType::Mul, gs, bf);
             } else {

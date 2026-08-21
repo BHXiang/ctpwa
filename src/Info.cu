@@ -62,7 +62,10 @@ void DecayInfo::buildDecayChains(
                 std::vector<Resonance> rlist;
                 for (const auto& rname : sc.resonances) {
                     auto it = config_resonances.find(rname);
-                    if (it != config_resonances.end() && it->second.J == sc.spin_parity[0]) {
+                    // J 哨兵（-1，Resonances 段未写 J）→ 跳过一致性过滤，
+                    // 量子数完全由 intermediates 的 [J, P] 决定
+                    if (it != config_resonances.end()
+                        && (it->second.J < 0 || it->second.J == sc.spin_parity[0])) {
                         std::vector<std::pair<double,double>> ch;
                         for (const auto& c : it->second.channels)
                             if (c.size() >= 2) ch.emplace_back(c[0], c[1]);
@@ -393,7 +396,16 @@ void DecayInfo::print() const
     for (size_t i = 0; i < param_names_.size(); ++i)
         printf("  [%zu] %s\n", i, param_names_[i].c_str());
 
-    printf("Resonance theta params (%zu):\n", resonance_param_names_.size());
-    for (size_t i = 0; i < resonance_param_names_.size(); ++i)
-        printf("  [%zu] %s\n", i, resonance_param_names_[i].c_str());
+    // 声明级参数列表：同 rname 跨链引用（CP 共轭对等）会重复出现——
+    // 实际拟合槽数由 addBlock 的同名共享决定，这里去重显示并标注
+    {
+        std::set<std::string> seen;
+        std::vector<std::string> unique_names;
+        for (const auto& n : resonance_param_names_)
+            if (seen.insert(n).second) unique_names.push_back(n);
+        printf("Resonance theta params (%zu declared, %zu unique):\n",
+               resonance_param_names_.size(), unique_names.size());
+        for (size_t i = 0; i < unique_names.size(); ++i)
+            printf("  [%zu] %s\n", i, unique_names[i].c_str());
+    }
 }

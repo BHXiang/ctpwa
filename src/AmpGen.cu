@@ -450,17 +450,22 @@ int AmpCasDecay::getNodeLMin(const std::string& mother_name) const
         }
         return (Lmin < 0) ? 0 : Lmin;
     }
-    return 0;
+    return -1;   // 未找到匹配节点（调用方退化: 块级 L）
 }
 
 bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
     Q0MassDep& md1_dep, double& md1_fixed,
     Q0MassDep& md2_dep, double& md2_fixed) const
 {
-    if (mother_idx < 0 || mother_idx >= (int)particleNames_.size()) return false;
-    const std::string& mname = particleNames_[mother_idx];
+    // mother_idx/target_idx 均为 particleToIndex_ 空间（字母序索引）——
+    // 不能用 particleNames_（config 顺序索引）按名反查，两个索引空间不一致。
+    // 直接按 particleToIndex_ 匹配 decay 节点。
     for (const auto& node : decayChain_) {
-        if (node.mother != mname) continue;
+        auto mit = particleToIndex_.find(node.mother);
+        if (mit == particleToIndex_.end() || mit->second != mother_idx) continue;
+        auto d1it = particleToIndex_.find(node.daug1);
+        auto d2it = particleToIndex_.find(node.daug2);
+        if (d1it == particleToIndex_.end() || d2it == particleToIndex_.end()) return false;
         // 质量依赖规则与 AD 版 kernel 的 q0 回退一致:
         //   固定质量(config 粒子表 mass>0) → FixedMass
         //   子粒子 = target（共振态，无固定质量）→ M0Param（= m0 参数）
@@ -472,10 +477,8 @@ bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
             if (d_idx == target_idx) return std::make_pair(Q0MassDep::M0Param, 0.0);
             return std::make_pair(Q0MassDep::EventMass, 0.0);
         };
-        int d1 = getParticleIndex(node.daug1);
-        int d2 = getParticleIndex(node.daug2);
-        auto p1 = dep(node.daug1, d1);
-        auto p2 = dep(node.daug2, d2);
+        auto p1 = dep(node.daug1, d1it->second);
+        auto p2 = dep(node.daug2, d2it->second);
         md1_dep = p1.first; md1_fixed = p1.second;
         md2_dep = p2.first; md2_fixed = p2.second;
         return true;
@@ -1525,20 +1528,14 @@ computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
 
         double q0 = std::sqrt((mass_mother * mass_mother - std::pow(mass_daug1 + mass_daug2, 2)) * (mass_mother * mass_mother - std::pow(mass_daug1 - mass_daug2, 2))) / 2 / mass_mother;
 
-        // printf("mother mass = %f, daug1 mass = %f, daug2 mass = %f, q0 = %f\n",
-        //     mass_mother, mass_daug1, mass_daug2, q0);
-        // // 打印qq
-        // printf("mm = %f, mdaug1 = %f, daug2 mass = %f, qq = %f\n", mm, pDaug1.M(), pDaug2.M(), qq);
-
         if (nodeIdx == 0)
         {
             // 第一个节点特殊处理（Bf 按节点门控: node.has_bf / node.bf_d）
             // resAmp *= BlattWeisskopf(sl.L, qq, q0);
-            if (node.has_bf)
-                resAmp *= Bf<double>(sl.L, qq, q0, node.bf_d);
-
-            // printf("Event %d, SL %d, Node %d: First node, resAmp = (%f, %f)\n",
-            //     event_idx, sl_idx, nodeIdx, resAmp.real(), resAmp.imag());
+            if (node.has_bf) {
+                double bf = Bf<double>(sl.L, qq, q0, node.bf_d);
+                resAmp *= bf;
+            }
 
             continue;
         }
@@ -1552,10 +1549,11 @@ computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
             // 宽度约定 Lmin: BWR Γ(L) 与波无关，恒用节点 SL 列表的最小 L；
             // 顶点 Bf 仍用逐波 sl.L
             int width_L = node.l_min;
-            resAmp *= computeNodeFactor<double>(sl.L, width_L, mm, qq, q0,
+            auto nf = computeNodeFactor<double>(sl.L, width_L, mm, qq, q0,
                 p, current_res.param_count, current_res.type,
                 ch, current_res.n_channels,
                 d_all_channels, current_res.aux_offset, node.bf_d, node.has_bf);
+            resAmp *= nf;
         }
     }
 
@@ -1584,121 +1582,6 @@ computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
         }
         amplitudes[amp_idx] = ctMake(A_tot[k - k0].real(), A_tot[k - k0].imag());
     }
-}
-
-// ============================================================
-// 单列插值（hist=0 / linear=1 / spline=2, Catmull-Rom）
-__device__ double interp1d(const double* y, int i, double frac, int method, int N)
-{
-    switch (method) {
-    case 0: return y[i];                                        // hist
-    case 1: return y[i] + (y[i+1] - y[i]) * frac;               // linear
-    case 2: {                                                   // spline
-        double y0 = (i > 0) ? y[i-1] : y[i] - (y[i+1]-y[i]);
-        double y1 = y[i], y2 = y[i+1];
-        double y3 = (i+2 < N) ? y[i+2] : y[i+1] + (y[i+1]-y[i]);
-        double f2 = frac * frac, f3 = f2 * frac;
-        return 0.5 * ((2*y1) + (-y0 + y2) * frac +
-                      (2*y0 - 5*y1 + 4*y2 - y3) * f2 +
-                      (-y0 + 3*y1 - 3*y2 + y3) * f3);
-    }
-    default: return y[i];
-    }
-}
-
-// 统一插值求值（Interp 模型：hist / linear / spline，复数）
-// aux 格式: [method, N, x_min, dx, re_0..re_{N-1}, im_0..im_{N-1}] (等距)
-//           [-(method+1), N, x_0..x_{N-1}, re_0..re_{N-1}, im_0..im_{N-1}] (非等距)
-// ============================================================
-__device__ void interpEval(const double* tab, double x,
-    double& Fr, double& Fi, double* dFr, double* dFi, int P)
-{
-    int hdr = (int)tab[0];
-    int method = (hdr >= 0) ? hdr : -(hdr + 1);
-    int N = (int)tab[1];
-
-    int i; double frac;
-    const double* re; const double* im;
-    if (hdr >= 0) {
-        // 等距 bin
-        double xmin = tab[2], dx = tab[3];
-        re = tab + 4;
-        im = tab + 4 + N;
-        double pos = (x - xmin) / dx;
-        i = (int)pos;
-        if (i < 0) { i = 0; frac = 0.0; }
-        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
-        else { frac = pos - (double)i; }
-    } else {
-        // 非等距点：二分查找
-        const double* xv = tab + 2;
-        re = tab + 2 + N;
-        im = tab + 2 + 2 * N;
-        int lo = 0, hi = N - 1;
-        while (lo < hi - 1) {
-            int mid = (lo + hi) / 2;
-            if (x < xv[mid]) hi = mid; else lo = mid;
-        }
-        i = lo;
-        if (i < 0) { i = 0; frac = 0.0; }
-        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
-        else { frac = (x - xv[i]) / (xv[i+1] - xv[i]); }
-        if (method == 2) method = 0;  // 非均匀 spline 未实现 → 回退 hist
-    }
-    Fr = interp1d(re, i, frac, method, N);
-    Fi = interp1d(im, i, frac, method, N);
-    // 梯度：bin 高度为拟合参数时（极少见；Interp 无自由参数 → 正常为 0）
-    for (int j = 0; j < P && j < 16; ++j) dFr[j] = dFi[j] = 0.0;
-    if (P > 0 && method < 2) {
-        if (hdr >= 0 && i < P)
-            dFr[i] = (method == 0) ? 1.0 : 1.0 - frac;
-        if (hdr >= 0 && i + 1 < P && method == 1)
-            dFr[i + 1] = frac;
-    }
-}
-
-// ============================================================
-// O 因子（非目标节点 Bf 乘积）对质量参数的导数辅助函数
-// O = Π_i Bf(L_i, qq_i, q0_i), q0_i = breakup(m0_i, m1_i, m2_i)
-// 当某子质量经回退等于 target_rp[0]（m0 参数）时，q0 依赖 m0 →
-// dO/dm0 = O · Σ_i ∂lnBf_i/∂q0_i · ∂q0_i/∂m0
-// ============================================================
-
-// ∂q(m,m1,m2)/∂m_which (which=1: m1, which=2: m2)
-// qsq ≤ 0 时 q 被钳位为 0（常数）→ 导数为 0
-__device__ double breakup_dq_dm(int which, double m, double m1, double m2)
-{
-    double s = m1 + m2, d = m1 - m2;
-    double A = m * m - s * s, B = m * m - d * d;
-    double qsq = A * B;
-    if (qsq <= 0.0) return 0.0;
-    double dqsq = (which == 1) ? (-2.0 * s * B - 2.0 * d * A)
-                               : (-2.0 * s * B + 2.0 * d * A);
-    return dqsq / (4.0 * m * sqrt(qsq));
-}
-
-// ∂ln Bf(L,q,q0,d)/∂q0 = 0.5·N0'(z0)/N0(z0)·d, z0 = q0·d
-// N0(z0) 多项式系数与 ResModel.cuh 的 Bf 完全一致
-__device__ double dlnBf_dq0(int L, double q0, double bf_d)
-{
-    double z0 = q0 * bf_d;
-    double z2 = z0 * z0;
-    double n0, dn0;
-    switch (L) {
-    case 0: n0 = 1.0; dn0 = 0.0; break;
-    case 1: n0 = 1.0 + z2; dn0 = 2.0 * z0; break;
-    case 2: n0 = 9.0 + z2 * (3.0 + z2); dn0 = z0 * (6.0 + 4.0 * z2); break;
-    case 3: n0 = 225.0 + z2 * (45.0 + z2 * (6.0 + z2));
-            dn0 = z0 * (90.0 + z2 * (24.0 + 6.0 * z2)); break;
-    case 4: n0 = 11025.0 + z2 * (1575.0 + z2 * (135.0 + z2 * (10.0 + z2)));
-            dn0 = z0 * (3150.0 + z2 * (540.0 + z2 * (60.0 + 8.0 * z2))); break;
-    case 5: n0 = 893025.0 + z2 * (99225.0 + z2 * (6300.0 + z2 * (315.0 + z2 * (15.0 + z2))));
-            dn0 = z0 * (198450.0 + z2 * (25200.0 + z2 * (1890.0 + z2 * (120.0 + 10.0 * z2)))); break;
-    case 6: n0 = 540326025.0 + z2 * (6185025.0 + z2 * (363825.0 + z2 * (17325.0 + z2 * (630.0 + z2 * (21.0 + z2)))));
-            dn0 = z0 * (12370050.0 + z2 * (1455300.0 + z2 * (103950.0 + z2 * (5040.0 + z2 * (210.0 + 12.0 * z2))))); break;
-    default: return 0.0;
-    }
-    return 0.5 * dn0 / n0 * bf_d;
 }
 
 // nPolar 分派 kernel 变体（见 polMode）:
@@ -1958,7 +1841,6 @@ __global__ void computeCustomAmpsKernelT(
                                 /*compute_2nd=*/false);
                         }
                     }
-
                     double den = Fr * Fr + Fi * Fi;
                     int off = B.res_dF_offset[match_r];
                     int cnt = B.res_dF_count[match_r];
@@ -1968,6 +1850,27 @@ __global__ void computeCustomAmpsKernelT(
                         if (p < 0 || p >= P_r) continue;
                         dln_re[j_glob] += (dFr[p] * Fr + dFi[p] * Fi) / den;
                         dln_im[j_glob] += (dFi[p] * Fr - dFr[p] * Fi) / den;
+                    }
+
+                    // 跨共振 Bf 项: 匹配节点 aux 内含的 Bf 因子其 q0 链含共振态子粒子
+                    // 质量（CVAR_MD1/2 为 VAR，aux 无该导数）→ 补 ∂lnBf/∂q0·∂q0/∂m
+                    // （仅 mass 参数受影响；BW 的 aux 不含 Bf，与 K0 固定路径一致）
+                    if (node.has_bf && res.type != ResModelType::BW) {
+                        for (int r = 0; r < R; ++r) {
+                            if (B.d_res[r].param_count <= 0) continue;
+                            double dq0_dm = 0.0;
+                            if (node.mass[1] <= 0 && node.daug1_idx == B.d_res[r].particle_idx)
+                                dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+                            if (node.mass[2] <= 0 && node.daug2_idx == B.d_res[r].particle_idx)
+                                dq0_dm += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+                            double dlnO = dlnBf_dq0(L, q0, node.bf_d) * dq0_dm;
+                            int off2 = B.res_dF_offset[r];
+                            int cnt2 = B.res_dF_count[r];
+                            for (int j_loc = 0; j_loc < cnt2; ++j_loc) {
+                                int j_glob = off2 + j_loc;
+                                if (B.d_param_map[j_glob] == 0) dln_re[j_glob] += dlnO;
+                            }
+                        }
                     }
 
                     double nr = Ftr * Fr - Fti * Fi;
@@ -2193,7 +2096,12 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                                          m1d, m1f, m2d, m2f)) {
                 m1d = Q0MassDep::EventMass; m2d = Q0MassDep::EventMass;
             }
-            aux = buildModelAST(dr.type, L, dd, dr.param_count, dr.n_channels, cf,
+            // 宽度约定 Lmin（BWR Γ 与波无关恒用节点 SL 最小 L）:
+            // 与 computeNodeFactor 的 node.l_min 同源（getHostDecayNodes 的
+            // node.mother）→ 用中间态名 tag 查询（共振态名≠中间态名时也能命中）
+            int Lmin = cas->getNodeLMin(res.getTag());
+            if (Lmin < 0) Lmin = L;   // 无匹配 decay 节点时退化为块级 L
+            aux = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
                                 m1d, m1f, m2d, m2f, has_bf);
         }
         dr.aux_offset = static_cast<int>(h_all_channels.size());
@@ -2248,6 +2156,21 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                 conjugate_broadcast_[{block_idx, (int)i}] = owner_it->second;
             }
             continue;
+        }
+        // 同名共振全局共享参数槽：共振名全局唯一（CP 共轭对等场景——
+        // 同一共振 N 在两条链中宇称相反，共享 m/Γ 参数）
+        {
+            auto owner_it = resonance_owners_.find(resonances[i].getName());
+            // 无自由参数的共振（如 ONE 模型的 chic0 出现在所有链，free 未配置）
+            // 不做广播：广播会把 owner 的 nFree 传染给本块（reComputeAmps 的
+            // conjugate_broadcast_ 循环把 cj.nFree = ow.nFree），导致无参数块
+            // 被误判为 AD block 而重算 —— 振幅被字节码路径覆盖，θ=标称时
+            // NLL 也偏离固定模式（实测 -950 vs -1427）。
+            if (owner_it != resonance_owners_.end()
+                && !free_indices[i].empty()) {
+                conjugate_broadcast_[{block_idx, (int)i}] = owner_it->second;
+                continue;
+            }
         }
         // Register as owner for this resonance name
         resonance_owners_[resonances[i].getName()] = {block_idx, (int)i};
@@ -2572,6 +2495,14 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cj.nFree = ow.nFree;
             cj.free_global_idx = ow.free_global_idx;
             cj.free_param_idx = ow.free_param_idx;
+            // 被广播共振的 d_dF 局部区间必须用 owner 的（cj 块自身 count=0，
+            // 否则该共振的 dF 在 cj 块内不累加 → θ 梯度/二阶导缺半块贡献）
+            int ci = cj_key.second, oi = owner_key.second;
+            if (ci >= 0 && ci < (int)cj.res_dF_count_.size()
+                && oi >= 0 && oi < (int)ow.res_dF_count_.size()) {
+                cj.res_dF_offset_[ci] = ow.res_dF_offset_[oi];
+                cj.res_dF_count_[ci] = ow.res_dF_count_[oi];
+            }
         }
 
         // 重跑 computeAmpsKernel：AD block 按 nFree 分组，每组一次合并启动
@@ -3122,6 +3053,8 @@ void AmpCalc::computeUnifiedHessian(
         double* d_dF_re = nullptr;
         double* d_dF_im = nullptr;
         int* d_gidx = nullptr;
+        int* d_res_off = nullptr;   // [Nres] 每共振态自由位置区间起始（Hessian 内核）
+        int* d_res_cnt = nullptr;   // [Nres] 每共振态自由位置数
         int NT;
         int nEv;
     };
@@ -3209,25 +3142,18 @@ void AmpCalc::computeUnifiedHessian(
             int nPol = static_cast<int>(cas->getNPolarizations());
             int dsz = cas->getDecayChainSize();
 
-            // 自由参数数（res 0；含 var_equal ghost 条目）
-            int Npr = (int)blk.res_dF_count_[0];
-
-            // 检查是否为 conjugate 块：如果 Npr==0，查 conjugate_broadcast_
-            //（该块的所有共振态通过 trans 约束与 owner 块共享参数）
+            // 检查是否为 conjugate 块（trans 约束与 owner 块共享参数；
+            // slot 位于 owner；res_dF 区间以 owner 的为准）
             bool is_conjugate = false;
             int ow_bi = -1;
-            if (Npr == 0) {
-                for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
-                    if (cj_key.first == (int)bi) {
-                        is_conjugate = true;
-                        ow_bi = owner_key.first;
-                        break;
-                    }
-                }
-                if (is_conjugate && ow_bi >= 0) {
-                    Npr = (int)blocks_[ow_bi].res_dF_count_[0];
+            for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+                if (cj_key.first == (int)bi) {
+                    is_conjugate = true;
+                    ow_bi = owner_key.first;
+                    break;
                 }
             }
+
             // Custom 模型（参数数运行时）→ 标量 Hessian kernel，无模板上限
             bool is_custom_block = !h_templates_[bi].empty() &&
                 h_templates_[bi][0].type == ResModelType::Custom;
@@ -3236,18 +3162,44 @@ void AmpCalc::computeUnifiedHessian(
             for (const auto& t : h_templates_[bi]) {
                 if (t.aux_size <= 0) { has_sym_aux = false; break; }
             }
+
+            // 自由参数数：标量路径 = Σ_r res_dF_count_[r]（多共振态；conjugate
+            // 块用 owner 的区间，与 d_param_map/global_idx 布局一致）；模板路径
+            // 沿用 res 0 语义
+            int Npr = 0;
             if (is_custom_block || has_sym_aux) {
-                // Npr==0：无自由参数（conjugate 块的 Npr 已覆盖为 owner 的值，
-                // 仍为 0 说明 owner 也无参数）→ 全量事件扫描纯浪费
-                // （唯一输出 phsp I 与块无关，同 d_S 任何块算都相同，
-                // 移交给后续 first_free_block）。stage 2-4 用 bt.d_g==nullptr 跳过。
-                if (Npr == 0) continue;
+                const auto& cnt_src = (is_conjugate && ow_bi >= 0)
+                    ? blocks_[ow_bi].res_dF_count_ : blk.res_dF_count_;
+                for (int r = 0; r < Nres && r < (int)cnt_src.size(); ++r)
+                    Npr += (int)cnt_src[r];
+                if (Npr > 16) Npr = 16;   // 标量内核栈数组上限
+                if (Npr == 0) {
+                    // 无自由参数（conjugate 块的 Npr 已覆盖为 owner 的值，
+                    // 仍为 0 说明 owner 也无参数）→ 全量事件扫描纯浪费
+                    // （唯一输出 phsp I 与块无关，同 d_S 任何块算都相同，
+                    // 移交给后续 first_free_block）。stage 2-4 用 bt.d_g==nullptr 跳过。
+                    continue;
+                }
                 // 仍需要 temp buffer（stage 2 交叉项）— 下方统一分配
-            } else if (Npr < 1 || Npr > 3) {
-                continue;
+            } else {
+                Npr = (int)blk.res_dF_count_[0];
+                if (Npr < 1 || Npr > 3) continue;
             }
 
             int NT = (is_custom_block || has_sym_aux) ? Npr : Npr * Nres;
+
+            // 每共振态自由位置区间（Hessian 内核 + global_idx 切片共用）
+            std::vector<int> res_off_h(Nres, 0), res_cnt_h(Nres, 0);
+            if (is_custom_block || has_sym_aux) {
+                const auto& off_src = (is_conjugate && ow_bi >= 0)
+                    ? blocks_[ow_bi].res_dF_offset_ : blk.res_dF_offset_;
+                const auto& cnt_src = (is_conjugate && ow_bi >= 0)
+                    ? blocks_[ow_bi].res_dF_count_ : blk.res_dF_count_;
+                for (int r = 0; r < Nres && r < 8; ++r) {
+                    res_off_h[r] = (r < (int)off_src.size()) ? (int)off_src[r] : 0;
+                    res_cnt_h[r] = (r < (int)cnt_src.size()) ? (int)cnt_src[r] : 0;
+                }
+            }
 
             // 构建全局索引映射（conjugate 块映射到 owner 的 slot 索引）
             std::vector<int> global_idx(NT, -1);
@@ -3262,17 +3214,18 @@ void AmpCalc::computeUnifiedHessian(
                         }
                     }
                 }
+                int off = (is_custom_block || has_sym_aux) ? res_off_h[r] : r * Npr;
                 int count = 0;
                 for (int s = 0; s < n_free; ++s) {
                     if (slots_[s].block_idx == target_bi && slots_[s].res_idx == target_ri) {
-                        if (count < Npr) { global_idx[r * Npr + count] = s; ++count; }
+                        if (off + count < NT) { global_idx[off + count] = s; ++count; }
                     }
                 }
                 // var_equal ghost 成员 → owner 全局槽（二阶导数归属 owner）
                 for (const auto& g : var_equal_ghosts_) {
                     if (g.member_block == target_bi && g.member_res == target_ri
-                        && count < Npr) {
-                        global_idx[r * Npr + count] = g.owner_global;
+                        && off + count < NT) {
+                        global_idx[off + count] = g.owner_global;
                         ++count;
                     }
                 }
@@ -3291,6 +3244,10 @@ void AmpCalc::computeUnifiedHessian(
             cudaMalloc(&bt.d_dF_im, (size_t)nEv * nSL * Npr * nSigma * sizeof(double));
             cudaMalloc(&bt.d_gidx, NT * sizeof(int));
             cudaMemcpy(bt.d_gidx, global_idx.data(), NT * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMalloc(&bt.d_res_off, Nres * sizeof(int));
+            cudaMalloc(&bt.d_res_cnt, Nres * sizeof(int));
+            cudaMemcpy(bt.d_res_off, res_off_h.data(), Nres * sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(bt.d_res_cnt, res_cnt_h.data(), Nres * sizeof(int), cudaMemcpyHostToDevice);
 
             int grid = (nEv + kBlockSize - 1) / kBlockSize;
 
@@ -3336,7 +3293,13 @@ void AmpCalc::computeUnifiedHessian(
                         jit_full = blk.jit.full_buf[gpu];
                     }
                 }
-                // Custom / 符号微分标量路径（P 运行时无上限）
+                // JIT-full 只物化 hessian_target 节点（单节点语义）；内核按
+                // 节点下标匹配读取，其他共振态节点回退解释器
+                int jit_target_node = -1;
+                if (jit_full && blk.jit.hessian_target >= 0
+                    && blk.jit.hessian_target < (int)blk.jit.nodes.size())
+                    jit_target_node = blk.jit.nodes[blk.jit.hessian_target].node_idx;
+                // Custom / 符号微分标量路径（P 运行时无上限；多共振态）
                 computeCustomHessianKernel<<<grid, kBlockSize>>>(
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
@@ -3346,7 +3309,9 @@ void AmpCalc::computeUnifiedHessian(
                     d_hess_g, hess_ld, nEv, nSL, nPol, default_weight, d_w,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im,
-                    d_pI_ptr, d_pg_g, d_phA_g, evt_off,
+                    d_pI_ptr, d_pg_g, d_phA_g,
+                    bt.d_res_off, bt.d_res_cnt, Nres, jit_target_node,
+                    evt_off,
                     nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu],
                     jit_full);
                 cudaDeviceSynchronize();
@@ -3421,19 +3386,32 @@ void AmpCalc::computeUnifiedHessian(
                 auto& blk = blocks_[bi];
                 // 用当前 block 自己的 cas，而非 cas0（多链时不同链 SL 数不同）
                 int nSL = static_cast<int>(cas_list_[blk.cas_idx]->getNSLCombs());
-                int Npr = 0;
-                for (int s = 0; s < n_free; ++s)
-                    if (slots_[s].block_idx == (int)bi && slots_[s].res_idx == 0) ++Npr;
-                // Conjugate 块：使用 owner 的 Npr（与 Stage 1 逻辑一致）
-                if (Npr == 0) {
-                    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
-                        if (cj_key.first == (int)bi) {
-                            int ow_bi = owner_key.first;
-                            for (int s = 0; s < n_free; ++s)
-                                if (slots_[s].block_idx == ow_bi && slots_[s].res_idx == 0) ++Npr;
-                            break;
-                        }
+                // Npr 与 Stage 1 一致（多共振态 = Σ res_dF_count；conjugate 用
+                // owner 区间）——旧逻辑只数 res_idx==0 导致 d_dF 步长错位，
+                // 同共振态 vθ 混合项 term2 读到跨共振态偏移（=0）而缺失
+                bool is_conjugate = false;
+                int ow_bi = -1;
+                for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+                    if (cj_key.first == (int)bi) {
+                        is_conjugate = true;
+                        ow_bi = owner_key.first;
+                        break;
                     }
+                }
+                bool is_custom_block = !h_templates_[bi].empty() &&
+                    h_templates_[bi][0].type == ResModelType::Custom;
+                bool has_sym_aux = !h_templates_[bi].empty();
+                for (const auto& t : h_templates_[bi]) {
+                    if (t.aux_size <= 0) { has_sym_aux = false; break; }
+                }
+                int Npr = 0;
+                if (is_custom_block || has_sym_aux) {
+                    const auto& cnt_src = (is_conjugate && ow_bi >= 0)
+                        ? blocks_[ow_bi].res_dF_count_ : blk.res_dF_count_;
+                    for (int r = 0; r < blk.resonance_count
+                         && r < (int)cnt_src.size(); ++r) Npr += (int)cnt_src[r];
+                } else {
+                    Npr = (int)blk.res_dF_count_[0];
                 }
                 if (Npr < 1) continue;
                 int nTotal_slamp = static_cast<int>(cas_list_[blk.cas_idx]->getNEventsVec()[gpu]) * nPol;
