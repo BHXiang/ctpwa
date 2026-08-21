@@ -455,7 +455,89 @@ __global__ void computeSfromAmpsKernel(
 }
 
 // ============================================================
-// Custom 模型 Hessian（标量路径，参数数 P 运行时无上限）
+// 单节点 Bf 的 q0 链对共振态质量参数的一阶/二阶对数导数
+// O = Bf(L, q, q0, d), q0 = breakup(m0, md1, md2)；md1/md2 经回退等于某自由
+// 共振态质量参数 θ_r 时（aux 中为 VAR，无导数）:
+//   dlnO_j = dlnBf/dq0 · ∂q0/∂θ_j
+//   d2lnO_jk = d2lnBf/dq0² · ∂q0/∂θ_j·∂q0/∂θ_k + dlnBf/dq0 · ∂²q0/∂θ_j∂θ_k
+// 只作用于 mass 槽位（d_param_map == 0）；im 恒 0（Bf 实数）。
+// 与梯度 kernel 的跨-Bf q0 项一致；∂²q0 混合项（两子粒子同为自由共振态）
+// 经 breakup_d2q_dm1dm2 计入。
+// ============================================================
+__device__ void addBfQ0HessianTerms(
+    const DecayNode& node, int L, double q0,
+    double m0_q0, double md1_q0, double md2_q0,
+    double* dln_re, double* dln_im, double* d2ln_re, double* d2ln_im,
+    const DeviceResonance* d_resonances, int R,
+    const int* res_off, const int* res_cnt, const int* pm)
+{
+    double lq0 = dlnBf_dq0(L, q0, node.bf_d);
+    double l2q0 = d2lnBf_dq0q0(L, q0, node.bf_d);
+    bool both_daug = (node.mass[1] <= 0 && node.mass[2] <= 0
+                      && node.daug1_idx == node.daug2_idx);
+    for (int r = 0; r < R; ++r) {
+        const DeviceResonance& res = d_resonances[r];
+        if (res.param_count <= 0) continue;
+        double dq0 = 0.0, d2q0 = 0.0;
+        if (node.mass[1] <= 0 && node.daug1_idx == res.particle_idx) {
+            dq0 += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+            d2q0 += breakup_d2q_dm2(1, m0_q0, md1_q0, md2_q0);
+        }
+        if (node.mass[2] <= 0 && node.daug2_idx == res.particle_idx) {
+            dq0 += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+            d2q0 += breakup_d2q_dm2(2, m0_q0, md1_q0, md2_q0);
+        }
+        if (both_daug && node.daug1_idx == res.particle_idx)
+            d2q0 += 2.0 * breakup_d2q_dm1dm2(m0_q0, md1_q0, md2_q0);
+        if (dq0 == 0.0 && d2q0 == 0.0) continue;
+        int off = res_off[r], cnt = res_cnt[r];
+        for (int j_loc = 0; j_loc < cnt; ++j_loc) {
+            int p = pm ? pm[off + j_loc] : (off + j_loc);
+            if (p != 0) continue;   // 仅 mass 参数受 q0 链影响
+            int jj = off + j_loc;
+            dln_re[jj] += lq0 * dq0;
+            double v2 = l2q0 * dq0 * dq0 + lq0 * d2q0;
+            d2ln_re[jj * 16 + jj] += v2;
+            // 与其他共振态质量参数的交叉项（q0 混合二阶导）
+            for (int r2 = 0; r2 < R; ++r2) {
+                if (r2 == r || d_resonances[r2].param_count <= 0) continue;
+                double dq0b = 0.0;
+                if (node.mass[1] <= 0 && node.daug1_idx == d_resonances[r2].particle_idx)
+                    dq0b += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
+                if (node.mass[2] <= 0 && node.daug2_idx == d_resonances[r2].particle_idx)
+                    dq0b += breakup_dq_dm(2, m0_q0, md1_q0, md2_q0);
+                if (dq0b == 0.0) continue;
+                double d2q0_cross = 0.0;
+                bool pair = (node.mass[1] <= 0 && node.daug1_idx == res.particle_idx
+                             && node.mass[2] <= 0 && node.daug2_idx == d_resonances[r2].particle_idx)
+                         || (node.mass[1] <= 0 && node.daug1_idx == d_resonances[r2].particle_idx
+                             && node.mass[2] <= 0 && node.daug2_idx == res.particle_idx);
+                if (pair) d2q0_cross = breakup_d2q_dm1dm2(m0_q0, md1_q0, md2_q0);
+                double v2x = l2q0 * dq0 * dq0b + lq0 * d2q0_cross;
+                int off2 = res_off[r2], cnt2 = res_cnt[r2];
+                for (int k_loc = 0; k_loc < cnt2; ++k_loc) {
+                    int q = pm ? pm[off2 + k_loc] : (off2 + k_loc);
+                    if (q != 0) continue;
+                    int kk = off2 + k_loc;
+                    d2ln_re[jj * 16 + kk] += v2x;
+                    d2ln_re[kk * 16 + jj] += v2x;   // 对称
+                }
+            }
+            break;  // 每共振态最多一个 mass 槽位
+        }
+    }
+}
+
+// ============================================================
+// Custom 模型 Hessian（标量路径，参数数 P 运行时无上限；多共振态）
+// F_total = Π 共振态因子 × Π Bf；log-derivative 累积（与梯度 kernel R>1 一致）:
+//   dln[j]  = Σ_n ∂ln F_n/∂θ_j
+//   d2ln[j][k] = Σ_n (∂²F_n/∂θ_j∂θ_k/F_n − ∂lnF_n/∂θ_j·∂lnF_n/∂θ_k)
+//   dF_t[j] = F_total·dln[j]
+//   d2F_t[j][k] = F_total·(d2ln[j][k] + dln[j]·dln[k])
+// 位置空间 = 块内自由参数位置 [0, Npr)（Npr = Σ_r res_dF_count[r]），
+// 每共振态 r 占据区间 [res_off[r], res_off[r]+res_cnt[r])；d_param_map 把位置
+// 映到该共振态自身参数下标（0=mass, 1=width, ...）。
 // ============================================================
 __global__ void computeCustomHessianKernel(
     const thrust::complex<double>* d_slamp_tab,
@@ -466,9 +548,9 @@ __global__ void computeCustomHessianKernel(
     const DeviceResonance* d_resonances,
     const double* d_all_params,
     const double* d_all_channels,
-    const int* d_global_idx,          // [Npr] 自由参数 → 全局 slot 下标
-    const int* d_param_map,           // [Npr] 位置 j → 参数下标（null → 恒等）
-    int Npr,                          // 自由参数数（≤ P；fix_var/var_equal 后 < P）
+    const int* d_global_idx,          // [Npr] 自由位置 → 全局 slot 下标
+    const int* d_param_map,           // [Npr] 位置 j → 该共振态参数下标（null → 恒等）
+    int Npr,                          // 自由参数数 = Σ_r res_dF_count[r]（≤ 16）
     double* d_hess, int hess_ld,
     int nEvents, int nSL, int nPolar, double default_weight,
     const double* d_event_weights,
@@ -477,6 +559,10 @@ __global__ void computeCustomHessianKernel(
     double* d_dS_re_out, double* d_dS_im_out,
     double* d_dF_re_out, double* d_dF_im_out,
     double* d_phsp_I, double* d_phsp_grad, double* d_phsp_hessA,
+    const int* d_res_off,             // [Nres] 每共振态自由位置区间起始
+    const int* d_res_cnt,             // [Nres] 每共振态自由位置数
+    int Nres,
+    int jit_target_node,              // JIT-full 物化节点下标（-1 → 解释器）
     int evt_offset = 0,
     int nSigma = 1,
     const DeviceMomenta* d_mom_tab = nullptr,
@@ -488,17 +574,14 @@ __global__ void computeCustomHessianKernel(
     int nTotal = d_momenta->n_events * nPolar;
     double weight = d_event_weights ? d_event_weights[evt] : default_weight;
 
-    const DeviceResonance& target = d_resonances[0];
-    int P = target.param_count;
-    if (P < 1) return;
-    if (P > 16) P = 16;
-    if (Npr < 0) Npr = P;
+    int R = Nres;
+    if (R > 8) R = 8;
+    if (Npr < 0) Npr = 0;
     if (Npr > 16) Npr = 16;
+    if (Npr < 1) return;
     // 位置 j → 参数下标（fix_var 固定 / var_equal 合并的参数不求导；null → 恒等）
     const int* pm = d_param_map;
-    const double* target_rp = d_all_params + target.param_offset;
     const double* aux = d_all_channels;
-    int aux_offset = target.aux_offset;
 
     double dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
 
@@ -552,10 +635,13 @@ __global__ void computeCustomHessianKernel(
             // （与模板版 hessianStage1Kernel 535 行 slamp_row 一致）
             const thrust::complex<double>* slam = d_slamp_tab + (size_t)s * ((size_t)nSL * nTotal);
 
-            // 节点循环（标量）→ F_total, dF_total, d2F_total
-            double Or = 1.0, Oi = 0.0;
-            double Fr = 1.0, Fi = 0.0;
-            bool custom_eval = false;
+            // 节点循环（标量）→ F_total, dF_total, d2F_total（log-derivative 累积）
+            double Ftr = 1.0, Fti = 0.0;
+            double dln_re[64], dln_im[64];
+            double d2ln_re[16 * 16], d2ln_im[16 * 16];
+            for (int j = 0; j < Npr; ++j) dln_re[j] = dln_im[j] = 0.0;
+            for (int j = 0; j < Npr * 16; ++j) d2ln_re[j] = d2ln_im[j] = 0.0;
+
             for (int nodeIdx = 0; nodeIdx < decayChain_size; ++nodeIdx) {
                 const DecayNode& node = d_decayNodes[nodeIdx];
                 const SL& sl = d_slComb[nodeIdx + sl_idx * decayChain_size];
@@ -566,71 +652,145 @@ __global__ void computeCustomHessianKernel(
                 double mm = pM.M();
                 double qq = breakup_momentum(mm, pD1.M(), pD2.M());
                 double md1 = pD1.M(), md2 = pD2.M();
-                bool is_target = (node.mother_idx == target.particle_idx && node.mass[0] <= 0);
-                double m0_q0 = is_target
-                    ? ((target.param_count > 0) ? target_rp[0] : 1.0)
-                    : ((node.mass[0] > 0) ? node.mass[0] : 1.0);
-                // 子粒子是目标共振态（无固定质量）→ 用其 m0 参数
-                // （否则回退到事件质量）
-                double md1_q0 = (node.mass[1] > 0) ? node.mass[1]
-                    : ((node.daug1_idx == target.particle_idx && target.param_count > 0)
-                           ? target_rp[0] : md1);
-                double md2_q0 = (node.mass[2] > 0) ? node.mass[2]
-                    : ((node.daug2_idx == target.particle_idx && target.param_count > 0)
-                           ? target_rp[0] : md2);
+
+                int match_r = -1;
+                for (int r = 0; r < R; ++r) {
+                    if (node.mother_idx == d_resonances[r].particle_idx && node.mass[0] <= 0) {
+                        match_r = r; break;
+                    }
+                }
+
+                // q0 链质量回退（与梯度 kernel R>1 一致）：
+                // m0 = 共振态名义质量；子粒子质量 = 固定质量，否则自由共振态
+                // 参数质量，否则事件质量
+                double m0_q0;
+                if (match_r >= 0)
+                    m0_q0 = (d_resonances[match_r].param_count > 0)
+                        ? d_all_params[d_resonances[match_r].param_offset + 0] : 1.0;
+                else if (node.mass[0] > 0)
+                    m0_q0 = node.mass[0];
+                else
+                    m0_q0 = 1.0;
+
+                double md1_q0 = node.mass[1];
+                double md2_q0 = node.mass[2];
+                if (md1_q0 <= 0)
+                    for (int r = 0; r < R; ++r)
+                        if (node.daug1_idx == d_resonances[r].particle_idx && d_resonances[r].param_count > 0)
+                            { md1_q0 = d_all_params[d_resonances[r].param_offset + 0]; break; }
+                if (md1_q0 <= 0) md1_q0 = md1;
+                if (md2_q0 <= 0)
+                    for (int r = 0; r < R; ++r)
+                        if (node.daug2_idx == d_resonances[r].particle_idx && d_resonances[r].param_count > 0)
+                            { md2_q0 = d_all_params[d_resonances[r].param_offset + 0]; break; }
+                if (md2_q0 <= 0) md2_q0 = md2;
                 double q0 = breakup_momentum(m0_q0, md1_q0, md2_q0);
 
-                if (is_target) {
-                    if (!custom_eval) {
-                        if (d_jit_out_full) {
-                            // JIT 物化读取（pass-1 已算 F/dF/d2F；nvals = 2+2P+2P²）
-                            const double* jb = d_jit_out_full
-                                + ((size_t)s * nEvents + evt) * nSL * (2 + 2 * P + 2 * P * P)
-                                + (size_t)sl_idx * (2 + 2 * P + 2 * P * P);
-                            Fr = jb[0]; Fi = jb[1];
-                            for (int j = 0; j < P; ++j) {
-                                dFr[j] = jb[2 + 2 * j];
-                                dFi[j] = jb[2 + 2 * j + 1];
-                            }
-                            for (int j = 0; j < P; ++j)
-                                for (int k = 0; k < P; ++k) {
-                                    int b = 2 + 2 * P + 2 * (j * P + k);
-                                    d2Fr[j * P + k] = jb[b];
-                                    d2Fi[j * P + k] = jb[b + 1];
-                                }
-                        } else {
-                            double p1_P = pD1.P(), p1_E = pD1.E;
-                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                            double p1_phi = atan2(pD1.Py, pD1.Px);
-                            double p2_P = pD2.P(), p2_E = pD2.E;
-                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                            double p2_phi = atan2(pD2.Py, pD2.Px);
-                            evalCustomAll(aux, aux_offset, mm, qq, q0, L, node.bf_d,
-                                md1_q0, md2_q0,
-                                p1_P, p1_E, p1_ct, p1_phi,
-                                p2_P, p2_E, p2_ct, p2_phi,
-                                target_rp, P, Fr, Fi, dFr, dFi, d2Fr, d2Fi);
+                if (match_r >= 0) {
+                    const DeviceResonance& res = d_resonances[match_r];
+                    const double* rp = d_all_params + res.param_offset;
+                    int P_r = res.param_count;
+                    if (P_r > 16) P_r = 16;
+                    int off = d_res_off[match_r];
+                    int cnt = d_res_cnt[match_r];
+
+                    double Fr, Fi, dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
+                    if (d_jit_out_full && nodeIdx == jit_target_node) {
+                        // JIT 物化读取（pass-1 已算 F/dF/d2F；nvals = 2+2P+2P²）
+                        const double* jb = d_jit_out_full
+                            + ((size_t)s * nEvents + evt) * nSL * (2 + 2 * P_r + 2 * P_r * P_r)
+                            + (size_t)sl_idx * (2 + 2 * P_r + 2 * P_r * P_r);
+                        Fr = jb[0]; Fi = jb[1];
+                        for (int j = 0; j < P_r; ++j) {
+                            dFr[j] = jb[2 + 2 * j];
+                            dFi[j] = jb[2 + 2 * j + 1];
                         }
-                        custom_eval = true;
+                        for (int j = 0; j < P_r; ++j)
+                            for (int k = 0; k < P_r; ++k) {
+                                int b = 2 + 2 * P_r + 2 * (j * P_r + k);
+                                d2Fr[j * P_r + k] = jb[b];
+                                d2Fi[j * P_r + k] = jb[b + 1];
+                            }
+                    } else if (res.type == ResModelType::Interp) {
+                        interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
+                        for (int j = 0; j < P_r; ++j)
+                            for (int k = 0; k < P_r; ++k) { d2Fr[j * P_r + k] = 0; d2Fi[j * P_r + k] = 0; }
+                    } else {
+                        double p1_P = pD1.P(), p1_E = pD1.E;
+                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                        double p1_phi = atan2(pD1.Py, pD1.Px);
+                        double p2_P = pD2.P(), p2_E = pD2.E;
+                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                        double p2_phi = atan2(pD2.Py, pD2.Px);
+                        // P_r=0（固定/ONE 模型）: 只读值段（dF/d2F 段不存在）
+                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                            md1_q0, md2_q0,
+                            p1_P, p1_E, p1_ct, p1_phi,
+                            p2_P, p2_E, p2_ct, p2_phi,
+                            rp, P_r, Fr, Fi, dFr, dFi, d2Fr, d2Fi,
+                            /*compute_2nd=*/(P_r > 0));
                     }
+
+                    double den = Fr * Fr + Fi * Fi;
+                    // 本节点 log-derivative（参数空间 → 位置空间）
+                    double ndln_re[16], ndln_im[16];
+                    for (int j_loc = 0; j_loc < cnt; ++j_loc) {
+                        int p = pm ? pm[off + j_loc] : (off + j_loc);
+                        if (p < 0 || p >= P_r) continue;
+                        ndln_re[j_loc] = (dFr[p] * Fr + dFi[p] * Fi) / den;
+                        ndln_im[j_loc] = (dFi[p] * Fr - dFr[p] * Fi) / den;
+                        dln_re[off + j_loc] += ndln_re[j_loc];
+                        dln_im[off + j_loc] += ndln_im[j_loc];
+                    }
+                    // d2ln = d2F/F − dln·dln（复数；d2F 对称 → 全矩阵写入）
+                    for (int j_loc = 0; j_loc < cnt; ++j_loc) {
+                        int p = pm ? pm[off + j_loc] : (off + j_loc);
+                        if (p < 0 || p >= P_r) continue;
+                        for (int k_loc = 0; k_loc < cnt; ++k_loc) {
+                            int q = pm ? pm[off + k_loc] : (off + k_loc);
+                            if (q < 0 || q >= P_r) continue;
+                            int jj = off + j_loc, kk = off + k_loc;
+                            double t = (d2Fr[p * P_r + q] * Fr + d2Fi[p * P_r + q] * Fi) / den;
+                            double u = (d2Fi[p * P_r + q] * Fr - d2Fr[p * P_r + q] * Fi) / den;
+                            d2ln_re[jj * 16 + kk] += t - (ndln_re[j_loc] * ndln_re[k_loc] - ndln_im[j_loc] * ndln_im[k_loc]);
+                            d2ln_im[jj * 16 + kk] += u - (ndln_re[j_loc] * ndln_im[k_loc] + ndln_im[j_loc] * ndln_re[k_loc]);
+                        }
+                    }
+
+                    // 跨共振 Bf 项: 匹配节点 aux 内含的 Bf 因子其 q0 链含共振态
+                    // 子粒子质量（CVAR_MD1/2 为 VAR，aux 无该导数）→ 补 q0 链的
+                    // 一阶/二阶对数导数（仅 mass 参数受影响；BW 的 aux 不含 Bf，
+                    // 与梯度 kernel 一致——Bf 因子整体不进 F_total）
+                    if (node.has_bf && res.type != ResModelType::BW)
+                        addBfQ0HessianTerms(node, L, q0, m0_q0, md1_q0, md2_q0,
+                            dln_re, dln_im, d2ln_re, d2ln_im,
+                            d_resonances, R, d_res_off, d_res_cnt, pm);
+
+                    double nr = Ftr * Fr - Fti * Fi;
+                    double ni = Ftr * Fi + Fti * Fr;
+                    Ftr = nr; Fti = ni;
                 } else if (node.has_bf) {
                     double bf = Bf<double>(L, qq, q0, node.bf_d);
-                    Or *= bf; Oi *= bf;
+                    Ftr *= bf; Fti *= bf;
+                    addBfQ0HessianTerms(node, L, q0, m0_q0, md1_q0, md2_q0,
+                        dln_re, dln_im, d2ln_re, d2ln_im,
+                        d_resonances, R, d_res_off, d_res_cnt, pm);
                 }
             }
 
-            // F_total = O × F_custom；dF/d2F 同理（O 为实因子 Oi=0 理论上，保留复数）
-            double Ftr = Or * Fr - Oi * Fi, Fti = Or * Fi + Oi * Fr;
+            // F_total = Π F_n；dF_t/d2F_t 位置空间（见头注释公式）
             double dF_t[16], dF_ti[16];
-            for (int j = 0; j < P; ++j) {
-                dF_t[j]  = Or * dFr[j] - Oi * dFi[j];
-                dF_ti[j] = Or * dFi[j] + Oi * dFr[j];
+            for (int j = 0; j < Npr; ++j) {
+                dF_t[j]  = Ftr * dln_re[j] - Fti * dln_im[j];
+                dF_ti[j] = Ftr * dln_im[j] + Fti * dln_re[j];
             }
             double d2F_t[16 * 16], d2F_ti[16 * 16];
-            for (int j = 0; j < P; ++j)
-                for (int k = 0; k < P; ++k) {
-                    d2F_t[j * P + k]  = Or * d2Fr[j * P + k] - Oi * d2Fi[j * P + k];
-                    d2F_ti[j * P + k] = Or * d2Fi[j * P + k] + Oi * d2Fr[j * P + k];
+            for (int j = 0; j < Npr; ++j)
+                for (int k = 0; k < Npr; ++k) {
+                    double l2_r = d2ln_re[j * 16 + k] + dln_re[j] * dln_re[k] - dln_im[j] * dln_im[k];
+                    double l2_i = d2ln_im[j * 16 + k] + dln_re[j] * dln_im[k] + dln_im[j] * dln_re[k];
+                    d2F_t[j * 16 + k]  = Ftr * l2_r - Fti * l2_i;
+                    d2F_ti[j * 16 + k] = Ftr * l2_i + Fti * l2_r;
                 }
 
             // dF 输出（mixed Hessian 用）: [nSigma × nEv*nSL*Npr]；与 p 无关，仅首 chunk 写
@@ -638,9 +798,8 @@ __global__ void computeCustomHessianKernel(
                 size_t row = (size_t)s * ((size_t)nEvents * nSL * Npr);
                 size_t base = row + (size_t)evt * nSL * Npr + sl_idx * Npr;
                 for (int j = 0; j < Npr; ++j) {
-                    int pj = pm ? pm[j] : j;
-                    d_dF_re_out[base + j] = dF_t[pj];
-                    d_dF_im_out[base + j] = dF_ti[pj];
+                    d_dF_re_out[base + j] = dF_t[j];
+                    d_dF_im_out[base + j] = dF_ti[j];
                 }
             }
 
@@ -655,9 +814,8 @@ __global__ void computeCustomHessianKernel(
                 double t_re = (double)vv.x * sl_amp.real() - (double)vv.y * sl_amp.imag();
                 double t_im = (double)vv.x * sl_amp.imag() + (double)vv.y * sl_amp.real();
                 for (int j = 0; j < Npr; ++j) {
-                    int pj = pm ? pm[j] : j;
-                    dS_re[j][p - plo] += sg * (dF_t[pj] * t_re - dF_ti[pj] * t_im);
-                    dS_im[j][p - plo] += sg * (dF_t[pj] * t_im + dF_ti[pj] * t_re);
+                    dS_re[j][p - plo] += sg * (dF_t[j] * t_re - dF_ti[j] * t_im);
+                    dS_im[j][p - plo] += sg * (dF_t[j] * t_im + dF_ti[j] * t_re);
                 }
                 // termC 标量折叠：cwr/cwi 与 SL/σ 无关，p 内层直接缩放累加
                 // （与原 Σ_p cwr·d2S_re − cwi·d2S_im 数学等价；double 累加顺序
@@ -665,11 +823,9 @@ __global__ void computeCustomHessianKernel(
                 double cwr_p = d_S_re_full[evt * nPolar + p] * inv_I;
                 double cwi_p = -d_S_im_full[evt * nPolar + p] * inv_I;
                 for (int j = 0; j < Npr; ++j) {
-                    int pj = pm ? pm[j] : j;
                     for (int k = 0; k < Npr; ++k) {
-                        int pk = pm ? pm[k] : k;
-                        double a = d2F_t[pj * P + pk] * t_re - d2F_ti[pj * P + pk] * t_im;
-                        double b = d2F_t[pj * P + pk] * t_im + d2F_ti[pj * P + pk] * t_re;
+                        double a = d2F_t[j * 16 + k] * t_re - d2F_ti[j * 16 + k] * t_im;
+                        double b = d2F_t[j * 16 + k] * t_im + d2F_ti[j * 16 + k] * t_re;
                         d2S_acc_re[j * 16 + k] += sg * (cwr_p * a - cwi_p * b);
                         d2S_acc_im[j * 16 + k] += sg * (cwr_p * b + cwi_p * a);
                     }

@@ -273,6 +273,15 @@ void CalculateAngleHist(LorentzVector *device_momenta,
             continue;
         }
 
+
+        // AngleCalculator kernel 固定 3 组输入（p=母粒子系, q=组合组, d=参考子粒子），
+        // 少于 3 组会越界读 group_sizes[2]/particle_indices → 明确报错而非非法访问
+        if (groupSizes.size() < 3) {
+            std::cerr << "Error: cosbeta config " << configIdx
+                      << " 需要 3 组粒子输入（如 [[母粒子], [组合1, 组合2], [参考子粒子]]），"
+                      << "实际只有 " << groupSizes.size() << " 组 —— 跳过该图" << std::endl;
+            continue;
+        }
         if (config.range.size() < 2) {
             std::cerr << "Error: Config " << configIdx << " range size < 2!"
                       << std::endl;

@@ -222,6 +222,178 @@ __host__ __device__ auto BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0, double 
     return ResResult<T>::make(x / s, y / s);
 }
 
+// ============================================================
+// 统一插值（Interp 模型，hist=0 / linear=1 / spline=2, Catmull-Rom）
+// aux 格式: [method, N, x_min, dx, re_0..re_{N-1}, im_0..im_{N-1}] (等距)
+//           [-(method+1), N, x_0..x_{N-1}, re_0..re_{N-1}, im_0..im_{N-1}] (非等距)
+// ============================================================
+__device__ inline double interp1d(const double* y, int i, double frac, int method, int N)
+{
+    switch (method) {
+    case 0: return y[i];                                        // hist
+    case 1: return y[i] + (y[i+1] - y[i]) * frac;               // linear
+    case 2: {                                                   // spline
+        double y0 = (i > 0) ? y[i-1] : y[i] - (y[i+1]-y[i]);
+        double y1 = y[i], y2 = y[i+1];
+        double y3 = (i+2 < N) ? y[i+2] : y[i+1] + (y[i+1]-y[i]);
+        double f2 = frac * frac, f3 = f2 * frac;
+        return 0.5 * ((2*y1) + (-y0 + y2) * frac +
+                      (2*y0 - 5*y1 + 4*y2 - y3) * f2 +
+                      (-y0 + 3*y1 - 3*y2 + y3) * f3);
+    }
+    default: return y[i];
+    }
+}
+
+__device__ inline void interpEval(const double* tab, double x,
+    double& Fr, double& Fi, double* dFr, double* dFi, int P)
+{
+    int hdr = (int)tab[0];
+    int method = (hdr >= 0) ? hdr : -(hdr + 1);
+    int N = (int)tab[1];
+
+    int i; double frac;
+    const double* re; const double* im;
+    if (hdr >= 0) {
+        // 等距 bin
+        double xmin = tab[2], dx = tab[3];
+        re = tab + 4;
+        im = tab + 4 + N;
+        double pos = (x - xmin) / dx;
+        i = (int)pos;
+        if (i < 0) { i = 0; frac = 0.0; }
+        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
+        else { frac = pos - (double)i; }
+    } else {
+        // 非等距点：二分查找
+        const double* xv = tab + 2;
+        re = tab + 2 + N;
+        im = tab + 2 + 2 * N;
+        int lo = 0, hi = N - 1;
+        while (lo < hi - 1) {
+            int mid = (lo + hi) / 2;
+            if (x < xv[mid]) hi = mid; else lo = mid;
+        }
+        i = lo;
+        if (i < 0) { i = 0; frac = 0.0; }
+        else if (i >= N - 1) { i = N - 2; frac = 1.0; }
+        else { frac = (x - xv[i]) / (xv[i+1] - xv[i]); }
+        if (method == 2) method = 0;  // 非均匀 spline 未实现 → 回退 hist
+    }
+    Fr = interp1d(re, i, frac, method, N);
+    Fi = interp1d(im, i, frac, method, N);
+    // 梯度：bin 高度为拟合参数时（极少见；Interp 无自由参数 → 正常为 0）
+    for (int j = 0; j < P && j < 16; ++j) dFr[j] = dFi[j] = 0.0;
+    if (P > 0 && method < 2) {
+        if (hdr >= 0 && i < P)
+            dFr[i] = (method == 0) ? 1.0 : 1.0 - frac;
+        if (hdr >= 0 && i + 1 < P && method == 1)
+            dFr[i + 1] = frac;
+    }
+}
+
+// ============================================================
+// Bf 因子对质量参数的一阶/二阶导数辅助（梯度/Hessian kernel 共用）
+// O = Π_i Bf(L_i, qq_i, q0_i), q0_i = breakup(m0_i, m1_i, m2_i)
+// 子粒子为共振态时 q0 依赖其 m0 参数 → ∂lnBf/∂m = ∂lnBf/∂q0 · ∂q0/∂m
+// ============================================================
+
+// ∂q(m,m1,m2)/∂m_which (which=1: m1, which=2: m2)
+// qsq ≤ 0 时 q 被钳位为 0（常数）→ 导数为 0
+__device__ inline double breakup_dq_dm(int which, double m, double m1, double m2)
+{
+    double s = m1 + m2, d = m1 - m2;
+    double A = m * m - s * s, B = m * m - d * d;
+    double qsq = A * B;
+    if (qsq <= 0.0) return 0.0;
+    double dqsq = (which == 1) ? (-2.0 * s * B - 2.0 * d * A)
+                               : (-2.0 * s * B + 2.0 * d * A);
+    return dqsq / (4.0 * m * sqrt(qsq));
+}
+
+// ∂²q/∂m_which²（q = sqrt(Q)/(2m), Q = A·B）
+// d²q = (d²Q·Q − dQ²/2) / (4m·Q^1.5)；Q≤0 时导数为 0
+__device__ inline double breakup_d2q_dm2(int which, double m, double m1, double m2)
+{
+    double s = m1 + m2, d = m1 - m2;
+    double A = m * m - s * s, B = m * m - d * d;
+    double Q = A * B;
+    if (Q <= 0.0) return 0.0;
+    double dA = -2.0 * s, dB = (which == 1) ? (-2.0 * d) : (2.0 * d);
+    double d2A = -2.0, d2B = (which == 1) ? -2.0 : 2.0;
+    double dQ = dA * B + A * dB;
+    double d2Q = d2A * B + 2.0 * dA * dB + A * d2B;
+    return (d2Q * Q - 0.5 * dQ * dQ) / (4.0 * m * Q * sqrt(Q));
+}
+
+// ∂²q/∂m1∂m2（两个子粒子同为同一共振态质量参数时的混合项；
+// 与 breakup_d2q_dm2 同公式，∂Q 取 ∂/∂m1 × ∂/∂m2）
+__device__ inline double breakup_d2q_dm1dm2(double m, double m1, double m2)
+{
+    double s = m1 + m2, d = m1 - m2;
+    double A = m * m - s * s, B = m * m - d * d;
+    double Q = A * B;
+    if (Q <= 0.0) return 0.0;
+    double dA1 = -2.0 * s, dB1 = -2.0 * d;   // ∂/∂m1
+    double dA2 = -2.0 * s, dB2 = +2.0 * d;   // ∂/∂m2
+    double dQ1 = dA1 * B + A * dB1;
+    double dQ2 = dA2 * B + A * dB2;
+    double d2Q = -2.0 * B + dA1 * dB2 + dA2 * dB1 + 2.0 * A;
+    return (d2Q * Q - 0.5 * dQ1 * dQ2) / (4.0 * m * Q * sqrt(Q));
+}
+
+// ∂ln Bf(L,q,q0,d)/∂q0 = 0.5·N0'(z0)/N0(z0)·d, z0 = q0·d
+// ∂²ln Bf/∂q0² = 0.5·d²·(N0''/N0 − (N0'/N0)²)
+// N0(z0) 多项式系数与上方 Bf 完全一致
+__device__ inline double dlnBf_dq0(int L, double q0, double bf_d)
+{
+    double z0 = q0 * bf_d;
+    double z2 = z0 * z0;
+    double n0, dn0;
+    switch (L) {
+    case 0: n0 = 1.0; dn0 = 0.0; break;
+    case 1: n0 = 1.0 + z2; dn0 = 2.0 * z0; break;
+    case 2: n0 = 9.0 + z2 * (3.0 + z2); dn0 = z0 * (6.0 + 4.0 * z2); break;
+    case 3: n0 = 225.0 + z2 * (45.0 + z2 * (6.0 + z2));
+            dn0 = z0 * (90.0 + z2 * (24.0 + 6.0 * z2)); break;
+    case 4: n0 = 11025.0 + z2 * (1575.0 + z2 * (135.0 + z2 * (10.0 + z2)));
+            dn0 = z0 * (3150.0 + z2 * (540.0 + z2 * (60.0 + 8.0 * z2))); break;
+    case 5: n0 = 893025.0 + z2 * (99225.0 + z2 * (6300.0 + z2 * (315.0 + z2 * (15.0 + z2))));
+            dn0 = z0 * (198450.0 + z2 * (25200.0 + z2 * (1890.0 + z2 * (120.0 + 10.0 * z2)))); break;
+    case 6: n0 = 540326025.0 + z2 * (6185025.0 + z2 * (363825.0 + z2 * (17325.0 + z2 * (630.0 + z2 * (21.0 + z2)))));
+            dn0 = z0 * (12370050.0 + z2 * (1455300.0 + z2 * (103950.0 + z2 * (5040.0 + z2 * (210.0 + 12.0 * z2))))); break;
+    default: return 0.0;
+    }
+    return 0.5 * dn0 / n0 * bf_d;
+}
+
+__device__ inline double d2lnBf_dq0q0(int L, double q0, double bf_d)
+{
+    double z0 = q0 * bf_d;
+    double z2 = z0 * z0;
+    double n0, dn0, d2n0;   // N, N'(z0), N''(z0)
+    switch (L) {
+    case 0: n0 = 1.0; dn0 = 0.0; d2n0 = 0.0; break;
+    case 1: n0 = 1.0 + z2; dn0 = 2.0 * z0; d2n0 = 2.0; break;
+    case 2: n0 = 9.0 + z2 * (3.0 + z2); dn0 = z0 * (6.0 + 4.0 * z2);
+            d2n0 = 6.0 + 12.0 * z2; break;
+    case 3: n0 = 225.0 + z2 * (45.0 + z2 * (6.0 + z2));
+            dn0 = z0 * (90.0 + z2 * (24.0 + 6.0 * z2));
+            d2n0 = 90.0 + z2 * (72.0 + 30.0 * z2); break;
+    case 4: n0 = 11025.0 + z2 * (1575.0 + z2 * (135.0 + z2 * (10.0 + z2)));
+            dn0 = z0 * (3150.0 + z2 * (540.0 + z2 * (60.0 + 8.0 * z2)));
+            d2n0 = 3150.0 + z2 * (1620.0 + z2 * (300.0 + 56.0 * z2)); break;
+    case 5: n0 = 893025.0 + z2 * (99225.0 + z2 * (6300.0 + z2 * (315.0 + z2 * (15.0 + z2))));
+            dn0 = z0 * (198450.0 + z2 * (25200.0 + z2 * (1890.0 + z2 * (120.0 + 10.0 * z2))));
+            d2n0 = 198450.0 + z2 * (75600.0 + z2 * (9450.0 + z2 * (840.0 + 90.0 * z2))); break;
+    case 6: n0 = 540326025.0 + z2 * (6185025.0 + z2 * (363825.0 + z2 * (17325.0 + z2 * (630.0 + z2 * (21.0 + z2)))));
+            dn0 = z0 * (12370050.0 + z2 * (1455300.0 + z2 * (103950.0 + z2 * (5040.0 + z2 * (210.0 + 12.0 * z2)))));
+            d2n0 = 12370050.0 + z2 * (4365900.0 + z2 * (519750.0 + z2 * (35280.0 + z2 * (1890.0 + 132.0 * z2)))); break;
+    default: return 0.0;
+    }
+    return 0.5 * bf_d * bf_d * (d2n0 / n0 - (dn0 / n0) * (dn0 / n0));
+}
+
 template <typename T>
 __host__ __device__ auto BW(T& m, T& m0, T& gamma0)
     -> typename ResResult<T>::type

@@ -45,6 +45,12 @@ enum CompositeId : int {
     MODEL_ONE = 5,         // 1 + 0i
     MODEL_FLATTE_RHO_RE = 6,  // Re(ρ_i): Re(csqrt(1-S/s) * sqrt(clip(1-D/s,0))) — deriv=0
     MODEL_FLATTE_RHO_IM = 7,  // Im(ρ_i): Im(csqrt(1-S/s) * sqrt(clip(1-D/s,0))) — deriv=0
+    // 运行期 lnBf 对数导数黑盒（L 为 CVAR_L 运行时逐波 L 时替代编译期
+    // bfPoly 展开；对参数导数恒 0 —— q/q0 均为 Var，见 modelDeriv 默认分支）
+    MODEL_BF_DLNQ = 8,       // ∂lnBf/∂q   = -0.5·d·N'(z)/N(z),  z = q·d   [L, q, q0, d]
+    MODEL_BF_DLNQ0 = 9,      // ∂lnBf/∂q0  = +0.5·d·N'(z0)/N0(z0)           [L, q, q0, d]
+    MODEL_BF_D2LNQQ = 10,    // ∂²lnBf/∂q²  = -0.5·d²·(N''/N - (N'/N)²)     [L, q, q0, d]
+    MODEL_BF_D2LNQ0Q0 = 11,  // ∂²lnBf/∂q0² = +0.5·d²·(N''/N - (N'/N)²)     [L, q, q0, d]
 };
 
 // AST 节点（host-only；派生规则与编译都在 host 端执行）
@@ -149,12 +155,14 @@ Node buildFlatteAST(const Node& m, const Node& m0,
 
 // 程序化构建模型 AST → deriv → simplify → compileNode → aux[]
 // 返回标准 aux 布局 [P, n_seg, 段...]（与 compileCustomExpr/evalCustomAll 一致）
-// P: 自由参数数; L/d: 块级势垒参数; channels: Flatte 道质量列表
+// P: 自由参数数; L: 顶点 Bf 的 L（运行时逐波 L 经 CVAR_L 注入内核）;
+//   Lmin: BWR 宽度约定（节点 SL 列表最小 L，编译期烘焙）;
+// d: 块级势垒因子; channels: Flatte 道质量列表
 // md1_dep/md2_dep: q0 链中两个子粒子质量的依赖（与 AD 版 kernel 的回退规则一致）
 // has_bf: 目标节点是否有势垒因子（false 时 AST 不含 Bf 因子）
 std::vector<double> buildModelAST(
     ResModelType model_type,
-    int L, double d,
+    int L, int Lmin, double d,
     int P, int n_channels,
     const std::vector<double>& channel_masses,
     Q0MassDep md1_dep, double md1_fixed,

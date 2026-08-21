@@ -91,6 +91,10 @@ __global__ void computeCustomHessianKernel(
     double* d_dS_re_out, double* d_dS_im_out,
     double* d_dF_re_out, double* d_dF_im_out,
     double* d_phsp_I, double* d_phsp_grad, double* d_phsp_hessA,
+    const int* d_res_off,             // [Nres] 每共振态自由位置区间起始
+    const int* d_res_cnt,             // [Nres] 每共振态自由位置数
+    int Nres,
+    int jit_target_node,              // JIT-full 物化节点下标（-1 → 解释器）
     int evt_offset,
     int nSigma,
     const DeviceMomenta* d_mom_tab,

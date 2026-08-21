@@ -1,6 +1,7 @@
 #include "Config.cuh"
 #include <complex>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -520,10 +521,17 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
                         if (dopts["sl"]) {
                             // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
+                            // config 层 S 为物理自旋（可半整数如 0.5），
+                            // 内部 SL.S 用 2S+1 记号 → 解析时转换
+                            std::vector<std::vector<double>> raw;
                             if (dopts["sl"][0].IsSequence())
-                                id.sl_filter = dopts["sl"].as<std::vector<std::vector<int>>>();
+                                raw = dopts["sl"].as<std::vector<std::vector<double>>>();
                             else
-                                id.sl_filter.push_back(dopts["sl"].as<std::vector<int>>());
+                                raw.push_back(dopts["sl"].as<std::vector<double>>());
+                            for (const auto& row : raw)
+                                if (row.size() >= 2)
+                                    id.sl_filter.push_back(
+                                        {(int)lround(2.0 * row[0] + 1.0), (int)row[1]});
                         }
                     }
                     return id;
@@ -588,6 +596,17 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                                 std::string rname = rname_node.as<std::string>();
                                 auto rit = resonances_.find(rname);
                                 if (rit != resonances_.end()) {
+                                    if (rit->second.J < 0) {
+                                        // Resonances 段未写 J/P：auto-detect 无法推断量子数，
+                                        // 必须用显式 [J: .., P: ..] 写法
+                                        std::cerr << "Error: resonance '" << rname
+                                                  << "' has no J/P in Resonances section; "
+                                                  << "auto-detect form requires J/P. Use explicit "
+                                                  << "[J: .., P: ..]: [" << rname << "] instead."
+                                                  << std::endl;
+                                        throw std::runtime_error(
+                                            "resonance without J/P requires explicit [J,P] form");
+                                    }
                                     jp_groups[{rit->second.J, rit->second.P}].push_back(rname);
                                 } else {
                                     std::cerr << "Warning: resonance '" << rname
@@ -663,10 +682,17 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     }
                     if (opts["sl"]) {
                         // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]（作用于第一步）
+                        // config 层 S 为物理自旋（可半整数如 0.5），
+                        // 内部 SL.S 用 2S+1 记号 → 解析时转换
+                        std::vector<std::vector<double>> raw;
                         if (opts["sl"][0].IsSequence())
-                            ch_sl_filter = opts["sl"].as<std::vector<std::vector<int>>>();
+                            raw = opts["sl"].as<std::vector<std::vector<double>>>();
                         else
-                            ch_sl_filter.push_back(opts["sl"].as<std::vector<int>>());
+                            raw.push_back(opts["sl"].as<std::vector<double>>());
+                        for (const auto& row : raw)
+                            if (row.size() >= 2)
+                                ch_sl_filter.push_back(
+                                    {(int)lround(2.0 * row[0] + 1.0), (int)row[1]});
                     }
                 }
 
@@ -915,10 +941,15 @@ void ConfigParser::parseResonances(const YAML::Node &node)
 
         ResonanceConfig res;
         res.name = name;
-        // res.J = props["J"].as<int>();
-        res.J =
-            static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
-        res.P = props["P"].as<int>();
+        // J/P 可选：不写时 J=-1（哨兵）、P=0（哨兵）——由 intermediates 的
+        // [J, P] 决定量子数（CP 共轭对等场景：同一共振 N 在两条链中宇称相反）。
+        // auto-detect（intermediates 不带 [J,P] 只写名字）依赖此字段分组，
+        // 哨兵值在该路径下会被报错跳过（见下方 jp_groups 检查）。
+        if (props["J"])
+            res.J = static_cast<int>(2 * transJValue(props["J"].as<std::string>()) + 1);
+        else
+            res.J = -1;
+        res.P = props["P"] ? props["P"].as<int>() : 0;
         res.type = props["model"].as<std::string>();
         // 参数值: paramValues（新规范名）或 parameters（旧名，兼容）
         if (props["paramValues"])
