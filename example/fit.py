@@ -461,7 +461,15 @@ class UnifiedPWAOptimizer:
         # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
         #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
         hessian_full = self._get_hessian_cached(params)
-        ff_result = self.analysis.getFitFractions(coupling, hessian_full)
+        try:
+            ff_result = self.analysis.getFitFractions(coupling, hessian_full)
+        except RuntimeError as e:
+            if "phsp_truth" in str(e):
+                # 早期拟合/试跑常不带 mctruth(无效率相空间 MC): 跳过, 不报错
+                print("跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
+                      "需要时再加入并重跑")
+                return None, None
+            raise
         return ff_result[:, 0], ff_result[:, 1]
 
     # --------------------------------------------------------
@@ -710,7 +718,8 @@ class UnifiedPWAOptimizer:
                       f"  (bounds=[{lower_np[j]:.6g}, {upper_np[j]:.6g}])")
 
     # --------------------------------------------------------
-    def save_all_results_summary(self, fit_values=None, fit_errors=None):
+    def save_all_results_summary(self, fit_values=None, fit_errors=None,
+                                 fit_attempted=False):
         if not self.all_results:
             print("没有结果!")
             return
@@ -746,8 +755,9 @@ class UnifiedPWAOptimizer:
                 f.write("最佳拟合分数 (fit fractions, 无效率/MC无关):\n")
                 f.write("=" * 100 + "\n")
                 try:
-                    # 传入主程序已算好的结果，避免重复跑 truth 积分
-                    if fit_values is None:
+                    # 传入主程序已算好的结果，避免重复跑 truth 积分;
+                    # fit_attempted=True 时主程序已处理(含 phsp_truth 缺失的跳过), 不再重试
+                    if fit_values is None and not fit_attempted:
                         fit_values, fit_errors = self.compute_fit_fractions(self.best_params)
                     if fit_values is not None:
                         for i in range(len(fit_values)):
@@ -880,4 +890,4 @@ if best_res["is_positive_definite"]:
         print(f"计算拟合分数失败: {e}")
 
 # 保存摘要
-optimizer.save_all_results_summary(ff_values, ff_errors)
+optimizer.save_all_results_summary(ff_values, ff_errors, fit_attempted=True)
