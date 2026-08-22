@@ -45,14 +45,19 @@ computeModTotalWeight(const ctComplex* __restrict__ complex_result,
     atomicAdd(total_sum, sum);
 }
 
-// 修改后的部分权重核函数，同时计算干涉矩阵
+// 修改后的部分权重核函数，同时计算干涉矩阵 + 逐事件干涉项
+// d_wave_mask: 可空; [npartials] 0/1 选择子集 —— 非空时把每事件总强度
+// 覆盖为 Σ_pol |Σ_{p∈S} A_p|² 并原子累加 d_selected_integral（其余输出不变）
 template <int N_PARTIALS>
 __global__ void
 computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     double* __restrict__ final_result,
     double* __restrict__ interference_matrix,
-    // double *__restrict__ event_interference,
+    double* __restrict__ event_interference,   // [nEvents × ninterference] 原始(未归一) Σ_λ2Re(A_i A_j*)
     int* d_nSLvectors, double* total_result,
+    const int* __restrict__ d_wave_mask,
+    double* __restrict__ d_selected_integral,
+    double* __restrict__ d_event_total,
     int npartials, int nEvents, int ngls, int npolar)
 {
     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -88,6 +93,8 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
         interference_accumulator[k] = 0.0;
     }
 
+    double selected_acc = 0.0;   // 子集总强度 Σ_pol |Σ_{p∈S} A_p|²
+
     for (int polar_idx = 0; polar_idx < npolar; polar_idx++) {
         // 初始化部分振幅为0
         for (int p = 0; p < npartials; p++) {
@@ -113,6 +120,15 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
             double partial_intensity = partial_real[p] * partial_real[p] +
                 partial_imag[p] * partial_imag[p];
             final_result[p * nEvents + event_idx] += partial_intensity;
+        }
+
+        // 子集总强度: Σ_pol |Σ_{p∈S} A_p|²（按极化累加到 selected_acc,
+        // 循环结束后覆盖 d_event_total[ev] 并累加 d_selected_integral）
+        if (d_wave_mask != nullptr) {
+            double sr = 0.0, si = 0.0;
+            for (int p = 0; p < npartials; ++p)
+                if (d_wave_mask[p]) { sr += partial_real[p]; si += partial_imag[p]; }
+            selected_acc += sr * sr + si * si;
         }
 
         // 计算干涉矩阵元素（仅上三角部分）
@@ -148,21 +164,31 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
         }
     }
 
-    // // 将干涉矩阵累加器写入event_interference
-    // for (int k = 0; k < ninterference; k++)
-    // {
-    //     event_interference[event_idx + nEvents * k] = total_result_value *
-    //     interference_accumulator[k];
-    // }
+    // 将干涉矩阵累加器写入 event_interference（原始值, 未除以总积分:
+    // 与 weight_<i> 同单位, 满足 weight 守恒: Σ_i|A_i|² + Σ_{i<j}2Re(A_iA_j*) = total）
+    if (event_interference != nullptr) {
+        for (int k = 0; k < ninterference; k++) {
+            event_interference[event_idx + nEvents * k] =
+                interference_accumulator[k] * total_result_value;
+        }
+    }
+
+    // 子集总强度覆盖每事件总值 + 子集积分累加（下游归一化自动切换）
+    if (d_wave_mask != nullptr) {
+        d_event_total[event_idx] = selected_acc;
+        atomicAdd(d_selected_integral, selected_acc);
+    }
 }
 
 // 主计算函数
 void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
     double* d_total_result, double* d_total_integral,
     double* d_partial_result,
-    // double *d_partial_sums,
     double* d_interference_matrix,
-    // double *d_event_interference,
+    double* d_event_interference,               // 可空; [nEvents × ninterf]
+    const int* d_wave_mask,                     // 可空; 选中子集(0/1)
+    double* d_selected_integral,                // 可空; 子集积分
+    double* d_total_out,                        // 可空; = d_total_result, 子集时覆盖
     int* d_nSLvectors, int npartials, int nEvents, int ngls,
     int npolar)
 {
@@ -215,31 +241,25 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
     // * npartials + ninterference) * sizeof(double);
 
     if (npartials <= 50) {
-        // computeModWithInterference<50><<<gridSize,
-        // blockSize>>>(d_result_matrix, d_partial_result,
-        // d_interference_matrix, d_event_interference, d_nSLvectors,
-        // d_total_integral, npartials, nEvents, npolar);
         computeModWithInterference<50> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
-            d_nSLvectors, d_total_integral, npartials, nEvents, ngls, npolar);
+            d_event_interference, d_nSLvectors, d_total_integral,
+            d_wave_mask, d_selected_integral, d_total_out,
+            npartials, nEvents, ngls, npolar);
     }
     else if (npartials <= 200) {
-        // computeModWithInterference<200><<<gridSize,
-        // blockSize>>>(d_result_matrix, d_partial_result,
-        // d_interference_matrix, d_event_interference, d_nSLvectors,
-        // d_total_integral, npartials, nEvents, npolar);
         computeModWithInterference<200> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
-            d_nSLvectors, d_total_integral, npartials, nEvents, ngls, npolar);
+            d_event_interference, d_nSLvectors, d_total_integral,
+            d_wave_mask, d_selected_integral, d_total_out,
+            npartials, nEvents, ngls, npolar);
     }
     else {
-        // computeModWithInterference<1000><<<gridSize,
-        // blockSize>>>(d_result_matrix, d_partial_result,
-        // d_interference_matrix, d_event_interference, d_nSLvectors,
-        // d_total_integral, npartials, nEvents, npolar);
         computeModWithInterference<1000> << <gridSize, blockSize >> > (
             d_result_matrix, d_partial_result, d_interference_matrix,
-            d_nSLvectors, d_total_integral, npartials, nEvents, ngls, npolar);
+            d_event_interference, d_nSLvectors, d_total_integral,
+            d_wave_mask, d_selected_integral, d_total_out,
+            npartials, nEvents, ngls, npolar);
     }
     // computeModWithInterference<<<gridSize, blockSize,
     // shared_mem_size>>>(d_result_matrix, d_partial_result, d_partial_sums,

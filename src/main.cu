@@ -100,18 +100,24 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getNParams", &analysis::getNParams)
         .def("getParamNames", &analysis::getParamNames)
         .def("getSLVectors", &analysis::getSLVectors)
-        .def("writeResult", &analysis::writeResult)
+        .def("writeResult", &analysis::writeResult,
+             pybind11::arg("params"), pybind11::arg("filename"),
+             pybind11::arg("is_saved_weight") = 0,
+             pybind11::arg("waves") = std::vector<int>(),
+             "Save weights/histograms. waves: 可选分波下标子集, 只画 |Σ_{i∈S}A_i·v_i|² 的分布"
+             "（空=全部）; is_saved_weight=1 时额外导出逐事件 TTree")
         .def("getHessian", &analysis::getHessian, pybind11::arg("params"),
              "Full Hessian (2n+P)×(2n+P). params: [real(v), imag(v), theta] float64")
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)
         .def("getFitFractions", &analysis::getFitFractions,
-             "Fit fractions: FF_i = ∫|A_i|² / ∫|ΣA|² (pure shape, no efficiency). "
-             "Returns [npartials, 2] = [center, error]. BF_i = BF_total × FF_i.")
-        .def("getBranchFractions", &analysis::getBranchFractions,
-             "Branch fractions: BF_i = D_i·N_data / (ε_i·N_truth) with per-wave "
-             "efficiency ε_i = phsp/truth. Returns [npartials, 2] = [center, error].")
+             pybind11::arg("vector"), pybind11::arg("hessian") = torch::Tensor(),
+             "Fit fractions: FF_i = ∫|A_i|² / Σ_j∫|A_j|² (纯形状份额, 无效率, "
+             "只用 phsp_truth → 与效率 MC/归一化无关, 跨实验可比). "
+             "Σ_i FF_i = 1; 绝对分支比 = BF_total × FF_i. "
+             "返回 [npartials, 2] = [center, error]. "
+             "hessian: 可选统一 Hessian (与拟合 getHessian 同源), 用于误差传播。")
         .def("getBkgTensor", &analysis::getBkgTensor)
         .def("getBkgWeightsTensor", &analysis::getBkgWeightsTensor)
         .def("saveSLAmps", &analysis::saveSLAmps)

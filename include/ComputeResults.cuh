@@ -24,7 +24,10 @@ void computeWeightResult(const ctComplex *d_matrix, const ctComplex *d_vector,
 void computeResults(const ctComplex *d_matrix, const ctComplex *d_vector,
                     double *d_total_result, double *d_total_integral,
                     double *d_partial_result, double *d_interference_matrix,
-                    // double *d_event_interference,
+                    double *d_event_interference,  // 可空; [nEvents × ninterf]
+                    const int *d_wave_mask,        // 可空; 选中子集(0/1)
+                    double *d_selected_integral,   // 可空; 子集积分
+                    double *d_total_out,           // 可空; = d_total_result, 子集时覆盖
                     int *d_nSLvectors, int npartials, int nEvents, int ngls,
                     int npolar);
 

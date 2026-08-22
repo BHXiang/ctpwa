@@ -139,30 +139,6 @@ void computeBranchingFractions(
 
 #include <cmath>
 
-void computeBFfromIntegrals(
-    const double* h_phsp_partial,
-    const double* h_truth_partial,
-    const double* h_scattering,
-    double* h_bf,
-    int npartials,
-    double dataIntegral)
-{
-    // 先算truth_total = Σ truth_partial
-    double truth_total = 0.0;
-    for (int i = 0; i < npartials; ++i)
-        truth_total += h_truth_partial[i];
-
-    for (int i = 0; i < npartials; ++i) {
-        double diag_i = h_scattering[i * npartials + i];
-        if (h_phsp_partial[i] > 0.0 && h_truth_partial[i] > 0.0 && truth_total > 0.0) {
-            double eff_i = h_phsp_partial[i] / h_truth_partial[i];
-            h_bf[i] = diag_i * dataIntegral / (eff_i * truth_total);
-        } else {
-            h_bf[i] = 0.0;
-        }
-    }
-}
-
 void computeBFErrors(
     const double* J,
     const double* cov,

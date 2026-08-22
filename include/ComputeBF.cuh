@@ -4,7 +4,7 @@
 #include "ComplexType.h"
 #include <cuda_runtime.h>
 
-// 计算分支比所需的积分和散射矩阵(单次评估)
+// 计算分波积分和散射矩阵(单次评估; 供 truth/phsp 积分与拟合分数使用)
 void computeBranchingFractions(
     const ctComplex* d_matrix,
     const ctComplex* d_vector,
@@ -14,17 +14,7 @@ void computeBranchingFractions(
     int* d_nSLvectors,
     int npartials, int nEvents, int ngls, int npolar);
 
-// 从已累积的积分计算BF值(纯host端公式)
-// bf[i] = scattering[i*np+i] * dataIntegral / (phsp_i/truth_i * truth_total)
-void computeBFfromIntegrals(
-    const double* h_phsp_partial,
-    const double* h_truth_partial,
-    const double* h_scattering,
-    double* h_bf,
-    int npartials,
-    double dataIntegral);
-
-// 从Jacobian和协方差计算BF误差(纯host端)
+// 从Jacobian和协方差计算分波误差(纯host端)
 // bf_errors[i] = sqrt(J_i @ cov @ J_i^T)
 void computeBFErrors(
     const double* J,

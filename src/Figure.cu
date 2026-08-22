@@ -535,3 +535,204 @@ void CalculateDalitzHist(LorentzVector *device_momenta,
         // << " events" << std::endl;
     }
 }
+
+// ============================================================================
+// 统一观测 (expr 形式): 一个通用 kernel 按函数枚举逐事件求值
+//   M/M2: args 求和后 M()/M2()   P/E/Perp/Pt: 单粒子标量
+//   Theta/Phi/CosTheta: boost 系内的球坐标/极角（boost 子系缺省 = 帧不变）
+//   Angle/CosAngle: 与顶层母粒子动量的夹角(余弦) —— 等价旧 cosbeta 公式
+// ============================================================================
+__global__ void ObservableKernel(
+    const LorentzVector* __restrict__ momenta, int n_particles,
+    const int* __restrict__ d_idx, int nargs, int nboost, int naxis, int func,
+    int mother_idx, int n_events, double* __restrict__ out)
+{
+    int ev = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ev >= n_events) return;
+    const LorentzVector* p = momenta + (size_t)ev * n_particles;
+
+    LorentzVector a;
+    for (int i = 0; i < nargs; ++i)
+        a = a + p[d_idx[i]];
+
+    bool do_boost = (nboost > 0);
+    LorentzVector boost_sys;
+    if (do_boost)
+        for (int i = 0; i < nboost; ++i)
+            boost_sys = boost_sys + p[d_idx[nargs + i]];
+    if (do_boost)
+        a.BoostToRest(boost_sys);
+
+    double val = 0.0;
+    switch (func) {
+        case OBS_M:    val = a.M(); break;
+        case OBS_M2:   val = a.M2(); break;
+        case OBS_P:    val = a.P(); break;
+        case OBS_E:    val = a.E; break;
+        case OBS_PERP:
+        case OBS_PT:   val = a.Perp(); break;
+        case OBS_THETA:    val = a.Theta(); break;
+        case OBS_PHI:      val = a.Phi(); break;
+        case OBS_COSTHETA: val = a.CosTheta(); break;
+        case OBS_ANGLE:
+        case OBS_COSANGLE: {
+            // 轴: 显式 axis 组 > 顶层母粒子; 无则退化为帧系固定轴球坐标
+            LorentzVector axis_v;
+            bool have_axis = (naxis > 0) || (mother_idx >= 0);
+            if (naxis > 0)
+                for (int i = 0; i < naxis; ++i)
+                    axis_v = axis_v + p[d_idx[nargs + nboost + i]];
+            else if (mother_idx >= 0)
+                axis_v = p[mother_idx];
+            if (have_axis) {
+                if (do_boost) axis_v.BoostToRest(boost_sys);
+                val = (func == OBS_ANGLE) ? a.Angle(axis_v) : a.CosAngle(axis_v);
+            } else {
+                val = (func == OBS_ANGLE) ? a.Theta() : a.CosTheta();
+            }
+            break;
+        }
+        default: val = a.M(); break;
+    }
+    out[ev] = val;
+}
+
+// 通用 2d 分箱（value 数组版）
+__global__ void fill2DValuesKernel(
+    const double* __restrict__ vx, const double* __restrict__ vy,
+    const double* __restrict__ weights, int n_events,
+    double* __restrict__ hist_bins, int x_bins, int y_bins,
+    double x_min, double x_max, double y_min, double y_max,
+    double x_bin_width, double y_bin_width)
+{
+    int ev = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ev >= n_events) return;
+    double weight = (weights != nullptr) ? weights[ev] : 1.0;
+    double x = vx[ev], y = vy[ev];
+    if (x < x_min || x >= x_max || y < y_min || y >= y_max) return;
+    int xb = (int)((x - x_min) / x_bin_width);
+    int yb = (int)((y - y_min) / y_bin_width);
+    if (xb < 0) xb = 0; if (xb >= x_bins) xb = x_bins - 1;
+    if (yb < 0) yb = 0; if (yb >= y_bins) yb = y_bins - 1;
+    atomicAdd(&hist_bins[yb * x_bins + xb], weight);
+}
+
+void CalculateObsHist(LorentzVector* device_momenta,
+                      const std::map<std::string, int>& particleToIndex,
+                      const std::vector<PlotConfig>& obsConfigs,
+                      double* weights, std::vector<TH1F*>& output1d,
+                      std::vector<TH2F*>& output2d,
+                      int nEvents, int nParticles, int motherIdx)
+{
+    if (nEvents == 0) return;
+    int blockSize = 256;
+    int gridSize = (nEvents + blockSize - 1) / blockSize;
+
+    for (size_t ci = 0; ci < obsConfigs.size(); ++ci) {
+        const auto& cfg = obsConfigs[ci];
+        const bool is2d = (cfg.obs.size() == 2);
+        TH1F* hist1 = is2d ? nullptr : output1d[ci];
+        TH2F* hist2 = is2d ? output2d[ci] : nullptr;
+        if ((is2d && hist2 == nullptr) || (!is2d && hist1 == nullptr)) {
+            std::cerr << "Warning: obs 直方图对象缺失, 跳过 " << ci << std::endl;
+            continue;
+        }
+        if (is2d) hist2->Reset(); else hist1->Reset();
+
+        bool ok = true;
+        int idx_flat[2][64];
+        int dims[2] = {0, 0};
+        for (int d = 0; d < (int)cfg.obs.size(); ++d) {
+            int n = 0;
+            for (const auto& nm : cfg.obs[d].args) {
+                auto it = particleToIndex.find(nm);
+                if (it == particleToIndex.end()) {
+                    std::cerr << "Warning: 观测粒子 '" << nm << "' 未找到, 跳过 " << ci << std::endl;
+                    ok = false; break;
+                }
+                idx_flat[d][n++] = it->second;
+            }
+            if (!ok) break;
+            for (const auto& nm : cfg.obs[d].boost) {
+                auto it = particleToIndex.find(nm);
+                if (it == particleToIndex.end()) {
+                    std::cerr << "Warning: boost 粒子 '" << nm << "' 未找到, 跳过 " << ci << std::endl;
+                    ok = false; break;
+                }
+                idx_flat[d][n++] = it->second;
+            }
+            if (!ok) break;
+            for (const auto& nm : cfg.obs[d].axis) {
+                auto it = particleToIndex.find(nm);
+                if (it == particleToIndex.end()) {
+                    std::cerr << "Warning: axis 粒子 '" << nm << "' 未找到, 跳过 " << ci << std::endl;
+                    ok = false; break;
+                }
+                idx_flat[d][n++] = it->second;
+            }
+            if (!ok) break;
+            dims[d] = n;
+        }
+        if (!ok) continue;
+
+        double* vals[2] = {nullptr, nullptr};
+        int* d_idx[2] = {nullptr, nullptr};
+        for (int d = 0; d < (int)cfg.obs.size(); ++d) {
+            cudaMalloc(&vals[d], nEvents * sizeof(double));
+            cudaMalloc(&d_idx[d], dims[d] * sizeof(int));
+            cudaMemcpy(d_idx[d], idx_flat[d], dims[d] * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            int nargs = (int)cfg.obs[d].args.size();
+            int nboost = (int)cfg.obs[d].boost.size();
+            int naxis = (int)cfg.obs[d].axis.size();
+            ObservableKernel<<<gridSize, blockSize>>>(
+                device_momenta, nParticles, d_idx[d], nargs, nboost, naxis,
+                cfg.obs[d].func, motherIdx, nEvents, vals[d]);
+        }
+        cudaDeviceSynchronize();
+
+        if (!is2d) {
+            double x_min = cfg.ranges[0][0], x_max = cfg.ranges[0][1];
+            int x_bins = cfg.bins[0];
+            double* d_hist;
+            cudaMalloc(&d_hist, x_bins * sizeof(double));
+            cudaMemset(d_hist, 0, x_bins * sizeof(double));
+            fillHistogramKernel<<<gridSize, blockSize>>>(vals[0], weights,
+                nEvents, d_hist, x_bins, x_min, x_max,
+                (x_max - x_min) / x_bins);
+            cudaDeviceSynchronize();
+            std::vector<double> hb(x_bins, 0.0);
+            cudaMemcpy(hb.data(), d_hist, x_bins * sizeof(double),
+                       cudaMemcpyDeviceToHost);
+            for (int b = 0; b < x_bins; ++b)
+                hist1->SetBinContent(b + 1, hb[b]);
+            hist1->SetBins(x_bins, x_min, x_max);
+            cudaFree(d_hist);
+        } else {
+            double x_min = cfg.ranges[0][0], x_max = cfg.ranges[0][1];
+            double y_min = cfg.ranges[1][0], y_max = cfg.ranges[1][1];
+            int x_bins = cfg.bins[0], y_bins = cfg.bins[1];
+            double* d_hist;
+            cudaMalloc(&d_hist, (size_t)x_bins * y_bins * sizeof(double));
+            cudaMemset(d_hist, 0, (size_t)x_bins * y_bins * sizeof(double));
+            fill2DValuesKernel<<<gridSize, blockSize>>>(
+                vals[0], vals[1], weights, nEvents, d_hist,
+                x_bins, y_bins, x_min, x_max, y_min, y_max,
+                (x_max - x_min) / x_bins, (y_max - y_min) / y_bins);
+            cudaDeviceSynchronize();
+            std::vector<double> hb((size_t)x_bins * y_bins, 0.0);
+            cudaMemcpy(hb.data(), d_hist, (size_t)x_bins * y_bins * sizeof(double),
+                       cudaMemcpyDeviceToHost);
+            for (int yb = 0; yb < y_bins; ++yb)
+                for (int xb = 0; xb < x_bins; ++xb)
+                    hist2->SetBinContent(xb + 1, yb + 1,
+                        hb[(size_t)yb * x_bins + xb]);
+            hist2->SetBins(x_bins, x_min, x_max, y_bins, y_min, y_max);
+            cudaFree(d_hist);
+        }
+        for (int d = 0; d < (int)cfg.obs.size(); ++d) {
+            if (vals[d]) cudaFree(vals[d]);
+            if (d_idx[d]) cudaFree(d_idx[d]);
+        }
+    }
+}

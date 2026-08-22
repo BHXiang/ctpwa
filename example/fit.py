@@ -94,6 +94,17 @@ class UnifiedPWAOptimizer:
         self.n_res_free = free_res_info.shape[1]
         self.n_params = 2 * self.n_coupling_free + self.n_res_free
         self.has_free_res = self.n_res_free > 0
+        # 耦合幅度上界（防 LBFGS 放飞，实测随机初值放开共振态参数时
+        # 耦合会无界增长到 1e14 → 振幅溢出）+ 投影梯度（防边界伪收敛）。
+        # ⚠️ 默认 10000 而不能更小: 不同波的振幅归一化差异极大
+        # （ONE 模型/弱归一化波如 PHSP 需要 |v|~300-1000，实测本模型
+        # 最佳解 |A| 达 297；v_max=50 会把它们掐死在墙上，模型形状被
+        # 强制扭曲 → 拟合直接失败/正 NLL）。FIT_VMAX / FIT_PROJECT 可覆盖。
+        self.v_max = float(os.environ.get("FIT_VMAX", "10000.0"))
+        self.project_grad = os.environ.get("FIT_PROJECT", "1") == "1"
+        # 统一 Hessian 缓存: 同参数点只在第一次真正计算一步 getHessian，
+        # 后续（正定性判定/参数误差/分支比误差）直接复用。
+        self._hess_cache = None  # (params.clone(), hessian_full)
 
         # 共振态参数bounds (GPU)
         if self.has_free_res:
@@ -103,15 +114,18 @@ class UnifiedPWAOptimizer:
     # --------------------------------------------------------
     def compute_loss_and_grad(self, params):
         """计算 NLL 和梯度。params: float64, [n_params]"""
-        # 固定第一个耦合参数 (1+0j)
+        nc = self.n_coupling_free
+        # 固定第一个耦合参数 (1+0j) + 耦合 clamp
         with torch.no_grad():
             params.data[0] = 1.0
-            params.data[self.n_coupling_free] = 0.0
+            params.data[nc] = 0.0
+            params.data[1:nc].clamp_(-self.v_max, self.v_max)
+            params.data[nc + 1:2 * nc].clamp_(-self.v_max, self.v_max)
 
         # 共振态参数有界约束: clamp
         if self.has_free_res:
             with torch.no_grad():
-                start = 2 * self.n_coupling_free
+                start = 2 * nc
                 params.data[start:] = torch.clamp(
                     params.data[start:], self._lower, self._upper
                 )
@@ -122,7 +136,25 @@ class UnifiedPWAOptimizer:
         # 固定参数的梯度清零
         with torch.no_grad():
             grad[0] = 0.0
-            grad[self.n_coupling_free] = 0.0
+            grad[nc] = 0.0
+            # 投影梯度: clamp 边界处指向边界外的梯度置零。
+            # 否则 LBFGS 在边界处"参数不动、梯度非零" → tolerance_change
+            # 伪收敛（实测停在正 NLL 的垃圾点）。FIT_PROJECT=0 可关闭。
+            if self.project_grad:
+                g_c = grad[1:nc]
+                c = params[1:nc]
+                g_c[(c <= -self.v_max) & (g_c < 0)] = 0.0
+                g_c[(c >= self.v_max) & (g_c > 0)] = 0.0
+                g_i = grad[nc + 1:2 * nc]
+                ci = params[nc + 1:2 * nc]
+                g_i[(ci <= -self.v_max) & (g_i < 0)] = 0.0
+                g_i[(ci >= self.v_max) & (g_i > 0)] = 0.0
+                if self.has_free_res:
+                    res_start = 2 * nc
+                    g_r = grad[res_start:]
+                    phys = params[res_start:]
+                    g_r[(phys <= self._lower) & (g_r < 0)] = 0.0
+                    g_r[(phys >= self._upper) & (g_r > 0)] = 0.0
 
         return nll, grad
 
@@ -162,10 +194,13 @@ class UnifiedPWAOptimizer:
         optimizer.step(closure)
         end_time = time.time()
 
-        # 最终clamp一次确保共振态参数在界内
+        # 最终clamp一次确保共振态参数在界内 + 耦合在 ±v_max 内
         with torch.no_grad():
             params.data[0] = 1.0
             params.data[self.n_coupling_free] = 0.0
+            params.data[1:self.n_coupling_free].clamp_(-self.v_max, self.v_max)
+            params.data[self.n_coupling_free + 1:2 * self.n_coupling_free].clamp_(
+                -self.v_max, self.v_max)
             if self.has_free_res:
                 start = 2 * self.n_coupling_free
                 params.data[start:] = torch.clamp(params.data[start:], self._lower, self._upper)
@@ -178,6 +213,8 @@ class UnifiedPWAOptimizer:
         hessian_full = self.analysis.getHessian(final_params)
         # print("hessian矩阵：", hessian_full)
         hessian_time = time.time() - hessian_start
+        # 播种缓存: 同一最佳点后续要 Hessian（正定性/误差/分支比）直接复用
+        self._hess_cache = (final_params.clone(), hessian_full)
 
         # 去除固定参数 (index 0 和 n_coupling_free)
         fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
@@ -255,6 +292,147 @@ class UnifiedPWAOptimizer:
         return result
 
     # --------------------------------------------------------
+    def _project_params_(self, p):
+        """把参数向量投影回可行域（固定参考 + 耦合 ±v_max + 共振态 bounds）"""
+        with torch.no_grad():
+            p.data[0] = 1.0
+            p.data[self.n_coupling_free] = 0.0
+            p.data[1:self.n_coupling_free].clamp_(-self.v_max, self.v_max)
+            p.data[self.n_coupling_free + 1:2 * self.n_coupling_free].clamp_(
+                -self.v_max, self.v_max)
+            if self.has_free_res:
+                res_start = 2 * self.n_coupling_free
+                p.data[res_start:].clamp_(self._lower, self._upper)
+
+    # --------------------------------------------------------
+    def polish_damped_newton(self, params_phys, max_steps=40, tol=1e-6, lam0=1.0,
+                             verbose=True):
+        """LBFGS 之后的精确 Hessian 抛光（damped Newton / Levenberg-Marquardt 式）。
+
+        params_phys: 完整参数 [Re_v, Im_v, θ_phys]（例: fit.py 的物理空间约定）。
+        在自由参数子空间（mask 掉固定参考方向）解 (H + λI)·d = -g：
+          - H 不正定时 λ 抬到 -λ_min + δ，保证方向可下降；
+          - 每步后投影回可行域；目标不下降 → 增大 λ 重试（信任域语义）；
+          - 收敛后 H 正定则再做一次纯 Newton 步收尾。
+        实测: LBFGS（宽容差）停在 NLL=-673 的伪平坦点，抛光可到 -1175；
+        对发散垃圾点也能救回（+903 → -1402）。
+        返回 (params, nll, is_pos_def)。
+        """
+        dev = self.device
+        mask = torch.ones(self.n_params, dtype=torch.bool, device=dev)
+        mask[0] = False
+        mask[self.n_coupling_free] = False
+        n_free = int(mask.sum().item())
+
+        best = params_phys.clone().detach()
+        self._project_params_(best)
+        nll_best = self.analysis.getNLL(best).item()
+        lam = lam0
+
+        for step in range(max_steps):
+            H_full = self.analysis.getHessian(best)
+            H = H_full[mask][:, mask]
+            eig = torch.linalg.eigvalsh(H)
+            eig_min = eig[0].item()
+
+            p = best.clone().requires_grad_(True)
+            nll = self.analysis.getNLL(p)
+            g = torch.autograd.grad(nll, p)[0]
+            g_m = g[mask]
+
+            if eig_min > 1e-8:
+                # 已正定：纯 Newton 一步收尾
+                d_m = torch.linalg.solve(H, -g_m)
+                cand = best.clone()
+                cand[mask] = best[mask] + d_m
+                self._project_params_(cand)
+                nll_cand = self.analysis.getNLL(cand).item()
+                if nll_cand < nll_best - tol:
+                    best, nll_best = cand, nll_cand
+                    if verbose:
+                        print(f"[polish] step{step}: Newton accept, NLL={nll_best:.6f}")
+                break
+
+            lam = max(lam, -eig_min + 1e-6)
+            I = torch.eye(n_free, dtype=torch.float64, device=dev)
+            try:
+                d_m = torch.linalg.solve(H + lam * I, -g_m)
+            except Exception:
+                d_m = torch.linalg.lstsq(H + lam * I, -g_m).solution
+            cand = best.clone()
+            cand[mask] = best[mask] + d_m
+            self._project_params_(cand)
+            nll_cand = self.analysis.getNLL(cand).item()
+            if nll_cand < nll_best - tol:
+                best, nll_best = cand, nll_cand
+                lam = max(lam * 0.3, 1e-6)
+                if verbose:
+                    print(f"[polish] step{step}: accept λ={lam:.2e}, NLL={nll_best:.6f}")
+            else:
+                lam *= 10.0
+                if verbose:
+                    print(f"[polish] step{step}: reject, λ={lam:.2e}")
+                if lam > 1e10:
+                    break
+
+        H_final = self.analysis.getHessian(best)
+        H_f = H_final[mask][:, mask]
+        eig_f = torch.linalg.eigvalsh(H_f)
+        pd = bool((eig_f[0] > 1e-8).item())
+        # 播种缓存: 抛光终点的 Hessian 供误差/分支比复用
+        self._hess_cache = (best.clone(), H_final)
+        if verbose:
+            print(f"[polish] done: NLL={nll_best:.6f}, PD={pd}, "
+                  f"min_eig={eig_f[0].item():.3e}, steps={step + 1}")
+        return best, nll_best, pd
+
+    # --------------------------------------------------------
+    def _get_hessian_cached(self, params):
+        """统一 Hessian（带缓存）: 参数与上次完全相同时直接复用，否则计算。
+        fit.py 在多处（正定性/参数误差/分支比误差）会在同一最佳点上要 Hessian,
+        只算一次即可。"""
+        if (self._hess_cache is not None
+                and self._hess_cache[0].shape == params.shape
+                and torch.equal(self._hess_cache[0], params)):
+            return self._hess_cache[1]
+        h = self.analysis.getHessian(params)
+        self._hess_cache = (params.clone(), h)
+        return h
+
+    # --------------------------------------------------------
+    def compute_param_errors(self, params_phys):
+        """在给定参数点用精确 Hessian 求参数误差（H 正定时有效）。
+        返回 (coupling_real_errors, coupling_imag_errors, res_errors)。
+        """
+        hessian_full = self._get_hessian_cached(params_phys)
+        fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
+        fixed_mask[0] = False
+        fixed_mask[self.n_coupling_free] = False
+        hessian = hessian_full[fixed_mask][:, fixed_mask]
+        eig = torch.linalg.eigvalsh(hessian)
+        if eig[0].item() <= 1e-8:
+            return None, None, None
+        try:
+            covariance = torch.linalg.inv(hessian)
+            std_dev = torch.sqrt(torch.diag(covariance))
+            n_c_var = self.n_coupling_free - 1
+            coupling_real_errors = torch.zeros(
+                self.n_coupling_free, dtype=torch.float32, device=self.device)
+            coupling_imag_errors = torch.zeros(
+                self.n_coupling_free, dtype=torch.float32, device=self.device)
+            for i in range(n_c_var):
+                coupling_real_errors[i + 1] = std_dev[2 * i].float()
+                coupling_imag_errors[i + 1] = std_dev[2 * i + 1].float()
+            res_errors = None
+            if self.has_free_res:
+                res_start = 2 * n_c_var
+                res_errors = std_dev[res_start:].float()
+            return coupling_real_errors, coupling_imag_errors, res_errors
+        except Exception as e:
+            print(f"计算参数误差时出错: {e}")
+            return None, None, None
+
+    # --------------------------------------------------------
     def extract_coupling_complex(self, params):
         """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
         real = params[:self.n_coupling_free].float()
@@ -268,7 +446,10 @@ class UnifiedPWAOptimizer:
         return params[2 * self.n_coupling_free:]
 
     # --------------------------------------------------------
-    def compute_branching_fractions(self, params=None):
+    def compute_fit_fractions(self, params=None):
+        """拟合分数 (fit fractions): FF_i = ∫|A_i|² / Σ_j ∫|A_j|²。
+        只用 phsp_truth（无效率 MC）→ 与效率/归一化无关，跨实验可比。
+        误差传播用拟合同源的统一 Hessian（缓存命中直接复用）。"""
         if params is None:
             if self.best_params is None:
                 print("没有优化结果!")
@@ -276,8 +457,12 @@ class UnifiedPWAOptimizer:
             params = self.best_params
 
         coupling = self.extract_coupling_complex(params)
-        bf_result = self.analysis.getBranchFractions(coupling)
-        return bf_result[:, 0], bf_result[:, 1]
+        # 传拟合同源的全量 Hessian → FF 误差的正定性判定与拟合完全一致
+        # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
+        #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
+        hessian_full = self._get_hessian_cached(params)
+        ff_result = self.analysis.getFitFractions(coupling, hessian_full)
+        return ff_result[:, 0], ff_result[:, 1]
 
     # --------------------------------------------------------
     def save_parameters(self, params, coupling_real_err, coupling_imag_err,
@@ -375,27 +560,43 @@ class UnifiedPWAOptimizer:
             return False
 
     # --------------------------------------------------------
-    def save_weight_file(self, params, filename):
-        """保存权重文件。先reCalcAmp再writeResult"""
+    def save_weight_file(self, params, filename, waves=None):
+        """保存权重文件。先reCalcAmp再writeResult。
+        waves: 可选分波下标子集（如 [6,7]）, 只画 |Σ_{i∈S}A_i·v_i|² 的分布,
+        空=全部。FIT_WAVES="6,7" 环境变量也可指定。"""
         try:
+            if waves is None:
+                w = os.environ.get("FIT_WAVES", "").strip()
+                waves = [int(x) for x in w.split(",")] if w else []
             if self.has_free_res:
                 theta = self.extract_theta_phys(params)
                 self.analysis.reCalcAmp(theta)
-            self.analysis.writeResult(params, filename, 0)
-            print(f"权重文件已保存: {filename}")
+            # is_saved_weight: 0=默认(不写逐事件 TTree; 大统计量/多分波时
+            # 逐事件数据 O(N×n波²) 可达 GB 级, 迭代过程不需要)。
+            # FIT_EVENT_DATA=1 时开启: TTree saved_weight = 每波强度 +
+            # 逐对干涉 interf_<i>_<j> + 末态四动量, 供任意分布按需现算
+            # (需要时在最终分析/AI 决策这一步显式打开)
+            flag = 1 if os.environ.get("FIT_EVENT_DATA", "0") == "1" else 0
+            self.analysis.writeResult(params, filename, flag, waves)
+            if waves:
+                print(f"权重文件已保存: {filename} (waves 子集: {waves}, "
+                      f"直方图为 |Σ_{waves}A_i·v_i|²)")
+            else:
+                print(f"权重文件已保存: {filename}")
             return True
         except Exception as e:
             print(f"保存权重文件失败 {filename}: {e}")
             return False
 
     # --------------------------------------------------------
-    def run_multiple_optimizations(self, num_runs=10, **kwargs):
+    def run_multiple_optimizations(self, num_runs=10, warm_start=None, **kwargs):
         results = []
         output_dir = "results"
         os.makedirs(output_dir, exist_ok=True)
 
         params_filename = os.path.join(output_dir, "parameters.txt")
         nll_filename = os.path.join(output_dir, "nll_history.txt")
+        checkpoint = os.path.join(output_dir, "best_params.pt")
 
         for i in range(num_runs):
             print(f"\n{'='*80}")
@@ -407,6 +608,14 @@ class UnifiedPWAOptimizer:
                 self.n_coupling_free, free_res_info,
                 seed=seed, device=self.device,
             )
+            # warm start: run 0 的耦合取自收敛解（共振态参数保持 PDG 初值）。
+            # 实测: 随机初值 + 放开共振态参数时 LBFGS 沿平坦方向放飞
+            # （NLL 正值/撞边界）；从已收敛耦合出发则稳定收敛。
+            # FIT_WARM=1 时自动用 results/best_params.pt 作为 warm start。
+            if i == 0 and warm_start is not None:
+                w = warm_start.to(self.device)
+                initial_params[:2 * self.n_coupling_free] = w[:2 * self.n_coupling_free]
+                print(f"warm start: 耦合来自收敛解 (NLL 优于随机初值的放飞解)")
 
             try:
                 result = self.optimize_single_run(initial_params, run_id=i, **kwargs)
@@ -429,6 +638,8 @@ class UnifiedPWAOptimizer:
 
                 self.save_nll_history(result["nll_history"], i,
                                       nll_filename.replace(".txt", ""))
+                if result["final_nll"] <= self.best_nll:
+                    torch.save(result["final_params"].cpu(), checkpoint)
             except Exception as e:
                 print(f"第 {i} 次优化失败: {e}")
                 import traceback
@@ -499,7 +710,7 @@ class UnifiedPWAOptimizer:
                       f"  (bounds=[{lower_np[j]:.6g}, {upper_np[j]:.6g}])")
 
     # --------------------------------------------------------
-    def save_all_results_summary(self):
+    def save_all_results_summary(self, fit_values=None, fit_errors=None):
         if not self.all_results:
             print("没有结果!")
             return
@@ -532,15 +743,17 @@ class UnifiedPWAOptimizer:
 
             if self.best_result.get("is_positive_definite", False):
                 f.write("=" * 100 + "\n")
-                f.write("最佳分支比:\n")
+                f.write("最佳拟合分数 (fit fractions, 无效率/MC无关):\n")
                 f.write("=" * 100 + "\n")
                 try:
-                    bf, bf_err = self.compute_branching_fractions(self.best_params)
-                    if bf is not None:
-                        for i in range(len(bf)):
-                            f.write(f"{i:2d}: {bf[i]:.6e} ± {bf_err[i]:.6e}\n")
+                    # 传入主程序已算好的结果，避免重复跑 truth 积分
+                    if fit_values is None:
+                        fit_values, fit_errors = self.compute_fit_fractions(self.best_params)
+                    if fit_values is not None:
+                        for i in range(len(fit_values)):
+                            f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
                 except Exception as e:
-                    f.write(f"计算分支比失败: {e}\n")
+                    f.write(f"计算拟合分数失败: {e}\n")
 
             if self.best_params is not None and self.has_free_res:
                 f.write("=" * 100 + "\n")
@@ -566,6 +779,16 @@ optimizer = UnifiedPWAOptimizer(
     ana, free_res_info, params_names
 )
 
+# warm start: FIT_WARM=1 时用上次拟合的 results/best_params.pt
+# （阶段式拟合: 先固定共振态参数拟合耦合, 再放开共振态参数 warm start,
+#  可避免随机初值 + 放开共振态参数时的 LBFGS 放飞）
+warm = None
+if os.environ.get("FIT_WARM", "0") == "1":
+    cp = os.path.join("results", "best_params.pt")
+    if os.path.exists(cp):
+        warm = torch.load(cp, weights_only=True)
+        print(f"FIT_WARM: 从 {cp} 载入耦合作为 run 0 初值")
+
 results = optimizer.run_multiple_optimizations(
     num_runs=1,
     max_iter=10000,
@@ -573,6 +796,7 @@ results = optimizer.run_multiple_optimizations(
     tolerance_grad=1e-10,
     tolerance_change=1e-10,
     history_size=500,
+    warm_start=warm,
 )
 
 # 分析结果
@@ -596,6 +820,30 @@ print(f"最佳NLL: {best_res['final_nll']:.6f} (来自第 {best_res['run_id']} �
 # print(f"Hessian正定性: {best_res['is_positive_definite']}")
 # print(f"Hessian条件数: {best_res['condition_number']:.2e}")
 
+# 精确 Hessian 抛光（FIT_POLISH=0 关闭）:
+# LBFGS 常在宽容差/平坦方向提前停住（正定性=False）；
+# damped Newton 用精确 Hessian 能继续大幅下降 NLL 并逼近正定极小值。
+if os.environ.get("FIT_POLISH", "1") == "1":
+    try:
+        p2, nll2, pd2 = optimizer.polish_damped_newton(best_res["final_params"])
+        if nll2 < best_res["final_nll"]:
+            print(f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                  f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}")
+            best_res["final_params"] = p2.clone()
+            best_res["final_nll"] = nll2
+            best_res["is_positive_definite"] = pd2
+            if pd2:
+                (best_res["coupling_real_errors"],
+                 best_res["coupling_imag_errors"],
+                 best_res["res_errors"]) = optimizer.compute_param_errors(p2)
+            else:
+                best_res["coupling_real_errors"] = None
+                best_res["coupling_imag_errors"] = None
+                best_res["res_errors"] = None
+            torch.save(p2.cpu(), os.path.join("results", "best_params.pt"))
+    except Exception as e:
+        print(f"抛光失败: {e}")
+
 # 打印最佳参数
 if best_res["is_positive_definite"] and best_res["coupling_real_errors"] is not None:
     optimizer.print_optimized_parameters(
@@ -614,20 +862,22 @@ print(f"{'='*80}")
 best_weight_file = "results/weight_best.root"
 optimizer.save_weight_file(best_res["final_params"], best_weight_file)
 
-# 分支比
+# 拟合分数（主输出: 无效率、与 MC 无关、跨实验可比; 只算一次,
+# 主程序打印 + 摘要文件共用, 避免 truth 积分重复计算）
+ff_values = ff_errors = None
 if best_res["is_positive_definite"]:
     try:
-        bf_values, bf_errors = optimizer.compute_branching_fractions(
+        ff_values, ff_errors = optimizer.compute_fit_fractions(
             best_res["final_params"]
         )
-        if bf_values is not None:
+        if ff_values is not None:
             print(f"\n{'='*80}")
-            print("最佳结果的分支比:")
+            print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
             print(f"{'='*80}")
-            for i in range(len(bf_values)):
-                print(f"{i:2d}: {bf_values[i]:.6e} ± {bf_errors[i]:.6e}")
+            for i in range(len(ff_values)):
+                print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
     except Exception as e:
-        print(f"计算分支比失败: {e}")
+        print(f"计算拟合分数失败: {e}")
 
 # 保存摘要
-optimizer.save_all_results_summary()
+optimizer.save_all_results_summary(ff_values, ff_errors)
