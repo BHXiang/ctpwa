@@ -1,0 +1,24 @@
+*
+.vscode
+.vscode/*
+!src/
+!src/**
+!include/
+!include/**
+!setup.py
+!example/
+!example/**
+!pyproject.toml
+!README.md
+!LICENSE
+tests/outputs/
+tests/__pycache__/
+tests/data/real_*
+tests/.pytest_cache/
+!.github/
+!.github/**
+!MANIFEST.in
+
+# Python runtime (在白名单 example/** 之后重新忽略)
+example/__pycache__/
+*.pyc
