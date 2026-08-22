@@ -45,6 +45,13 @@ def get_labels(directory):
                 ylabel = str(ylabel_obj)
     return xlabel, ylabel
 
+def math_label(s):
+    """matplotlib mathtext 包装; 空标签原样返回(避免 '$$' 解析错误)"""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    return f"${s}$"
+
 def read_legends(file):
     """从legends TTree中读取图例名称"""
     if 'legends' not in file:
@@ -232,7 +239,7 @@ def create_legend_column(fig, all_component_plots, all_component_labels, legend_
         # 如果标签看起来像数学公式，可以添加$符号
         if any(c in label for c in ['\\', '^', '_', '{', '}']):
             label_fixed = label.replace('\\\\', '\\')
-            formatted_label = fr"${label_fixed}$"
+            formatted_label = math_label(label_fixed)
         legend_labels.append(formatted_label)
     
     # 创建图例
@@ -321,8 +328,8 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
                                  vmax=vmax,
                                  zorder=1)
         ax_data.set_title("Data", fontsize=10, fontweight='bold')
-        ax_data.set_xlabel(f"${xlabel}$", fontsize=12)
-        ax_data.set_ylabel(f"${ylabel}$", fontsize=12)
+        ax_data.set_xlabel(math_label(xlabel), fontsize=12)
+        ax_data.set_ylabel(math_label(ylabel), fontsize=12)
         ax_data.xaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_data.yaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_data.tick_params(axis='both', which='both', direction='in', labelsize=10, left=True, bottom=True)
@@ -345,8 +352,8 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
                                vmax=vmax,
                                zorder=1)
         ax_fit.set_title("Fit", fontsize=10, fontweight='bold')
-        ax_fit.set_xlabel(f"${xlabel}$", fontsize=12)
-        ax_fit.set_ylabel(f"${ylabel}$", fontsize=12)
+        ax_fit.set_xlabel(math_label(xlabel), fontsize=12)
+        ax_fit.set_ylabel(math_label(ylabel), fontsize=12)
         ax_fit.xaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_fit.yaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_fit.tick_params(axis='both', which='both', direction='in', labelsize=10, left=True, bottom=True)
@@ -374,8 +381,8 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
                                  vmin=-pull_vmax, vmax=pull_vmax,
                                  zorder=1)
         ax_pull.set_title("Pull", fontsize=10, fontweight='bold')
-        ax_pull.set_xlabel(f"${xlabel}$", fontsize=12)
-        ax_pull.set_ylabel(f"${ylabel}$", fontsize=12)
+        ax_pull.set_xlabel(math_label(xlabel), fontsize=12)
+        ax_pull.set_ylabel(math_label(ylabel), fontsize=12)
         ax_pull.xaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_pull.yaxis.set_minor_locator(plt.MultipleLocator(0.2))
         ax_pull.tick_params(axis='both', which='both', direction='in', labelsize=10, left=True, bottom=True)
@@ -603,7 +610,7 @@ def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, x
         formatter.set_scientific(True)
         formatter.set_powerlimits((-2, 3))  # 根据你的数据范围调整
         ax_top.yaxis.set_major_formatter(formatter)
-        ax_top.set_ylabel(f"${ylabel}$", fontsize=12)
+        ax_top.set_ylabel(math_label(ylabel), fontsize=12)
         ax_top.grid(True, alpha=0.6)
         ax_top.xaxis.set_minor_locator(plt.MultipleLocator(0.1))
         ax_top.tick_params(axis='both', direction='in', which='both', labelsize=10, left=False, top=True, bottom=False)
@@ -624,7 +631,7 @@ def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, x
         # 现在在下方轴绘制pull分布
         if data_hist is None or fit_hist is None:
             ax_bottom.text(0.5, 0.5, 'No data/fit', ha='center', va='center')
-            ax_bottom.set_xlabel(f"${xlabel}$", fontsize=8)
+            ax_bottom.set_xlabel(math_label(xlabel), fontsize=8)
             # 设置x轴范围（从第一个直方图获取）
             if histograms:
                 first_hist = next(iter(histograms.values()))
@@ -654,7 +661,7 @@ def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, x
         mask = total_fit_values > 0
         if not np.any(mask):
             ax_bottom.text(0.5, 0.5, 'No positive fit values', ha='center', va='center')
-            ax_bottom.set_xlabel(f"${xlabel}$", fontsize=8)
+            ax_bottom.set_xlabel(math_label(xlabel), fontsize=8)
             # 设置x轴范围
             x_min = edges[0]
             x_max = edges[-1]
@@ -681,7 +688,7 @@ def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, x
         ax_bottom.axhline(y=-3, color='red', linestyle='--', linewidth=0.8, alpha=0.5)
 
         # 设置下方轴的标签和样式
-        ax_bottom.set_xlabel(f"${xlabel}$", fontsize=12)
+        ax_bottom.set_xlabel(math_label(xlabel), fontsize=12)
         ax_bottom.set_ylabel('Pull', fontsize=12)
         ax_bottom.grid(True, alpha=0.6)
         ax_bottom.xaxis.set_minor_locator(plt.MultipleLocator(0.1))
@@ -865,7 +872,7 @@ def main(args=None):
     # 读取图例
     legend_list = read_legends(file)
     
-    # 分类存储目录
+    # 按直方图类型分类目录（自适应: mass/cosbeta/obs-1d → 1d; dalitz/obs-2d → 2d）
     mass_dirs = []
     cosbeta_dirs = []
     h1f_dirs = []
@@ -875,18 +882,27 @@ def main(args=None):
     for key in file.keys():
         if isinstance(file[key], uproot.ReadOnlyDirectory):
             dir_name = key.split(';')[0]
-            if 'mass' in dir_name:
-                mass_dirs.append(dir_name)
-                h1f_dirs.append(dir_name)
-            elif 'cosbeta' in dir_name:
-                cosbeta_dirs.append(dir_name)
-                h1f_dirs.append(dir_name)
-            elif 'dalitz' in dir_name:
+            if dir_name in ('legends', 'interference'):
+                continue
+            try:
+                dir_obj = file[dir_name]
+                has_th1 = any('TH1F' in str(type(dir_obj[k])) for k in dir_obj.keys())
+                has_th2 = any('TH2F' in str(type(dir_obj[k])) for k in dir_obj.keys())
+            except Exception:
+                continue
+            if has_th2:
                 dalitz_dirs.append(dir_name)
+            elif has_th1:
+                h1f_dirs.append(dir_name)
+                if 'mass' in dir_name:
+                    mass_dirs.append(dir_name)
+                elif 'cosbeta' in dir_name:
+                    cosbeta_dirs.append(dir_name)
     
     print(f"共 {len(mass_dirs)} 个mass目录")
     print(f"共 {len(cosbeta_dirs)} 个cosbeta目录")
-    print(f"共 {len(dalitz_dirs)} 个dalitz目录")
+    print(f"共 {len(h1f_dirs)} 个1d观测目录(mass/cosbeta/obs)")
+    print(f"共 {len(dalitz_dirs)} 个2d观测目录(dalitz/obs)")
     
     # 准备PDF输出文件
     if args.params is not None:

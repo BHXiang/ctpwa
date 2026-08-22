@@ -1,6 +1,7 @@
 #include "Config.cuh"
 #include <complex>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +10,110 @@
 #include <set>
 #include <sstream>
 #include <string>
+
+// ---- 统一观测表达式解析: "M(p,pbar)" / "CosAngle(p; [p,pbar])" / "Phi(p)" ----
+static std::string trimStr(const std::string &s)
+{
+    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t e = s.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    return s.substr(b, e - b + 1);
+}
+
+static std::vector<std::string> splitComma(const std::string &s)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : s) {
+        if (ch == ',') { out.push_back(trimStr(cur)); cur.clear(); }
+        else cur += ch;
+    }
+    out.push_back(trimStr(cur));
+    return out;
+}
+
+static int mapObsFunc(const std::string &name)
+{
+    std::string n;
+    for (char c : name) n += (char)std::toupper(c);
+    if (n == "M")  return OBS_M;
+    if (n == "M2") return OBS_M2;
+    if (n == "P")  return OBS_P;
+    if (n == "E")  return OBS_E;
+    if (n == "PERP" || n == "PT") return OBS_PERP;
+    if (n == "THETA") return OBS_THETA;
+    if (n == "PHI")   return OBS_PHI;
+    if (n == "COSTHETA" || n == "COS_THETA") return OBS_COSTHETA;
+    if (n == "ANGLE") return OBS_ANGLE;
+    if (n == "COSANGLE" || n == "COS_ANGLE") return OBS_COSANGLE;
+    return -1;
+}
+
+static ObsSpec parseObsExpr(const std::string &expr)
+{
+    ObsSpec spec;
+    size_t lp = expr.find('(');
+    size_t rp = expr.rfind(')');
+    if (lp == std::string::npos || rp == std::string::npos || rp < lp) {
+        std::cerr << "Warning: 观测表达式缺少括号, 跳过: " << expr << std::endl;
+        return spec;
+    }
+    std::string fname = trimStr(expr.substr(0, lp));
+    std::string inner = trimStr(expr.substr(lp + 1, rp - lp - 1));
+
+    // 语法: Func([主体系统], [帧系统], [轴系统])  (";" 与 "," 等价, 帧/轴可省)
+    //   第1组=主体, 第2组=帧(缺省=顶层母粒子静系), 第3组=轴(缺省=顶层母粒子; 角度类)
+    //   例: M([p,pbar]) / M(p,pbar) / CosAngle([p], [p,pbar], [psip]) / CosAngle(p; [p,pbar])
+    std::vector<std::string> groups;
+    std::string cur;
+    char sep = 0;  // 0=未定, ',' 或 ';'
+    int depth = 0; // 括号深度: 深度内的 , 不分割 ([p,pbar] 内部逗号是粒子分隔)
+    for (char ch : inner) {
+        if (ch == '[') ++depth;
+        else if (ch == ']') --depth;
+        if ((ch == ';' || ch == ',') && depth == 0) {
+            if (sep != 0 && ch != sep) continue;  // 只认第一个分隔符
+            sep = ch;
+            groups.push_back(trimStr(cur));
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    groups.push_back(trimStr(cur));
+
+    // 识别显式 [...] 组
+    auto isBracket = [](const std::string &g) {
+        return g.size() >= 2 && g.front() == '[' && g.back() == ']';
+    };
+    auto flatNames = [](const std::string &g, std::vector<std::string> &out) {
+        std::string s = g;
+        if (!s.empty() && s.front() == '[' && s.back() == ']')
+            s = s.substr(1, s.size() - 2);
+        for (auto &t : splitComma(s))
+            if (!t.empty()) out.push_back(t);
+    };
+
+    std::vector<std::string> brack;
+    std::vector<std::string> loose;
+    for (const auto &g : groups) {
+        if (!g.empty() && isBracket(g)) brack.push_back(g);
+        else if (!g.empty()) loose.push_back(g);
+    }
+    if (brack.size() >= 1) flatNames(brack[0], spec.args);  // 主体
+    for (const auto &g : loose) spec.args.push_back(g);       // 无括号名并入主体
+    if (brack.size() >= 2) flatNames(brack[1], spec.boost);  // 帧
+    if (brack.size() >= 3) flatNames(brack[2], spec.axis);   // 轴
+
+    spec.func = mapObsFunc(fname);
+    if (spec.func < 0) {
+        std::cerr << "Warning: 未知观测函数 \"" << fname
+                  << "\" (支持: M/M2/P/E/Perp/Pt/Theta/Phi/CosTheta/Angle/CosAngle), "
+                  << "跳到 M" << std::endl;
+        spec.func = OBS_M;
+    }
+    return spec;
+}
 
 float transJValue(const std::string &str)
 {
@@ -1207,6 +1312,75 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
 void ConfigParser::parsePlotConfig(const YAML::Node &node)
 {
     plot_configs_.clear();
+
+    // ---- 统一形式: Plot 直接是观测列表（1d=一个 expr 字符串, 2d=两个字符串）----
+    // 例:
+    //   Plot:
+    //     - expr: "M(p,pbar)"
+    //       bins: [60]; ranges: [[1.8, 3.0]]
+    //     - expr: ["M(p,pbar)", "CosAngle(p; [p,pbar])"]
+    //       bins: [60, 50]; ranges: [[1.8, 3.0], [-1, 1]]
+    if (node.IsSequence()) {
+        int idx = 0;
+        for (const auto &plot_item : node) {
+            PlotConfig config;
+            config.type = "obs";
+            if (plot_item["name"])
+                config.name = plot_item["name"].as<std::string>();
+
+            const YAML::Node &expr_node = plot_item["expr"]
+                ? plot_item["expr"] : plot_item["expression"];  // expression 为别名(与 Custom 一致)
+            std::vector<std::string> exprs;
+            if (!expr_node) {
+                std::cerr << "Warning: Plot 项缺少 expr/expression, 跳过" << std::endl;
+                continue;
+            }
+            if (expr_node.IsScalar())
+                exprs.push_back(expr_node.as<std::string>());
+            else
+                exprs = expr_node.as<std::vector<std::string>>();
+            for (const auto &e : exprs)
+                config.obs.push_back(parseObsExpr(e));
+            if (config.obs.empty() || config.obs.size() > 2) {
+                std::cerr << "Warning: expr 需要 1 (1d) 或 2 (2d) 个表达式, 实际 "
+                          << config.obs.size() << ", 跳过" << std::endl;
+                continue;
+            }
+
+            if (plot_item["bins"].IsScalar())
+                config.bins = { plot_item["bins"].as<int>() };
+            else
+                config.bins = plot_item["bins"].as<std::vector<int>>();
+            if (config.bins.size() != config.obs.size()) {
+                std::cerr << "Warning: bins 数量(" << config.bins.size()
+                          << ") != 维度(" << config.obs.size()
+                          << "), 补到一样长" << std::endl;
+                while ((int)config.bins.size() < (int)config.obs.size())
+                    config.bins.push_back(config.bins.back());
+            }
+
+            if (plot_item["ranges"]) {
+                for (const auto &r : plot_item["ranges"])
+                    config.ranges.push_back(r.as<std::vector<double>>());
+            } else if (plot_item["range"]) {   // 单数 range 为别名 (与旧格式一致)
+                const auto &rn = plot_item["range"];
+                if (rn.IsSequence() && rn[0].IsSequence()) {
+                    for (const auto &r : rn)
+                        config.ranges.push_back(r.as<std::vector<double>>());
+                } else {
+                    config.ranges.push_back(rn.as<std::vector<double>>());
+                }
+            }
+            if (plot_item["display"])
+                config.display =
+                    plot_item["display"].as<std::vector<std::string>>();
+            if (config.name.empty())
+                config.name = "obs" + std::to_string(idx);
+            ++idx;
+            plot_configs_.push_back(config);
+        }
+        return;
+    }
 
     // 解析mass图配置
     if (node["mass"]) {

@@ -94,5 +94,13 @@ void CalculateDalitzHist(LorentzVector *device_momenta,
                          const std::vector<DalitzHistConfig> &histConfigs,
                          double *weights, std::vector<TH2F *> &outputHistograms,
                          int nEvents, int nParticles);
+// 统一观测直方图 (type=="obs"): 1d → output1d, 2d → output2d (与 obsConfigs 同序)
+// weights 可空(数据=1); motherIdx = 顶层母粒子 index (角度轴, -1 禁用)
+void CalculateObsHist(LorentzVector *device_momenta,
+                      const std::map<std::string, int> &particleToIndex,
+                      const std::vector<PlotConfig> &obsConfigs,
+                      double *weights, std::vector<TH1F *> &output1d,
+                      std::vector<TH2F *> &output2d,
+                      int nEvents, int nParticles, int motherIdx);
 
 #endif // FIGURE_CUH

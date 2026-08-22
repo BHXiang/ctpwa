@@ -204,6 +204,20 @@ Resonances:
   #   tex: ["BWR", "(custom)"]
 
 # ---- 输出绘图 ----
+# 统一形式 (Plot 直接是观测列表; 1d=一个表达式, 2d=两个; expr 与 expression 等价):
+#   Plot:
+#     - name: m_KK                          # 输出目录名; 缺省 obsN
+#       expression: "M([Kp,Km])"            # 系统不变质量: [粒子列表] = 系统 (括号可省)
+#       bins: [100]; ranges: [[1.0, 2.6]]
+#       display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events"]
+#     - expression: "Phi([Kp])"             # K+ 在顶层母粒子静系内方位角
+#       bins: [40]; ranges: [[-3.15, 3.15]]
+#     - expression: ["M([Kp,Km])", "CosAngle([Kp], [Kp,Km])"]   # 2d: 质量 × cosβ (逗号同义于分号)
+#       bins: [100, 50]; ranges: [[1.0, 2.6], [-1, 1]]
+#   语法: Func([主体系统], [帧系统]) —— 第二组=帧(缺省=顶层母粒子静系); ";" 与 "," 等价, 括号可省;
+#   函数: M/M2/P/E/Perp/Pt/Theta/Phi/CosTheta/Angle/CosAngle (全部先对系统 4-矢量和);
+#   Angle/CosAngle = 与顶层母粒子动量的夹角(余弦)。中间态名不可用作帧(写成其末态子集)。
+# 旧格式 (mass/cosbeta/dalitz 键) 仍然支持, 语义与上面等价。
 Plot:
   # 不变质量谱
   mass:

@@ -74,12 +74,36 @@ struct ConstraintConfig {
   std::string type;
 };
 
+// 统一观测函数（函数名与 LorentzVector/TLorentzVector 方法一致）
+enum ObsFunc {
+    OBS_M = 0,        // M(...): 任意粒子子集 4-矢量和取 M()
+    OBS_M2,           // M2(...)
+    OBS_P,            // P(p)
+    OBS_E,            // E(p)
+    OBS_PERP,         // Perp(p) = Pt(p)
+    OBS_PT,           // Pt(p)
+    OBS_THETA,        // Theta(p): boost 系内极角
+    OBS_PHI,          // Phi(p): boost 系内方位角
+    OBS_COSTHETA,     // CosTheta(p)
+    OBS_ANGLE,        // Angle(a): 与母粒子夹角（boost 系内）
+    OBS_COSANGLE,     // CosAngle(a): 与母粒子夹角余弦
+};
+
+struct ObsSpec {
+    int func = OBS_M;
+    std::vector<std::string> args;   // 主体: 粒子名（求和为系统 4-矢量）
+    std::vector<std::string> boost;  // 帧: boost 子系粒子名（空 = 顶层母粒子静系）
+    std::vector<std::string> axis;   // 轴: 角度类函数的参考方向粒子（空 = 顶层母粒子）
+};
+
 struct PlotConfig {
   std::vector<std::vector<std::string>> particles;
   std::vector<int> bins;
   std::vector<std::vector<double>> ranges;
   std::vector<std::string> display;
-  std::string type; // "mass", "cosbeta", "dalitz"
+  std::string type; // "mass", "cosbeta", "dalitz", "obs"(统一 expr 形式)
+  std::string name;
+  std::vector<ObsSpec> obs;          // 1 个 = 1d, 2 个 = 2d
 };
 
 class ConfigParser {
