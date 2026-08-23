@@ -871,20 +871,27 @@ optimizer.save_weight_file(best_res["final_params"], best_weight_file)
 
 # 拟合分数（主输出: 无效率、与 MC 无关、跨实验可比; 只算一次,
 # 主程序打印 + 摘要文件共用, 避免 truth 积分重复计算）
+# ⚠️ 仅在配置提供 phsp_truth 且 Hessian 正定时才调用 —— 早期拟合/未定解时
+# 不带 mctruth, 不应触碰拟合分数相关 kernel (避免集群上异步 CUDA 错误)
 ff_values = ff_errors = None
-if best_res["is_positive_definite"]:
-    try:
-        ff_values, ff_errors = optimizer.compute_fit_fractions(
-            best_res["final_params"]
-        )
-        if ff_values is not None:
-            print(f"\n{'='*80}")
-            print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
-            print(f"{'='*80}")
-            for i in range(len(ff_values)):
-                print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-    except Exception as e:
-        print(f"计算拟合分数失败: {e}")
+if ana.hasPhspTruth():
+    if best_res["is_positive_definite"]:
+        try:
+            ff_values, ff_errors = optimizer.compute_fit_fractions(
+                best_res["final_params"]
+            )
+            if ff_values is not None:
+                print(f"\n{'='*80}")
+                print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
+                print(f"{'='*80}")
+                for i in range(len(ff_values)):
+                    print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
+        except Exception as e:
+            print(f"计算拟合分数失败: {e}")
+    else:
+        print("跳过拟合分数: Hessian 不正定 (拟合未收敛), 参数不可信")
+else:
+    print("跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), 需要时再加入并重跑")
 
 # 保存摘要
 optimizer.save_all_results_summary(ff_values, ff_errors, fit_attempted=True)

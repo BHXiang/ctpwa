@@ -1291,6 +1291,13 @@ public:
 
     bool isValid() const { return initialized_; }
 
+    // 配置能力查询: 是否提供 phsp_truth (无效率相空间 MC)。
+    // 未配置时不应调用 getFitFractions/getFitFractions 等 (会触发 kernel → 集群上
+    // 可能以异步非法访问形式报错); fit.py 用它在"没放 mctruth"时直接跳过分数计算。
+    bool hasPhspTruth() const {
+        return config_parser_.getDataFiles().count("phsp_truth") > 0;
+    }
+
     torch::Tensor getNLL(torch::Tensor params)
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");

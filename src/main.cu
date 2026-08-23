@@ -96,6 +96,8 @@ PYBIND11_MODULE(ctpwa, m)
              "Set fit mode: 0=FREEPARAMS (chain×step), 1=VSPACE (direct amplitudes, default)")
         .def("getFitMode", &analysis::getFitMode)
         .def("getNVector", &analysis::getNVector)
+        .def("hasPhspTruth", &analysis::hasPhspTruth,
+             "配置是否提供 phsp_truth (无效率相空间 MC); 未配置时跳过拟合分数计算")
         .def("getNFreeTheta", &analysis::getNFreeTheta)
         .def("getNParams", &analysis::getNParams)
         .def("getParamNames", &analysis::getParamNames)
