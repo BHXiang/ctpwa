@@ -1371,6 +1371,19 @@ void ConfigParser::parsePlotConfig(const YAML::Node &node)
                     config.ranges.push_back(rn.as<std::vector<double>>());
                 }
             }
+            if (config.ranges.empty()) {
+                std::cerr << "Warning: Plot 项 '"
+                          << (config.name.empty() ? "obs" + std::to_string(idx) : config.name)
+                          << "' 缺少 range/ranges (检查拼写 rages?), 跳过" << std::endl;
+                continue;
+            }
+            if ((int)config.ranges.size() != (int)config.obs.size()) {
+                std::cerr << "Warning: Plot 项 '"
+                          << (config.name.empty() ? "obs" + std::to_string(idx) : config.name)
+                          << "' ranges 数量(" << config.ranges.size()
+                          << ") != 维度(" << config.obs.size() << "), 跳过" << std::endl;
+                continue;
+            }
             if (plot_item["display"])
                 config.display =
                     plot_item["display"].as<std::vector<std::string>>();

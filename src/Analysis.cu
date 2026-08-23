@@ -2309,6 +2309,18 @@ public:
             for (const auto& pc : plotconfig)
                 if (pc.type == "obs") obshists.push_back(pc);
             if (!obshists.empty()) {
+                // 防御: 过滤 bins/ranges 维度不足的项(正常解析不会发生; 兜底手写/旧 .so)
+                std::vector<PlotConfig> valid;
+                for (const auto& cfg : obshists) {
+                    bool ok = (int)cfg.bins.size() >= (int)cfg.obs.size()
+                           && (int)cfg.ranges.size() >= (int)cfg.obs.size();
+                    for (int d = 0; ok && d < (int)cfg.obs.size(); ++d)
+                        if (cfg.ranges[d].size() < 2) ok = false;
+                    if (ok) valid.push_back(cfg);
+                    else std::cerr << "Warning: 跳过格式不完整的 obs 项 '"
+                                   << cfg.name << "' (bins/ranges 维度不足)" << std::endl;
+                }
+                obshists.swap(valid);
                 // 顶层母粒子 index（Angle/CosAngle 的轴; 取第一个链的第一步母粒子）
                 int motherIdx = -1;
                 {
