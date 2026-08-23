@@ -53,43 +53,40 @@ def math_label(s):
     return f"${s}$"
 
 def read_legends(file):
-    """从legends TTree中读取图例名称"""
+    """从legends TTree中读取图例名称 + 逐分波显示名"""
     if 'legends' not in file:
         print("警告: 未找到legends TTree")
-        return []
+        return [], []
     
-    try:
-        # 读取legends树
-        legends_tree = file['legends']
-        legend_branch = legends_tree['legend']
-        legends_array = legend_branch.array()
-        
-        if len(legends_array) == 0:
-            print("警告: legends树中没有数据")
-            return []
-        
-        # 第一个条目包含所有图例
-        legend_list = legends_array[0]
-        print(f"legends中读取到 {len(legend_list)} 个图例")
-        
-        # 将awkward数组转换为Python列表，确保正确解码字符串
-        python_legend_list = []
-        for item in legend_list:
-            # 处理可能的bytes对象，类似get_labels函数中的处理
+    def _to_list(arr):
+        out = []
+        for item in arr:
             if hasattr(item, 'decode'):
                 try:
-                    decoded_item = item.decode('utf-8')
-                    python_legend_list.append(decoded_item)
-                except Exception as decode_error:
-                    print(f"解码图例项时出错: {decode_error}, 使用字符串表示")
-                    python_legend_list.append(str(item))
+                    out.append(item.decode('utf-8'))
+                except Exception:
+                    out.append(str(item))
             else:
-                python_legend_list.append(str(item))
+                out.append(str(item))
+        return out
 
-        return python_legend_list
+    legend_list = []
+    resonance_list = []
+    try:
+        legends_tree = file['legends']
+        if 'legend' in legends_tree:
+            arr = legends_tree['legend'].array()
+            if len(arr) > 0:
+                legend_list = _to_list(arr[0])
+                print(f"legends中读取到 {len(legend_list)} 个图例")
+        if 'resonance' in legends_tree:
+            arr = legends_tree['resonance'].array()
+            if len(arr) > 0:
+                resonance_list = _to_list(arr[0])
+                print(f"resonance中读取到 {len(resonance_list)} 个分波名")
     except Exception as e:
         print(f"读取legends时出错: {e}")
-        return []
+    return legend_list, resonance_list
 
 def determine_subplot_layout(n_plots):
     """根据子图数量确定最优布局"""
@@ -396,7 +393,8 @@ def plot_dalitz_histograms(dalitz_data_list, pdf_pages):
         pdf_pages.savefig(fig_dalitz, bbox_inches='tight')
         plt.close(fig_dalitz)
 
-def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, xlabel, ylabel, legend_list=None):
+def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, xlabel, ylabel,
+                             legend_list=None, resonance_list=None):
     """在上下两个轴上绘制直方图和pull分布，不再单独绘制hfit，而是绘制hfit+hbkg"""
     from matplotlib.ticker import ScalarFormatter
 
@@ -512,45 +510,47 @@ def plot_combined_histogram_with_pull(ax_top, ax_bottom, histograms, dir_name, x
             background_patch = (background_line, background_fill)
             main_plots.append(background_line)
         
-        # 然后绘制共振态分量（使用阶梯图）
+        # 然后绘制共振态分量（使用阶梯图）。
+        # 按共振态分组: 同一共振态的多个 SL 分波求和成一条曲线
+        # (label 取自 writeResult 写入的 resonance 分支, 与分量索引一致)
+        grouped = {}
         for i, (name, hist) in enumerate(resonance_hists):
-            edges = hist.to_numpy()[1]
-            values = hist.to_numpy()[0]
-
-            # 获取图例标签
-            if legend_list is not None and len(legend_list) > 0 and i < len(legend_list):
-                component_label = legend_list[i]
+            if resonance_list is not None and i < len(resonance_list) and resonance_list[i]:
+                component_label = resonance_list[i]
             else:
-                # 格式化直方图名称作为图例
                 component_label = name.replace('h_', '').replace('-', ' ').replace('_', ' ')
+            values = hist.to_numpy()[0]
+            if component_label in grouped:
+                grouped[component_label] = grouped[component_label] + values
+            else:
+                grouped[component_label] = values.copy()
+        group_items = list(grouped.items())
 
-            # 确定线型
+        # 确定线型
+        for k, (component_label, values) in enumerate(group_items):
             if num_resonances <= 20:
                 linestyle = '-'
             else:
-                # 超过20种，使用不同的线型
-                linestyle = line_styles_list[(i // 20) % len(line_styles_list)]
+                linestyle = line_styles_list[(k // 20) % len(line_styles_list)]
 
             # 创建阶梯图的x和y
             step_centers = np.zeros(len(values) * 2 + 2)
             step_values = np.zeros(len(values) * 2 + 2)
-            
+            edges = resonance_hists[0][1].to_numpy()[1]
             for j in range(len(values)):
-                # 每个bin的左右边界
                 step_centers[2*j] = edges[j]
                 step_centers[2*j+1] = edges[j+1]
                 step_values[2*j] = values[j]
                 step_values[2*j+1] = values[j]
-            
-            # 添加最后的点
+
             step_centers[-2] = edges[-1]
             step_centers[-1] = edges[-1]
             step_values[-2] = values[-1] if len(values) > 0 else 0
             step_values[-1] = 0
 
-            line, = ax_top.plot(step_centers, step_values, 
+            line, = ax_top.plot(step_centers, step_values,
                                linewidth=1, alpha=0.7,
-                               color=colors[i], linestyle=linestyle, 
+                               color=colors[k % len(colors)], linestyle=linestyle,
                                label=component_label)
             component_plots.append(line)
             component_labels.append(component_label)
@@ -870,7 +870,7 @@ def main(args=None):
         return
     
     # 读取图例
-    legend_list = read_legends(file)
+    legend_list, resonance_list = read_legends(file)
     
     # 按直方图类型分类目录（自适应: mass/cosbeta/obs-1d → 1d; dalitz/obs-2d → 2d）
     mass_dirs = []
@@ -968,7 +968,8 @@ def main(args=None):
 
                 # 绘制组合图
                 component_plots, component_labels, chi2, ndf = plot_combined_histogram_with_pull(
-                    ax_top, ax_bottom, histograms, dir_name, xlabel, ylabel, legend_list)
+                    ax_top, ax_bottom, histograms, dir_name, xlabel, ylabel,
+                    legend_list, resonance_list)
 
                 all_component_plots.append(component_plots)
                 all_component_labels.append(component_labels)
