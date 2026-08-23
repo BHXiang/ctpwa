@@ -1309,6 +1309,9 @@ public:
     void setFitMode(int mode) { fit_mode_ = mode; }
     int getFitMode() const { return fit_mode_; }
 
+    // legends: config 的 legends 规则按展开后的链顺序解析出的图例名 (getLegends() 结果)
+    std::vector<std::string> getLegends() const { return legends_; }
+
     int getNVector() const {
         if (fit_mode_ == 1) return params_.nFreeVector();  // vspace: 自由振幅 (trans 折叠后)
         if (params_.hasCouplingMatrix()) return params_.couplingMatrix().n_free;
@@ -1574,32 +1577,8 @@ public:
         // 创建 ROOT 文件
         TFile* rootFile = new TFile(filename.c_str(), "RECREATE");
 
-        // 逐分波显示名 (与 h_<波名> 分量索引一致; plot.py 给分量正确命名)。
-        // 取 full 名中"最后出现"的共振态(避免把中间态如 chic1 误当)的 tex, 无 tex 回退原名。
-        {
-            const auto& resmap = config_parser_.getResonances();
-            for (const auto& full : resonance_names_) {
-                std::string label;
-                size_t best = 0;
-                for (const auto& [rname, rcfg] : resmap) {
-                    size_t pos = full.rfind(rname);
-                    if (pos != std::string::npos && pos >= best) {
-                        best = pos;
-                        if (!rcfg.tex.empty()) {
-                            label.clear();
-                            for (const auto& tp : rcfg.tex) label += tp;  // 拼接全部 tex 段
-                        } else {
-                            label = rname;
-                        }
-                    }
-                }
-                if (label.empty()) label = full;
-                res_display_.push_back(label);
-            }
-        }
         TTree* legend = new TTree("legends", "Amplitude Legends");
         legend->Branch("legend", &legends_);
-        legend->Branch("resonance", &res_display_);
         legend->Fill();
         legend->Write();
         delete legend;
@@ -4151,7 +4130,6 @@ private:
     std::vector<std::string> amplitude_names_;
     std::vector<std::string> resonance_names_;
     std::vector<std::string> legends_;
-    std::vector<std::string> res_display_;  // 逐分波显示名(tex), writeResult 写入 legends 树
 
     // 参数管理器（统一管理 vector / theta / 约束 / 耦合矩阵）
     Parameters params_;

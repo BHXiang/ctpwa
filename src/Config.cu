@@ -738,7 +738,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             }
 
             // --- Expand each channel: for multi-mode intermediates, generate one chain per mode ---
-            size_t ch_idx = 0;
+            size_t legend_rule_idx = 0;  // 展开后的链序号: 每条链按序取一条 legend 规则(该块共用的 legends 列表)
             for (const auto& ch : channels) {
                 std::string bachelor = ch[0].as<std::string>();
                 std::string intermediate = ch[1].as<std::string>();
@@ -750,15 +750,15 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                 bool ch_p_break1 = false, ch_p_break2 = false;
                 bool has_ch_p_break = false;
                 std::vector<std::vector<int>> ch_sl_filter; // 第一步 (mother) 的分波白名单
-                std::vector<std::string> ch_legend;
-                // Fall back to top-level legends list
-                if (ch_idx < all_legends.size())
-                    ch_legend = all_legends[ch_idx];
+                std::vector<std::string> ch_legend;   // 本行显式 legend 覆盖 (opts["legend"])
+                bool ch_legend_from_opts = false;      // opts 显式给出时整行共用、不消耗规则
 
                 if (ch.size() >= 3 && ch[2].IsMap()) {
                     const auto& opts = ch[2];
-                    if (opts["legend"])
+                    if (opts["legend"]) {
                         ch_legend = opts["legend"].as<std::vector<std::string>>();
+                        ch_legend_from_opts = true;
+                    }
                     if (opts["has_bf"]) {
                         if (opts["has_bf"].IsSequence()) {
                             ch_has_bf1 = opts["has_bf"][0].as<bool>();
@@ -830,6 +830,14 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             if (mode && (mode->d1 == bachelor || mode->d2 == bachelor))
                                 continue;
                         }
+                    }
+
+                    // Legend 规则分配: 无显式 opts 覆盖时, 每条展开链按顺序取一条 legend 规则,
+                    // 使多模式中间态(如 chic1→eta+R_KK / Kp+R_Keta / Km+R_Keta)各得其规则。
+                    if (!ch_legend_from_opts) {
+                        ch_legend = (legend_rule_idx < all_legends.size())
+                            ? all_legends[legend_rule_idx]
+                            : std::vector<std::string>{};
                     }
 
                     DecayChainConfig chain;
@@ -945,8 +953,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         chain.legend_template = {intermediate, " ", bachelor};
 
                     decay_chains_.push_back(chain);
+                    if (!ch_legend_from_opts) ++legend_rule_idx;
                 } // for each mode
-                ++ch_idx;
             }
 
         } else {

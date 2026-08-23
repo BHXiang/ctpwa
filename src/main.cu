@@ -100,6 +100,8 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getNParams", &analysis::getNParams)
         .def("getParamNames", &analysis::getParamNames)
         .def("getSLVectors", &analysis::getSLVectors)
+        .def("getLegends", &analysis::getLegends,
+             "config legends 规则按展开链顺序解析出的图例名列表 (getLegends())")
         .def("writeResult", &analysis::writeResult,
              pybind11::arg("params"), pybind11::arg("filename"),
              pybind11::arg("is_saved_weight") = 0,
