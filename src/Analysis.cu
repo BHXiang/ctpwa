@@ -1465,8 +1465,20 @@ public:
         // ⚠️ 只在 is_saved_weight==1 时分配——N 事件 × nintf 是 O(n波²) 增长,
         // 大统计量/多分波时可达 GB 级, 迭代过程不需要, 需要时显式开启。
         const int nintf = npartials * (npartials + 1) / 2;
+        // 容量防护: 逐事件干涉总字节数超限(默认 1.5GB)时跳过导出(仍写 TTree 权重+四动量),
+        // 避免 19+ 波 × 大 MC 时 GPU/host 内存爆掉 → kernel OOM → 粘性非法访问错误
+        const double kMaxEventInterfBytes = 1.5e9;
+        bool export_event_interf = (is_saved_weight == 1)
+            && (double)nintf * N_phsp * sizeof(double) <= kMaxEventInterfBytes;
+        if (is_saved_weight == 1 && !export_event_interf) {
+            std::cout << "警告: 逐事件干涉导出跳过 — nintf=" << nintf
+                      << " × N_phsp=" << N_phsp << " ≈ "
+                      << (double)nintf * N_phsp * sizeof(double) / 1e9
+                      << " GB > 1.5GB 上限; TTree 仍写 weight/四动量, 干涉可在小样本/少波时导出"
+                      << std::endl;
+        }
         double* h_event_interference =
-            (is_saved_weight == 1) ? new double[(size_t)nintf * N_phsp] : nullptr;
+            export_event_interf ? new double[(size_t)nintf * N_phsp] : nullptr;
         int ev_cumulative = 0;  // 多GPU累加偏移
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
@@ -1481,9 +1493,9 @@ public:
             double* d_interference_matrix_gpu;
             cudaMalloc(&d_interference_matrix_gpu, npartials * npartials * sizeof(double));
             cudaMemset(d_interference_matrix_gpu, 0, npartials * npartials * sizeof(double));
-            // 单个GPU event interference（仅 is_saved_weight==1; kernel 支持 nullptr）
+            // 单个GPU event interference（仅导出可用时; kernel 支持 nullptr）
             double* d_event_interference_gpu = nullptr;
-            if (is_saved_weight == 1)
+            if (export_event_interf)
                 cudaMalloc(&d_event_interference_gpu,
                     (size_t)events_[gpu][0] * nintf * sizeof(double));
             // 子集选择（waves 非空时）: mask + 子集积分缓冲
@@ -1685,8 +1697,9 @@ public:
                     // std::cout << "  Partial Weight " << j << " = " <<
                     // partial_weights[j] << std::endl;
                 }
-                for (int k = 0; k < nintf; ++k)
-                    interf_vals[k] = h_event_interference[(size_t)k * N_phsp + i] * normFactor;
+                if (h_event_interference != nullptr)
+                    for (int k = 0; k < nintf; ++k)
+                        interf_vals[k] = h_event_interference[(size_t)k * N_phsp + i] * normFactor;
                 for (int m = 0; m < n_mom; ++m)
                 {
                     const LorentzVector& mv = mom_host[(size_t)i * n_mom + m];
