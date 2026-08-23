@@ -1291,13 +1291,6 @@ public:
 
     bool isValid() const { return initialized_; }
 
-    // 配置能力查询: 是否提供 phsp_truth (无效率相空间 MC)。
-    // 未配置时不应调用 getFitFractions/getFitFractions 等 (会触发 kernel → 集群上
-    // 可能以异步非法访问形式报错); fit.py 用它在"没放 mctruth"时直接跳过分数计算。
-    bool hasPhspTruth() const {
-        return config_parser_.getDataFiles().count("phsp_truth") > 0;
-    }
-
     torch::Tensor getNLL(torch::Tensor params)
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
@@ -3699,6 +3692,14 @@ public:
         if (hessian_in.numel() > 0)
             TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
                 "hessian_in must be float64 CUDA");
+
+        // 未配置 phsp_truth(无效率相空间 MC)时天然返回空张量 [0,2]:
+        // 早期拟合不带 mctruth, fit.py 据此自然跳过, 不抛异常、不触碰任何相关 kernel
+        const auto& data_files = config_parser_.getDataFiles();
+        if (data_files.count("phsp_truth") == 0) {
+            return torch::empty({0, 2},
+                torch::TensorOptions().dtype(torch::kFloat64));
+        }
 
         // 自由耦合 p → 扩展振幅 v（乘法链映射），Jacobian/Hessian 在 p 空间
         torch::Tensor ev_center = freeParamsToAmplitudes(vector);

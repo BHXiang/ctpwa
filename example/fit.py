@@ -461,15 +461,13 @@ class UnifiedPWAOptimizer:
         # （旧版内部用独立的 computeCouplingHessian, 近平坦方向
         #  min_eig~1e-5 时正定判定翻脸 → 误差被跳过变全 0）。
         hessian_full = self._get_hessian_cached(params)
-        try:
-            ff_result = self.analysis.getFitFractions(coupling, hessian_full)
-        except RuntimeError as e:
-            if "phsp_truth" in str(e):
-                # 早期拟合/试跑常不带 mctruth(无效率相空间 MC): 跳过, 不报错
-                print("跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
-                      "需要时再加入并重跑")
-                return None, None
-            raise
+        # getFitFractions 在配置无 phsp_truth 时天然返回空张量 [0,2]
+        # （早期拟合不带 mctruth）→ 这里自然跳过, 不抛异常、不触碰相关 kernel
+        ff_result = self.analysis.getFitFractions(coupling, hessian_full)
+        if ff_result is None or ff_result.numel() == 0:
+            print("跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), "
+                  "需要时再加入并重跑")
+            return None, None
         return ff_result[:, 0], ff_result[:, 1]
 
     # --------------------------------------------------------
@@ -871,27 +869,21 @@ optimizer.save_weight_file(best_res["final_params"], best_weight_file)
 
 # 拟合分数（主输出: 无效率、与 MC 无关、跨实验可比; 只算一次,
 # 主程序打印 + 摘要文件共用, 避免 truth 积分重复计算）
-# ⚠️ 仅在配置提供 phsp_truth 且 Hessian 正定时才调用 —— 早期拟合/未定解时
-# 不带 mctruth, 不应触碰拟合分数相关 kernel (避免集群上异步 CUDA 错误)
+# 配置无 phsp_truth 时 getFitFractions 返回空张量 → compute_fit_fractions 自然跳过
 ff_values = ff_errors = None
-if ana.hasPhspTruth():
-    if best_res["is_positive_definite"]:
-        try:
-            ff_values, ff_errors = optimizer.compute_fit_fractions(
-                best_res["final_params"]
-            )
-            if ff_values is not None:
-                print(f"\n{'='*80}")
-                print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
-                print(f"{'='*80}")
-                for i in range(len(ff_values)):
-                    print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
-        except Exception as e:
-            print(f"计算拟合分数失败: {e}")
-    else:
-        print("跳过拟合分数: Hessian 不正定 (拟合未收敛), 参数不可信")
-else:
-    print("跳过拟合分数: 配置没有 phsp_truth (无效率相空间 MC), 需要时再加入并重跑")
+if best_res["is_positive_definite"]:
+    try:
+        ff_values, ff_errors = optimizer.compute_fit_fractions(
+            best_res["final_params"]
+        )
+        if ff_values is not None:
+            print(f"\n{'='*80}")
+            print("最佳结果的拟合分数 (fit fractions, Σ=1, 无效率/MC无关):")
+            print(f"{'='*80}")
+            for i in range(len(ff_values)):
+                print(f"{i:2d}: {ff_values[i]:.6f} ± {ff_errors[i]:.6f}")
+    except Exception as e:
+        print(f"计算拟合分数失败: {e}")
 
 # 保存摘要
 optimizer.save_all_results_summary(ff_values, ff_errors, fit_attempted=True)
