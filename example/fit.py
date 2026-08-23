@@ -568,18 +568,6 @@ class UnifiedPWAOptimizer:
             return False
 
     # --------------------------------------------------------
-    def write_interf_result(self, params, filename, pairs):
-        """保存指定波对的逐事件干涉形状到 TTree saved_weight。
-        pairs: [[i,j], ...] 波对下标(与 weight_<i> 分支序一致)。
-        容量 = len(pairs)×N_phsp, 按需选择, 不会因全波数×大MC爆显存。
-        用法: fit.py 末尾 / AI 决策时:
-          optimizer.write_interf_result(best_params, "results/interf.root",
-                                        [[0, 6], [6, 7], [1, 9]])"""
-        coupling_ok = True
-        self.analysis.writeInterfResult(params, filename, pairs)
-        return True
-
-    # --------------------------------------------------------
     def save_weight_file(self, params, filename, waves=None):
         """保存权重文件。先reCalcAmp再writeResult。
         waves: 可选分波下标子集（如 [6,7]）, 只画 |Σ_{i∈S}A_i·v_i|² 的分布,
