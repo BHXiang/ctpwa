@@ -2393,6 +2393,60 @@ public:
                     }
                 }
 
+                // ---- 本底直方图 hbkg (与旧格式一致: bkg 事件 × bkg_weights_, 不 Scale) ----
+                if (N_bkg > 0) {
+                    std::vector<TH1F*> obs1d_bkg(obshists.size(), nullptr);
+                    std::vector<TH2F*> obs2d_bkg(obshists.size(), nullptr);
+                    for (size_t j = 0; j < obshists.size(); ++j) {
+                        const auto& cfg = obshists[j];
+                        if (cfg.obs.size() == 1)
+                            obs1d_bkg[j] = new TH1F((cfg.name + "_bkg").c_str(), "",
+                                cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1]);
+                        else
+                            obs2d_bkg[j] = new TH2F((cfg.name + "_bkg").c_str(), "",
+                                cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1],
+                                cfg.bins[1], cfg.ranges[1][0], cfg.ranges[1][1]);
+                    }
+                    for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
+                        if (events_[gpu][2] == 0) continue;
+                        cudaSetDevice(gpu);
+                        std::vector<TH1F*> t1(obshists.size(), nullptr);
+                        std::vector<TH2F*> t2(obshists.size(), nullptr);
+                        for (size_t j = 0; j < obshists.size(); ++j) {
+                            const auto& cfg = obshists[j];
+                            if (cfg.obs.size() == 1)
+                                t1[j] = new TH1F((cfg.name + "_t").c_str(), "",
+                                    cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1]);
+                            else
+                                t2[j] = new TH2F((cfg.name + "_t").c_str(), "",
+                                    cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1],
+                                    cfg.bins[1], cfg.ranges[1][0], cfg.ranges[1][1]);
+                        }
+                        CalculateObsHist(
+                            device_momenta_list[gpu] + events_offsets_[gpu][2] * n_particles,
+                            particleToIndex, obshists, bkg_weights_[gpu], t1, t2,
+                            events_[gpu][2], n_particles, motherIdx);
+                        for (size_t j = 0; j < obshists.size(); ++j) {
+                            if (obs1d_bkg[j]) obs1d_bkg[j]->Add(t1[j]);
+                            if (obs2d_bkg[j]) obs2d_bkg[j]->Add(t2[j]);
+                        }
+                        for (auto* h : t1) if (h) delete h;
+                        for (auto* h : t2) if (h) delete h;
+                    }
+                    for (size_t j = 0; j < obshists.size(); ++j) {
+                        TDirectory* dir = rootFile->GetDirectory(obshists[j].name.c_str());
+                        dir->cd();
+                        if (obs1d_bkg[j]) {
+                            obs1d_bkg[j]->Write("hbkg", TObject::kOverwrite);
+                            delete obs1d_bkg[j];
+                        }
+                        if (obs2d_bkg[j]) {
+                            obs2d_bkg[j]->Write("hbkg", TObject::kOverwrite);
+                            delete obs2d_bkg[j];
+                        }
+                    }
+                }
+
                 // ---- 模型直方图 ----
                 std::vector<TH1F*> obs1d_fit(obshists.size(), nullptr);
                 std::vector<TH2F*> obs2d_fit(obshists.size(), nullptr);
