@@ -1460,25 +1460,6 @@ public:
         double* h_interference_matrix = new double[nSLvectors_.size() * nSLvectors_.size()];
         double* h_total_results = new double[N_phsp];
         double* h_partial_results = new double[N_phsp * npartials];
-        // 逐事件干涉项 Σ_λ2Re(A_i A_j*): [ninterf × N_phsp]（与 weight_<i> 同单位,
-        // 守恒校验: totalweight = Σ_i weight_i + Σ_{i<j} interf_ij）。
-        // ⚠️ 只在 is_saved_weight==1 时分配——N 事件 × nintf 是 O(n波²) 增长,
-        // 大统计量/多分波时可达 GB 级, 迭代过程不需要, 需要时显式开启。
-        const int nintf = npartials * (npartials + 1) / 2;
-        // 容量防护: 逐事件干涉总字节数超限(默认 1.5GB)时跳过导出(仍写 TTree 权重+四动量),
-        // 避免 19+ 波 × 大 MC 时 GPU/host 内存爆掉 → kernel OOM → 粘性非法访问错误
-        const double kMaxEventInterfBytes = 1.5e9;
-        bool export_event_interf = (is_saved_weight == 1)
-            && (double)nintf * N_phsp * sizeof(double) <= kMaxEventInterfBytes;
-        if (is_saved_weight == 1 && !export_event_interf) {
-            std::cout << "警告: 逐事件干涉导出跳过 — nintf=" << nintf
-                      << " × N_phsp=" << N_phsp << " ≈ "
-                      << (double)nintf * N_phsp * sizeof(double) / 1e9
-                      << " GB > 1.5GB 上限; TTree 仍写 weight/四动量, 干涉可在小样本/少波时导出"
-                      << std::endl;
-        }
-        double* h_event_interference =
-            export_event_interf ? new double[(size_t)nintf * N_phsp] : nullptr;
         int ev_cumulative = 0;  // 多GPU累加偏移
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
@@ -1493,11 +1474,7 @@ public:
             double* d_interference_matrix_gpu;
             cudaMalloc(&d_interference_matrix_gpu, npartials * npartials * sizeof(double));
             cudaMemset(d_interference_matrix_gpu, 0, npartials * npartials * sizeof(double));
-            // 单个GPU event interference（仅导出可用时; kernel 支持 nullptr）
-            double* d_event_interference_gpu = nullptr;
-            if (export_event_interf)
-                cudaMalloc(&d_event_interference_gpu,
-                    (size_t)events_[gpu][0] * nintf * sizeof(double));
+            // 单个GPU event interference（本函数不用, 传 nullptr; writeInterfResult 使用）
             // 子集选择（waves 非空时）: mask + 子集积分缓冲
             int* d_wave_mask_gpu = nullptr;
             double* d_selected_integral_gpu = nullptr;
@@ -1514,9 +1491,10 @@ public:
             computeResults(d_all_amplitudes_[gpu],
                 reinterpret_cast<const ctComplex*>(extended_vec_per_gpu[gpu].data_ptr()),
                 d_final_result_vec[gpu], d_total_integral_gpu, d_partial_result_vec[gpu],
-                d_interference_matrix_gpu, d_event_interference_gpu,
+                d_interference_matrix_gpu, nullptr,
                 d_wave_mask_gpu, d_selected_integral_gpu,
                 d_final_result_vec[gpu],
+                nullptr, 0,
                 d_nSLvectors, npartials, events_[gpu][0], n_amplitudes_, n_polar_);
 
             // 将单个GPU的结果累加到全局结果
@@ -1542,15 +1520,9 @@ public:
                 cudaMemcpy(h_partial_results + (size_t)p * N_phsp + ev_cumulative,
                     d_partial_result_vec[gpu] + (size_t)p * events_[gpu][0],
                     events_[gpu][0] * sizeof(double), cudaMemcpyDeviceToHost);
-            if (h_event_interference != nullptr)
-                for (int k = 0; k < nintf; ++k)
-                    cudaMemcpy(h_event_interference + (size_t)k * N_phsp + ev_cumulative,
-                        d_event_interference_gpu + (size_t)k * events_[gpu][0],
-                        events_[gpu][0] * sizeof(double), cudaMemcpyDeviceToHost);
             ev_cumulative += events_[gpu][0];
             cudaFree(d_total_integral_gpu);
             cudaFree(d_interference_matrix_gpu);
-            if (d_event_interference_gpu) cudaFree(d_event_interference_gpu);
             if (d_wave_mask_gpu) cudaFree(d_wave_mask_gpu);
             if (d_selected_integral_gpu) cudaFree(d_selected_integral_gpu);
             delete[] h_interference_matrix_gpu;
@@ -1642,17 +1614,6 @@ public:
                 phspTree->Branch(branch_name.c_str(), &partial_weights[i]);
             }
 
-            // 逐事件干涉分支 interf_<i>_<j> (i<j) = Σ_λ2Re(A_i^λ A_j^λ*)×normFactor
-            // 单位与 weight_<i> 一致; 守恒: totalweight = Σ_i weight_i + Σ_{i<j} interf_ij
-            std::vector<double> interf_vals(nintf, 0.0);
-            for (int i = 0; i < npartials; ++i)
-                for (int j = i + 1; j < npartials; ++j)
-                {
-                    int idx = i * npartials - i * (i - 1) / 2 + (j - i);
-                    std::string bn = "interf_" + std::to_string(i) + "_" + std::to_string(j);
-                    phspTree->Branch(bn.c_str(), &interf_vals[idx]);
-                }
-
             // 末态粒子四动量分支（任意分布按需现算: M/θ/φ/cosβ/... 全部可由它导出）
             std::vector<std::string> mom_names;
             if (!Vp4_all_.empty())
@@ -1697,9 +1658,6 @@ public:
                     // std::cout << "  Partial Weight " << j << " = " <<
                     // partial_weights[j] << std::endl;
                 }
-                if (h_event_interference != nullptr)
-                    for (int k = 0; k < nintf; ++k)
-                        interf_vals[k] = h_event_interference[(size_t)k * N_phsp + i] * normFactor;
                 for (int m = 0; m < n_mom; ++m)
                 {
                     const LorentzVector& mv = mom_host[(size_t)i * n_mom + m];
@@ -2509,9 +2467,198 @@ public:
         if (d_total_integral != nullptr) cudaFree(d_total_integral);
         if (d_interference_matrix != nullptr) cudaFree(d_interference_matrix);
         delete[] h_total_results;
-        delete[] h_event_interference;
         // h_partial_results 可能未分配，检查是否为空
         // if (h_partial_results != nullptr) delete[] h_partial_results;
+    }
+
+    // =====================================================================
+    // writeInterfResult: 保存指定波对的逐事件干涉形状。
+    //   输出 TTree saved_weight: totalweight / weight_<i>(全部分波) /
+    //   interf_<i>_<j>(只含选中对) / 末态粒子四动量。
+    //   容量 = len(pairs) × N_phsp（用户按需选择, 不会因全波数×大MC爆显存）。
+    //   pairs: [[i,j], ...] 波对(partial 索引, 与 weight_<i> 分支序一致)。
+    // =====================================================================
+    void writeInterfResult(torch::Tensor params, const std::string& filename,
+                           const std::vector<std::vector<int>>& pairs)
+    {
+        TORCH_CHECK(params.is_cuda(), "params must be on CUDA");
+        TORCH_CHECK(!pairs.empty(), "pairs 不能为空");
+        int npartials = (int)nSLvectors_.size();
+        std::vector<int> pair_list;
+        std::vector<std::pair<int, int>> pair_named;
+        for (const auto& pr : pairs) {
+            TORCH_CHECK(pr.size() == 2, "每个 pair 需要 [i, j] 两元素");
+            int i = pr[0], j = pr[1];
+            TORCH_CHECK(i >= 0 && i < npartials && j >= 0 && j < npartials && i != j,
+                "pair 下标越界或相同: ", i, ",", j);
+            if (i > j) std::swap(i, j);
+            pair_list.push_back(i * npartials - i * (i - 1) / 2 + (j - i));
+            pair_named.emplace_back(i, j);
+        }
+        const int npairs = (int)pair_list.size();
+
+        torch::Device dev = params.device();
+        torch::Tensor extended_vector;
+        int nt = 0;
+        if (params_.hasCouplingMatrix()) {
+            TORCH_CHECK(params.dtype() == torch::kFloat64,
+                "params must be float64 with coupling matrix");
+            const auto& cm = params_.couplingMatrix();
+            int ncf = cm.n_free, na = cm.n_amps;
+            nt = (int)params.size(0) - 2 * ncf;
+            auto ext = torch::empty({2 * na + nt},
+                torch::TensorOptions().dtype(torch::kFloat64).device(dev));
+            params_.extendCouplingParams(params.data_ptr<double>(),
+                ext.data_ptr<double>(), ncf, nt);
+            extended_vector = torch::complex(
+                ext.slice(0, 0, na).to(TORCH_FLOAT),
+                ext.slice(0, na, 2 * na).to(TORCH_FLOAT));
+            if (nt > 0) {
+                auto theta = params.slice(0, 2 * ncf, params.size(0));
+                amp_calc_.reComputeAmps(d_all_amplitudes_,
+                    reinterpret_cast<const double*>(theta.data_ptr()),
+                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+                    dev.index());
+            }
+        } else {
+            TORCH_CHECK(params.dtype() == TORCH_COMPLEX,
+                "params must be complex128 in legacy mode");
+            extended_vector = params_.extendVector(params, dev);
+        }
+        std::vector<torch::Tensor> ev_per_gpu;
+        for (size_t i = 0; i < d_all_amplitudes_.size(); ++i)
+            ev_per_gpu.push_back(extended_vector.to(torch::Device(torch::kCUDA, i)));
+
+        int N_phsp = 0;
+        for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu)
+            N_phsp += events_[gpu][0];
+        TORCH_CHECK(N_phsp > 0, "没有 phsp 事件");
+
+        double* h_total = new double[N_phsp];
+        double* h_partial = new double[(size_t)N_phsp * npartials];
+        double* h_interf = new double[(size_t)N_phsp * npairs];
+        int* d_pair_list = nullptr;
+        cudaMalloc(&d_pair_list, npairs * sizeof(int));
+        cudaMemcpy(d_pair_list, pair_list.data(), npairs * sizeof(int),
+            cudaMemcpyHostToDevice);
+
+        double* d_total_integral = nullptr;
+        cudaMalloc(&d_total_integral, sizeof(double));
+        int ev_cum = 0;
+        for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+            int ne = events_[gpu][0];
+            if (ne == 0) continue;
+            cudaSetDevice(gpu);
+            int* d_nsl = nullptr;
+            cudaMalloc(&d_nsl, npartials * sizeof(int));
+            cudaMemcpy(d_nsl, nSLvectors_.data(), npartials * sizeof(int),
+                cudaMemcpyHostToDevice);
+            double* d_total = nullptr;
+            cudaMalloc(&d_total, ne * sizeof(double));
+            double* d_partial = nullptr;
+            cudaMalloc(&d_partial, (size_t)ne * npartials * sizeof(double));
+            cudaMemset(d_partial, 0, (size_t)ne * npartials * sizeof(double));
+            double* d_intf = nullptr;
+            cudaMalloc(&d_intf, (size_t)ne * npairs * sizeof(double));
+            double* d_imat = nullptr;
+            cudaMalloc(&d_imat, npartials * npartials * sizeof(double));
+            cudaMemset(d_imat, 0, npartials * npartials * sizeof(double));
+            cudaMemset(d_total_integral, 0, sizeof(double));
+
+            computeResults(d_all_amplitudes_[gpu],
+                reinterpret_cast<const ctComplex*>(ev_per_gpu[gpu].data_ptr()),
+                d_total, d_total_integral, d_partial, d_imat, d_intf,
+                nullptr, nullptr, nullptr,
+                d_pair_list, npairs,
+                d_nsl, npartials, ne, n_amplitudes_, n_polar_);
+
+            cudaMemcpy(h_total + ev_cum, d_total, ne * sizeof(double),
+                cudaMemcpyDeviceToHost);
+            for (int p = 0; p < npartials; ++p)
+                cudaMemcpy(h_partial + (size_t)p * N_phsp + ev_cum,
+                    d_partial + (size_t)p * ne, ne * sizeof(double),
+                    cudaMemcpyDeviceToHost);
+            for (int q = 0; q < npairs; ++q)
+                cudaMemcpy(h_interf + (size_t)q * N_phsp + ev_cum,
+                    d_intf + (size_t)q * ne, ne * sizeof(double),
+                    cudaMemcpyDeviceToHost);
+            ev_cum += ne;
+            cudaFree(d_nsl); cudaFree(d_total); cudaFree(d_partial);
+            cudaFree(d_intf); cudaFree(d_imat);
+        }
+        cudaFree(d_pair_list);
+        cudaFree(d_total_integral);
+        cudaSetDevice(dev.index());
+
+        double h_phsp_integral = 0.0;
+        for (int i = 0; i < N_phsp; ++i) h_phsp_integral += h_total[i];
+        double dataIntegral = data_total_weight_ - bkg_integral_;
+        double normFactor = h_phsp_integral > 0
+            ? dataIntegral / h_phsp_integral : 1.0;
+
+        TFile* rootFile = new TFile(filename.c_str(), "RECREATE");
+        TTree* tree = new TTree("saved_weight", "interference shapes per event");
+        double total_weight = 0.0;
+        tree->Branch("totalweight", &total_weight);
+        std::vector<double> partial_weights(npartials, 0.0);
+        for (int i = 0; i < npartials; ++i)
+            tree->Branch(("weight_" + resonance_names_[i]).c_str(), &partial_weights[i]);
+        std::vector<double> interf_vals(npairs, 0.0);
+        for (int q = 0; q < npairs; ++q) {
+            std::string bn = "interf_" + std::to_string(pair_named[q].first)
+                + "_" + std::to_string(pair_named[q].second);
+            tree->Branch(bn.c_str(), &interf_vals[q]);
+        }
+        // 末态四动量
+        std::vector<std::string> mom_names;
+        if (!Vp4_all_.empty())
+            for (const auto& kv : Vp4_all_[0]) mom_names.push_back(kv.first);
+        const int n_mom = (int)mom_names.size();
+        std::vector<LorentzVector> mom_host((size_t)N_phsp * std::max(1, n_mom));
+        {
+            int off = 0;
+            for (size_t gpu = 0; gpu < Vp4_all_.size(); ++gpu) {
+                int ne = events_[gpu][0];
+                for (int m = 0; m < n_mom; ++m) {
+                    const auto& vec = Vp4_all_[gpu].at(mom_names[m]);
+                    for (int e = 0; e < ne; ++e)
+                        mom_host[(size_t)(off + e) * n_mom + m] = vec[e];
+                }
+                off += ne;
+            }
+        }
+        std::vector<double> mom_vals(std::max(1, n_mom) * 4, 0.0);
+        for (int m = 0; m < n_mom; ++m) {
+            const std::string& nm = mom_names[m];
+            tree->Branch((nm + "_px").c_str(), &mom_vals[m * 4 + 0]);
+            tree->Branch((nm + "_py").c_str(), &mom_vals[m * 4 + 1]);
+            tree->Branch((nm + "_pz").c_str(), &mom_vals[m * 4 + 2]);
+            tree->Branch((nm + "_E").c_str(),  &mom_vals[m * 4 + 3]);
+        }
+        for (int i = 0; i < N_phsp; ++i) {
+            total_weight = h_total[i] * normFactor;
+            for (int j = 0; j < npartials; ++j)
+                partial_weights[j] = h_partial[(size_t)j * N_phsp + i] * normFactor;
+            for (int q = 0; q < npairs; ++q)
+                interf_vals[q] = h_interf[(size_t)q * N_phsp + i] * normFactor;
+            for (int m = 0; m < n_mom; ++m) {
+                const LorentzVector& mv = mom_host[(size_t)i * n_mom + m];
+                mom_vals[m * 4 + 0] = mv.Px;
+                mom_vals[m * 4 + 1] = mv.Py;
+                mom_vals[m * 4 + 2] = mv.Pz;
+                mom_vals[m * 4 + 3] = mv.E;
+            }
+            tree->Fill();
+        }
+        tree->Write();
+        rootFile->Close();
+        delete rootFile;
+        delete[] h_total;
+        delete[] h_partial;
+        delete[] h_interf;
+        std::cout << "writeInterfResult: " << filename
+                  << " (pairs=" << npairs << ", events=" << N_phsp << ")" << std::endl;
+        return;
     }
 
     // ---- 内部 Hessian 计算 ----

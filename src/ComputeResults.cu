@@ -58,6 +58,8 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     const int* __restrict__ d_wave_mask,
     double* __restrict__ d_selected_integral,
     double* __restrict__ d_event_total,
+    const int* __restrict__ d_pair_list,       // 可空; [npairs] 上三角线性索引, 只导出这些对
+    int npairs_exported,
     int npartials, int nEvents, int ngls, int npolar)
 {
     int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -166,10 +168,19 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
 
     // 将干涉矩阵累加器写入 event_interference（原始值, 未除以总积分:
     // 与 weight_<i> 同单位, 满足 weight 守恒: Σ_i|A_i|² + Σ_{i<j}2Re(A_iA_j*) = total）
+    // d_pair_list 给出要导出的对(上三角线性索引); 写为紧凑布局 [npairs × nEvents]
     if (event_interference != nullptr) {
-        for (int k = 0; k < ninterference; k++) {
-            event_interference[event_idx + nEvents * k] =
-                interference_accumulator[k] * total_result_value;
+        if (d_pair_list != nullptr) {
+            for (int q = 0; q < npairs_exported; ++q) {
+                int k = d_pair_list[q];
+                event_interference[event_idx + nEvents * q] =
+                    interference_accumulator[k] * total_result_value;
+            }
+        } else {
+            for (int k = 0; k < ninterference; k++) {
+                event_interference[event_idx + nEvents * k] =
+                    interference_accumulator[k] * total_result_value;
+            }
         }
     }
 
@@ -185,10 +196,11 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
     double* d_total_result, double* d_total_integral,
     double* d_partial_result,
     double* d_interference_matrix,
-    double* d_event_interference,               // 可空; [nEvents × ninterf]
+    double* d_event_interference,               // 可空; [npairs或ninterf × nEvents]
     const int* d_wave_mask,                     // 可空; 选中子集(0/1)
     double* d_selected_integral,                // 可空; 子集积分
     double* d_total_out,                        // 可空; = d_total_result, 子集时覆盖
+    const int* d_pair_list, int npairs_exported,// 可空; 只导出这些对
     int* d_nSLvectors, int npartials, int nEvents, int ngls,
     int npolar)
 {
@@ -245,6 +257,7 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_event_interference, d_nSLvectors, d_total_integral,
             d_wave_mask, d_selected_integral, d_total_out,
+            d_pair_list, npairs_exported,
             npartials, nEvents, ngls, npolar);
     }
     else if (npartials <= 200) {
@@ -252,6 +265,7 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_event_interference, d_nSLvectors, d_total_integral,
             d_wave_mask, d_selected_integral, d_total_out,
+            d_pair_list, npairs_exported,
             npartials, nEvents, ngls, npolar);
     }
     else {
@@ -259,6 +273,7 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
             d_result_matrix, d_partial_result, d_interference_matrix,
             d_event_interference, d_nSLvectors, d_total_integral,
             d_wave_mask, d_selected_integral, d_total_out,
+            d_pair_list, npairs_exported,
             npartials, nEvents, ngls, npolar);
     }
     // computeModWithInterference<<<gridSize, blockSize,

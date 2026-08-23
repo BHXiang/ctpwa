@@ -28,6 +28,8 @@ void computeResults(const ctComplex *d_matrix, const ctComplex *d_vector,
                     const int *d_wave_mask,        // 可空; 选中子集(0/1)
                     double *d_selected_integral,   // 可空; 子集积分
                     double *d_total_out,           // 可空; = d_total_result, 子集时覆盖
+                    const int *d_pair_list,        // 可空; [npairs] 只导出这些对
+                    int npairs_exported,
                     int *d_nSLvectors, int npartials, int nEvents, int ngls,
                     int npolar);
 

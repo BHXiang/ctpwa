@@ -108,6 +108,11 @@ PYBIND11_MODULE(ctpwa, m)
              "（空=全部）; is_saved_weight=1 时额外导出逐事件 TTree")
         .def("getHessian", &analysis::getHessian, pybind11::arg("params"),
              "Full Hessian (2n+P)×(2n+P). params: [real(v), imag(v), theta] float64")
+        .def("writeInterfResult", &analysis::writeInterfResult,
+             pybind11::arg("params"), pybind11::arg("filename"),
+             pybind11::arg("pairs"),
+             "保存指定波对的逐事件干涉形状到 TTree saved_weight "
+             "(totalweight/weight_<i>/interf_<i>_<j>/末态四动量); pairs=[[i,j],...]")
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)

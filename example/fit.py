@@ -568,10 +568,24 @@ class UnifiedPWAOptimizer:
             return False
 
     # --------------------------------------------------------
+    def write_interf_result(self, params, filename, pairs):
+        """保存指定波对的逐事件干涉形状到 TTree saved_weight。
+        pairs: [[i,j], ...] 波对下标(与 weight_<i> 分支序一致)。
+        容量 = len(pairs)×N_phsp, 按需选择, 不会因全波数×大MC爆显存。
+        用法: fit.py 末尾 / AI 决策时:
+          optimizer.write_interf_result(best_params, "results/interf.root",
+                                        [[0, 6], [6, 7], [1, 9]])"""
+        coupling_ok = True
+        self.analysis.writeInterfResult(params, filename, pairs)
+        return True
+
+    # --------------------------------------------------------
     def save_weight_file(self, params, filename, waves=None):
         """保存权重文件。先reCalcAmp再writeResult。
         waves: 可选分波下标子集（如 [6,7]）, 只画 |Σ_{i∈S}A_i·v_i|² 的分布,
-        空=全部。FIT_WAVES="6,7" 环境变量也可指定。"""
+        空=全部。FIT_WAVES="6,7" 环境变量也可指定。
+        FIT_EVENT_DATA=1 时 TTree 额外含末态四动量(任意分布按需现算);
+        逐事件干涉 (interf_<i>_<j>) 请用 write_interf_result(pairs) 按需导出。"""
         try:
             if waves is None:
                 w = os.environ.get("FIT_WAVES", "").strip()
@@ -579,11 +593,6 @@ class UnifiedPWAOptimizer:
             if self.has_free_res:
                 theta = self.extract_theta_phys(params)
                 self.analysis.reCalcAmp(theta)
-            # is_saved_weight: 0=默认(不写逐事件 TTree; 大统计量/多分波时
-            # 逐事件数据 O(N×n波²) 可达 GB 级, 迭代过程不需要)。
-            # FIT_EVENT_DATA=1 时开启: TTree saved_weight = 每波强度 +
-            # 逐对干涉 interf_<i>_<j> + 末态四动量, 供任意分布按需现算
-            # (需要时在最终分析/AI 决策这一步显式打开)
             flag = 1 if os.environ.get("FIT_EVENT_DATA", "0") == "1" else 0
             self.analysis.writeResult(params, filename, flag, waves)
             if waves:
