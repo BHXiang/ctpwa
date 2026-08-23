@@ -2445,6 +2445,70 @@ public:
                         delete obs2d_fit[j];
                     }
                 }
+
+                // ---- 分波形状: 每个 obs 图 × 每波 |A_i|² 权重 → h_<波名> 子目录 ----
+                // (与旧格式的 mass/angle 分波形状一致; 1d 用 TH1F, 2d 用 TH2F)
+                for (size_t j = 0; j < obshists.size(); ++j) {
+                    const auto& cfg = obshists[j];
+                    const bool is2 = (cfg.obs.size() == 2);
+                    std::vector<TH1F*> obs1d_part(npartials, nullptr);
+                    std::vector<TH2F*> obs2d_part(npartials, nullptr);
+                    for (int p = 0; p < npartials; ++p) {
+                        std::string pn = cfg.name + "_p" + std::to_string(p);
+                        if (is2)
+                            obs2d_part[p] = new TH2F(pn.c_str(), "",
+                                cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1],
+                                cfg.bins[1], cfg.ranges[1][0], cfg.ranges[1][1]);
+                        else
+                            obs1d_part[p] = new TH1F(pn.c_str(), "",
+                                cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1]);
+                    }
+                    for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
+                        if (events_[gpu][0] == 0) continue;
+                        cudaSetDevice(gpu);
+                        for (int p = 0; p < npartials; ++p) {
+                            std::vector<PlotConfig> one = {cfg};
+                            std::vector<TH1F*> t1(is2 ? 0 : 1, nullptr);
+                            std::vector<TH2F*> t2(is2 ? 1 : 0, nullptr);
+                            std::string tn = cfg.name + "_t" + std::to_string(p);
+                            if (is2)
+                                t2[0] = new TH2F(tn.c_str(), "",
+                                    cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1],
+                                    cfg.bins[1], cfg.ranges[1][0], cfg.ranges[1][1]);
+                            else
+                                t1[0] = new TH1F(tn.c_str(), "",
+                                    cfg.bins[0], cfg.ranges[0][0], cfg.ranges[0][1]);
+                            double* partial_weight_ptr =
+                                d_partial_result_vec[gpu] + (size_t)p * events_[gpu][0];
+                            CalculateObsHist(device_momenta_list[gpu], particleToIndex,
+                                one, partial_weight_ptr, t1, t2,
+                                events_[gpu][0], n_particles, motherIdx);
+                            if (is2) obs2d_part[p]->Add(t2[0]);
+                            else obs1d_part[p]->Add(t1[0]);
+                            if (!t1.empty() && t1[0]) delete t1[0];
+                            if (!t2.empty() && t2[0]) delete t2[0];
+                        }
+                    }
+                    for (int p = 0; p < npartials; ++p) {
+                        std::string partial_dir_name =
+                            "h_" + sanitizeROOTName(resonance_names_[p]);
+                        TDirectory* dir = rootFile->GetDirectory(cfg.name.c_str());
+                        dir->cd();
+                        if (is2) {
+                            if (!obs2d_part[p]) continue;
+                            obs2d_part[p]->Scale(normFactor);
+                            obs2d_part[p]->Write(partial_dir_name.c_str(),
+                                TObject::kOverwrite);
+                            delete obs2d_part[p];
+                        } else {
+                            if (!obs1d_part[p]) continue;
+                            obs1d_part[p]->Scale(normFactor);
+                            obs1d_part[p]->Write(partial_dir_name.c_str(),
+                                TObject::kOverwrite);
+                            delete obs1d_part[p];
+                        }
+                    }
+                }
             }
         }
 
