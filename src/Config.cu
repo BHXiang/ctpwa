@@ -876,12 +876,16 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     }
 
                     // --- BFS: recursively resolve intermediates ---
+                    // used: 链中已出现的粒子(行级 bachelor + 已展开模式的子粒子)。
+                    // 深层多模式中间态选模式时避开 used——与行级 multi-mode filter
+                    // (模式不得含 bachelor, 否则同一粒子重复出现) 同一约束的递归推广。
                     struct BFSItem {
                         std::string name;
                         bool is_first;
                         bool has_bf, has_bf_explicit, pb;
                         double bf_d;
                         std::vector<std::vector<int>> sl; // 该步的分波白名单
+                        std::vector<std::string> used;    // 链中已出现的粒子
                     };
                     std::queue<BFSItem> queue;
 
@@ -897,7 +901,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
                         queue.push({intermediate, !bachelor_drives_modes, step2_has_bf,
                             step2_has_bf_explicit, step2_p_break, step2_bf_d,
-                            ifm ? ifm->sl_filter : std::vector<std::vector<int>>{}});
+                            ifm ? ifm->sl_filter : std::vector<std::vector<int>>{},
+                            std::vector<std::string>{bachelor}});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
@@ -907,13 +912,47 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             bm && bm->has_bf_explicit,
                             bm ? bm->p_break : false,
                             (bm && !std::isnan(bm->bf_d)) ? bm->bf_d : NAN,
-                            bm ? bm->sl_filter : std::vector<std::vector<int>>{}});
+                            bm ? bm->sl_filter : std::vector<std::vector<int>>{},
+                            std::vector<std::string>{intermediate}});
                     }
 
                     while (!queue.empty()) {
                         auto item = queue.front(); queue.pop();
-                        const IntDecay* mode = getDecayMode(item.name,
-                            item.is_first ? mi : 0);
+
+                        // 模式选择: 首层中间态用外层模式 mi (行级 filter 已保证其
+                        // 不含行 bachelor); 深层中间态避开链中已出现的粒子。
+                        size_t mode_idx = 0;
+                        if (item.is_first) {
+                            mode_idx = mi;
+                        } else if (!item.used.empty()) {
+                            const auto& modes = int_decay_modes[item.name];
+                            bool all_conflict = true;
+                            for (size_t k = 0; k < modes.size(); ++k) {
+                                bool conflict = false;
+                                for (const auto& u : item.used) {
+                                    if (modes[k].d1 == u || modes[k].d2 == u) {
+                                        conflict = true;
+                                        break;
+                                    }
+                                }
+                                if (!conflict) {
+                                    mode_idx = k;
+                                    all_conflict = false;
+                                    break;
+                                }
+                            }
+                            if (mode_idx > 0)
+                                std::cerr << "Note: intermediate '" << item.name
+                                          << "' uses decay mode " << mode_idx
+                                          << " (avoids particles already in chain)"
+                                          << std::endl;
+                            else if (all_conflict)
+                                std::cerr << "Warning: intermediate '" << item.name
+                                          << "': all decay modes contain a particle "
+                                          << "already in the chain; using mode 0 (duplicate "
+                                          << "particle may appear)" << std::endl;
+                        }
+                        const IntDecay* mode = getDecayMode(item.name, mode_idx);
                         if (!mode) continue;
 
                         DecayStep substep;
@@ -930,7 +969,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         if (res_chain_map.count(item.name))
                             chain.resonance_chains.push_back(res_chain_map[item.name]);
 
-                        // Enqueue any daughter that is itself an intermediate
+                        // Enqueue any daughter that is itself an intermediate.
+                        // 本模式的子粒子已出现在链中, 传给后代的 used。
+                        std::vector<std::string> child_used = item.used;
+                        child_used.push_back(mode->d1);
+                        child_used.push_back(mode->d2);
                         auto enqueue = [&](const std::string& d) {
                             if (int_decay_modes.count(d)) {
                                 const auto* dm = getDecayMode(d, 0);
@@ -939,7 +982,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                                     dm && dm->has_bf_explicit,
                                     dm ? dm->p_break : false,
                                     (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
-                                    dm ? dm->sl_filter : std::vector<std::vector<int>>{}});
+                                    dm ? dm->sl_filter : std::vector<std::vector<int>>{},
+                                    child_used});
                             }
                         };
                         enqueue(mode->d1);
