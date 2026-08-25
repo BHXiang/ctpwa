@@ -226,16 +226,100 @@ ConfigParser::ConfigParser(const std::string &config_file)
         if (config["precision"])
             precision_ = config["precision"].as<std::string>();
 
-        // 链过滤器: 子串匹配剔除不想要的衰变链（确保 legends/Info/Analysis 一致）
+        // 链过滤器: 子串匹配剔除不想要的衰变链（确保 legends/Info/Analysis 一致）。
+        // 匹配链名 → 整链保留（原语义）; 匹配"组合级完整路径串"→ 只保留该共振态
+        // 组合（该 intermediate 内只留匹配共振态, 其余 intermediate 是链结构、一律
+        // 保留）——即"指定具体衰变链, 每步衰变到哪个共振态"。
+        // 路径串 = 每步 [mother, d1, d2] 平铺、中间态名用选中共振态替换,
+        // 如 psip_gamma_chic1_chic1_eta_f2_1525_f2_1525_Kp_Km（= h_ 波名无前缀）。
         if (!chain_filter_.empty() && !decay_chains_.empty()) {
+            // 组合级完整路径串: 每个 intermediate 选一个共振态的笛卡尔积组合,
+            // 返回 (路径串, 该组合的 intermediate→共振态 映射)。
+            auto combPaths = [](const DecayChainConfig& dc) {
+                std::vector<std::pair<std::string, std::vector<std::string>>> choices;
+                for (const auto& rc : dc.resonance_chains) {
+                    std::vector<std::string> res;
+                    for (const auto& sc : rc.spin_chains)
+                        for (const auto& r : sc.resonances) res.push_back(r);
+                    if (!res.empty()) choices.push_back({rc.intermediate, std::move(res)});
+                }
+                std::vector<std::map<std::string, std::string>> combos = {{}};
+                for (const auto& [iname, res] : choices) {
+                    std::vector<std::map<std::string, std::string>> next;
+                    next.reserve(combos.size() * res.size());
+                    for (const auto& c : combos)
+                        for (const auto& r : res) {
+                            auto c2 = c;
+                            c2[iname] = r;
+                            next.push_back(std::move(c2));
+                        }
+                    combos = std::move(next);
+                }
+                std::vector<std::pair<std::string, std::map<std::string, std::string>>> out;
+                out.reserve(combos.size());
+                for (const auto& combo : combos) {
+                    auto sub = [&](const std::string& n) {
+                        auto it = combo.find(n);
+                        return it != combo.end() ? it->second : n;
+                    };
+                    std::string p;
+                    for (const auto& step : dc.decay_steps) {
+                        p += sub(step.mother) + "_";
+                        for (const auto& d : step.daughters) p += sub(d) + "_";
+                    }
+                    out.push_back({std::move(p), combo});
+                }
+                return out;
+            };
+
             std::vector<DecayChainConfig> kept;
-            for (const auto& dc : decay_chains_) {
+            for (auto& dc : decay_chains_) {
+                bool keep_whole = false;
+                // intermediate → 要保留的共振态（匹配组合的并集）
+                std::map<std::string, std::set<std::string>> keep_pairs;
+                const auto paths = combPaths(dc);
                 for (const auto& pat : chain_filter_) {
                     if (dc.name.find(pat) != std::string::npos) {
-                        kept.push_back(dc);
+                        keep_whole = true;
+                        break;
+                    }
+                    for (const auto& [path, combo] : paths) {
+                        if (path.find(pat) != std::string::npos) {
+                            for (const auto& [iname, r] : combo)
+                                keep_pairs[iname].insert(r);
+                        }
+                    }
+                }
+                if (!keep_whole && keep_pairs.empty()) continue; // 无匹配 → 剔除
+                if (keep_whole) { kept.push_back(dc); continue; }
+
+                // 只过滤"参与匹配组合"的 intermediate: 其内只留匹配的共振态分波,
+                // 剔除空的 spin_chain; 其余 intermediate 的共振态全部保留。
+                for (auto& rc : dc.resonance_chains) {
+                    auto it = keep_pairs.find(rc.intermediate);
+                    if (it == keep_pairs.end()) continue;
+                    const auto& keep = it->second;
+                    for (auto sit = rc.spin_chains.begin();
+                         sit != rc.spin_chains.end();) {
+                        std::vector<std::string> kept_r;
+                        for (const auto& r : sit->resonances)
+                            if (keep.count(r)) kept_r.push_back(r);
+                        sit->resonances = kept_r;
+                        if (sit->resonances.empty())
+                            sit = rc.spin_chains.erase(sit);
+                        else
+                            ++sit;
+                    }
+                }
+                // 若匹配涉及的 intermediate 全部共振态被过滤掉 → 链不可构建
+                bool viable = true;
+                for (const auto& rc : dc.resonance_chains) {
+                    if (keep_pairs.count(rc.intermediate) && rc.spin_chains.empty()) {
+                        viable = false;
                         break;
                     }
                 }
+                if (viable) kept.push_back(dc);
             }
             std::cout << "Chain filter: " << kept.size() << "/" << decay_chains_.size()
                       << " chains selected" << std::endl;
