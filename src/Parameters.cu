@@ -617,12 +617,60 @@ CouplingMatrixResult CouplingMatrixBuilder::buildWithTrans(
         };
 
         // Collect all chains matching A and B, indexed by resonance name
-        std::map<std::string, int> chainsA, chainsB;
-        for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
-            if (chain_keys[ci].find(nameA) != std::string::npos)
-                chainsA[resName(chain_keys[ci])] = (int)ci;
-            if (chain_keys[ci].find(nameB) != std::string::npos)
-                chainsB[resName(chain_keys[ci])] = (int)ci;
+        auto matchChains = [&](const std::string& name)
+            -> std::map<std::string, int> {
+            std::map<std::string, int> out;
+            // 1) 直接子串匹配（顶层中间态链名形式: decay1_R_Keta_0/1 等）
+            for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
+                if (chain_keys[ci].find(name) != std::string::npos)
+                    out[resName(chain_keys[ci])] = (int)ci;
+            }
+            if (!out.empty()) return out;
+            // 2) 实例语义: "<中间态名>_<出现序号>" —— 该中间态是深层
+            //    子中间态时链名不含此串, 按链前缀(chain.name)分组,
+            //    序号为含该中间态的链组在 chain_keys 中的出现次序。
+            std::string base = name;
+            int inst = -1;
+            auto us = name.rfind('_');
+            if (us != std::string::npos) {
+                std::string num = name.substr(us + 1);
+                if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
+                    base = name.substr(0, us);
+                    inst = atoi(num.c_str());
+                }
+            }
+            if (inst < 0) return out;   // 无实例序号可解析
+            std::string tag = "_" + base + "[";
+            std::map<int, std::vector<int>> grp_chains; // 组序号 → [链 id…]
+            std::map<std::string, int> grp_of;          // 链前缀 → 组序号
+            for (size_t ci = 0; ci < chain_keys.size(); ++ci) {
+                if (chain_keys[ci].find(tag) == std::string::npos) continue;
+                auto first_br = chain_keys[ci].find('[');   // chain.name 段无 '['
+                if (first_br == std::string::npos) continue;
+                std::string prefix = chain_keys[ci].substr(0, first_br);
+                auto it = grp_of.find(prefix);
+                int gi;
+                if (it == grp_of.end()) {
+                    gi = (int)grp_chains.size();
+                    grp_of[prefix] = gi;
+                } else {
+                    gi = it->second;
+                }
+                grp_chains[gi].push_back((int)ci);
+            }
+            if (inst < (int)grp_chains.size()) {
+                for (int ci : grp_chains[inst]) out[resName(chain_keys[ci])] = ci;
+            }
+            return out;
+        };
+
+        std::map<std::string, int> chainsA = matchChains(nameA);
+        std::map<std::string, int> chainsB = matchChains(nameB);
+        if (chainsA.empty() || chainsB.empty()) {
+            fprintf(stderr,
+                "[ctpwa] warn: trans constraint [%s, %s] = %g matched no chains "
+                "(检查名字是否为链名或 <中间态名>_<出现序号>); 忽略\n",
+                nameA.c_str(), nameB.c_str(), ratio);
         }
 
         // Pairwise fold: same resonance → B folds into A

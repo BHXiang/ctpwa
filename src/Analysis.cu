@@ -4695,15 +4695,17 @@ private:
             // 这发生在同一共振态有多个 SL 组合时
             std::map<int, std::vector<int>> chain_owners;
             for (int ai = 0; ai < n_amplitudes_; ++ai) {
-                if (std::abs(cm.amp_chain_ratio[ai] - 1.0) < 1e-10) {
-                    chain_owners[cm.amp_chain[ai]].push_back(ai);
-                }
+                if (cm.amp_chain[ai] < 0) continue;   // 不按 ratio 过滤: trans 值可为 1.0
+                chain_owners[cm.amp_chain[ai]].push_back(ai);
             }
 
             bool needs_split = false;
             for (const auto& [ci, owners] : chain_owners) {
                 if (owners.size() > 1) { needs_split = true; break; }
             }
+
+            // free param → 组代表链振幅名(折叠链共享参数时显示代表链)
+            std::map<int, std::string> free_idx_to_name;
 
             if (!needs_split) {
                 // 简单情况：每个 active chain 恰好 1 个 owner 振幅
@@ -4723,36 +4725,37 @@ private:
                     std::sort(amps.begin(), amps.end());
                 }
 
-                // 识别哪些原始 chain 被折叠（其振幅的 ratio ≠ 1.0）
-                std::set<std::string> folded_orig_chains;
-                for (const auto& [ck, amps] : orig_chain_amps) {
-                    if (!amps.empty() && std::abs(cm.amp_chain_ratio[amps[0]] - 1.0) > 1e-10) {
-                        folded_orig_chains.insert(ck);
-                    }
-                }
-
+                // 折叠判定: 映射到同一 active index 的多条原链共享参数。
+                // 注意不能用 ratio ≠ 1 判定 —— trans 约束值本身可为 1.0,
+                // 折叠链的 ratio(=约束值) 与「每条链一个参数」时的 ratio 都是 1.0。
+                // 组内第一条原链(按字符串序, 即展开顺序)的振幅分配独立参数,
+                // 同组其余原链按位置对齐到组代表的对应参数。
                 int next_free = 0;
-                // active_chain → 该 chain 内各位置对应的 free param index
+                std::map<int, std::map<std::string, std::vector<int>>> groups; // ac → ck → amps
+                for (const auto& [ck, amps] : orig_chain_amps) {
+                    if (amps.empty() || cm.amp_chain[amps[0]] < 0) continue;
+                    groups[cm.amp_chain[amps[0]]][ck] = amps;
+                }
+                // active_chain → 组代表(第一条原链)各位置对应的 free param index
                 std::map<int, std::vector<int>> ac_free_indices;
 
-                // 第一遍：非折叠 chain 的振幅，每个分配独立 free param
-                for (const auto& [ck, amps] : orig_chain_amps) {
-                    if (folded_orig_chains.count(ck)) continue;
-                    int ac = cm.amp_chain[amps[0]];
-                    for (int ai : amps) {
-                        id.amp_chain[ai] = next_free;
-                        ac_free_indices[ac].push_back(next_free);
-                        next_free++;
-                    }
-                }
-
-                // 第二遍：折叠 chain 的振幅，按位置映射到 owner chain 对应 free param
-                for (const auto& [ck, amps] : orig_chain_amps) {
-                    if (!folded_orig_chains.count(ck)) continue;
-                    int ac = cm.amp_chain[amps[0]];
-                    const auto& free_indices = ac_free_indices[ac];
-                    for (size_t pos = 0; pos < amps.size() && pos < free_indices.size(); ++pos) {
-                        id.amp_chain[amps[pos]] = free_indices[pos];
+                for (const auto& [ac, ck_amps] : groups) {
+                    for (const auto& [ck, amps] : ck_amps) {
+                        bool is_owner = (ck == ck_amps.begin()->first);
+                        const std::vector<int>& owner_amps = ck_amps.begin()->second;
+                        if (is_owner) {
+                            for (int ai : amps) {
+                                id.amp_chain[ai] = next_free;
+                                ac_free_indices[ac].push_back(next_free);
+                                next_free++;
+                            }
+                        } else {
+                            const auto& free_indices = ac_free_indices[ac];
+                            for (size_t pos = 0; pos < amps.size()
+                                 && pos < free_indices.size() && pos < owner_amps.size(); ++pos) {
+                                id.amp_chain[amps[pos]] = free_indices[pos];
+                            }
+                        }
                     }
                 }
 
@@ -4762,16 +4765,17 @@ private:
 
             params_.setCouplingMatrix(id);
 
-            // 只保留非折叠振幅的名字，按 free param index 排序
-            std::map<int, std::string> free_idx_to_name;
+            // 参数名 = 最后一个映射到该 free param 的振幅名（与历史行为一致：
+            // 折叠链共享参数时均指向同一个 index, 后写覆盖 = 展开序靠后者）
             for (int ai = 0; ai < n_amplitudes_; ++ai) {
-                if (std::abs(id.amp_chain_ratio[ai] - 1.0) < 1e-10) {
-                    free_idx_to_name[id.amp_chain[ai]] = amplitude_names_[ai];
-                }
+                int f = id.amp_chain[ai];
+                if (f < 0) continue;
+                free_idx_to_name[f] = amplitude_names_[ai];
             }
             std::vector<std::string> vspace_names;
-            for (const auto& [idx, name] : free_idx_to_name) {
-                vspace_names.push_back(name);
+            for (int idx = 0; idx < id.n_chain_free; ++idx) {
+                auto it = free_idx_to_name.find(idx);
+                vspace_names.push_back(it != free_idx_to_name.end() ? it->second : "");
             }
             const auto& rnames = info.resonanceParamNames();
             vspace_names.insert(vspace_names.end(), rnames.begin(), rnames.end());
