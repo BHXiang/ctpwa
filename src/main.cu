@@ -118,13 +118,33 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getDataTensor", &analysis::getDataTensor)
         .def("getPhspTensor", &analysis::getPhspTensor)
         // .def("getTruthTensor", &analysis::getTruthTensor)
-        .def("getFitFractions", &analysis::getFitFractions,
-             pybind11::arg("vector"), pybind11::arg("hessian") = torch::Tensor(),
+        .def("getFitFractions", pybind11::overload_cast<torch::Tensor>(
+                 &analysis::getFitFractions),
+             pybind11::arg("vector"),
              "Fit fractions: FF_i = ∫|A_i|² / Σ_j∫|A_j|² (纯形状份额, 无效率, "
              "只用 phsp_truth → 与效率 MC/归一化无关, 跨实验可比). "
              "Σ_i FF_i = 1; 绝对分支比 = BF_total × FF_i. "
-             "返回 [npartials, 2] = [center, error]. "
-             "hessian: 可选统一 Hessian (与拟合 getHessian 同源), 用于误差传播。")
+             "返回 [npartials, 2] = [center, error].")
+        .def("getFitFractions", pybind11::overload_cast<torch::Tensor, torch::Tensor>(
+                 &analysis::getFitFractions),
+             pybind11::arg("vector"), pybind11::arg("hessian"),
+             "getFitFractions(vector, hessian): hessian 为可选统一 Hessian "
+             "(与拟合 getHessian 同源), 用于误差传播。")
+        .def("getEfficiency", pybind11::overload_cast<torch::Tensor>(
+                 &analysis::getEfficiency),
+             pybind11::arg("vector"),
+             "分波效率: ε_i = (Σ_{phsp}|A_i|²/N_phsp) / (Σ_{phsp_truth}|A_i|²/N_truth), "
+             "phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth, "
+             "即分波加权的探测/选择效率 ∫|A_i|²ε(x)dΦ/∫|A_i|²dΦ. "
+             "依赖拟合结果(振幅形状含共振参数), 用拟合后 vector 计算. "
+             "返回 [npartials, 2] = [center, error], "
+             "误差 = 参数误差(Jacobian@H⁻¹@Jᵀ) ⊕ MC 统计误差(tf-pwa add_int_error 同款). "
+             "缺 phsp 或 phsp_truth 时返回空张量 [0,2].")
+        .def("getEfficiency", pybind11::overload_cast<torch::Tensor, torch::Tensor>(
+                 &analysis::getEfficiency),
+             pybind11::arg("vector"), pybind11::arg("hessian"),
+             "getEfficiency(vector, hessian): hessian 为可选统一 Hessian, "
+             "用于参数误差传播。")
         .def("getBkgTensor", &analysis::getBkgTensor)
         .def("getBkgWeightsTensor", &analysis::getBkgWeightsTensor)
         .def("saveSLAmps", &analysis::saveSLAmps)

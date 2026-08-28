@@ -2819,7 +2819,7 @@ public:
 
     // 耦合参数 Hessian [2n × 2n]（被 getFitFractions 作为 hessian_in 缺省回退）
     // 输入: 自由耦合 p（complex [n_free]）；内部先映射为振幅 v 再对 v 求 Hessian。
-    torch::Tensor computeCouplingHessian(torch::Tensor& vector)
+    torch::Tensor computeCouplingHessian(torch::Tensor vector)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
@@ -3670,14 +3670,16 @@ public:
         return hessian;
     }
 
-    // Helper: compute truth partial + scattering integrals from given amplitudes.
-    // Accumulates into out_partial and out_scattering (caller must zero-initialize).
+    // Helper: compute partial + scattering (+square) integrals from given amplitudes.
+    // Accumulates into out_partial/out_scattering/out_square (caller must zero-init;
+    // out_square may be nullptr when Σ|A_i|⁴ 不需要, e.g. 拟合分数).
     void computeTruthIntegrals(
         const torch::Tensor& extended_vector,
         const std::vector<ctComplex*>& d_amps,
         const std::vector<int>& ev_per_gpu,
         double* out_partial,
         double* out_scattering,
+        double* out_square,
         int npartials) const
     {
         for (size_t gpu = 0; gpu < d_amps.size(); ++gpu) {
@@ -3694,11 +3696,16 @@ public:
             double* d_s; cudaMalloc(&d_s, npartials * npartials * sizeof(double));
             cudaMemset(d_s, 0, npartials * npartials * sizeof(double));
             double* d_t; cudaMalloc(&d_t, sizeof(double)); cudaMemset(d_t, 0, sizeof(double));
+            double* d_sq = nullptr;
+            if (out_square != nullptr) {
+                cudaMalloc(&d_sq, npartials * sizeof(double));
+                cudaMemset(d_sq, 0, npartials * sizeof(double));
+            }
 
             auto vg = extended_vector.to(torch::Device(torch::kCUDA, gpu));
             computeBranchingFractions(d_amps[gpu],
                 reinterpret_cast<const ctComplex*>(vg.data_ptr()),
-                d_p, d_s, d_t, d_nsl, npartials, nt, n_amplitudes_, n_polar_);
+                d_p, d_s, d_t, d_sq, d_nsl, npartials, nt, n_amplitudes_, n_polar_);
 
             std::vector<double> hp(npartials), hs(npartials * npartials); double ht;
             cudaMemcpy(hp.data(), d_p, npartials * sizeof(double), cudaMemcpyDeviceToHost);
@@ -3709,57 +3716,65 @@ public:
                 for (int j = 0; j < npartials; ++j)
                     out_scattering[i * npartials + j] += hs[i * npartials + j];
             }
+            if (d_sq != nullptr) {
+                std::vector<double> hsq(npartials);
+                cudaMemcpy(hsq.data(), d_sq, npartials * sizeof(double), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < npartials; ++i) out_square[i] += hsq[i];
+                cudaFree(d_sq);
+            }
             cudaFree(d_p); cudaFree(d_s); cudaFree(d_t); cudaFree(d_nsl);
         }
     }
 
     // =====================================================================
-    // 公共: phsp_truth（无效率 MC）批处理积分 + Jacobian 扰动积分
-    // 输出（调用方清零后传入）:
-    //   truth_c_partial [npartials]          Σ|A_i|²（中心）
-    //   truth_c_scattering [npartials²]      2Re(A_i A_j*)（中心）
-    //   truth_p/m_partial [n2×npartials]     ±ε 扰动后的 Σ|A_i|²
-    //   truth_p/m_scattering [n2×npartials²] ±ε 扰动后的散射矩阵
+    // 通用: 在指定数据文件（phsp_truth/phsp 等）上分批积分
+    //   out_partial [npartials]          Σ|A_i|²（中心）
+    //   out_scattering [npartials²]      2Re(A_i A_j*)（中心）
+    //   out_square [npartials]           Σ|A_i|⁴（中心, 可传 nullptr）
+    //   out_p/m_partial/scattering        ±ε 扰动后的积分（可为 nullptr 跳过扰动）
+    // 返回该文件的事件总数（供归一化）。
     // =====================================================================
-    void computeTruthBatchIntegrals(
+    int computeFileBatchIntegrals(
+        const std::string& file_key,
         const torch::Tensor& ev_center,
         const std::vector<torch::Tensor>& ev_perturbed_p,
         const std::vector<torch::Tensor>& ev_perturbed_m,
-        std::vector<double>& truth_c_partial,
-        std::vector<double>& truth_c_scattering,
-        std::vector<double>& truth_p_partial,
-        std::vector<double>& truth_p_scattering,
-        std::vector<double>& truth_m_partial,
-        std::vector<double>& truth_m_scattering,
+        double* out_partial,
+        double* out_scattering,
+        double* out_square,
+        double* out_p_partial,
+        double* out_p_scattering,
+        double* out_m_partial,
+        double* out_m_scattering,
         int npartials)
     {
         const auto& data_files = config_parser_.getDataFiles();
-        TORCH_CHECK(data_files.count("phsp_truth") > 0, "No phsp_truth in config");
+        TORCH_CHECK(data_files.count(file_key) > 0,
+            std::string("No data file '") + file_key + "' in config");
 
         std::vector<std::string> particles_names;
         for (const auto& p : particles_) particles_names.push_back(p.name);
 
-        // Count total truth events
-        std::string truth_file = data_files.at("phsp_truth")[1];
-        int total_truth = 0;
+        std::string file = data_files.at(file_key)[1];
+        int total_events = 0;
         {
-            std::ifstream f(truth_file);
+            std::ifstream f(file);
             std::string line;
-            while (std::getline(f, line))
-                if (!line.empty()) ++total_truth;
-            total_truth /= particles_.size();
+            int lines = 0;
+            while (std::getline(f, line)) if (!line.empty()) ++lines;
+            total_events = lines / (int)particles_.size();
         }
-        std::cout << "Phase space truth events: " << total_truth << std::endl;
+        std::cout << "[" << file_key << "] events: " << total_events << std::endl;
 
-        // Batched truth accumulation
+        // Batched accumulation
         const int batch_size = 100000;
         const auto& data_order = config_parser_.getDataOrder();
         auto saved_ev = events_offsets_, saved_amp = amp_offsets_;
 
-        for (int start = 0; start < total_truth; start += batch_size) {
-            int n_batch = std::min(batch_size, total_truth - start);
+        for (int start = 0; start < total_events; start += batch_size) {
+            int n_batch = std::min(batch_size, total_events - start);
 
-            auto Vp4_batch = readMomentaFromDat(data_files.at("phsp_truth"),
+            auto Vp4_batch = readMomentaFromDat(data_files.at(file_key),
                 data_order, particles_names, n_batch, start);
 
             // Split across GPUs
@@ -3787,18 +3802,20 @@ public:
             events_offsets_ = t_ev_off; amp_offsets_ = t_amp_off;
             std::vector<ctComplex*> d_batch_amps = calculateAmplitudes(Vp4_tpg);
 
-            // Center
+            // Center (+ square)
             computeTruthIntegrals(ev_center, d_batch_amps, batch_ev_per_gpu,
-                truth_c_partial.data(), truth_c_scattering.data(), npartials);
+                out_partial, out_scattering, out_square, npartials);
 
             // Jacobian perturbations (reuse same batch amplitudes)
-            for (int j = 0; j < (int)ev_perturbed_p.size(); ++j) {
-                computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps, batch_ev_per_gpu,
-                    truth_p_partial.data() + j * npartials,
-                    truth_p_scattering.data() + j * npartials * npartials, npartials);
-                computeTruthIntegrals(ev_perturbed_m[j], d_batch_amps, batch_ev_per_gpu,
-                    truth_m_partial.data() + j * npartials,
-                    truth_m_scattering.data() + j * npartials * npartials, npartials);
+            if (out_p_partial != nullptr) {
+                for (int j = 0; j < (int)ev_perturbed_p.size(); ++j) {
+                    computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps, batch_ev_per_gpu,
+                        out_p_partial + j * npartials,
+                        out_p_scattering + j * npartials * npartials, nullptr, npartials);
+                    computeTruthIntegrals(ev_perturbed_m[j], d_batch_amps, batch_ev_per_gpu,
+                        out_m_partial + j * npartials,
+                        out_m_scattering + j * npartials * npartials, nullptr, npartials);
+                }
             }
 
             // Free batch amplitudes
@@ -3806,6 +3823,7 @@ public:
                 if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
         }
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
+        return total_events;
     }
 
     // =====================================================================
@@ -3817,8 +3835,12 @@ public:
     // hessian_in: 可选统一 Hessian。分波误差与拟合 getHessian 同源。
     // 返回 [npartials, 2]: [center, error]
     // =====================================================================
-    torch::Tensor getFitFractions(torch::Tensor& vector,
-        torch::Tensor hessian_in = torch::Tensor())
+    torch::Tensor getFitFractions(torch::Tensor vector)
+    {
+        return getFitFractions(vector, torch::Tensor());
+    }
+    torch::Tensor getFitFractions(torch::Tensor vector,
+        torch::Tensor hessian_in)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
@@ -3871,10 +3893,10 @@ public:
         std::vector<double> truth_p_scattering(n2 * npartials * npartials, 0.0);
         std::vector<double> truth_m_partial(n2 * npartials, 0.0);
         std::vector<double> truth_m_scattering(n2 * npartials * npartials, 0.0);
-        computeTruthBatchIntegrals(ev_center, ev_perturbed_p, ev_perturbed_m,
-            truth_c_partial, truth_c_scattering,
-            truth_p_partial, truth_p_scattering,
-            truth_m_partial, truth_m_scattering, npartials);
+        computeFileBatchIntegrals("phsp_truth", ev_center, ev_perturbed_p, ev_perturbed_m,
+            truth_c_partial.data(), truth_c_scattering.data(), nullptr,
+            truth_p_partial.data(), truth_p_scattering.data(),
+            truth_m_partial.data(), truth_m_scattering.data(), npartials);
 
         // FF_i = truth_partial[i] / Σ_j truth_partial[j]
         double truth_total = 0.0;
@@ -3900,6 +3922,9 @@ public:
             for (int j = 0; j < n2; ++j)
                 if (j != 0 && j != n) free_idx.push_back(j);
             const int n_free = (int)free_idx.size();
+            if (n_free == 0) {
+                // 全部方向固定(如单链仅参考耦合): 无自由参数可传播, 参数误差为 0
+            } else {
             auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
             torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
             auto eig = torch::linalg_eigvalsh(H_free);
@@ -3927,6 +3952,7 @@ public:
 
                 computeBFErrors(J.data(), h_cov.data(), ff_errors.data(), npartials, n_free);
             }
+            }
         }
         // 返回 n×2: [center, error]
         auto opts = torch::TensorOptions().dtype(torch::kFloat64);
@@ -3934,6 +3960,169 @@ public:
         for (int i = 0; i < npartials; ++i) {
             result[i][0] = ff_center[i];
             result[i][1] = ff_errors[i];
+        }
+        return result;
+    }
+
+    // =====================================================================
+    // 效率: ε_i = (Σ_{phsp}|A_i|² / N_phsp) / (Σ_{phsp_truth}|A_i|² / N_truth)
+    //   phsp（如 cut 后 MC）= 带效率样本; phsp_truth = 无效率 MC truth。
+    //   ⇒ 分波加权的探测/选择效率: ∫|A_i|²ε(x)dΦ / ∫|A_i|²dΦ。
+    //   ε 是拟合依赖的（振幅形状含共振参数）, 用拟合后 v 计算。
+    // 误差 = 参数误差（Jacobian @ H⁻¹ @ Jᵀ, 与 getFitFractions 同机制）⊕
+    //        MC 统计误差（tf-pwa add_int_error 同款: σ²/ε² = S_eff/I²_eff + S_tr/I²_tr,
+    //        S = Σ|A_i|⁴, I = Σ|A_i|²）。
+    // 返回 [npartials, 2]: [center, error]
+    // =====================================================================
+    torch::Tensor getEfficiency(torch::Tensor vector)
+    {
+        return getEfficiency(vector, torch::Tensor());
+    }
+    torch::Tensor getEfficiency(torch::Tensor vector,
+        torch::Tensor hessian_in)
+    {
+        TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+        if (hessian_in.numel() > 0)
+            TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
+                "hessian_in must be float64 CUDA");
+
+        // 需要 phsp（带效率 MC）与 phsp_truth（无效率 MC）两个数据键;
+        // 缺任一 → 天然返回空张量 [0,2]（同 getFitFractions 的缺数据行为）
+        const auto& data_files = config_parser_.getDataFiles();
+        if (data_files.count("phsp_truth") == 0 || data_files.count("phsp") == 0) {
+            return torch::empty({0, 2},
+                torch::TensorOptions().dtype(torch::kFloat64));
+        }
+
+        torch::Tensor ev_center = freeParamsToAmplitudes(vector);
+        const int n = vector.numel();
+        const int n2 = 2 * n;
+        const int npartials = nSLvectors_.size();
+
+        // Perturbed vectors for Jacobian（与 getFitFractions 相同约定）
+        auto vr = torch::view_as_real(vector);
+        torch::Tensor p_real = torch::cat({
+            vr.slice(1, 0, 1).reshape({ -1 }),
+            vr.slice(1, 1, 2).reshape({ -1 }),
+            }).contiguous();
+        std::vector<double> eps_j(n2, 5e-6);
+        std::vector<torch::Tensor> ev_perturbed_p(n2), ev_perturbed_m(n2);
+        auto grouped_to_complex = [&](const torch::Tensor& g) {
+            return torch::view_as_complex(
+                torch::stack({ g.slice(0, 0, n), g.slice(0, n, 2 * n) }, 1).contiguous());
+            };
+        for (int j = 0; j < n2; ++j) {
+            eps_j[j] = 5e-6 * std::max(std::abs((double)p_real[j].item<float>()), 1.0);
+            auto vp = p_real.clone(); vp[j] += eps_j[j];
+            auto vm = p_real.clone(); vm[j] -= eps_j[j];
+            ev_perturbed_p[j] = freeParamsToAmplitudes(grouped_to_complex(vp));
+            ev_perturbed_m[j] = freeParamsToAmplitudes(grouped_to_complex(vm));
+        }
+
+        // phsp（带效率）与 phsp_truth（无效率）各做一次批积分（中心+扰动+平方）
+        std::vector<double> eff_c_partial(npartials, 0.0);
+        std::vector<double> eff_c_scattering(npartials * npartials, 0.0);
+        std::vector<double> eff_c_square(npartials, 0.0);
+        std::vector<double> eff_p_partial(n2 * npartials, 0.0);
+        std::vector<double> eff_p_scattering(n2 * npartials * npartials, 0.0);
+        std::vector<double> eff_m_partial(n2 * npartials, 0.0);
+        std::vector<double> eff_m_scattering(n2 * npartials * npartials, 0.0);
+        int N_eff = computeFileBatchIntegrals("phsp", ev_center,
+            ev_perturbed_p, ev_perturbed_m,
+            eff_c_partial.data(), eff_c_scattering.data(), eff_c_square.data(),
+            eff_p_partial.data(), eff_p_scattering.data(),
+            eff_m_partial.data(), eff_m_scattering.data(), npartials);
+
+        std::vector<double> tr_c_partial(npartials, 0.0);
+        std::vector<double> tr_c_scattering(npartials * npartials, 0.0);
+        std::vector<double> tr_c_square(npartials, 0.0);
+        std::vector<double> tr_p_partial(n2 * npartials, 0.0);
+        std::vector<double> tr_p_scattering(n2 * npartials * npartials, 0.0);
+        std::vector<double> tr_m_partial(n2 * npartials, 0.0);
+        std::vector<double> tr_m_scattering(n2 * npartials * npartials, 0.0);
+        int N_truth = computeFileBatchIntegrals("phsp_truth", ev_center,
+            ev_perturbed_p, ev_perturbed_m,
+            tr_c_partial.data(), tr_c_scattering.data(), tr_c_square.data(),
+            tr_p_partial.data(), tr_p_scattering.data(),
+            tr_m_partial.data(), tr_m_scattering.data(), npartials);
+
+        if (N_eff <= 0 || N_truth <= 0) {
+            return torch::empty({0, 2},
+                torch::TensorOptions().dtype(torch::kFloat64));
+        }
+
+        const double scale_eff = 1.0 / N_eff, scale_tr = 1.0 / N_truth;
+        auto effOf = [&](double num_eff, double num_tr) -> double {
+            double den = num_tr * scale_tr;
+            if (den <= 0.0) return 0.0;
+            return (num_eff * scale_eff) / den;
+        };
+        std::vector<double> eff_center(npartials);
+        for (int i = 0; i < npartials; ++i)
+            eff_center[i] = effOf(eff_c_partial[i], tr_c_partial[i]);
+
+        // ===== 误差: σ² = σ_param² + σ_stat² =====
+        std::vector<double> eff_errors(npartials, 0.0);
+
+        // 参数误差（同 getFitFractions: H⁻¹ 用 mask 掉固定方向的自由块）
+        torch::Tensor hessian;
+        if (hessian_in.numel() > 0)
+            hessian = hessian_in.slice(0, 0, n2).slice(1, 0, n2);
+        else
+            hessian = computeCouplingHessian(vector);
+        if (hessian.numel() > 0 && hessian.size(0) == n2) {
+            std::vector<int64_t> free_idx;
+            for (int j = 0; j < n2; ++j)
+                if (j != 0 && j != n) free_idx.push_back(j);
+            const int n_free = (int)free_idx.size();
+            if (n_free == 0) {
+                // 全部方向固定(如单链仅参考耦合): 无自由参数可传播, 参数误差为 0
+            } else {
+            auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
+            torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
+            auto eig = torch::linalg_eigvalsh(H_free);
+            if (eig[0].item<double>() > 1e-8) {
+                torch::Tensor cov = torch::linalg_inv(H_free).cpu();
+                std::vector<double> h_cov(n_free * n_free);
+                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n_free * n_free * sizeof(double));
+
+                std::vector<double> J(npartials * n_free, 0.0);
+                for (int fj = 0; fj < n_free; ++fj) {
+                    const int j = free_idx[fj];
+                    for (int i = 0; i < npartials; ++i) {
+                        double e_p = effOf(eff_p_partial[j * npartials + i],
+                                           tr_p_partial[j * npartials + i]);
+                        double e_m = effOf(eff_m_partial[j * npartials + i],
+                                           tr_m_partial[j * npartials + i]);
+                        J[i * n_free + fj] = (e_p - e_m) / (2.0 * eps_j[j]);
+                    }
+                }
+                computeBFErrors(J.data(), h_cov.data(), eff_errors.data(), npartials, n_free);
+            }
+            }
+        }
+
+        // MC 统计误差（tf-pwa add_int_error 同款）:
+        //   σ_stat_i² = ε_i² × ( S_eff / I_eff² + S_tr / I_tr² )
+        //   S, I 均为未归一化总和 Σ|A_i|⁴ / Σ|A_i|²（每事件均值因子 N 自然相消,
+        //   与 tf-pwa cached_square / int_total² 一致）
+        for (int i = 0; i < npartials; ++i) {
+            double Ie = eff_c_partial[i];   // Σ|A_i|² (未归一化)
+            double It = tr_c_partial[i];
+            double stat2 = 0.0;
+            if (Ie > 0.0) stat2 += eff_c_square[i] / (Ie * Ie);
+            if (It > 0.0) stat2 += tr_c_square[i] / (It * It);
+            double e = eff_center[i];
+            double total2 = eff_errors[i] * eff_errors[i] + e * e * stat2;
+            eff_errors[i] = std::sqrt(std::max(0.0, total2));
+        }
+
+        auto opts = torch::TensorOptions().dtype(torch::kFloat64);
+        torch::Tensor result = torch::empty({ npartials, 2 }, opts);
+        for (int i = 0; i < npartials; ++i) {
+            result[i][0] = eff_center[i];
+            result[i][1] = eff_errors[i];
         }
         return result;
     }

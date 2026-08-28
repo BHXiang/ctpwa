@@ -13,6 +13,7 @@ __global__ void computeBFKernel(
     double* __restrict__ d_partial_integral,       // [npartials]
     double* __restrict__ d_scattering_matrix,      // [npartials × npartials]
     double* __restrict__ d_total_integral,         // [1]
+    double* __restrict__ d_square_integral,        // [npartials] Σ|A_i|⁴ (可空)
     const int* __restrict__ d_nSLvectors,          // [npartials]
     int npartials, int nEvents, int ngls, int npolar)
 {
@@ -46,6 +47,8 @@ __global__ void computeBFKernel(
                                partial_imag[p] * partial_imag[p];
             if (d_partial_integral != nullptr)
                 atomicAdd(&d_partial_integral[p], intensity);
+            if (d_square_integral != nullptr)
+                atomicAdd(&d_square_integral[p], intensity * intensity);
             event_total += intensity;
         }
 
@@ -78,6 +81,7 @@ void computeBranchingFractions(
     double* d_partial_integral,
     double* d_scattering_matrix,
     double* d_total_integral,
+    double* d_square_integral,
     int* d_nSLvectors,
     int npartials, int nEvents, int ngls, int npolar)
 {
@@ -114,17 +118,17 @@ void computeBranchingFractions(
     if (npartials <= 50)
         computeBFKernel<50><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
     else if (npartials <= 200)
         computeBFKernel<200><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
     else
         computeBFKernel<1000><<<gridSize, kBlockSize>>>(
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
 
     cudaError_t cuda_error = cudaGetLastError();

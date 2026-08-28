@@ -5,12 +5,15 @@
 #include <cuda_runtime.h>
 
 // 计算分波积分和散射矩阵(单次评估; 供 truth/phsp 积分与拟合分数使用)
+// d_square_integral: 可选 [npartials] Σ|A_i|⁴（每事件 intensity² 累加），
+//   用于效率的 MC 统计误差（tf-pwa add_int_error 同款）；不需要时传 nullptr。
 void computeBranchingFractions(
     const ctComplex* d_matrix,
     const ctComplex* d_vector,
     double* d_partial_integral,
     double* d_scattering_matrix,
     double* d_total_integral,
+    double* d_square_integral,
     int* d_nSLvectors,
     int npartials, int nEvents, int ngls, int npolar);
 

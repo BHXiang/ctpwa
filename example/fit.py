@@ -471,6 +471,29 @@ class UnifiedPWAOptimizer:
         return ff_result[:, 0], ff_result[:, 1]
 
     # --------------------------------------------------------
+    def compute_efficiency(self, params=None):
+        """分波效率: ε_i = (Σ_{phsp}|A_i|²/N_phsp) / (Σ_{phsp_truth}|A_i|²/N_truth)。
+        phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth,
+        即分波加权的探测/选择效率 ∫|A_i|²ε(x)dΦ / ∫|A_i|²dΦ (tf-pwa get_efficiency 语义)。
+        效率依赖拟合结果(振幅形状含共振参数), 用拟合后 params 计算。
+        误差 = 参数误差(拟合同源 Hessian) ⊕ MC 统计误差(tf-pwa add_int_error 同款)。
+        配置缺 phsp 或 phsp_truth 时返回空张量 [0,2] → 这里自然跳过。"""
+        if params is None:
+            if self.best_params is None:
+                print("没有优化结果!")
+                return None, None
+            params = self.best_params
+
+        coupling = self.extract_coupling_complex(params)
+        hessian_full = self._get_hessian_cached(params)
+        eff_result = self.analysis.getEfficiency(coupling, hessian_full)
+        if eff_result is None or eff_result.numel() == 0:
+            print("跳过分波效率: 配置缺 phsp (带效率 MC) 或 phsp_truth, "
+                  "需要时再加入并重跑")
+            return None, None
+        return eff_result[:, 0], eff_result[:, 1]
+
+    # --------------------------------------------------------
     def save_parameters(self, params, coupling_real_err, coupling_imag_err,
                         res_errors, run_id, filename_base):
         """保存所有参数到文件"""
@@ -714,7 +737,8 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def save_all_results_summary(self, fit_values=None, fit_errors=None,
-                                 fit_attempted=False):
+                                 fit_attempted=False,
+                                 eff_values=None, eff_errors=None):
         if not self.all_results:
             print("没有结果!")
             return
@@ -759,6 +783,13 @@ class UnifiedPWAOptimizer:
                             f.write(f"{i:2d}: {fit_values[i]:.6e} ± {fit_errors[i]:.6e}\n")
                 except Exception as e:
                     f.write(f"计算拟合分数失败: {e}\n")
+
+            if eff_values is not None:
+                f.write("=" * 100 + "\n")
+                f.write("分波效率 (ε_i, phsp带效率/phsp_truth无效率 加权比值):\n")
+                f.write("=" * 100 + "\n")
+                for i in range(len(eff_values)):
+                    f.write(f"{i:2d}: {eff_values[i]:.6e} ± {eff_errors[i]:.6e}\n")
 
             if self.best_params is not None and self.has_free_res:
                 f.write("=" * 100 + "\n")
@@ -885,5 +916,23 @@ if best_res["is_positive_definite"]:
     except Exception as e:
         print(f"计算拟合分数失败: {e}")
 
+# 分波效率（主输出: 各道探测/选择效率, 依赖拟合结果; 与 FF 共用一次
+# Hessian 缓存; 配置缺 phsp/phsp_truth 时 getEfficiency 返回空张量 → 自然跳过）
+eff_values = eff_errors = None
+if best_res["is_positive_definite"]:
+    try:
+        eff_values, eff_errors = optimizer.compute_efficiency(
+            best_res["final_params"]
+        )
+        if eff_values is not None:
+            print(f"\n{'='*80}")
+            print("最佳结果的分波效率 (ε_i, phsp/phsp_truth 加权比值):")
+            print(f"{'='*80}")
+            for i in range(len(eff_values)):
+                print(f"{i:2d}: {eff_values[i]:.6f} ± {eff_errors[i]:.6f}")
+    except Exception as e:
+        print(f"计算分波效率失败: {e}")
+
 # 保存摘要
-optimizer.save_all_results_summary(ff_values, ff_errors, fit_attempted=True)
+optimizer.save_all_results_summary(ff_values, ff_errors, fit_attempted=True,
+                                   eff_values=eff_values, eff_errors=eff_errors)
