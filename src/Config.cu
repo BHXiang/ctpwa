@@ -969,7 +969,10 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         bool has_bf, has_bf_explicit, pb;
                         double bf_d;
                         std::vector<std::vector<int>> sl; // 该步的分波白名单
-                        std::vector<std::string> used;    // 链中已出现的粒子
+                        // 链级共享的"链中已出现粒子"列表: 同一条链的所有深层项
+                        // 共享一份, 兄弟项展开时把产物写回, 后处理的同名兄弟
+                        // (如 R_4pi0→R_2pi0+R_2pi0) 能感知并避开 → 4 个 π 不重名。
+                        std::shared_ptr<std::vector<std::string>> used;
                     };
                     std::queue<BFSItem> queue;
 
@@ -986,7 +989,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         queue.push({intermediate, !bachelor_drives_modes, step2_has_bf,
                             step2_has_bf_explicit, step2_p_break, step2_bf_d,
                             ifm ? ifm->sl_filter : std::vector<std::vector<int>>{},
-                            std::vector<std::string>{bachelor}});
+                            std::make_shared<std::vector<std::string>>(
+                                std::vector<std::string>{bachelor})});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
@@ -997,7 +1001,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             bm ? bm->p_break : false,
                             (bm && !std::isnan(bm->bf_d)) ? bm->bf_d : NAN,
                             bm ? bm->sl_filter : std::vector<std::vector<int>>{},
-                            std::vector<std::string>{intermediate}});
+                            std::make_shared<std::vector<std::string>>(
+                                std::vector<std::string>{intermediate})});
                     }
 
                     while (!queue.empty()) {
@@ -1008,12 +1013,12 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         size_t mode_idx = 0;
                         if (item.is_first) {
                             mode_idx = mi;
-                        } else if (!item.used.empty()) {
+                        } else if (!item.used->empty()) {
                             const auto& modes = int_decay_modes[item.name];
                             bool all_conflict = true;
                             for (size_t k = 0; k < modes.size(); ++k) {
                                 bool conflict = false;
-                                for (const auto& u : item.used) {
+                                for (const auto& u : *item.used) {
                                     if (modes[k].d1 == u || modes[k].d2 == u) {
                                         conflict = true;
                                         break;
@@ -1054,10 +1059,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             chain.resonance_chains.push_back(res_chain_map[item.name]);
 
                         // Enqueue any daughter that is itself an intermediate.
-                        // 本模式的子粒子已出现在链中, 传给后代的 used。
-                        std::vector<std::string> child_used = item.used;
-                        child_used.push_back(mode->d1);
-                        child_used.push_back(mode->d2);
+                        // 本模式的子粒子写回链级共享 used —— 同一步的同名兄弟
+                        // (R_4pi0→R_2pi0+R_2pi0) 后处理时可见, 能避开已选的产物;
+                        // 后代项共享同一份 used, 深度不受限。
+                        item.used->push_back(mode->d1);
+                        item.used->push_back(mode->d2);
                         auto enqueue = [&](const std::string& d) {
                             if (int_decay_modes.count(d)) {
                                 const auto* dm = getDecayMode(d, 0);
@@ -1067,7 +1073,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                                     dm ? dm->p_break : false,
                                     (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
                                     dm ? dm->sl_filter : std::vector<std::vector<int>>{},
-                                    child_used});
+                                    item.used});
                             }
                         };
                         enqueue(mode->d1);
