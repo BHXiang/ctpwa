@@ -676,6 +676,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
             // Compact format — expand one block into N DecayChainConfigs
             // ============================================================
             const auto& channels = chain_data[mother];
+            // 本块展开链的起点（链名统一加完整中间态路径时只处理本块）
+            size_t start_ci = decay_chains_.size();
 
             // --- Parse intermediate decays ---
             // Single mode:  R_KK: [Kp, Km]  or  [Kp, Km, {opts}]
@@ -925,9 +927,7 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     }
 
                     DecayChainConfig chain;
-                    chain.name = chain_name + "_" + (bachelor_drives_modes ? bachelor : intermediate);
-                    if (n_modes > 1)
-                        chain.name += "_" + std::to_string(mi);
+                    chain.name = chain_name;  // 占位; 完整中间态路径名在块末统一生成
 
                     // --- Step 1: mother → bachelor + intermediate ---
                     DecayStep step1;
@@ -1083,8 +1083,41 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                     decay_chains_.push_back(chain);
                     if (!ch_legend_from_opts) ++legend_rule_idx;
                 } // for each mode
-            }
 
+            // ============================================================
+            // 链名: 完整中间态路径（去重保序）+ 同名 0-based 序号
+            // 旧实现只含第一级中间态 + 行模式序号 (decay1_R_chic1_0/1/2),
+            // 二级中间态不同 (R_KK vs R_Keta) 时名字无法区分。新名字:
+            //   decay1_R_chic1_R_KK / decay1_R_chic1_R_Keta_0 /
+            //   decay1_R_chic1_R_Keta_1
+            // （Constraints.trans/chains 按"中间态名_序号"匹配, 不受影响;
+            //   链过滤器按完整路径串或新链名子串匹配）
+            // ============================================================
+            auto chainBaseName = [&](const DecayChainConfig& ch) -> std::string {
+                std::string base = chain_name;
+                std::set<std::string> seen_m;
+                // step1 的中间态子（非已知粒子 daughter, 如 R_chic1）
+                for (const auto& d : ch.decay_steps[0].daughters)
+                    if (!particle_names.count(d) && seen_m.insert(d).second)
+                        base += "_" + d;
+                // 后续衰变步的中间态（R_KK/R_Keta 等, 与 step1 去重）
+                for (size_t si = 1; si < ch.decay_steps.size(); ++si)
+                    if (seen_m.insert(ch.decay_steps[si].mother).second)
+                        base += "_" + ch.decay_steps[si].mother;
+                return base;
+            };
+            std::map<std::string, int> name_count;
+            for (size_t ci = start_ci; ci < decay_chains_.size(); ++ci)
+                name_count[chainBaseName(decay_chains_[ci])]++;
+            std::map<std::string, int> name_seen;
+            for (size_t ci = start_ci; ci < decay_chains_.size(); ++ci) {
+                auto& ch = decay_chains_[ci];
+                std::string base = chainBaseName(ch);
+                int k = name_seen[base]++;
+                ch.name = (name_count[base] > 1)
+                    ? base + "_" + std::to_string(k) : base;
+            }
+            } // if (is_compact)
         } else {
             // ============================================================
             // Original format (unchanged)
