@@ -959,135 +959,136 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         continue;
                     }
 
-                    // --- BFS: recursively resolve intermediates ---
-                    // used: 链中已出现的粒子(行级 bachelor + 已展开模式的子粒子)。
-                    // 深层多模式中间态选模式时避开 used——与行级 multi-mode filter
-                    // (模式不得含 bachelor, 否则同一粒子重复出现) 同一约束的递归推广。
+                    // --- DFS 多分支展开中间态 ---
+                    // 深层中间态对"每个无冲突模式"各展开一条链分支(物理上不同的
+                    // 粒子分配, 如 π⁺π⁻π⁺π⁻ 的两种配对); 同名兄弟
+                    // (R_4pi0→R_2pi0+R_2pi0) 模式序号递增约束(last_mode) →
+                    // {a,b} 与 {b,a} 只生成一次。
+                    // used = 链中已出现的粒子(行级 bachelor/intermediate + 已展开
+                    // 模式的子粒子), 与行级 multi-mode filter 同一约束的递归推广。
                     struct BFSItem {
                         std::string name;
                         bool is_first;
                         bool has_bf, has_bf_explicit, pb;
                         double bf_d;
                         std::vector<std::vector<int>> sl; // 该步的分波白名单
-                        // 链级共享的"链中已出现粒子"列表: 同一条链的所有深层项
-                        // 共享一份, 兄弟项展开时把产物写回, 后处理的同名兄弟
-                        // (如 R_4pi0→R_2pi0+R_2pi0) 能感知并避开 → 4 个 π 不重名。
-                        std::shared_ptr<std::vector<std::string>> used;
                     };
-                    std::queue<BFSItem> queue;
-
+                    struct ChainState {
+                        std::vector<std::string> used;        // 链中已出现的粒子
+                        std::map<std::string, int> last_mode; // 同名兄弟最近选中的模式
+                    };
+                    std::vector<BFSItem> items;
                     if (intermediate_decays) {
                         const IntDecay* ifm = getDecayMode(intermediate,
                             bachelor_drives_modes ? 0 : mi);
-                        bool step2_has_bf = ch_has_bf2_explicit ? ch_has_bf2
-                            : (ifm && ifm->has_bf_explicit ? ifm->has_bf : true);
-                        bool step2_has_bf_explicit = ch_has_bf2_explicit
-                            || (ifm && ifm->has_bf_explicit);
-                        double step2_bf_d = !std::isnan(ch_bf_d2) ? ch_bf_d2
-                            : (ifm && !std::isnan(ifm->bf_d) ? ifm->bf_d : NAN);
-                        bool step2_p_break = has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false);
-                        queue.push({intermediate, !bachelor_drives_modes, step2_has_bf,
-                            step2_has_bf_explicit, step2_p_break, step2_bf_d,
-                            ifm ? ifm->sl_filter : std::vector<std::vector<int>>{},
-                            std::make_shared<std::vector<std::string>>(
-                                std::vector<std::string>{bachelor})});
+                        items.push_back({intermediate, !bachelor_drives_modes,
+                            ch_has_bf2_explicit ? ch_has_bf2
+                                : (ifm && ifm->has_bf_explicit ? ifm->has_bf : true),
+                            ch_has_bf2_explicit || (ifm && ifm->has_bf_explicit),
+                            has_ch_p_break ? ch_p_break2 : (ifm ? ifm->p_break : false),
+                            !std::isnan(ch_bf_d2) ? ch_bf_d2
+                                : (ifm && !std::isnan(ifm->bf_d) ? ifm->bf_d : NAN),
+                            ifm ? ifm->sl_filter : std::vector<std::vector<int>>{}});
                     }
                     if (bachelor_decays) {
                         const IntDecay* bm = getDecayMode(bachelor,
                             bachelor_drives_modes ? mi : 0);
-                        queue.push({bachelor, bachelor_drives_modes,
+                        items.push_back({bachelor, bachelor_drives_modes,
                             bm && bm->has_bf_explicit ? bm->has_bf : true,
                             bm && bm->has_bf_explicit,
                             bm ? bm->p_break : false,
                             (bm && !std::isnan(bm->bf_d)) ? bm->bf_d : NAN,
-                            bm ? bm->sl_filter : std::vector<std::vector<int>>{},
-                            std::make_shared<std::vector<std::string>>(
-                                std::vector<std::string>{intermediate})});
+                            bm ? bm->sl_filter : std::vector<std::vector<int>>{}});
                     }
 
-                    while (!queue.empty()) {
-                        auto item = queue.front(); queue.pop();
+                    std::function<void(std::vector<BFSItem>, size_t, ChainState,
+                                       DecayChainConfig)> dfs;
+                    dfs = [&](std::vector<BFSItem> its, size_t idx,
+                              ChainState st, DecayChainConfig ch) {
+                        if (idx >= its.size()) {
+                            // 链完成: legend 规则按展开链顺序分配
+                            ch.legend_template = ch_legend.empty()
+                                ? std::vector<std::string>{intermediate, " ", bachelor}
+                                : ch_legend;
+                            decay_chains_.push_back(ch);
+                            if (!ch_legend_from_opts) ++legend_rule_idx;
+                            return;
+                        }
+                        const BFSItem& item = its[idx];
 
-                        // 模式选择: 首层中间态用外层模式 mi (行级 filter 已保证其
-                        // 不含行 bachelor); 深层中间态避开链中已出现的粒子。
-                        size_t mode_idx = 0;
+                        // 候选模式: 首层固定 mi; 深层 = 无冲突模式(避开 st.used;
+                        // 同名兄弟从 last_mode+1 起 → 组合去重); 带 last_mode 时
+                        // 无候选则该分支丢弃(物理上不可能, 如两个 R_2pi0 争用同一 π)。
+                        std::vector<std::pair<int, const IntDecay*>> cand;
                         if (item.is_first) {
-                            mode_idx = mi;
-                        } else if (!item.used->empty()) {
+                            if (const IntDecay* mode = getDecayMode(item.name, mi))
+                                cand.push_back({(int)mi, mode});
+                        } else {
                             const auto& modes = int_decay_modes[item.name];
-                            bool all_conflict = true;
-                            for (size_t k = 0; k < modes.size(); ++k) {
+                            int start = 0;
+                            auto lm = st.last_mode.find(item.name);
+                            if (lm != st.last_mode.end()) start = lm->second + 1;
+                            for (size_t m = (size_t)start; m < modes.size(); ++m) {
                                 bool conflict = false;
-                                for (const auto& u : *item.used) {
-                                    if (modes[k].d1 == u || modes[k].d2 == u) {
-                                        conflict = true;
-                                        break;
+                                for (const auto& u : st.used)
+                                    if (modes[m].d1 == u || modes[m].d2 == u) {
+                                        conflict = true; break;
                                     }
-                                }
                                 if (!conflict) {
-                                    mode_idx = k;
-                                    all_conflict = false;
-                                    break;
+                                    cand.push_back({(int)m, &modes[m]});
+                                    if (m > (size_t)start)
+                                        std::cerr << "Note: intermediate '"
+                                                  << item.name << "' uses decay mode "
+                                                  << m << " (avoids particles already in chain)"
+                                                  << std::endl;
                                 }
                             }
-                            if (mode_idx > 0)
-                                std::cerr << "Note: intermediate '" << item.name
-                                          << "' uses decay mode " << mode_idx
-                                          << " (avoids particles already in chain)"
-                                          << std::endl;
-                            else if (all_conflict)
+                            if (cand.empty() && start == 0) {
                                 std::cerr << "Warning: intermediate '" << item.name
                                           << "': all decay modes contain a particle "
                                           << "already in the chain; using mode 0 (duplicate "
                                           << "particle may appear)" << std::endl;
-                        }
-                        const IntDecay* mode = getDecayMode(item.name, mode_idx);
-                        if (!mode) continue;
-
-                        DecayStep substep;
-                        substep.mother = item.name;
-                        substep.daughters = {mode->d1, mode->d2};
-                        substep.has_bf = item.has_bf;
-                        substep.has_bf_explicit = item.has_bf_explicit;
-                        substep.bf_d = item.bf_d;
-                        substep.p_break = item.pb;
-                        substep.sl_filter = item.sl;
-                        chain.decay_steps.push_back(substep);
-
-                        // Resonance chain for this intermediate
-                        if (res_chain_map.count(item.name))
-                            chain.resonance_chains.push_back(res_chain_map[item.name]);
-
-                        // Enqueue any daughter that is itself an intermediate.
-                        // 本模式的子粒子写回链级共享 used —— 同一步的同名兄弟
-                        // (R_4pi0→R_2pi0+R_2pi0) 后处理时可见, 能避开已选的产物;
-                        // 后代项共享同一份 used, 深度不受限。
-                        item.used->push_back(mode->d1);
-                        item.used->push_back(mode->d2);
-                        auto enqueue = [&](const std::string& d) {
-                            if (int_decay_modes.count(d)) {
-                                const auto* dm = getDecayMode(d, 0);
-                                queue.push({d, false,
-                                    dm && dm->has_bf_explicit ? dm->has_bf : true,
-                                    dm && dm->has_bf_explicit,
-                                    dm ? dm->p_break : false,
-                                    (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
-                                    dm ? dm->sl_filter : std::vector<std::vector<int>>{},
-                                    item.used});
+                                cand.push_back({0, &modes[0]});
                             }
-                        };
-                        enqueue(mode->d1);
-                        enqueue(mode->d2);
-                    }
+                        }
+                        for (const auto& [m, mode] : cand) {
+                            if (!mode) continue;
+                            ChainState st2 = st;
+                            st2.used.push_back(mode->d1);
+                            st2.used.push_back(mode->d2);
+                            st2.last_mode[item.name] = m;
 
-                    // --- Legend ---
-                    if (!ch_legend.empty())
-                        chain.legend_template = ch_legend;
-                    else
-                        chain.legend_template = {intermediate, " ", bachelor};
+                            DecayChainConfig ch2 = ch;
+                            DecayStep substep;
+                            substep.mother = item.name;
+                            substep.daughters = {mode->d1, mode->d2};
+                            substep.has_bf = item.has_bf;
+                            substep.has_bf_explicit = item.has_bf_explicit;
+                            substep.bf_d = item.bf_d;
+                            substep.p_break = item.pb;
+                            substep.sl_filter = item.sl;
+                            ch2.decay_steps.push_back(substep);
+                            if (res_chain_map.count(item.name))
+                                ch2.resonance_chains.push_back(res_chain_map[item.name]);
 
-                    decay_chains_.push_back(chain);
-                    if (!ch_legend_from_opts) ++legend_rule_idx;
+                            std::vector<BFSItem> its2 = its;
+                            auto enqueue = [&](const std::string& d) {
+                                if (int_decay_modes.count(d)) {
+                                    const auto* dm = getDecayMode(d, 0);
+                                    its2.push_back({d, false,
+                                        dm && dm->has_bf_explicit ? dm->has_bf : true,
+                                        dm && dm->has_bf_explicit,
+                                        dm ? dm->p_break : false,
+                                        (dm && !std::isnan(dm->bf_d)) ? dm->bf_d : NAN,
+                                        dm ? dm->sl_filter : std::vector<std::vector<int>>{}});
+                                }
+                            };
+                            enqueue(mode->d1);
+                            enqueue(mode->d2);
+                            dfs(its2, idx + 1, st2, ch2);
+                        }
+                    };
+                    dfs(items, 0, ChainState{{bachelor, intermediate}, {}}, chain);
                 } // for each mode
 
             // ============================================================
