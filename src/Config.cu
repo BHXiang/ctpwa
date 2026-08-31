@@ -1411,6 +1411,13 @@ void ConfigParser::parseConstraints(const YAML::Node &node)
         }
     }
 
+    // free_phsp_amplitudes: true/false — phsp 振幅不驻留（流式），仅固定质量/宽度时生效
+    if (node["free_phsp_amplitudes"]) {
+        free_phsp_amplitudes_ = node["free_phsp_amplitudes"].as<bool>();
+        std::cout << "Constraints.free_phsp_amplitudes = "
+                  << (free_phsp_amplitudes_ ? "true" : "false") << std::endl;
+    }
+
     // 解析全同粒子分组: identical: [[pi01, pi02], [Ks1, Ks2]]
     if (node["identical"]) {
         int group_idx = 1;

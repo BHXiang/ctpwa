@@ -41,4 +41,8 @@ double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
 void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
     ctComplex* d_P_vec, ctPhspReal* d_phsp_r, ctPhspReal* d_phsp_i, int n);
 
+// 双精度 phsp 归一化因子: Re(v^H · M_double · v)（M_double 为 cuDoubleComplex n×n，
+// 由流式分块构建，替代 computePhspMeanSum 的原始振幅扫描）。当前设备须为调用方指定。
+double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, int n);
+
 #endif

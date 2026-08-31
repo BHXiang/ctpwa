@@ -595,3 +595,93 @@ void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
             d_M, d_v, d_P_vec, d_phsp_r, d_phsp_i, n);
     }
 }
+
+// -----------------------------------------------------------------------------
+// 双精度 phsp 归一化因子（freed 模式）:
+//   phsp_sum = Re(v^H · M_double · v),  M_double = Σ_ev,p A_ev,p A_ev,p^H（double 累加）
+// 语义与 computePhspMeanSum 完全一致（Σ|A·v|²），精度只升不降。
+// 仅主 GPU 调用（M_double 固定在主 GPU），当前设备由调用方设置。
+// -----------------------------------------------------------------------------
+// 把 ctComplex 向量拆成实/虚两个 double 数组（供 doublePhspSumKernel 共享内存用）
+__global__ void castComplexSplitKernel(
+    const ctComplex* __restrict__ src, double* __restrict__ vr, double* __restrict__ vi, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    vr[i] = (double)src[i].x;
+    vi[i] = (double)src[i].y;
+}
+
+// 每线程负责若干行: w_i = Σ_j M_ij v_j, 累加 Re(v_i^* w_i); 多块时 atomicAdd
+__global__ void doublePhspSumKernel(
+    const cuDoubleComplex* __restrict__ M,
+    const double* __restrict__ vr,
+    const double* __restrict__ vi,
+    int n, double* __restrict__ out)
+{
+    extern __shared__ double s_vrvi[];  // [2n]: vr, vi
+    int tid = threadIdx.x;
+    for (int j = tid; j < n; j += blockDim.x) { s_vrvi[j] = vr[j]; s_vrvi[j + n] = vi[j]; }
+    __syncthreads();
+
+    double block_sum = 0.0;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += gridDim.x * blockDim.x) {
+        const cuDoubleComplex* row = M + (size_t)i * n;
+        double wr = 0.0, wi = 0.0;
+        for (int j = 0; j < n; ++j) {
+            double mjr = row[j].x, mji = row[j].y;
+            wr += mjr * s_vrvi[j] - mji * s_vrvi[j + n];
+            wi += mjr * s_vrvi[j + n] + mji * s_vrvi[j];
+        }
+        block_sum += s_vrvi[i] * wr + s_vrvi[i + n] * wi;  // Re(v_i^* w_i)
+    }
+    // block 内规约（warp shuffle + 共享内存）
+    __shared__ double s_part[32];
+    int lane = tid & 31, warp = tid >> 5;
+    for (int off = 16; off > 0; off >>= 1)
+        block_sum += __shfl_down_sync(0xffffffffu, block_sum, off);
+    if (lane == 0) s_part[warp] = block_sum;
+    __syncthreads();
+    if (warp == 0) {
+        double v = (tid < (blockDim.x >> 5)) ? s_part[tid] : 0.0;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (tid == 0) atomicAdd(out, v);
+    }
+}
+
+double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, int n)
+{
+    static std::vector<double*> s_vr;
+    static std::vector<double*> s_vi;
+    static std::vector<double*> s_out;
+    static std::vector<int> s_alloc_n;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_vr.size() <= dev) {
+        s_vr.resize(dev + 1, nullptr);
+        s_vi.resize(dev + 1, nullptr);
+        s_out.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < n) {
+        if (s_vr[dev]) cudaFree(s_vr[dev]);
+        if (s_vi[dev]) cudaFree(s_vi[dev]);
+        if (s_out[dev]) cudaFree(s_out[dev]);
+        cudaMalloc(&s_vr[dev], (size_t)std::max(1, n) * sizeof(double));
+        cudaMalloc(&s_vi[dev], (size_t)std::max(1, n) * sizeof(double));
+        cudaMalloc(&s_out[dev], sizeof(double));
+        s_alloc_n[dev] = n;
+    }
+    int grid = (n + 255) / 256;
+    if (grid > 64) grid = 64;
+    castComplexSplitKernel<<<grid, 256>>>(d_v, s_vr[dev], s_vi[dev], n);
+    cudaMemset(s_out[dev], 0, sizeof(double));
+    size_t shm = (size_t)2 * n * sizeof(double);
+    cudaFuncSetAttribute(doublePhspSumKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+    doublePhspSumKernel<<<grid, 256, shm>>>(d_M, s_vr[dev], s_vi[dev], n, s_out[dev]);
+    double h = 0.0;
+    cudaMemcpy(&h, s_out[dev], sizeof(double), cudaMemcpyDeviceToHost);
+    return h;
+}

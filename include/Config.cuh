@@ -149,6 +149,10 @@ public:
   const std::map<std::string, double> &getGaussConstr() const {
     return gauss_constr_;
   }
+  // Constraints.free_phsp_amplitudes: true = phsp 振幅不驻留（构造期分块流式
+  // 建 phsp 矩阵、拟合期零 phsp 驻留、writeResult 按批重算）；false = 现状（驻留）。
+  // 仅当所有共振态质量/宽度固定（无 free 参数）时生效，否则警告并忽略。
+  bool getFreePhspAmplitudes() const { return free_phsp_amplitudes_; }
 
   std::vector<std::string> getLegends() const;
   std::string generateLegend(const std::vector<std::string> &particles) const;
@@ -186,6 +190,7 @@ private:
   std::map<std::string, std::pair<double, double>> var_range_; // name → [lower, upper]
   std::vector<std::vector<std::string>> var_equal_;  // [[n1, n2, ...], ...] 共享参数
   std::map<std::string, double> gauss_constr_;  // name → sigma
+  bool free_phsp_amplitudes_ = false;  // Constraints.free_phsp_amplitudes
 };
 
 #endif // CONFIG_CUH

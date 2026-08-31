@@ -109,6 +109,27 @@ Resonances:
 | `writeResult(params, file)` | 保存拟合结果 |
 | `DeviceManager` | GPU 检测 / 显存容量检查 / 精度查询 |
 
+## 大 phsp 低显存模式（`Constraints.free_phsp_amplitudes: true`）
+
+当 phsp 样本远大于 data（如千万级 phsp）时，默认把 phsp 振幅整表驻留显存会爆。
+config 的 `Constraints` 段加一行开关即可切换为 **phsp 全程流式（不驻留）**：
+
+```yaml
+Constraints:
+  free_phsp_amplitudes: true   # 仅当所有共振态质量/宽度固定（无 free 参数）时生效
+```
+
+效果：
+- 构造期：phsp 振幅按批（默认 ≤10 万事件/批，按振幅规模自适应）从四动量算完即弃，
+  分块累加 phsp 矩阵（float32 给梯度/Hessian + double 给归一化因子）；
+- 拟合期：phsp 零驻留，NLL/梯度/Hessian 只依赖 data/bkg 表 + n×n 矩阵；
+- `writeResult` / `writeInterfResult`：按批重算 phsp 振幅出图，峰值与 phsp 总量无关。
+
+注意：
+- 有任一 `free` 参数时开关被忽略（打印警告，保持驻留）；
+- 流式模式下 `getPhspTensor()` / `saveSLAmps()` / `getSLAmpsTensor()` 不可用（明确报错）；
+- 数值上 phsp 归一化因子改走 double 矩阵，与驻留模式一致（精度只升不降）。
+
 ## 性能（RTX 5060, 50 万事件）
 
 - fwd+bwd（NLL+梯度）：约 18 ms
