@@ -38,6 +38,18 @@ PYBIND11_MODULE(ctpwa, m)
 {
     m.doc() = "ctpwa";
 
+    pybind11::class_<ChainView>(m, "ChainView")
+        .def_readonly("name", &ChainView::name)
+        .def_readonly("topology", &ChainView::topology)
+        .def_readonly("steps", &ChainView::steps)
+        .def_readonly("intermediates", &ChainView::intermediates)
+        .def_readonly("amplitude_names", &ChainView::amplitude_names)
+        .def("exactchains", &ChainView::exactchains, pybind11::arg("containing") = "",
+             "该链全部完整链串(chains_exact 格式); containing 非空时只返回含它的串")
+        .def("amplitudes", &ChainView::amplitudes, "该链波名(_LS 格式)")
+        .def("counts", &ChainView::counts, "返回 [中间态数, 共振态总数, 完整链串数, 振幅数]")
+        .def("print", &ChainView::print);
+
     pybind11::class_<DecayInfo>(m, "DecayInfo")
         .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
         .def("isValid", &DecayInfo::isValid)
@@ -48,7 +60,19 @@ PYBIND11_MODULE(ctpwa, m)
         .def("resonanceNames", &DecayInfo::resonanceNames)
         .def("resonanceParamNames", &DecayInfo::resonanceParamNames)
         .def("hasCouplingMatrix", &DecayInfo::hasCouplingMatrix)
-        .def("print", &DecayInfo::print);
+        .def("print", &DecayInfo::print, pybind11::arg("level") = 1,
+             "0=总览 1=链概览(默认) 2=链明细+完整链串 3=全部振幅")
+        .def("summary", &DecayInfo::summary, "只打总览(粒子/链数/振幅数/链串数)")
+        .def("chains", &DecayInfo::chains, "分层浏览: 返回 [ChainView, ...]")
+        .def("exactchains", &DecayInfo::exactchains,
+             pybind11::arg("chain") = -1, pybind11::arg("containing") = "",
+             "完整链串(chains_exact 格式); chain<0=全部链, containing 非空时过滤")
+        .def("printExactChains", &DecayInfo::printExactChains,
+             pybind11::arg("containing") = "",
+             "扁平打印全部完整链串(一行一条, 首行 # 计数); 可直接存为 chains_exact 外部文件")
+        .def("amplitudes", &DecayInfo::amplitudes,
+             pybind11::arg("chain") = -1, pybind11::arg("resonance") = "",
+             "波名(_LS 格式); chain<0=全部链, resonance 非空时按名字子串过滤");
 
     pybind11::class_<DeviceManager>(m, "DeviceManager")
         .def(pybind11::init<>())

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -53,6 +54,73 @@ static std::vector<std::vector<int>> parseSLFilter(const YAML::Node &node,
         out.push_back({(int)lround(2.0 * s_phys + 1.0), (int)lround(L)});
     }
     return out;
+}
+
+// ================================================================
+// 链过滤器共享工具（chains_exact 过滤器与 ConfigParser::getExactChainStrings
+// 共用同一实现 —— 保证"看到的完整链串 = 能匹配的链串"）
+// ================================================================
+// 组合构建: 每个 intermediate 选一个共振态的笛卡尔积
+static std::vector<std::map<std::string, std::string>> buildCombos(
+    const DecayChainConfig &dc)
+{
+    std::vector<std::pair<std::string, std::vector<std::string>>> choices;
+    for (const auto &rc : dc.resonance_chains) {
+        std::vector<std::string> res;
+        for (const auto &sc : rc.spin_chains)
+            for (const auto &r : sc.resonances) res.push_back(r);
+        if (!res.empty()) choices.push_back({rc.intermediate, std::move(res)});
+    }
+    std::vector<std::map<std::string, std::string>> combos = {{}};
+    for (const auto &[iname, res] : choices) {
+        std::vector<std::map<std::string, std::string>> next;
+        next.reserve(combos.size() * res.size());
+        for (const auto &c : combos)
+            for (const auto &r : res) {
+                auto c2 = c;
+                c2[iname] = r;
+                next.push_back(std::move(c2));
+            }
+        combos = std::move(next);
+    }
+    return combos;
+}
+
+// 中间态名 → 该组合选中的共振态名（未选中的保持原名）
+static std::string comboSub(const std::map<std::string, std::string> &combo,
+                            const std::string &n)
+{
+    auto it = combo.find(n);
+    return it != combo.end() ? it->second : n;
+}
+
+// 下划线平铺路径串（h_ 波名无前缀; chains 子串匹配用）
+static std::string flattenPath(const DecayChainConfig &dc,
+                               const std::map<std::string, std::string> &combo)
+{
+    std::string p;
+    for (const auto &step : dc.decay_steps) {
+        p += comboSub(combo, step.mother) + "_";
+        for (const auto &d : step.daughters) p += comboSub(combo, d) + "_";
+    }
+    return p;
+}
+
+// TFPWA 式完整链串 "[a->b+c, b->d+e, ...]"（chains_exact 精确匹配用）
+static std::string tfpwaString(const DecayChainConfig &dc,
+                               const std::map<std::string, std::string> &combo)
+{
+    std::string s = "[";
+    bool first = true;
+    for (const auto &step : dc.decay_steps) {
+        if (!first) s += ", ";
+        first = false;
+        s += comboSub(combo, step.mother) + "->"
+           + comboSub(combo, step.daughters[0]) + "+"
+           + comboSub(combo, step.daughters[1]);
+    }
+    s += "]";
+    return s;
 }
 
 static int mapObsFunc(const std::string &name)
@@ -289,60 +357,6 @@ ConfigParser::ConfigParser(const std::string &config_file)
         // ================================================================
         if ((!chain_filter_.empty() || !chain_exact_filter_.empty())
             && !decay_chains_.empty()) {
-            // 组合构建: 每个 intermediate 选一个共振态的笛卡尔积 → 组合列表
-            auto buildCombos = [](const DecayChainConfig& dc) {
-                std::vector<std::pair<std::string, std::vector<std::string>>> choices;
-                for (const auto& rc : dc.resonance_chains) {
-                    std::vector<std::string> res;
-                    for (const auto& sc : rc.spin_chains)
-                        for (const auto& r : sc.resonances) res.push_back(r);
-                    if (!res.empty()) choices.push_back({rc.intermediate, std::move(res)});
-                }
-                std::vector<std::map<std::string, std::string>> combos = {{}};
-                for (const auto& [iname, res] : choices) {
-                    std::vector<std::map<std::string, std::string>> next;
-                    next.reserve(combos.size() * res.size());
-                    for (const auto& c : combos)
-                        for (const auto& r : res) {
-                            auto c2 = c;
-                            c2[iname] = r;
-                            next.push_back(std::move(c2));
-                        }
-                    combos = std::move(next);
-                }
-                return combos;
-            };
-            // 中间态名 → 该组合选中的共振态名（未选中的保持原名）
-            auto comboSub = [](const std::map<std::string, std::string>& combo,
-                               const std::string& n) {
-                auto it = combo.find(n);
-                return it != combo.end() ? it->second : n;
-            };
-            // 下划线平铺路径串（h_ 波名无前缀; 子串匹配用）
-            auto flattenPath = [&](const DecayChainConfig& dc,
-                                   const std::map<std::string, std::string>& combo) {
-                std::string p;
-                for (const auto& step : dc.decay_steps) {
-                    p += comboSub(combo, step.mother) + "_";
-                    for (const auto& d : step.daughters) p += comboSub(combo, d) + "_";
-                }
-                return p;
-            };
-            // TFPWA 式完整链串 "[a->b+c, b->d+e, ...]"（精确匹配用）
-            auto tfpwaString = [&](const DecayChainConfig& dc,
-                                   const std::map<std::string, std::string>& combo) {
-                std::string s = "[";
-                bool first = true;
-                for (const auto& step : dc.decay_steps) {
-                    if (!first) s += ", ";
-                    first = false;
-                    s += comboSub(combo, step.mother) + "->"
-                       + comboSub(combo, step.daughters[0]) + "+"
-                       + comboSub(combo, step.daughters[1]);
-                }
-                s += "]";
-                return s;
-            };
             // 修剪: 把匹配 intermediate 的共振态过滤到 keep_pairs, 剔除空 spin_chain
             auto pruneResonances = [](DecayChainConfig& dc,
                 const std::map<std::string, std::set<std::string>>& keep_pairs) {
@@ -425,6 +439,26 @@ ConfigParser::ConfigParser(const std::string &config_file)
         std::cerr << "Warning: Failed to parse config file \"" << config_file
                   << "\": " << e.what() << std::endl;
     }
+}
+
+// 完整链串生成（与 chains_exact 过滤器共用同一实现; containing 非空时只返回包含它的串）
+std::vector<std::string> ConfigParser::getExactChainStrings(
+    const DecayChainConfig &dc, const std::string &containing) const
+{
+    std::vector<std::string> out;
+    for (const auto &combo : buildCombos(dc)) {
+        std::string s = tfpwaString(dc, combo);
+        if (containing.empty() || s.find(containing) != std::string::npos)
+            out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::vector<std::string> ConfigParser::getExactChainStrings(
+    int chain_idx, const std::string &containing) const
+{
+    if (chain_idx < 0 || (size_t)chain_idx >= decay_chains_.size()) return {};
+    return getExactChainStrings(decay_chains_[chain_idx], containing);
 }
 
 std::map<std::string, std::vector<std::string>> ConfigParser::getIdenticalGroups() const
@@ -1114,7 +1148,8 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                                     }
                                 if (!conflict) {
                                     cand.push_back({(int)m, &modes[m]});
-                                    if (m > (size_t)start)
+                                    // 信息性 note（默认关闭; CTPWA_VERBOSE_CHAINS=1 打开）
+                                    if (m > (size_t)start && getenv("CTPWA_VERBOSE_CHAINS"))
                                         std::cerr << "Note: intermediate '"
                                                   << item.name << "' uses decay mode "
                                                   << m << " (avoids particles already in chain)"

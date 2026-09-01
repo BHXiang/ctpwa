@@ -14,6 +14,25 @@ struct ChainInfo {
     std::map<std::pair<std::string, std::vector<int>>, std::vector<Resonance>>
         intermediate_resonance_map;
     std::vector<std::vector<Particle>> intermediate_combs;
+    std::vector<std::string> amplitude_names;  // 该链的振幅名(_LS 格式)
+};
+
+// 用户侧链视图（分层浏览用）: 一条展开链的只读结构 + 按需取完整链串/波名
+struct ChainView {
+    std::string name;                          // 链名(与 chains 子串过滤一致)
+    std::string topology;                      // 拓扑串 "Jpsi→R+γ_R→d1+d2_..."(与旧 print 一致)
+    std::vector<std::string> steps;            // 每步 "mother->d1+d2"(含 sl/ls 白名单文本)
+    std::vector<std::string> intermediates;    // 每行 "int: [J,P]: res1 res2 ..."
+    std::vector<std::string> amplitude_names;  // 该链波名(_LS 格式)
+    int n_resonances = 0;                      // 该链共振态总数
+    std::vector<std::string> exact_chain_strings; // 全部完整链串(与 chains_exact 同一实现, 预生成)
+
+    // 完整链串: containing 非空时只返回含它的串
+    std::vector<std::string> exactchains(const std::string &containing = "") const;
+    std::vector<std::string> amplitudes() const { return amplitude_names; }
+    // counts = {中间态数, 共振态总数, 完整链串数, 振幅数}
+    std::vector<int> counts() const;
+    void print() const;
 };
 
 class DecayInfo {
@@ -54,7 +73,20 @@ public:
     const std::vector<int>& nSLvectors() const { return nsl_vectors_; }
 
     // Print summary
-    void print() const;
+    void print(int level = 1) const;   // 0=总览 1=链概览(默认) 2=链明细+完整链串 3=全部振幅
+    void summary() const;              // 只打总览
+
+    // 分层浏览（层级对象, 对应 Python: d.chains[i].exactchains(...)）
+    std::vector<ChainView> chains() const;
+    // 完整链串: chain<0 = 全部链; containing 非空时只返回包含它的串
+    std::vector<std::string> exactchains(int chain = -1,
+                                         const std::string &containing = "") const;
+    // 扁平打印全部完整链串(一行一条, 首行 # 计数; containing 非空时过滤)
+    // 输出可直接保存为 chains_exact 外部文件(自动跳过 # 注释)
+    void printExactChains(const std::string &containing = "") const;
+    // 波名: chain<0 = 全部链; resonance 非空时只返回名字含该子串的
+    std::vector<std::string> amplitudes(int chain = -1,
+                                        const std::string &resonance = "") const;
 
 private:
     void initialize(const std::string& config_file);

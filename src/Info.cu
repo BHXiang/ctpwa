@@ -1,6 +1,7 @@
 #include <Info.cuh>
 #include <AmpGen.cuh>
 #include <complex>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -180,27 +181,29 @@ void DecayInfo::buildDecayChains(
             auto slcombs = cas->getSLCombinations();
 
             // Print decay chain structure for this J^P combination
-            // std::cout << "  ";
-            for (size_t si = 0; si < step_infos.size(); ++si) {
-                if (si > 0) std::cout << ", ";
-                const auto& info = step_infos[si];
-                std::cout << info.mother << "("; printJ(info.spins[0]);
-                std::cout << (info.parities[0] == 1 ? "+)" : info.parities[0] == -1 ? "-)" : ")");
-                std::cout << "→" << info.d1 << "("; printJ(info.spins[1]);
-                std::cout << (info.parities[1] == 1 ? "+)" : info.parities[1] == -1 ? "-)" : ")");
-                std::cout << info.d2 << "("; printJ(info.spins[2]);
-                std::cout << (info.parities[2] == 1 ? "+)" : info.parities[2] == -1 ? "-)" : ")");
-                // Print SL list for this step（用户侧: LS 序 + 物理自旋）
-                std::cout << " {";
-                for (size_t sli = 0; sli < info.sl_list.size(); ++sli) {
-                    if (sli > 0) std::cout << " ";
-                    std::cout << "(" << info.sl_list[sli].L << ",";
-                    printJ(info.sl_list[sli].S);
-                    std::cout << ")";
+            // （默认关闭, 5 体全模型会刷屏; CTPWA_VERBOSE_CHAINS=1 打开调试）
+            if (getenv("CTPWA_VERBOSE_CHAINS")) {
+                for (size_t si = 0; si < step_infos.size(); ++si) {
+                    if (si > 0) std::cout << ", ";
+                    const auto& info = step_infos[si];
+                    std::cout << info.mother << "("; printJ(info.spins[0]);
+                    std::cout << (info.parities[0] == 1 ? "+)" : info.parities[0] == -1 ? "-)" : ")");
+                    std::cout << "→" << info.d1 << "("; printJ(info.spins[1]);
+                    std::cout << (info.parities[1] == 1 ? "+)" : info.parities[1] == -1 ? "-)" : ")");
+                    std::cout << info.d2 << "("; printJ(info.spins[2]);
+                    std::cout << (info.parities[2] == 1 ? "+)" : info.parities[2] == -1 ? "-)" : ")");
+                    // Print SL list for this step（用户侧: LS 序 + 物理自旋）
+                    std::cout << " {";
+                    for (size_t sli = 0; sli < info.sl_list.size(); ++sli) {
+                        if (sli > 0) std::cout << " ";
+                        std::cout << "(" << info.sl_list[sli].L << ",";
+                        printJ(info.sl_list[sli].S);
+                        std::cout << ")";
+                    }
+                    std::cout << "}";
                 }
-                std::cout << "}";
+                std::cout << std::endl;
             }
-            std::cout << std::endl;
 
             // Build resonance combinations
             std::vector<std::vector<std::pair<std::string,std::string>>> res_combos = {{}};
@@ -215,8 +218,8 @@ void DecayInfo::buildDecayChains(
                 res_combos = std::move(temp);
             }
 
-            // Print resonances for each combination
-            if (!res_combos.empty()) {
+            // Print resonances for each combination（CTPWA_VERBOSE_CHAINS=1 时打开）
+            if (getenv("CTPWA_VERBOSE_CHAINS") && !res_combos.empty()) {
                 std::cout << "Res:";
                 for (size_t ki = 0; ki < res_combos.size(); ++ki) {
                     std::cout << " {";
@@ -305,6 +308,7 @@ void DecayInfo::buildDecayChains(
                                   + physSpinStr(sl.S) + ")";
                     }
                     amplitude_names_.push_back(full_name);
+                    info.amplitude_names.push_back(full_name);
 
                     // Step→SL mapping for coupling matrix
                     std::vector<std::pair<int,int>> step_sl_pairs;
@@ -364,56 +368,187 @@ void DecayInfo::buildDecayChains(
     }
 }
 
-void DecayInfo::print() const
+// 内部 {2S+1, L} 白名单 → 用户侧文本 "(L,S物理)"
+static std::string slFilterText(const std::vector<std::vector<int>>& f)
+{
+    if (f.empty()) return "";
+    std::string s = " {";
+    for (size_t i = 0; i < f.size(); ++i) {
+        if (i) s += " ";
+        s += "(" + std::to_string(f[i][1]) + "," + physSpinStr(f[i][0]) + ")";
+    }
+    s += "}";
+    return s;
+}
+
+void DecayInfo::summary() const
 {
     printf("=== DecayInfo ===\n");
     printf("Particles: %zu\n", particles_.size());
     for (const auto& p : particles_)
-        printf("  %s J=%d P=%d mass=%.4f\n", p.name.c_str(), p.spin, p.parity, p.mass);
+        printf("  %s J=%s P=%d mass=%.4f\n", p.name.c_str(),
+               physSpinStr(p.spin).c_str(), p.parity, p.mass);
+    size_t n_ec = 0;
+    for (const auto& c : chains()) n_ec += (size_t)c.counts()[2];
+    printf("Chains: %zu | Amplitudes: %zu | Exact chains: %zu\n",
+           chains_info_.size(), amplitude_names_.size(), n_ec);
+    std::set<std::string> unique_theta;
+    for (const auto& n : resonance_param_names_) unique_theta.insert(n);
+    printf("Constraints: %zu | Param names: %zu | Resonance theta: %zu (unique %zu)\n",
+           constraints_.size(), param_names_.size(),
+           resonance_param_names_.size(), unique_theta.size());
+}
 
-    printf("Chains: %zu\n", chains_info_.size());
-    auto all_chains = config_parser_.getDecayChains();
-    for (const auto& ch : all_chains) {
-        std::string topo;
-        for (const auto& step : ch.decay_steps) {
-            if (!topo.empty()) topo += "_";
-            topo += step.mother + "→" + step.daughters[0] + "+" + step.daughters[1];
+void DecayInfo::print(int level) const
+{
+    summary();
+    if (level <= 0) return;
+    auto cvs = chains();
+    printf("Chains (%zu):\n", cvs.size());
+    for (size_t ci = 0; ci < cvs.size(); ++ci) {
+        const auto& c = cvs[ci];
+        const auto cnt = c.counts();
+        printf("  [%zu] %s: %s  (ints=%d res=%d chains=%d waves=%d)\n",
+               ci, c.name.c_str(), c.topology.c_str(),
+               cnt[0], cnt[1], cnt[2], cnt[3]);
+        if (level >= 2) {
+            for (const auto& s : c.steps) printf("      step %s\n", s.c_str());
+            for (const auto& s : c.intermediates) printf("      int  %s\n", s.c_str());
+            auto ec = c.exactchains();
+            printf("      Exact chains (%zu):\n", ec.size());
+            for (const auto& s : ec) printf("        %s\n", s.c_str());
         }
-        printf("  %s: %s\n", ch.name.c_str(), topo.c_str());
     }
-    printf("Amplitudes: %zu\n", amplitude_names_.size());
-    for (size_t i = 0; i < amplitude_names_.size(); ++i)
-        printf("  [%zu] %s\n", i, amplitude_names_[i].c_str());
-
-    printf("Constraints (%zu):\n", constraints_.size());
-    for (const auto& c : constraints_) {
-        std::string names_str;
-        for (size_t ni = 0; ni < c.names.size(); ++ni) {
-            if (ni > 0) names_str += ", ";
-            names_str += c.names[ni];
+    if (level >= 2) {
+        printf("Constraints (%zu):\n", constraints_.size());
+        for (const auto& c : constraints_) {
+            std::string names_str;
+            for (size_t ni = 0; ni < c.names.size(); ++ni) {
+                if (ni > 0) names_str += ", ";
+                names_str += c.names[ni];
+            }
+            printf("  trans: [%s]", names_str.c_str());
+            if (!c.values.empty()) printf(" = (%.1f)", std::real(c.values[0]));
+            printf("\n");
         }
-        printf("  trans: [%s]", names_str.c_str());
-        if (!c.values.empty())
-            printf(" = (%.1f)", std::real(c.values[0]));
-        printf("\n");
     }
-
-    printf("Param names (%zu):\n", param_names_.size());
-    // if (n_chain_free_after_trans_ > 0 && n_chain_free_after_trans_ < (int)param_names_.size())
-    //     printf("  (chain params after trans: %d)\n", n_chain_free_after_trans_);
-    for (size_t i = 0; i < param_names_.size(); ++i)
-        printf("  [%zu] %s\n", i, param_names_[i].c_str());
-
-    // 声明级参数列表：同 rname 跨链引用（CP 共轭对等）会重复出现——
-    // 实际拟合槽数由 addBlock 的同名共享决定，这里去重显示并标注
-    {
-        std::set<std::string> seen;
-        std::vector<std::string> unique_names;
-        for (const auto& n : resonance_param_names_)
-            if (seen.insert(n).second) unique_names.push_back(n);
-        printf("Resonance theta params (%zu declared, %zu unique):\n",
-               resonance_param_names_.size(), unique_names.size());
-        for (size_t i = 0; i < unique_names.size(); ++i)
-            printf("  [%zu] %s\n", i, unique_names[i].c_str());
+    if (level >= 3) {
+        printf("Amplitudes (%zu):\n", amplitude_names_.size());
+        for (size_t i = 0; i < amplitude_names_.size(); ++i)
+            printf("  [%zu] %s\n", i, amplitude_names_[i].c_str());
+        printf("Param names (%zu):\n", param_names_.size());
+        for (size_t i = 0; i < param_names_.size(); ++i)
+            printf("  [%zu] %s\n", i, param_names_[i].c_str());
     }
+}
+
+std::vector<ChainView> DecayInfo::chains() const
+{
+    std::vector<ChainView> out;
+    const auto& dcs = config_parser_.getDecayChains();
+    for (size_t ci = 0; ci < dcs.size() && ci < chains_info_.size(); ++ci) {
+        const auto& dc = dcs[ci];
+        const auto& info = chains_info_[ci];
+        ChainView cv;
+        cv.name = dc.name;
+        {
+            std::string topo;
+            for (const auto& st : dc.decay_steps) {
+                if (!topo.empty()) topo += "_";
+                topo += st.mother + "→" + st.daughters[0] + "+" + st.daughters[1];
+            }
+            cv.topology = topo;
+        }
+        cv.exact_chain_strings = config_parser_.getExactChainStrings(dc);
+        cv.amplitude_names = info.amplitude_names;
+        for (const auto& st : dc.decay_steps) {
+            cv.steps.push_back(st.mother + "->" + st.daughters[0]
+                               + "+" + st.daughters[1]
+                               + slFilterText(st.sl_filter));
+        }
+        for (const auto& rc : dc.resonance_chains) {
+            std::string s = rc.intermediate + ":";
+            for (const auto& sc : rc.spin_chains) {
+                s += " [" + physSpinStr(sc.spin_parity[0]) + ","
+                   + std::to_string(sc.spin_parity[1]) + "]:";
+                for (const auto& r : sc.resonances) {
+                    s += " " + r;
+                    ++cv.n_resonances;
+                }
+            }
+            cv.intermediates.push_back(s);
+        }
+        out.push_back(std::move(cv));
+    }
+    return out;
+}
+
+std::vector<std::string> DecayInfo::exactchains(
+    int chain, const std::string& containing) const
+{
+    if (chain < 0) {
+        std::vector<std::string> out;
+        const auto& dcs = config_parser_.getDecayChains();
+        for (size_t i = 0; i < dcs.size(); ++i) {
+            auto v = config_parser_.getExactChainStrings(dcs[i], containing);
+            out.insert(out.end(), v.begin(), v.end());
+        }
+        return out;
+    }
+    return config_parser_.getExactChainStrings(chain, containing);
+}
+
+std::vector<std::string> DecayInfo::amplitudes(
+    int chain, const std::string& resonance) const
+{
+    const std::vector<std::string>* names = nullptr;
+    if (chain < 0) names = &amplitude_names_;
+    else if ((size_t)chain < chains_info_.size()) names = &chains_info_[chain].amplitude_names;
+    else return {};
+    if (resonance.empty()) return *names;
+    std::vector<std::string> out;
+    for (const auto& n : *names)
+        if (n.find(resonance) != std::string::npos) out.push_back(n);
+    return out;
+}
+
+void DecayInfo::printExactChains(const std::string& containing) const
+{
+    auto ec = exactchains(-1, containing);
+    printf("# exact chains: %zu\n", ec.size());
+    for (const auto& s : ec) printf("%s\n", s.c_str());
+}
+
+// ---- ChainView ----
+std::vector<std::string> ChainView::exactchains(const std::string& containing) const
+{
+    if (containing.empty()) return exact_chain_strings;
+    std::vector<std::string> out;
+    for (const auto& s : exact_chain_strings)
+        if (s.find(containing) != std::string::npos) out.push_back(s);
+    return out;
+}
+
+std::vector<int> ChainView::counts() const
+{
+    std::vector<int> out(4, 0);
+    out[0] = (int)intermediates.size();
+    out[1] = n_resonances;
+    out[2] = (int)exact_chain_strings.size();
+    out[3] = (int)amplitude_names.size();
+    return out;
+}
+
+void ChainView::print() const
+{
+    auto cnt = counts();
+    printf("Chain: %s  (ints=%d res=%d chains=%d waves=%d)\n",
+           name.c_str(), cnt[0], cnt[1], cnt[2], cnt[3]);
+    for (const auto& s : steps) printf("  step %s\n", s.c_str());
+    for (const auto& s : intermediates) printf("  int  %s\n", s.c_str());
+    auto ec = exactchains();
+    printf("  Exact chains (%zu):\n", ec.size());
+    for (const auto& s : ec) printf("    %s\n", s.c_str());
+    printf("  Amplitudes (%zu):\n", amplitude_names.size());
+    for (const auto& s : amplitude_names) printf("    %s\n", s.c_str());
 }

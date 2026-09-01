@@ -158,6 +158,14 @@ public:
   std::string generateLegend(const std::vector<std::string> &particles) const;
   // 返回全同粒子分组: group_name -> {particle_name, ...}
   std::map<std::string, std::vector<std::string>> getIdenticalGroups() const;
+  // 完整链串生成（与 chains_exact 过滤器同一实现; 用户抄串用）
+  //   getExactChainStrings(dc): 该级联全部共振态组合的 "[a->b+c, ...]" 串
+  //   getExactChainStrings(chain_idx): 指定展开链(decay_chains_[idx]); <0 返回空
+  //   containing 非空时只返回包含该子串的串
+  std::vector<std::string> getExactChainStrings(
+      const DecayChainConfig &dc, const std::string &containing = "") const;
+  std::vector<std::string> getExactChainStrings(
+      int chain_idx, const std::string &containing = "") const;
 
 private:
   // 解析函数
