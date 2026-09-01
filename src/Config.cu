@@ -5,6 +5,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <queue>
 #include <set>
@@ -29,6 +30,28 @@ static std::vector<std::string> splitComma(const std::string &s)
         else cur += ch;
     }
     out.push_back(trimStr(cur));
+    return out;
+}
+
+// 分波白名单解析 → 内部统一存 {2S+1, L}（S 为物理自旋, 可为半整数 0.5）:
+//   sl: [[S, L], ...] 或扁平 [S, L]   —— S 在前
+//   ls: [[L, S], ...] 或扁平 [L, S]   —— L 在前（TFPWA ls_list 同序）
+// 内部 SL.S 用 2S+1 记号（整数方便）; 用户侧始终用物理自旋。
+static std::vector<std::vector<int>> parseSLFilter(const YAML::Node &node,
+                                                   bool ls_first)
+{
+    std::vector<std::vector<int>> out;
+    std::vector<std::vector<double>> raw;
+    if (node[0].IsSequence())
+        raw = node.as<std::vector<std::vector<double>>>();
+    else
+        raw.push_back(node.as<std::vector<double>>());
+    for (const auto &row : raw) {
+        if (row.size() < 2) continue;
+        double s_phys = ls_first ? row[1] : row[0]; // ls: [L,S]→S=row[1]; sl: [S,L]→S=row[0]
+        double L      = ls_first ? row[0] : row[1];
+        out.push_back({(int)lround(2.0 * s_phys + 1.0), (int)lround(L)});
+    }
     return out;
 }
 
@@ -189,6 +212,35 @@ ConfigParser::ConfigParser(const std::string &config_file)
             }
         }
 
+        // 链精确整链过滤器（Constraints.chains_exact, TFPWA chains.inp 兼容）：
+        // 每条 = 一条完整衰变链串 "[a->b+c, b->d+e, ...]"（中间态名用共振态名替换），
+        // 精确匹配 → 只保留该级联并把匹配 intermediate 修剪到命中共振态（整链唯一）；
+        // 无命中级联 → 剔除。可内联列表或外部文件（每行一条, # 注释）。
+        if (config["Constraints"] && config["Constraints"]["chains_exact"]) {
+            const auto& ce = config["Constraints"]["chains_exact"];
+            if (ce.IsScalar()) {
+                std::filesystem::path exact_path =
+                    std::filesystem::path(config_file).parent_path() /
+                    ce.as<std::string>();
+                std::ifstream f(exact_path);
+                std::string line;
+                while (std::getline(f, line)) {
+                    size_t b = line.find_first_not_of(" \t\r\n");
+                    if (b == std::string::npos) continue;
+                    size_t e = line.find_last_not_of(" \t\r\n");
+                    std::string pat = line.substr(b, e - b + 1);
+                    if (pat.empty() || pat[0] == '#') continue;
+                    chain_exact_filter_.push_back(pat);
+                }
+                if (chain_exact_filter_.empty())
+                    std::cerr << "Warning: chains_exact file \"" << exact_path
+                              << "\" empty or not found" << std::endl;
+            } else if (ce.IsSequence()) {
+                for (const auto& s : ce)
+                    chain_exact_filter_.push_back(s.as<std::string>());
+            }
+        }
+
         if (config["Resonances"]) {
             if (config["Resonances"].IsScalar()) {
                 // 外部共振态文件: Resonances 栏写文件名 → 从该文件读取（相对 config.yml 所在目录）
@@ -226,16 +278,19 @@ ConfigParser::ConfigParser(const std::string &config_file)
         if (config["precision"])
             precision_ = config["precision"].as<std::string>();
 
-        // 链过滤器: 子串匹配剔除不想要的衰变链（确保 legends/Info/Analysis 一致）。
-        // 匹配链名 → 整链保留（原语义）; 匹配"组合级完整路径串"→ 只保留该共振态
-        // 组合（该 intermediate 内只留匹配共振态, 其余 intermediate 是链结构、一律
-        // 保留）——即"指定具体衰变链, 每步衰变到哪个共振态"。
-        // 路径串 = 每步 [mother, d1, d2] 平铺、中间态名用选中共振态替换,
-        // 如 psip_gamma_chic1_chic1_eta_f2_1525_f2_1525_Kp_Km（= h_ 波名无前缀）。
-        if (!chain_filter_.empty() && !decay_chains_.empty()) {
-            // 组合级完整路径串: 每个 intermediate 选一个共振态的笛卡尔积组合,
-            // 返回 (路径串, 该组合的 intermediate→共振态 映射)。
-            auto combPaths = [](const DecayChainConfig& dc) {
+        // ================================================================
+        // 链过滤器（确保 legends/Info/Analysis 一致）：
+        //  ① Constraints.chains        —— 子串匹配（原语义）
+        //       匹配链名 → 整链保留; 匹配"组合级完整路径串"(下划线平铺, h_ 波名无前缀)
+        //       → 该 intermediate 内只留匹配共振态, 其余 intermediate 一律保留。
+        //  ② Constraints.chains_exact  —— TFPWA chains.inp 兼容（精确整链串）
+        //       每条 "[a->b+c, b->d+e, ...]"（中间态名用共振态名替换）精确匹配:
+        //       命中 → 保留该级联并修剪到命中共振态（整链唯一）; 无命中 → 剔除。
+        // ================================================================
+        if ((!chain_filter_.empty() || !chain_exact_filter_.empty())
+            && !decay_chains_.empty()) {
+            // 组合构建: 每个 intermediate 选一个共振态的笛卡尔积 → 组合列表
+            auto buildCombos = [](const DecayChainConfig& dc) {
                 std::vector<std::pair<std::string, std::vector<std::string>>> choices;
                 for (const auto& rc : dc.resonance_chains) {
                     std::vector<std::string> res;
@@ -255,46 +310,42 @@ ConfigParser::ConfigParser(const std::string &config_file)
                         }
                     combos = std::move(next);
                 }
-                std::vector<std::pair<std::string, std::map<std::string, std::string>>> out;
-                out.reserve(combos.size());
-                for (const auto& combo : combos) {
-                    auto sub = [&](const std::string& n) {
-                        auto it = combo.find(n);
-                        return it != combo.end() ? it->second : n;
-                    };
-                    std::string p;
-                    for (const auto& step : dc.decay_steps) {
-                        p += sub(step.mother) + "_";
-                        for (const auto& d : step.daughters) p += sub(d) + "_";
-                    }
-                    out.push_back({std::move(p), combo});
-                }
-                return out;
+                return combos;
             };
-
-            std::vector<DecayChainConfig> kept;
-            for (auto& dc : decay_chains_) {
-                bool keep_whole = false;
-                // intermediate → 要保留的共振态（匹配组合的并集）
-                std::map<std::string, std::set<std::string>> keep_pairs;
-                const auto paths = combPaths(dc);
-                for (const auto& pat : chain_filter_) {
-                    if (dc.name.find(pat) != std::string::npos) {
-                        keep_whole = true;
-                        break;
-                    }
-                    for (const auto& [path, combo] : paths) {
-                        if (path.find(pat) != std::string::npos) {
-                            for (const auto& [iname, r] : combo)
-                                keep_pairs[iname].insert(r);
-                        }
-                    }
+            // 中间态名 → 该组合选中的共振态名（未选中的保持原名）
+            auto comboSub = [](const std::map<std::string, std::string>& combo,
+                               const std::string& n) {
+                auto it = combo.find(n);
+                return it != combo.end() ? it->second : n;
+            };
+            // 下划线平铺路径串（h_ 波名无前缀; 子串匹配用）
+            auto flattenPath = [&](const DecayChainConfig& dc,
+                                   const std::map<std::string, std::string>& combo) {
+                std::string p;
+                for (const auto& step : dc.decay_steps) {
+                    p += comboSub(combo, step.mother) + "_";
+                    for (const auto& d : step.daughters) p += comboSub(combo, d) + "_";
                 }
-                if (!keep_whole && keep_pairs.empty()) continue; // 无匹配 → 剔除
-                if (keep_whole) { kept.push_back(dc); continue; }
-
-                // 只过滤"参与匹配组合"的 intermediate: 其内只留匹配的共振态分波,
-                // 剔除空的 spin_chain; 其余 intermediate 的共振态全部保留。
+                return p;
+            };
+            // TFPWA 式完整链串 "[a->b+c, b->d+e, ...]"（精确匹配用）
+            auto tfpwaString = [&](const DecayChainConfig& dc,
+                                   const std::map<std::string, std::string>& combo) {
+                std::string s = "[";
+                bool first = true;
+                for (const auto& step : dc.decay_steps) {
+                    if (!first) s += ", ";
+                    first = false;
+                    s += comboSub(combo, step.mother) + "->"
+                       + comboSub(combo, step.daughters[0]) + "+"
+                       + comboSub(combo, step.daughters[1]);
+                }
+                s += "]";
+                return s;
+            };
+            // 修剪: 把匹配 intermediate 的共振态过滤到 keep_pairs, 剔除空 spin_chain
+            auto pruneResonances = [](DecayChainConfig& dc,
+                const std::map<std::string, std::set<std::string>>& keep_pairs) {
                 for (auto& rc : dc.resonance_chains) {
                     auto it = keep_pairs.find(rc.intermediate);
                     if (it == keep_pairs.end()) continue;
@@ -311,19 +362,64 @@ ConfigParser::ConfigParser(const std::string &config_file)
                             ++sit;
                     }
                 }
-                // 若匹配涉及的 intermediate 全部共振态被过滤掉 → 链不可构建
-                bool viable = true;
-                for (const auto& rc : dc.resonance_chains) {
-                    if (keep_pairs.count(rc.intermediate) && rc.spin_chains.empty()) {
-                        viable = false;
-                        break;
+                // 匹配涉及的 intermediate 全被过滤掉 → 链不可构建
+                for (const auto& rc : dc.resonance_chains)
+                    if (keep_pairs.count(rc.intermediate) && rc.spin_chains.empty())
+                        return false;
+                return true;
+            };
+
+            // ---- ① Constraints.chains 子串过滤（原语义）----
+            if (!chain_filter_.empty()) {
+                std::vector<DecayChainConfig> kept;
+                for (auto& dc : decay_chains_) {
+                    bool keep_whole = false;
+                    std::map<std::string, std::set<std::string>> keep_pairs;
+                    const auto combos = buildCombos(dc);
+                    for (const auto& pat : chain_filter_) {
+                        if (dc.name.find(pat) != std::string::npos) {
+                            keep_whole = true;
+                            break;
+                        }
+                        for (const auto& combo : combos) {
+                            if (flattenPath(dc, combo).find(pat) != std::string::npos) {
+                                for (const auto& [iname, r] : combo)
+                                    keep_pairs[iname].insert(r);
+                            }
+                        }
                     }
+                    if (!keep_whole && keep_pairs.empty()) continue; // 无匹配 → 剔除
+                    if (keep_whole) { kept.push_back(dc); continue; }
+                    if (pruneResonances(dc, keep_pairs)) kept.push_back(dc);
                 }
-                if (viable) kept.push_back(dc);
+                std::cout << "Chain filter: " << kept.size() << "/"
+                          << decay_chains_.size() << " chains selected" << std::endl;
+                decay_chains_ = std::move(kept);
             }
-            std::cout << "Chain filter: " << kept.size() << "/" << decay_chains_.size()
-                      << " chains selected" << std::endl;
-            decay_chains_ = std::move(kept);
+
+            // ---- ② Constraints.chains_exact 精确整链过滤（TFPWA 兼容）----
+            if (!chain_exact_filter_.empty()) {
+                std::set<std::string> exact_set;
+                for (const auto& s : chain_exact_filter_)
+                    exact_set.insert(s);
+                std::vector<DecayChainConfig> kept;
+                for (auto& dc : decay_chains_) {
+                    std::map<std::string, std::set<std::string>> keep_pairs;
+                    bool any = false;
+                    for (const auto& combo : buildCombos(dc)) {
+                        if (exact_set.count(tfpwaString(dc, combo))) {
+                            any = true;
+                            for (const auto& [iname, r] : combo)
+                                keep_pairs[iname].insert(r);
+                        }
+                    }
+                    if (!any) continue; // 无精确命中 → 剔除
+                    if (pruneResonances(dc, keep_pairs)) kept.push_back(dc);
+                }
+                std::cout << "Chain exact filter: " << kept.size() << "/"
+                          << decay_chains_.size() << " chains selected" << std::endl;
+                decay_chains_ = std::move(kept);
+            }
         }
     } catch (const YAML::Exception &e) {
         std::cerr << "Warning: Failed to parse config file \"" << config_file
@@ -710,20 +806,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                         }
                         if (dopts["bf_d"]) id.bf_d = dopts["bf_d"].as<double>();
                         if (dopts["p_break"]) id.p_break = dopts["p_break"].as<bool>();
-                        if (dopts["sl"]) {
-                            // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
-                            // config 层 S 为物理自旋（可半整数如 0.5），
-                            // 内部 SL.S 用 2S+1 记号 → 解析时转换
-                            std::vector<std::vector<double>> raw;
-                            if (dopts["sl"][0].IsSequence())
-                                raw = dopts["sl"].as<std::vector<std::vector<double>>>();
-                            else
-                                raw.push_back(dopts["sl"].as<std::vector<double>>());
-                            for (const auto& row : raw)
-                                if (row.size() >= 2)
-                                    id.sl_filter.push_back(
-                                        {(int)lround(2.0 * row[0] + 1.0), (int)row[1]});
-                        }
+                        // 分波白名单: sl=[S,L] 或 ls=[L,S]（S 为物理自旋）→ 内部 {2S+1, L}
+                        if (dopts["ls"])
+                            id.sl_filter = parseSLFilter(dopts["ls"], true);
+                        else if (dopts["sl"])
+                            id.sl_filter = parseSLFilter(dopts["sl"], false);
                     }
                     return id;
                 };
@@ -871,20 +958,11 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             ch_p_break1 = ch_p_break2 = opts["p_break"].as<bool>();
                         }
                     }
-                    if (opts["sl"]) {
-                        // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]（作用于第一步）
-                        // config 层 S 为物理自旋（可半整数如 0.5），
-                        // 内部 SL.S 用 2S+1 记号 → 解析时转换
-                        std::vector<std::vector<double>> raw;
-                        if (opts["sl"][0].IsSequence())
-                            raw = opts["sl"].as<std::vector<std::vector<double>>>();
-                        else
-                            raw.push_back(opts["sl"].as<std::vector<double>>());
-                        for (const auto& row : raw)
-                            if (row.size() >= 2)
-                                ch_sl_filter.push_back(
-                                    {(int)lround(2.0 * row[0] + 1.0), (int)row[1]});
-                    }
+                    // 分波白名单(作用于第一步): sl=[S,L] 或 ls=[L,S]（S 物理自旋）→ 内部 {2S+1, L}
+                    if (opts["ls"])
+                        ch_sl_filter = parseSLFilter(opts["ls"], true);
+                    else if (opts["sl"])
+                        ch_sl_filter = parseSLFilter(opts["sl"], false);
                 }
 
                 // --- Determine multi-mode iteration driver ---
@@ -1155,16 +1233,13 @@ void ConfigParser::parseDecayChains(const YAML::Node &node)
                             if (decay_pair.second["p_break"])
                                 step.p_break =
                                     decay_pair.second["p_break"].as<bool>();
-                            if (decay_pair.second["sl"]) {
-                                // 支持扁平 [S, L] 或嵌套 [[S1, L1], [S2, L2], ...]
-                                if (decay_pair.second["sl"][0].IsSequence())
-                                    step.sl_filter = decay_pair.second["sl"]
-                                        .as<std::vector<std::vector<int>>>();
-                                else
-                                    step.sl_filter.push_back(
-                                        decay_pair.second["sl"]
-                                            .as<std::vector<int>>());
-                            }
+                            // 分波白名单: sl=[S,L] 或 ls=[L,S]（S 物理自旋）→ 内部 {2S+1, L}
+                            if (decay_pair.second["ls"])
+                                step.sl_filter = parseSLFilter(
+                                    decay_pair.second["ls"], true);
+                            else if (decay_pair.second["sl"])
+                                step.sl_filter = parseSLFilter(
+                                    decay_pair.second["sl"], false);
                         }
                         chain.decay_steps.push_back(step);
                     }

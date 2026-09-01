@@ -174,6 +174,7 @@ private:
   std::vector<DecayChainConfig> decay_chains_;
   std::string config_file_;                    // 配置文件路径（供解析相对路径）
   std::vector<std::string> chain_filter_;      // Constraints.chains 子串过滤; 空 = 全跑
+  std::vector<std::string> chain_exact_filter_; // Constraints.chains_exact: TFPWA 式精确整链串过滤; 空 = 不启用
   std::map<std::string, ResonanceConfig> resonances_;
   std::map<std::string, std::vector<std::string>> data_files_;
   std::vector<std::string> data_order_;

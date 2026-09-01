@@ -5538,7 +5538,7 @@ private:
                                   << jpLabel(spins[1], parities[1]) << "] + "
                                   << step.daughters[1] << "["
                                   << jpLabel(spins[2], parities[2]) << "]"
-                                  << " has no valid (S,L) waves"
+                                  << " has no valid (L,S) waves"
                                   << " (maxL=" << maxL2
                                   << (step.sl_filter.empty() ? "" : ", sl whitelist active")
                                   << "): amplitude will be identically zero. "
@@ -5552,7 +5552,7 @@ private:
                 // 链级诊断：任一步零-SL 都会使整条链的 SL 组合（笛卡尔积）为空，
                 // 链内所有共振态振幅恒为零——这是比单步更严重的静默失败。
                 if (slcombs.empty()) {
-                    std::cerr << "Warning: chain \"" << chain.name << "\" has NO valid (S,L) wave "
+                    std::cerr << "Warning: chain \"" << chain.name << "\" has NO valid (L,S) wave "
                                  "combinations across its decay steps: all amplitudes of this "
                                  "chain will be identically zero. Check the per-step warnings above."
                               << std::endl;

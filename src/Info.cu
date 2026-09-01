@@ -4,11 +4,18 @@
 #include <iostream>
 #include <memory>
 #include <set>
+#include <string>
 
 // Helper: print spin as proper J (config stores 2J+1)
 static inline void printJ(int spin) {
     if (spin % 2 != 0) std::cout << (spin - 1) / 2;
     else std::cout << spin - 1 << "/2";
+}
+
+// Helper: 内部 2S+1 → 物理自旋字符串（"0"/"1"/"1/2"/"3/2"...）
+static inline std::string physSpinStr(int twoS1) {
+    if (twoS1 % 2 != 0) return std::to_string((twoS1 - 1) / 2);
+    return std::to_string(twoS1 - 1) + "/2";
 }
 
 DecayInfo::DecayInfo(const std::string& config_file)
@@ -183,12 +190,13 @@ void DecayInfo::buildDecayChains(
                 std::cout << (info.parities[1] == 1 ? "+)" : info.parities[1] == -1 ? "-)" : ")");
                 std::cout << info.d2 << "("; printJ(info.spins[2]);
                 std::cout << (info.parities[2] == 1 ? "+)" : info.parities[2] == -1 ? "-)" : ")");
-                // Print SL list for this step
+                // Print SL list for this step（用户侧: LS 序 + 物理自旋）
                 std::cout << " {";
                 for (size_t sli = 0; sli < info.sl_list.size(); ++sli) {
                     if (sli > 0) std::cout << " ";
-                    std::cout << "("; printJ(info.sl_list[sli].S); 
-                    std::cout << "," << info.sl_list[sli].L << ")";
+                    std::cout << "(" << info.sl_list[sli].L << ",";
+                    printJ(info.sl_list[sli].S);
+                    std::cout << ")";
                 }
                 std::cout << "}";
             }
@@ -284,7 +292,7 @@ void DecayInfo::buildDecayChains(
 
                 for (size_t si = 0; si < slcombs.size(); ++si) {
                     const auto& slcomb = slcombs[si];
-                    // Build name with per-step SL: step1_SL(S,L)_step2_SL(S,L)...
+                    // Build name with per-step LS: step1_LS(L,S)_step2_LS(L,S)...（S 物理自旋）
                     std::string full_name;
                     for (size_t sni = 0; sni < slcomb.size() && sni < chain.decay_steps.size(); ++sni) {
                         if (!full_name.empty()) full_name += "_";
@@ -293,8 +301,8 @@ void DecayInfo::buildDecayChains(
                         full_name += replace_tag(step.mother) + "→"
                                   + replace_tag(step.daughters[0]) + "+"
                                   + replace_tag(step.daughters[1])
-                                  + "_SL(" + std::to_string(sl.S) + ","
-                                  + std::to_string(sl.L) + ")";
+                                  + "_LS(" + std::to_string(sl.L) + ","
+                                  + physSpinStr(sl.S) + ")";
                     }
                     amplitude_names_.push_back(full_name);
 
@@ -348,9 +356,9 @@ void DecayInfo::buildDecayChains(
             if (s.first_free_idx < 0) continue; // folded or all-fixed
             for (int sli = 1; sli < s.n_sl(); ++sli) {
                 param_names_.push_back(
-                    s.label + "_SL("
-                    + std::to_string(s.sl_list[sli].S) + ","
-                    + std::to_string(s.sl_list[sli].L) + ")");
+                    s.label + "_LS("
+                    + std::to_string(s.sl_list[sli].L) + ","
+                    + physSpinStr(s.sl_list[sli].S) + ")");
             }
         }
     }
