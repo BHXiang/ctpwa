@@ -2997,7 +2997,7 @@ public:
     torch::Tensor computeCouplingHessian(torch::Tensor vector)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
         TORCH_CHECK(vector.device().index() == primary_dev_,
             "vector 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
@@ -4022,7 +4022,7 @@ public:
         torch::Tensor hessian_in)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         if (hessian_in.numel() > 0)
             TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
                 "hessian_in must be float64 CUDA");
@@ -4161,7 +4161,7 @@ public:
         torch::Tensor hessian_in)
     {
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector must be ComplexFloat");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         if (hessian_in.numel() > 0)
             TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
                 "hessian_in must be float64 CUDA");
