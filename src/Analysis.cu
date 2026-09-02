@@ -4489,6 +4489,7 @@ private:
     // phsp_sum = Re(v^H M_double v)，替代对原始 phsp 振幅的逐 forward 扫描
     cuDoubleComplex* d_phsp_matrix_double_ = nullptr;
     bool phsp_freed_ = false;   // true = phsp 振幅不驻留（流式模式）
+    bool float_amps_ = false;   // true = 混合精度: 驻留振幅矩阵存 float（double .so + config precision:float）
     std::vector<double*> data_weights_;
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
@@ -4601,22 +4602,28 @@ private:
         device_mgr_.detect();
         n_gpus_ = device_mgr_.numDevices();
 
-        // 精度匹配检查：config.yml 显式请求的精度必须与 .so 编译精度一致
+        // 精度解析（config precision 为"请求精度"）:
+        //   .so 编译 double（默认）: precision:double/auto → 全 double;
+        //                            precision:float → float_amps_=true（内存大户 A 存 float, 核心计算仍 double）
+        //   .so 编译 float:          precision:float/auto → 原生 float; precision:double → 报错（float .so 无法提精度）
         {
             const std::string& req = config_parser_.getPrecision();
-            if (req == "auto") {
-                // 未显式声明精度：跟随 .so 编译精度，不检查
-            } else if (req != "float" && req != "double") {
+            if (req != "auto" && req != "float" && req != "double") {
                 std::cerr << "ERROR: 配置 precision=\"" << req
-                          << "\" 无效（仅支持 float | double）" << std::endl;
+                          << "\" 无效（仅支持 auto | float | double）" << std::endl;
                 throw std::runtime_error("invalid precision in config");
-            } else if (req != PRECISION_NAME) {
-                std::cerr << "ERROR: 配置文件请求 precision=" << req
-                          << "，但当前安装的 ctpwa 编译为 " << PRECISION_NAME
-                          << "。请用 CTPWA_DOUBLE_COMPLEX=1 pip install -e . "
-                             "重新编译安装双精度版本。" << std::endl;
-                throw std::runtime_error("precision mismatch");
             }
+            if (req == "float" && std::string(PRECISION_NAME) == "double")
+                float_amps_ = true;   // 混合精度: A 存 float（D1 起生效）, 核心 double
+            else if (req == "double" && std::string(PRECISION_NAME) == "float") {
+                std::cerr << "ERROR: 配置文件请求 precision=double，但当前 .so 编译为 float；"
+                             "请用默认编译（double）重新 build_ext。float .so 仅供大统计量省显存。"
+                          << std::endl;
+                throw std::runtime_error("double requested on float build");
+            }
+            if (float_amps_)
+                std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double"
+                          << std::endl;
         }
         if (n_gpus_ == 0) {
             std::cerr << "ERROR: 无可用 CUDA 设备。ctpwa 当前仅支持 GPU 计算"
