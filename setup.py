@@ -188,8 +188,16 @@ extension = CUDAExtension(
             # "-fPIC",
             "-std=c++17",
             "--extended-lambda",
-            # 双精度 complex 编译开关: CTPWA_DOUBLE_COMPLEX=1 pip install -e .
-            *(["-DCTPWA_DOUBLE_COMPLEX"] if os.environ.get("CTPWA_DOUBLE_COMPLEX", "0") == "1" else []),
+            # ---- 复精度：默认 double（高精度求导/数值；释放 phsp 后显存足够）----
+            # float 为显式选择（超大统计量时配 free_phsp_amplitudes 使用）：
+            #   CTPWA_COMPLEX=float 或 CTPWA_DOUBLE_COMPLEX=0 → 编译 float 版
+            #   默认 / CTPWA_COMPLEX=double / CTPWA_DOUBLE_COMPLEX=1 → double 版
+            *(
+                ["-DCTPWA_DOUBLE_COMPLEX"]
+                if os.environ.get("CTPWA_COMPLEX", "double") != "float"
+                and os.environ.get("CTPWA_DOUBLE_COMPLEX", "1") != "0"
+                else []
+            ),
             #"--generate-line-info",
             #"-D_FORCE_INLINES",
             #"--extended-lambda",

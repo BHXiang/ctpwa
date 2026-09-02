@@ -1,10 +1,15 @@
-// ComplexType.h — complex 精度统一抽象层（float / double 编译时切换）
+// ComplexType.h — complex 精度统一抽象层（double 默认 / float 编译时切换）
 //
 // 设计原则:
 //   整个代码库中只有这一个文件包含 #ifdef CTPWA_DOUBLE_COMPLEX。
 //   业务代码通过 ctComplex / ctFloat / ctMake 等类型和函数选择精度，
-//   不出现 ifdef。切换精度只需:
-//     CTPWA_DOUBLE_COMPLEX=1 pip install -e . --no-build-isolation
+//   不出现 ifdef。
+//   精度默认 double（高精度求导/数值；释放 phsp 后显存足够）；
+//   float 为显式选择（超大统计量时配 free_phsp_amplitudes 使用）:
+//     CTPWA_COMPLEX=float  或  CTPWA_DOUBLE_COMPLEX=0  → float 版
+//   编译示例:
+//     python3 setup.py build_ext --inplace            # double（默认）
+//     CTPWA_COMPLEX=float python3 setup.py build_ext --inplace  # float
 //   用户侧通过 config.yml 的 `precision: float|double` 声明请求的精度，
 //   初始化时自动检查是否与 .so 编译精度一致（不匹配报清晰错误）。
 //
@@ -76,7 +81,7 @@ constexpr auto TORCH_COMPLEX_STR = "complex128";
 constexpr auto PRECISION_NAME = "double";
 
 // ====================================================================
-// float 精度（cuComplex / float2）— 默认
+// float 精度（cuComplex / float2）— 显式选择（CTPWA_COMPLEX=float，超大统计量配 free_phsp_amplitudes）
 // ====================================================================
 
 #else
