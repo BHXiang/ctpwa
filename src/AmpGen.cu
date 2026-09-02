@@ -1392,10 +1392,20 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     }
 }
 
+// 振幅输出写入辅助: 计算恒在 double, 输出按 Out 存 float2(混合精度省显存)或 ctComplex(原生)
+template<typename Out>
+__device__ inline Out cplxOut(double re, double im) {
+    if constexpr (std::is_same_v<Out, ctComplex>) {
+        return ctMake(re, im);
+    } else {
+        return make_float2((float)re, (float)im);  // Out = float2（仅 double .so 的 float 存储用）
+    }
+}
+
 // nPolar 分块实验变体（与 computeCustomAmpsKernelT 同语义；CTPWA_POL_MODE 分派）
-template<int CHUNK, int MAXPOL>
+template<int CHUNK, int MAXPOL, typename Out>
 __global__ void
-computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
+computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
@@ -1580,7 +1590,7 @@ computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
         {
             return;
         }
-        amplitudes[amp_idx] = ctMake(A_tot[k - k0].real(), A_tot[k - k0].imag());
+        amplitudes[amp_idx] = cplxOut<Out>(A_tot[k - k0].real(), A_tot[k - k0].imag());
     }
 }
 
@@ -1590,9 +1600,9 @@ computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
 //   CHUNK  > 0: 每次 launch 只算 [k_start, k_start+CHUNK) 的 polar（B 变体）。
 //               输出按全局 k 覆盖写，无跨 launch 依赖；F 因子每 launch 重算，
 //               开销即实验量化的分块代价（B8/B16 均慢于 A）。
-template<int CHUNK, int MAXPOL>
+template<int CHUNK, int MAXPOL, typename Out = ctComplex>
 __global__ void computeCustomAmpsKernelT(
-    ctComplex* amplitudes,
+    Out* amplitudes,
     const ADBlockDesc* desc, int nblocks, int nSL_total,
     const int* amp_offsets, const int* event_offsets, int num_offsets,
     int n_amplitudes, int k_start)
@@ -1925,7 +1935,7 @@ __global__ void computeCustomAmpsKernelT(
             int amp_idx = amp_offsets[offset_idx]
                         + (event_idx - event_offsets[offset_idx]) * n_amplitudes * B.nPolar
                         + k * n_amplitudes + sl_idx + B.site;
-            amplitudes[amp_idx] = ctMake(R_re[k - k0], R_im[k - k0]);
+            amplitudes[amp_idx] = cplxOut<Out>(R_re[k - k0], R_im[k - k0]);
         }
         (void)idx;
     }

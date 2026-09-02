@@ -414,9 +414,9 @@ __global__ void addSLAmpsKernel(
     int total_size, double sign);
 
 // nPolar 分块实验变体（CHUNK=0 全量 / CHUNK>0 分块，CTPWA_POL_MODE 分派）
-template<int CHUNK, int MAXPOL>
+template<int CHUNK, int MAXPOL, typename Out = ctComplex>
 __global__ void
-computeAmpsKernelT(ctComplex* amplitudes,                 // 输出振幅
+computeAmpsKernelT(Out* amplitudes,                      // 输出振幅(计算恒 double, Out=float2 时混合精度存储)
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
     const thrust::complex<double>* slamp_tab, // SL振幅 [nSigma × nSL×nPol×nEv]
