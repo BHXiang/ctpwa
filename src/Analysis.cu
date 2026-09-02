@@ -4525,8 +4525,8 @@ private:
     bool initialized_ = false;
     int primary_dev_ = 0;  // 主 GPU：构造时 torch 当前设备；d_phsp_matrix_ 等跨 GPU 缓冲所在
 
-    // fit mode: 0 = FREEPARAMS (chain×step), 1 = VSPACE (direct amplitudes, default)
-    int fit_mode_ = 1;
+    // fit mode: 0 = FREEPARAMS (chain×step, default), 1 = VSPACE (direct amplitudes)
+    int fit_mode_ = 0;
 
     void initialize(std::string config_file = "config.yml")
     {

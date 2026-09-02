@@ -117,7 +117,7 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getNLL", &analysis::getNLL, pybind11::arg("params"),
              "Compute NLL. params: [real(v), imag(v), theta] float64")
         .def("setFitMode", &analysis::setFitMode, pybind11::arg("mode"),
-             "Set fit mode: 0=FREEPARAMS (chain×step), 1=VSPACE (direct amplitudes, default)")
+             "Set fit mode: 0=FREEPARAMS (chain×step, default), 1=VSPACE (direct amplitudes)")
         .def("getFitMode", &analysis::getFitMode)
         .def("getNVector", &analysis::getNVector)
         .def("getNFreeTheta", &analysis::getNFreeTheta)
