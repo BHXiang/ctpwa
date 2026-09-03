@@ -3116,15 +3116,29 @@ void AmpCalc::computeUnifiedHessian(
             }
         }
 
-        // Pre-pass: compute full S[p] = Σ_a v[a]·amp[a,e,p] and I[e] from raw amplitudes
+        // ===== 事件窗口循环（临时缓冲峰值按窗口大小；输出 atomicAdd 跨窗口累加）=====
+        // 每个窗口 [c0, c0+nch) 独立跑 pre-pass + stage1-4：kernel 全部带 evt_offset
+        //（momenta/slamp 全局绝对索引）且临时缓冲按 nch 分配 → 峰值 O(窗口) 而非 O(nEv)。
+        // 与全量一次数学等价（hess/phsp/mixed/t3 输出均为 atomicAdd 或主缓冲+=）。
         auto& cas0 = cas_list_[blocks_[0].cas_idx];
         int nPol = static_cast<int>(cas0->getNPolarizations());
+
+        int kUhChunk = 150000;
+        if (const char* e = getenv("CTPWA_UH_CHUNK")) { int v = atoi(e); if (v > 0) kUhChunk = v; }
+        for (int c0 = 0; c0 < nEv; c0 += kUhChunk) {
+            int nch = std::min(kUhChunk, nEv - c0);
+            int evt_off_c = evt_off + c0;             // 全局绝对事件起点
+            // 权重数组按段内事件索引 → 窗口起点偏移 c0（nullptr 原样）
+            const double* d_w_c = d_w ? d_w + c0 : nullptr;
+            const ctComplex* d_amp_c = d_amp + (size_t)evt_off_c * nPol * n_amp_total;
+
+        // Pre-pass: compute full S[p] = Σ_a v[a]·amp[a,e,p] and I[e] from raw amplitudes
         double *d_S_re, *d_S_im, *d_I_full;
-        cudaMalloc(&d_S_re, nEv*nPol*sizeof(double));
-        cudaMalloc(&d_S_im, nEv*nPol*sizeof(double));
-        cudaMalloc(&d_I_full, nEv*sizeof(double));
+        cudaMalloc(&d_S_re, nch*nPol*sizeof(double));
+        cudaMalloc(&d_S_im, nch*nPol*sizeof(double));
+        cudaMalloc(&d_I_full, nch*sizeof(double));
         {
-            int grid = (nEv + kBlockSize - 1) / kBlockSize;
+            int grid = (nch + kBlockSize - 1) / kBlockSize;
             double *t3_re = nullptr, *t3_im = nullptr;
             if (d_t3_g) {
                 t3_re = d_t3_g;
@@ -3132,15 +3146,15 @@ void AmpCalc::computeUnifiedHessian(
             }
             computeSfromAmpsKernel<<<grid, kBlockSize>>>(
                 d_S_re, d_S_im, d_I_full,
-                d_amp + evt_off * nPol * n_amp_total,
-                d_v, nEv, nPol, n_amp_total,
+                d_amp_c,
+                d_v, nch, nPol, n_amp_total,
                 t3_re, t3_im);
             cudaDeviceSynchronize();
         }
 
         temps_per_gpu[gpu].resize(blocks_.size());
 
-        bool first_free_block = true;  // track first block with free params for phsp_I
+        bool first_free_block = true;  // 每窗口重置：phsp_I 需每个窗口的 I 都累加一次
 
         for (size_t bi = 0; bi < blocks_.size(); ++bi) {
             auto& blk = blocks_[bi];
@@ -3244,14 +3258,14 @@ void AmpCalc::computeUnifiedHessian(
             // Allocate temp buffers for this block
             auto& bt = temps_per_gpu[gpu][bi];
             bt.NT = NT;
-            bt.nEv = nEv;
-            cudaMalloc(&bt.d_g, nEv * NT * sizeof(double));
-            cudaMalloc(&bt.d_dS_re, nEv * NT * nPol * sizeof(double));
-            cudaMalloc(&bt.d_dS_im, nEv * NT * nPol * sizeof(double));
+            bt.nEv = nch;
+            cudaMalloc(&bt.d_g, nch * NT * sizeof(double));
+            cudaMalloc(&bt.d_dS_re, nch * NT * nPol * sizeof(double));
+            cudaMalloc(&bt.d_dS_im, nch * NT * nPol * sizeof(double));
             // dF 按 σ 行存储（全同粒子置换拓扑；σ=0 恒等）
             int nSigma = cas->getNSigma();
-            cudaMalloc(&bt.d_dF_re, (size_t)nEv * nSL * Npr * nSigma * sizeof(double));
-            cudaMalloc(&bt.d_dF_im, (size_t)nEv * nSL * Npr * nSigma * sizeof(double));
+            cudaMalloc(&bt.d_dF_re, (size_t)nch * nSL * Npr * nSigma * sizeof(double));
+            cudaMalloc(&bt.d_dF_im, (size_t)nch * nSL * Npr * nSigma * sizeof(double));
             cudaMalloc(&bt.d_gidx, NT * sizeof(int));
             cudaMemcpy(bt.d_gidx, global_idx.data(), NT * sizeof(int), cudaMemcpyHostToDevice);
             cudaMalloc(&bt.d_res_off, Nres * sizeof(int));
@@ -3259,7 +3273,7 @@ void AmpCalc::computeUnifiedHessian(
             cudaMemcpy(bt.d_res_off, res_off_h.data(), Nres * sizeof(int), cudaMemcpyHostToDevice);
             cudaMemcpy(bt.d_res_cnt, res_cnt_h.data(), Nres * sizeof(int), cudaMemcpyHostToDevice);
 
-            int grid = (nEv + kBlockSize - 1) / kBlockSize;
+            int grid = (nch + kBlockSize - 1) / kBlockSize;
 
             const ctComplex* d_v_blk = d_v + blk.site;
             // Conjugate 块：phsp 积分已由 owner 计算，跳过 d_pI_g。
@@ -3298,7 +3312,7 @@ void AmpCalc::computeUnifiedHessian(
                                        cas->getMomentaTab()[gpu],
                                        blk.d_all_params[gpu], rpo.data(),
                                        cas->getDeviceSLCombs()[gpu], dsz,
-                                       nEv, evt_off, nSL, nSigma)) {
+                                       nch, evt_off_c, nSL, nSigma)) {
                         jitLaunchFull(blk.jit, gpu);
                         jit_full = blk.jit.full_buf[gpu];
                     }
@@ -3316,12 +3330,12 @@ void AmpCalc::computeUnifiedHessian(
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
                     blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx,
                     d_pmap, Npr,
-                    d_hess_g, hess_ld, nEv, nSL, nPol, default_weight, d_w,
+                    d_hess_g, hess_ld, nch, nSL, nPol, default_weight, d_w_c,
                     d_S_re, d_S_im, bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im,
                     d_pI_ptr, d_pg_g, d_phA_g,
                     bt.d_res_off, bt.d_res_cnt, Nres, jit_target_node,
-                    evt_off,
+                    evt_off_c,
                     nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu],
                     jit_full);
                 cudaDeviceSynchronize();
@@ -3366,13 +3380,13 @@ void AmpCalc::computeUnifiedHessian(
                 auto& btB = temps_per_gpu[gpu][bj];
                 if (!btB.d_g) continue;
 
-                int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                int grid = (nch + kBlockSize - 1) / kBlockSize;
                 hessianCrossBlockKernel<<<grid, kBlockSize>>>(
                     btA.d_g, btA.d_dS_re, btA.d_dS_im,
                     btB.d_g, btB.d_dS_re, btB.d_dS_im,
                     d_I_full, btA.d_gidx, btB.d_gidx,
-                    btA.NT, btB.NT, nEv, nPol,
-                    d_hess_g, hess_ld, default_weight, d_w,
+                    btA.NT, btB.NT, nch, nPol,
+                    d_hess_g, hess_ld, default_weight, d_w_c,
                     (default_weight == 0.0) ? d_phA_g : nullptr,
                     (d_phA_g ? nFreeResParams() : 1));
                 cudaDeviceSynchronize();
@@ -3425,16 +3439,16 @@ void AmpCalc::computeUnifiedHessian(
                 }
                 if (Npr < 1) continue;
                 int nTotal_slamp = static_cast<int>(cas_list_[blk.cas_idx]->getNEventsVec()[gpu]) * nPol;
-                int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                int grid = (nch + kBlockSize - 1) / kBlockSize;
                 hessianMixedBlockKernel<<<grid, kBlockSize>>>(
                     d_S_re, d_S_im, d_I_full,
-                    d_amp + evt_off * nPol * n_amp_total,
+                    d_amp_c,
                     cas_list_[blk.cas_idx]->getSLAmpsTab()[gpu],
                     bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mix_g, nFreeResParams(),
-                    nEv, nSL, Npr, nPol, n_amp_total, blk.site,
-                    nTotal_slamp, default_weight, d_w, d_msum_g, evt_off,
+                    nch, nSL, Npr, nPol, n_amp_total, blk.site,
+                    nTotal_slamp, default_weight, d_w_c, d_msum_g, evt_off_c,
                     cas_list_[blk.cas_idx]->getNSigma(),
                     cas_list_[blk.cas_idx]->getSignsTab()[gpu]);
                 cudaDeviceSynchronize();
@@ -3450,15 +3464,15 @@ void AmpCalc::computeUnifiedHessian(
                     auto& btB = temps_per_gpu[gpu][bj];
                     if (!btB.d_g) continue;
                     // 跨链 vθ 项是必需的：去掉 cas_idx 过滤（kernel 只用 d_amp，与链无关）
-                    int grid = (nEv + kBlockSize - 1) / kBlockSize;
+                    int grid = (nch + kBlockSize - 1) / kBlockSize;
                     hessianCrossMixedKernel<<<grid, kBlockSize>>>(
                         d_S_re, d_S_im, d_I_full,
-                        d_amp + evt_off * nPol * n_amp_total,
+                        d_amp_c,
                         btB.d_g, btB.d_dS_re, btB.d_dS_im, btB.d_gidx, btB.NT,
                         nSL_A, blkA.site,
-                        nEv, nPol, n_amp_total,
+                        nch, nPol, n_amp_total,
                         d_mix_g, nFreeResParams(),
-                        default_weight, d_w, d_msum_g, evt_off);
+                        default_weight, d_w_c, d_msum_g, evt_off_c);
                     cudaDeviceSynchronize();
                 }
             }
@@ -3481,6 +3495,7 @@ void AmpCalc::computeUnifiedHessian(
             if (bt.d_gidx) cudaFree(bt.d_gidx);
         }
         cudaFree(d_S_re); cudaFree(d_S_im); cudaFree(d_I_full);
+        }  // for (c0 ...) 事件窗口循环
 
         // --- Accumulate remote GPU results to global buffers on primary_dev ---
         if (is_remote) {
