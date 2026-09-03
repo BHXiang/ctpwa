@@ -21,6 +21,16 @@
 # 可用模型: BWR | BW | Flatte | GS | ONE | Interp | Custom
 # ============================================================
 
+# ---- 数值精度（可选, 根键 precision; 缺省 auto）----
+# auto（默认）= double .so 上"混合精度": 驻留振幅矩阵 A 存 float
+#   （显存约减半, 核心计算仍 double, NLL 相对漂移 ~1e-9）——大统计量
+#   分波的早期大量测试推荐; float .so 上 auto = 原生 float
+# float    = double .so 上同 auto（显式声明）
+# double   = 全 double 数值（最终参数/分支比报告前验证用; float .so 不支持）
+# 需要全 double 时取消下行注释:
+# precision: double
+# ============================================================
+
 # ---- 粒子定义 ----
 Particles:
   Jpsi:       {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
