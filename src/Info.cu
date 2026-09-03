@@ -519,6 +519,38 @@ void DecayInfo::printExactChains(const std::string& containing) const
     for (const auto& s : ec) printf("%s\n", s.c_str());
 }
 
+// 拟合参数名扁平打印（与 printExactChains 并列的调试入口; CPU 即可）
+// 布局与拟合参数向量一致: [Re_coupling | Im_coupling | theta]; 下标即 parameters.txt 的 idx
+void DecayInfo::printParamNames(const std::string& containing) const
+{
+    const size_t n_coup = param_names_.size();
+    const size_t n_theta = resonance_param_names_.size();
+    if (!use_coupling_matrix_ || n_coup == 0) {
+        printf("# param names: %zu (无耦合矩阵/无振幅, 检查链过滤与分波白名单)\n", n_coup);
+        return;
+    }
+    const auto& cm = coupling_matrix_;
+    const size_t n_chain = static_cast<size_t>(cm.n_chain_free);
+    printf("# param names: %zu (chain×step: %zu chain + %d step) | waves: %d | theta: %zu\n",
+           n_coup, n_chain, cm.n_step_free, cm.n_amps, n_theta);
+    for (size_t i = 0; i < n_coup; ++i) {
+        if (!containing.empty()
+            && param_names_[i].find(containing) == std::string::npos)
+            continue;
+        printf("  [%2zu] %s %s\n", i,
+               i < n_chain ? "(chain)" : "(step )",
+               param_names_[i].c_str());
+    }
+    for (size_t j = 0; j < n_theta; ++j) {
+        if (!containing.empty()
+            && resonance_param_names_[j].find(containing) == std::string::npos)
+            continue;
+        printf("  [%2zu] (theta) %s\n", n_coup + j, resonance_param_names_[j].c_str());
+    }
+    if (containing.empty())
+        printf("note: 拟合脚本通常把 [0] 固定为 1+0i 作参考相位(见 fit.py); 引擎本身不固定\n");
+}
+
 // ---- ChainView ----
 std::vector<std::string> ChainView::exactchains(const std::string& containing) const
 {

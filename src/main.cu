@@ -70,6 +70,9 @@ PYBIND11_MODULE(ctpwa, m)
         .def("printExactChains", &DecayInfo::printExactChains,
              pybind11::arg("containing") = "",
              "扁平打印全部完整链串(一行一条, 首行 # 计数); 可直接存为 chains_exact 外部文件")
+        .def("printParamNames", &DecayInfo::printParamNames,
+             pybind11::arg("containing") = "",
+             "扁平打印全部拟合参数名(chain×step: 链/步耦合 + 末尾 θ 段; 下标与 parameters.txt 一致)")
         .def("amplitudes", &DecayInfo::amplitudes,
              pybind11::arg("chain") = -1, pybind11::arg("resonance") = "",
              "波名(_LS 格式); chain<0=全部链, resonance 非空时按名字子串过滤");

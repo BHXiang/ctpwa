@@ -84,6 +84,9 @@ public:
     // 扁平打印全部完整链串(一行一条, 首行 # 计数; containing 非空时过滤)
     // 输出可直接保存为 chains_exact 外部文件(自动跳过 # 注释)
     void printExactChains(const std::string &containing = "") const;
+    // 扁平打印全部拟合参数名(chain×step 耦合段: 链参数+步参数; 末尾共振态 θ 段;
+    // 下标与拟合参数向量/parameters.txt 一致; containing 非空时只打印含它的参数)
+    void printParamNames(const std::string &containing = "") const;
     // 波名: chain<0 = 全部链; resonance 非空时只返回名字含该子串的
     std::vector<std::string> amplitudes(int chain = -1,
                                         const std::string &resonance = "") const;
