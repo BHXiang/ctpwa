@@ -3236,50 +3236,59 @@ public:
 
             cudaSetDevice(primary_dev);
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+            // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
+            // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
+            const int kPhspBatch = 150000;  // 150k 事件/块 ≈ 3×29×16×150k ≈ 209MB
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
-
-                int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-                ctComplex* d_phsp_scaled;
-                cudaMalloc(&d_phsp_scaled, nPhsp_total * sizeof(ctComplex));
-                cudaMemcpy(d_phsp_scaled, d_all_amplitudes_[gpu],
-                           nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
                 const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
-                int grid = (nPhsp_total + 255) / 256;
-                scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
-                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
-
-                ctComplex* d_phsp_gpu;
-                cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                 cublasHandle_t h;
                 cublasCreate(&h);
                 ctComplex alpha = ctMake(1.0f, 0.0f);
-                ctComplex beta  = ctMake(0.0f, 0.0f);
-                CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
-                    &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
-                    &beta, d_phsp_gpu, n_amplitudes_);
-                cublasDestroy(h);
-                cudaFree(d_phsp_scaled);
+                for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
+                    int nch = std::min(kPhspBatch, nPhsp - c0);
+                    int nTot = nch * n_polar_ * n_amplitudes_;
+                    ctComplex* d_phsp_scaled;
+                    cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
+                    // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
+                    cudaMemcpy(d_phsp_scaled,
+                        d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
+                        nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                    int grid = (nTot + 255) / 256;
+                    scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled,
+                        d_w ? d_w + c0 : nullptr, nch, n_polar_, n_amplitudes_,
+                        1.0 / W_total, 0);
 
-                if (gpu == (size_t)primary_dev) {
-                    ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
-                    cudaFree(d_phsp_gpu);
-                } else {
-                    cudaSetDevice(primary_dev);
-                    ctComplex* d_temp;
-                    cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                    cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                        n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                    cudaSetDevice(gpu);
-                    cudaFree(d_phsp_gpu);
-                    cudaSetDevice(primary_dev);
-                    ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
-                    cudaFree(d_temp);
+                    ctComplex* d_phsp_gpu;
+                    cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                    ctComplex beta = ctMake(0.0f, 0.0f);
+                    CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nch * n_polar_,
+                        &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
+                        &beta, d_phsp_gpu, n_amplitudes_);
+                    cudaFree(d_phsp_scaled);
+
+                    if (gpu == (size_t)primary_dev) {
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                        cudaFree(d_phsp_gpu);
+                    } else {
+                        cudaSetDevice(primary_dev);
+                        ctComplex* d_temp;
+                        cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                        cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
+                            n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                        cudaSetDevice(gpu);
+                        cudaFree(d_phsp_gpu);
+                        cudaSetDevice(primary_dev);
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                        cudaFree(d_temp);
+                        cudaSetDevice(gpu);
+                    }
                 }
+                cublasDestroy(h);
             }
         }
         }  // if (!phsp_freed_) (getHessian phsp 矩阵重建)
