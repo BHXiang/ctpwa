@@ -241,6 +241,22 @@ static int tuneChunkCount(cublasHandle_t h, int nA, int nT,
 // （50 万事件 float32 累加有 ~1e-4 相对系统偏差，导致 ln(mean f) 与
 // tf-pwa (float64) 差 ~2.4e-4 → NLL 差 ~2.4）
 // -----------------------------------------------------------------------------
+// 就地: x_j = conj(S_j) · (w_ev/W_total)（S 用完覆盖为 d_P_vec 的 CGEMV 输入 x）
+// 布局: S 为 [nEvents × n_polar]，每事件 n_polar 个极化相邻；权重按事件索引。
+__global__ void scaleConjForGradPKernel(
+    ctComplex* __restrict__ d_S, const double* __restrict__ d_w,
+    int nEvents, int nPolar, double inv_W_total)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int nTotal = nEvents * nPolar;
+    if (i >= nTotal) return;
+    int evt = i / nPolar;   // 极化快变 → 事件 = i/nPolar
+    double scale = (d_w != nullptr) ? d_w[evt] * inv_W_total : inv_W_total;
+    ctFloat s = ctCastFloat(scale);
+    ctComplex v = d_S[i];
+    d_S[i] = ctMake(s * v.x, -s * v.y);   // conj(S)·scale
+}
+
 __global__ void computePhspMeanKernel(
     const ctComplex* __restrict__ d_S,   // S = A^T·v [nEvents × n_polar]
     double* __restrict__ d_sum,          // Σ f_ev（double 累加）
@@ -267,6 +283,64 @@ __global__ void computePhspMeanKernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) atomicAdd(d_sum, s_f_partial[0]);
+}
+
+// 一次 phsp 扫描同时给出:
+//   (1) phsp_sum = Σ_ev,p |S_ev,p|²（double 累加，语义与 computePhspMeanSum 完全一致）
+//   (2) d_P_out = Σ_ev,p (w_ev/W)·A_ev,p·conj(S_ev,p)（每 GPU 局部和）
+// 数学身份: d_P_out ≡ B̄·v̄（B̄ = Σ(w/W)AA^H），免去每 forward 的 7.2GB B̄ 加权副本重建
+//（S = A^T·v 一次 CGEMV → Σ|S|² → x = conj(S)·scale → d_P_out = A·x 第二次 CGEMV）。
+// 仅 free-θ 常驻模式调用（fixed-θ 用构造期预建 B̄ 的 computeQuadraticForm 快速路径）。
+double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_w, int nEvents, int n_polar, int n_amplitudes,
+    double inv_W_total, ctComplex* d_P_out)
+{
+    const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;
+    static std::vector<ctComplex*> s_dS;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_sum;
+    static std::vector<int> s_alloc_n;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_dS.size() <= dev) {
+        s_dS.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr);
+        s_d_sum.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < nTotal || s_handle[dev] == nullptr) {
+        if (s_dS[dev]) cudaFree(s_dS[dev]);
+        if (s_d_sum[dev]) cudaFree(s_d_sum[dev]);
+        if (s_handle[dev]) cublasDestroy(s_handle[dev]);
+        cudaMalloc(&s_dS[dev], nTotal * sizeof(ctComplex));
+        cudaMalloc(&s_d_sum[dev], sizeof(double));
+        cublasCreate(&s_handle[dev]);
+        s_alloc_n[dev] = nTotal;
+    }
+    ctComplex a1 = ctMake(1, 0), b0 = ctMake(0, 0);
+    // S = A^T·v（phsp 段；与 computePhspMeanSum 相同的 CGEMV）
+    CUBLAS_CGEMV(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal, &a1,
+                 d_amp, strideA, d_vector, 1, &b0, s_dS[dev], 1);
+    // phsp_sum = Σ|S|² double 累加
+    cudaMemset(s_d_sum[dev], 0, sizeof(double));
+    int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
+    computePhspMeanKernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    // x = conj(S)·(w/W) 就地（S 已用完）
+    int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
+    scaleConjForGradPKernel<<<gridX, kBlockSize>>>(s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
+    // d_P_out = A·x（每 GPU 局部和；n_amplitudes 输出）
+    CUBLAS_CGEMV(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal, &a1,
+                 d_amp, strideA, s_dS[dev], 1, &b0, d_P_out, 1);
+    // 共轭约定: 梯度按 ∂L/∂conj(v)（torch complex 约定）→ phsp 项须为 conj(A)·S 方向。
+    // 上面 A·conj(S) = conj(conj(A)·S)，故对输出再取共轭得 conj(A)·S（与 data 梯度同向）。
+    {
+        int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        conjugateKernel<<<gOut, kBlockSize>>>(d_P_out, n_amplitudes);
+    }
+    double h_sum = 0.0;
+    cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
+    return h_sum;
 }
 
 double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,

@@ -674,14 +674,14 @@ public:
         TORCH_CHECK(params_mgr && params_mgr->initialized(), "Parameters not initialized");
         bool tprof = getenv("CTPWA_PROF") != nullptr;
         auto tF0 = std::chrono::high_resolution_clock::now();
-        // phsp 矩阵/梯度段的持久化缓冲（懒分配，避免每次 forward 的 cublasCreate/cudaMalloc）
-        static std::vector<ctComplex*> s_d_phsp_scaled;
-        static std::vector<ctComplex*> s_d_phsp_gpu;
-        static std::vector<cublasHandle_t> s_phsp_handle;
-        static std::vector<int> s_phsp_alloc_sz;   // 每 GPU 已分配的 nPhsp_total
-        static std::vector<int> s_phsp_mat_sz;     // 已分配的矩阵大小（nA*nA）
-        static std::vector<ctComplex*> s_d_S_bufs;
+        // phsp 梯度段的持久化缓冲（懒分配，避免每次 forward 的 cublasCreate/cudaMalloc）
+        static std::vector<cublasHandle_t> s_phsp_handle;   // phsp CGEMV（θ 段 S 也用）
+        static std::vector<ctComplex*> s_d_S_bufs;          // θ 段 S = A^T·v
         static std::vector<int> s_dS_alloc_sz;
+        static std::vector<ctComplex*> s_d_P_part;          // free-θ: 每 GPU 局部 d_P_vec
+        static std::vector<int> s_d_P_part_sz;
+        static ctComplex* s_d_P_peer = nullptr;             // free-θ: 主 GPU 规约临时
+        static int s_d_P_peer_sz = 0;
 
         // 0. 拆分 params → vector + theta
         torch::Tensor vector, theta;
@@ -754,9 +754,48 @@ public:
                 std::chrono::duration<double, std::milli>(t1_reamp - t0_reamp).count(),
                 std::chrono::duration<double, std::milli>(t2_reamp - t1_reamp).count());
 
-            // 更新 d_phsp_matrix_（振幅已变，phsp 矩阵需同步）
+        }
+
+        tF2 = std::chrono::high_resolution_clock::now();  // reAmp+T 完成
+        // (free-θ 的 B̄ 重建已移除: d_P_vec 由下方 phsp_factor 融合扫描直接给出,
+        //  免 7.2GB 加权副本; fixed-θ 仍用构造期预建 B̄ 的快速 matvec)
+
+        // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
+        //   fixed-θ（常驻或流式）: B̄ 构造期就绪 → computeQuadraticForm 快速 matvec
+        //   free-θ:  B̄ 不再每 forward 重建（删 7.2GB 加权副本）;
+        //            phsp_factor 与 d_P_vec 由一次融合扫描直接给出
+        //            d_P_vec = Σ_ev,p (w/W)·A·conj(S) ≡ B̄·v̄
+        bool free_theta = (amp_calc && n_free_res > 0 && theta.numel() > 0);
+        cudaSetDevice(primary_dev);
+        ctComplex* d_P_vec;
+        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
+        double phsp_sum = 0.0;
+        int total_phsp_evts = 0;
+        if (d_phsp_matrix_double_ != nullptr) {
+            // phsp 流式模式: 原始 phsp 振幅不驻留，phsp_sum = Re(v^H M_double v)（主 GPU）
+            TORCH_CHECK(n_free_res == 0,
+                "phsp 流式模式（free_phsp_amplitudes）要求无自由共振态参数");
             cudaSetDevice(primary_dev);
-            // Pre-compute total phsp weight for correct global normalization
+            const ctComplex* d_v_primary = reinterpret_cast<const ctComplex*>(
+                extended_vector.data_ptr());
+            phsp_sum = computeDoublePhspSum(d_phsp_matrix_double_, d_v_primary,
+                                            n_amplitudes_);
+            for (int gpu = 0; gpu < num_gpus; ++gpu) total_phsp_evts += events_list[gpu][0];
+            // fixed-θ（n_free_res==0 必成立）: 构造期预建 B̄ → matvec
+            ctPhspReal* d_phsp_r, * d_phsp_i;
+            cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
+            cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
+            {
+                torch::Tensor extended_vector_conj = extended_vector.conj();
+                const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
+                computeQuadraticForm(d_phsp_matrix_, d_vec_conj, d_P_vec,
+                    d_phsp_r, d_phsp_i, n_amplitudes_);
+            }
+            cudaFree(d_phsp_r);
+            cudaFree(d_phsp_i);
+        } else if (free_theta) {
+            // free-θ 常驻: phsp_factor 与 d_P_vec 一次融合扫描（免 B̄ 重建）
+            //（phsp_factor 语义与 computePhspMeanSum 一致: double 累加 Σ|S|²）
             double W_total = 0.0;
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nP = events_list[gpu][0];
@@ -771,101 +810,67 @@ public:
             }
             if (W_total <= 0.0) W_total = 1.0;
             cudaSetDevice(primary_dev);
-            tF2 = std::chrono::high_resolution_clock::now();  // W_total reduce 完成
-
-            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-            if ((int)s_phsp_handle.size() < num_gpus) {
-                s_d_phsp_scaled.resize(num_gpus, nullptr);
-                s_d_phsp_gpu.resize(num_gpus, nullptr);
-                s_phsp_handle.resize(num_gpus, nullptr);
-                s_phsp_alloc_sz.assign(num_gpus, 0);
-                s_phsp_mat_sz.assign(num_gpus, 0);
+            if ((int)s_d_P_part.size() < num_gpus) {
+                s_d_P_part.resize(num_gpus, nullptr);
+                s_d_P_part_sz.assign(num_gpus, 0);
+            }
+            if (s_d_P_peer_sz < n_amplitudes_) {
+                if (s_d_P_peer) cudaFree(s_d_P_peer);
+                cudaMalloc(&s_d_P_peer, n_amplitudes_ * sizeof(ctComplex));
+                s_d_P_peer_sz = n_amplitudes_;
             }
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
-                int nPhsp = events_list[gpu][0];
-                if (nPhsp == 0) continue;
+                int nP = events_list[gpu][0];
+                if (nP == 0) continue;
                 cudaSetDevice(gpu);
-                if (!s_phsp_handle[gpu]) cublasCreate(&s_phsp_handle[gpu]);
-
-                int nPhsp_total = nPhsp * n_polar_ * n_amplitudes_;
-                int nMat = n_amplitudes_ * n_amplitudes_;
-                if (s_phsp_alloc_sz[gpu] < nPhsp_total) {
-                    if (s_d_phsp_scaled[gpu]) cudaFree(s_d_phsp_scaled[gpu]);
-                    cudaMalloc(&s_d_phsp_scaled[gpu], nPhsp_total * sizeof(ctComplex));
-                    s_phsp_alloc_sz[gpu] = nPhsp_total;
+                if ((int)s_phsp_handle.size() < num_gpus) s_phsp_handle.resize(num_gpus, nullptr);
+                if (!s_phsp_handle[gpu]) cublasCreate(&s_phsp_handle[gpu]);   // θ 段 S CGEMV 共用
+                if (s_d_P_part_sz[gpu] < n_amplitudes_) {
+                    if (s_d_P_part[gpu]) cudaFree(s_d_P_part[gpu]);
+                    cudaMalloc(&s_d_P_part[gpu], n_amplitudes_ * sizeof(ctComplex));
+                    s_d_P_part_sz[gpu] = n_amplitudes_;
                 }
-                if (s_phsp_mat_sz[gpu] < nMat) {
-                    if (s_d_phsp_gpu[gpu]) cudaFree(s_d_phsp_gpu[gpu]);
-                    cudaMalloc(&s_d_phsp_gpu[gpu], nMat * sizeof(ctComplex));
-                    s_phsp_mat_sz[gpu] = nMat;
-                }
-                ctComplex* d_phsp_scaled = s_d_phsp_scaled[gpu];
-                cudaMemcpy(d_phsp_scaled, d_all_amplitudes_list[gpu],
-                           nPhsp_total * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
-                const double* d_w = (gpu < (int)d_phsp_weights_list.size()) ? d_phsp_weights_list[gpu] : nullptr;
-                int grid = (nPhsp_total + 255) / 256;
-                scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled, d_w,
-                    nPhsp, n_polar_, n_amplitudes_, 1.0 / W_total, 0);
-
-                ctComplex* d_phsp_gpu = s_d_phsp_gpu[gpu];
-                ctComplex alpha = ctMake(1.0f, 0.0f);
-                ctComplex beta  = ctMake(0.0f, 0.0f);
-                CUBLAS_CGEMM(s_phsp_handle[gpu], CUBLAS_OP_N, CUBLAS_OP_C,
-                    n_amplitudes_, n_amplitudes_, nPhsp * n_polar_,
-                    &alpha, d_phsp_scaled, n_amplitudes_,
-                    d_phsp_scaled, n_amplitudes_,
-                    &beta, d_phsp_gpu, n_amplitudes_);
-
-                if (gpu == primary_dev) {
-                    ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, nMat);
-                } else {
-                    cudaSetDevice(primary_dev);
-                    ctComplex* d_temp;
-                    cudaMalloc(&d_temp, nMat * sizeof(ctComplex));
-                    cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                        nMat * sizeof(ctComplex));
-                    cudaSetDevice(gpu);
-                    cudaSetDevice(primary_dev);
-                    ctComplex one = ctMake(1.0f, 0.0f);
-                    axpyComplex(d_phsp_matrix_, d_temp, one, nMat);
-                    cudaFree(d_temp);
+                const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
+                    extended_vec_per_gpu[gpu].data_ptr());
+                const double* d_w = (gpu < (int)d_phsp_weights_list.size())
+                    ? d_phsp_weights_list[gpu] : nullptr;
+                phsp_sum += computePhspMeanSumAndGradP(d_all_amplitudes_list[gpu], d_v_gpu,
+                    d_w, nP, n_polar_, n_amplitudes_, 1.0 / W_total, s_d_P_part[gpu]);
+                total_phsp_evts += nP;
+            }
+            // 跨 GPU 规约局部 d_P_vec → 主 GPU d_P_vec
+            cudaSetDevice(primary_dev);
+            cudaMemset(d_P_vec, 0, n_amplitudes_ * sizeof(ctComplex));
+            {
+                ctComplex one = ctMake(1.0f, 0.0f);
+                for (int gpu = 0; gpu < num_gpus; ++gpu) {
+                    int nP = events_list[gpu][0];
+                    if (nP == 0) continue;
+                    if (gpu == primary_dev) {
+                        axpyComplex(d_P_vec, s_d_P_part[gpu], one, n_amplitudes_);
+                    } else {
+                        cudaMemcpyPeer(s_d_P_peer, primary_dev, s_d_P_part[gpu], gpu,
+                            n_amplitudes_ * sizeof(ctComplex));
+                        cudaSetDevice(primary_dev);
+                        axpyComplex(d_P_vec, s_d_P_peer, one, n_amplitudes_);
+                    }
                 }
             }
-        }
-
-        tF3 = std::chrono::high_resolution_clock::now();  // phsp 矩阵 CGEMM 完成
-
-        // 3. 全局量: d_P_vec和phsp_factor（小矩阵M<100，用自定义核替代cuBLAS更快）
-        cudaSetDevice(primary_dev);
-        ctComplex* d_P_vec;
-        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
-        ctPhspReal* d_phsp_r, * d_phsp_i;
-        cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
-        cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
-        {
-            torch::Tensor extended_vector_conj = extended_vector.conj();
-            const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
-            computeQuadraticForm(d_phsp_matrix_, d_vec_conj, d_P_vec,
-                d_phsp_r, d_phsp_i, n_amplitudes_);
-        }
-        cudaFree(d_phsp_r);
-        cudaFree(d_phsp_i);
-        // phsp_factor = mean f: Σ f_ev 用 double 累加（float32 phsp 矩阵求和在
-        // 50 万事件上有 ~1e-4 相对系统偏差 → NLL 与 tf-pwa (float64) 差 ~2.4）
-        double phsp_sum = 0.0;
-        int total_phsp_evts = 0;
-        if (d_phsp_matrix_double_ != nullptr) {
-            // phsp 流式模式: 原始 phsp 振幅不驻留，phsp_sum = Re(v^H M_double v)（主 GPU）
-            TORCH_CHECK(n_free_res == 0,
-                "phsp 流式模式（free_phsp_amplitudes）要求无自由共振态参数");
-            cudaSetDevice(primary_dev);
-            const ctComplex* d_v_primary = reinterpret_cast<const ctComplex*>(
-                extended_vector.data_ptr());
-            phsp_sum = computeDoublePhspSum(d_phsp_matrix_double_, d_v_primary,
-                                            n_amplitudes_);
-            for (int gpu = 0; gpu < num_gpus; ++gpu) total_phsp_evts += events_list[gpu][0];
         } else {
+            // fixed-θ 常驻: B̄ 构造期预建（forward 不重建）→ matvec（快速路径）
+            ctPhspReal* d_phsp_r, * d_phsp_i;
+            cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
+            cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
+            {
+                torch::Tensor extended_vector_conj = extended_vector.conj();
+                const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
+                computeQuadraticForm(d_phsp_matrix_, d_vec_conj, d_P_vec,
+                    d_phsp_r, d_phsp_i, n_amplitudes_);
+            }
+            cudaFree(d_phsp_r);
+            cudaFree(d_phsp_i);
+            // phsp_factor = mean f: Σ f_ev 用 double 累加（float32 phsp 矩阵求和在
+            // 50 万事件上有 ~1e-4 相对系统偏差 → NLL 与 tf-pwa (float64) 差 ~2.4）
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nP = events_list[gpu][0];
                 if (nP == 0) continue;
@@ -879,7 +884,8 @@ public:
         }
         double phsp_factor = (total_phsp_evts > 0) ? phsp_sum / total_phsp_evts : 0.0;
         cudaSetDevice(primary_dev);
-        tF4 = std::chrono::high_resolution_clock::now();  // phsp_factor D2H 完成
+        tF3 = std::chrono::high_resolution_clock::now();  // phsp_factor/d_P_vec（free-θ 融合扫描）完成
+        tF4 = tF3;  // （原 B̄ CGEMM 段已删；D2H 计入 tF3 段）
 
         // //输出 d_P_vec 检查
         // std::vector<ctComplex> h_P_vec(n_amplitudes_);
@@ -1227,9 +1233,9 @@ public:
             auto tFend = std::chrono::high_resolution_clock::now();
             auto ms = [](auto a, auto b) {
                 return std::chrono::duration<double, std::milli>(b - a).count(); };
-            printf("[PROF] f.extend: %.2f | f.reAmp+T: %.2f | f.Wred: %.2f | f.phspM: %.2f | f.quad+D2H: %.2f | f.nll: %.2f | f.gradRes: %.2f | f.tail: %.2f\n",
-                ms(tF0, tF1), ms(tF1, t2_reamp), ms(t2_reamp, tF2), ms(tF2, tF3),
-                ms(tF3, tF4), ms(tF4, t6_nll), ms(t6_nll, t7_rg), ms(t7_rg, tFend));
+            printf("[PROF] f.extend: %.2f | f.reAmp+T: %.2f | f.phspFactor+dPvec: %.2f | f.nll: %.2f | f.gradRes: %.2f | f.tail: %.2f\n",
+                ms(tF0, tF1), ms(tF1, t2_reamp), ms(t2_reamp, tF3),
+                ms(tF3, t6_nll), ms(t6_nll, t7_rg), ms(t7_rg, tFend));
         }
         return torch::tensor(loss, torch::kDouble).to(vector.device());
     }

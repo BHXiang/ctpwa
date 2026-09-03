@@ -36,6 +36,14 @@ void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n);
 double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
     int nEvents, int n_polar, int n_amplitudes);
 
+// free-θ 常驻模式: 一次 phsp 扫描同时给出 phsp_sum（语义同 computePhspMeanSum）
+// 与 v 梯度 phsp 项 d_P_vec = Σ_ev,p (w_ev/W)·A_ev,p·conj(S_ev,p)（每 GPU 局部和，
+// 调用方负责跨 GPU 求和）。数学身份 d_P_vec ≡ B̄·v̄（B̄=Σ(w/W)AA^H），
+// 免去 free-θ 下每 forward 的 7.2GB B̄ 加权副本重建。
+double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vector,
+    const double* d_w, int nEvents, int n_polar, int n_amplitudes,
+    double inv_W_total, ctComplex* d_P_out);
+
 // 自定义核计算二次型 v^H·M·v，同时输出d_P_vec = M * v
 // M: n×n Hermitian矩阵(行主序), v: n维向量(已共轭), n: 维度(<~200)
 void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
