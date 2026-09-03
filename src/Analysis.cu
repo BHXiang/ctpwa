@@ -4218,7 +4218,8 @@ public:
         torch::Tensor hessian_in)
     {
         TORCH_CHECK(!float_amps_,
-            "precision:float 的 getFitFractions 路径尚未 float 化，请先用 precision:double");
+            "precision:float 的 getFitFractions/getEfficiency（phsp_truth 批振幅积分）"
+            "路径尚未 float 化，请先用 precision:double 调用分支比/效率分析");
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         if (hessian_in.numel() > 0)
