@@ -1223,7 +1223,8 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     const int site,
     const int n_amplitudes,
     const std::vector<std::vector<int>>& event_offsets,
-    const std::vector<std::vector<int>>& amp_offsets)
+    const std::vector<std::vector<int>>& amp_offsets,
+    bool out_float)
 {
     for (size_t i = 0; i < d_amplitudes.size(); ++i)
     {
@@ -1323,55 +1324,62 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
             if (nPol_here > 512) m = 3;
             if (nPol_here > 1024) m = 5;
         }
-        switch (m) {
-        case 2:
-            computeAmpsKernelT<0, 512><<<gridDim, blockDim>>>(
-                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
-                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
-                d_resonances, resonance_count, d_all_params, d_all_channels,
-                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
-                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
-                n_amplitudes, site, 0);
-            break;
-        case 3:
-            computeAmpsKernelT<0, 1024><<<gridDim, blockDim>>>(
-                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
-                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
-                d_resonances, resonance_count, d_all_params, d_all_channels,
-                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
-                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
-                n_amplitudes, site, 0);
-            break;
-        case 4:
-            for (int k0 = 0; k0 < nPol_here; k0 += 8)
-                computeAmpsKernelT<8, 8><<<gridDim, blockDim>>>(
-                    d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+        // 输出精度由第一实参推导（ctComplex*/float2*）——switch 只写一份，双实例化
+        auto launchAmps = [&](auto* out_amp) {
+            switch (m) {
+            case 2:
+                computeAmpsKernelT<0, 512><<<gridDim, blockDim>>>(
+                    out_amp, d_momenta_[i], d_slCombination_[i],
                     d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                     d_resonances, resonance_count, d_all_params, d_all_channels,
                     d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
-                    n_amplitudes, site, k0);
-            break;
-        case 5:
-            for (int k0 = 0; k0 < nPol_here; k0 += 16)
-                computeAmpsKernelT<16, 16><<<gridDim, blockDim>>>(
-                    d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
+                    n_amplitudes, site, 0);
+                break;
+            case 3:
+                computeAmpsKernelT<0, 1024><<<gridDim, blockDim>>>(
+                    out_amp, d_momenta_[i], d_slCombination_[i],
                     d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                     d_resonances, resonance_count, d_all_params, d_all_channels,
                     d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
-                    n_amplitudes, site, k0);
-            break;
-        default:  // 1 = A256：全量单 launch
-            computeAmpsKernelT<0, 256><<<gridDim, blockDim>>>(
-                d_amplitudes[i], d_momenta_[i], d_slCombination_[i],
-                d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
-                d_resonances, resonance_count, d_all_params, d_all_channels,
-                d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
-                nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
-                n_amplitudes, site, 0);
-            break;
-        }
+                    n_amplitudes, site, 0);
+                break;
+            case 4:
+                for (int k0 = 0; k0 < nPol_here; k0 += 8)
+                    computeAmpsKernelT<8, 8><<<gridDim, blockDim>>>(
+                        out_amp, d_momenta_[i], d_slCombination_[i],
+                        d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                        d_resonances, resonance_count, d_all_params, d_all_channels,
+                        d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                        nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                        n_amplitudes, site, k0);
+                break;
+            case 5:
+                for (int k0 = 0; k0 < nPol_here; k0 += 16)
+                    computeAmpsKernelT<16, 16><<<gridDim, blockDim>>>(
+                        out_amp, d_momenta_[i], d_slCombination_[i],
+                        d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                        d_resonances, resonance_count, d_all_params, d_all_channels,
+                        d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                        nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                        n_amplitudes, site, 0);
+                break;
+            default:  // 1 = A256：全量单 launch
+                computeAmpsKernelT<0, 256><<<gridDim, blockDim>>>(
+                    out_amp, d_momenta_[i], d_slCombination_[i],
+                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    d_resonances, resonance_count, d_all_params, d_all_channels,
+                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
+                    n_amplitudes, site, 0);
+                break;
+            }
+        };
+        if (out_float)
+            launchAmps(reinterpret_cast<float2*>(d_amplitudes[i]));
+        else
+            launchAmps(d_amplitudes[i]);
 
         cudaDeviceSynchronize();
 
@@ -2696,35 +2704,42 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (nPol_first > 512) m = 3;
                 if (nPol_first > 1024) m = 5;
             }
-            switch (m) {
-            case 2:
-                computeCustomAmpsKernelT<0, 512><<<gridC, blockSize>>>(
-                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
-                break;
-            case 3:
-                computeCustomAmpsKernelT<0, 1024><<<gridC, blockSize>>>(
-                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
-                break;
-            case 4:
-                for (int k0 = 0; k0 < nPol_first; k0 += 8)
-                    computeCustomAmpsKernelT<8, 8><<<gridC, blockSize>>>(
-                        d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
-                break;
-            case 5:
-                for (int k0 = 0; k0 < nPol_first; k0 += 16)
-                    computeCustomAmpsKernelT<16, 16><<<gridC, blockSize>>>(
-                        d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
-                break;
-            default:  // 1 = A256：全量单 launch
-                computeCustomAmpsKernelT<0, 256><<<gridC, blockSize>>>(
-                    d_amplitudes[gpu], d_ad_desc_[gpu], nblocks, sl_start,
-                    d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
-                break;
-            }
+            // 输出精度由第一实参推导（ctComplex*/float2*）
+            auto launchCustom = [&](auto* out_amp) {
+                switch (m) {
+                case 2:
+                    computeCustomAmpsKernelT<0, 512, std::remove_pointer_t<decltype(out_amp)>> <<<gridC, blockSize>>>(
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                    break;
+                case 3:
+                    computeCustomAmpsKernelT<0, 1024, std::remove_pointer_t<decltype(out_amp)>> <<<gridC, blockSize>>>(
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                    break;
+                case 4:
+                    for (int k0 = 0; k0 < nPol_first; k0 += 8)
+                        computeCustomAmpsKernelT<8, 8, std::remove_pointer_t<decltype(out_amp)>> <<<gridC, blockSize>>>(
+                            out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                            d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
+                    break;
+                case 5:
+                    for (int k0 = 0; k0 < nPol_first; k0 += 16)
+                        computeCustomAmpsKernelT<16, 16, std::remove_pointer_t<decltype(out_amp)>> <<<gridC, blockSize>>>(
+                            out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                            d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
+                    break;
+                default:  // 1 = A256：全量单 launch
+                    computeCustomAmpsKernelT<0, 256, std::remove_pointer_t<decltype(out_amp)>> <<<gridC, blockSize>>>(
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                        d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
+                    break;
+                }
+            };
+            if (float_out_)
+                launchCustom(reinterpret_cast<float2*>(d_amplitudes[gpu]));
+            else
+                launchCustom(d_amplitudes[gpu]);
         }
 
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，

@@ -175,7 +175,8 @@ public:
         const int site,
         const int n_amplitudes,
         const std::vector<std::vector<int>>& event_offsets,
-        const std::vector<std::vector<int>>& amp_offsets);
+        const std::vector<std::vector<int>>& amp_offsets,
+        bool out_float = false);  // true: 振幅写 float2（混合精度，双倍率内存）
 
     // 衰变顶点 SL 列表的最小 L（tf 宽度约定 Lmin；未找到返回 0）
     int getNodeLMin(const std::string& mother_name) const;
@@ -363,8 +364,13 @@ public:
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
     const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
+    // 混合精度: 振幅缓冲按 float2 存储（config precision:float）。由 analysis
+    // initialize 设置；reComputeAmps 的写出与读取按此选实例。
+    void setFloatOutput(bool v) { float_out_ = v; }
+    bool floatOutput() const { return float_out_; }
 
 private:
+    bool float_out_ = false;
     std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放
     std::vector<ResBlock> blocks_;
     std::vector<ParamSlot> slots_;
