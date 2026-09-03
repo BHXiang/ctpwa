@@ -121,3 +121,16 @@ constexpr auto TORCH_COMPLEX_STR = "complex64";
 constexpr auto PRECISION_NAME = "float";
 
 #endif
+
+// ====================================================================
+// 通用 float2 复数辅助（混合精度用: double .so + config precision:float 时
+// A/S/w 等内存大户按 float2 存储/计算。不依赖编译精度宏，两分支均可用）
+// ====================================================================
+inline __host__ __device__ float2 cfMake(float re, float im) { return make_float2(re, im); }
+inline __host__ __device__ float2 cfConj(float2 a) { return make_float2(a.x, -a.y); }
+inline __host__ __device__ float2 cfMul(float2 a, float2 b) {
+    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+inline __host__ __device__ float2 cfAdd(float2 a, float2 b) { return make_float2(a.x + b.x, a.y + b.y); }
+inline __host__ __device__ float2 cfScale(float2 a, float s) { return make_float2(a.x * s, a.y * s); }
+inline __host__ __device__ double cfAbsSq(float2 a) { return (double)a.x * a.x + (double)a.y * a.y; }

@@ -53,4 +53,28 @@ void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
 // 由流式分块构建，替代 computePhspMeanSum 的原始振幅扫描）。当前设备须为调用方指定。
 double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, int n);
 
+// ===========================================================================
+// 混合精度（config precision:float，double .so 内）float 变体:
+//   A 驻留 float2（8B），耦合 v 恒 double（调用内 downcast 一份 float 副本喂 Sgemv），
+//   S/w 缓冲 float2，逐事件 factor 用 double 累加（float2 读入 → double 平方和），
+//   -log/跨事件累加恒 double —— 与 V1/V2 nvcc 验证算法逐字一致。
+// 纯新增：double 路径不调用，调用点按 float_amps_ 分派。
+// ===========================================================================
+
+// 语义同 computeFactorNLL；d_amp 为 float2 布局。d_grad_out / d_w_out 可选。
+// d_w_out（float2，仅共振梯度消费方需要）为 null 表示不输出。
+double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
+    ctComplex* d_grad_out, int nEvents, int n_polar, int n_amplitudes,
+    const double* d_weights = nullptr, float2* d_w_out = nullptr);
+
+// 语义同 computePhspMeanSum（Σ|A·v|² double 累加）；d_amp 为 float2 布局。
+double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
+    int nEvents, int n_polar, int n_amplitudes);
+
+// 语义同 computePhspMeanSumAndGradP；d_amp 为 float2 布局。
+// d_P_out 仍为 double（ctComplex）输出——float matvec 局部和 → double 累加。
+double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vector,
+    const double* d_w, int nEvents, int n_polar, int n_amplitudes,
+    double inv_W_total, ctComplex* d_P_out);
+
 #endif

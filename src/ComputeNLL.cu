@@ -759,3 +759,336 @@ double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, in
     cudaMemcpy(&h, s_out[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h;
 }
+
+// ===========================================================================
+// 混合精度 float 变体（double .so + config precision:float 专用，纯新增）:
+//   A 驻留 float2(8B)、v 恒 double（内部 downcast float2 副本喂 Sgemv）、
+//   S/w 缓冲 float2，逐事件 factor 用 double 累加（float2 读入 → double 平方和），
+//   -log/跨事件累加恒 double —— 与 V1/V2 nvcc 验证算法逐字一致。
+// 注意: 本文件同时被 double/float .so 编译；float .so 下这些函数不被调用
+// （float_amps_ 只在 double .so + precision:float 置位），但须可编译。
+// ===========================================================================
+
+// 逐事件: factor=Σ|S|²（double 累加, float2 读入）; 输出 w=S·weight/factor (float2);
+// NLL = -Σ log(factor)·weight（double 累加）—— 与 computeFactorsAndWeightsKernel 同语义
+__global__ void computeFactorsAndWeightsF2Kernel(
+    float2* __restrict__ d_S,          // 输入 S=A^T·v (float2)；输出 w (float2)
+    double* __restrict__ d_nll,
+    const double* __restrict__ d_weights, // 每event权重（null则=1）
+    int nEvents, int n_polar)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ double s_logf_partial[256];
+    double my_logf = 0.0;
+    if (evt < nEvents) {
+        float2* S_evt = d_S + (size_t)evt * n_polar;
+        double factor = 0.0;
+        for (int p = 0; p < n_polar; ++p) {
+            double x = (double)S_evt[p].x, y = (double)S_evt[p].y;
+            factor += x * x + y * y;
+        }
+        double weight = (d_weights != nullptr) ? d_weights[evt] : 1.0;
+        if (factor == 0.0) {
+            my_logf = -log(1e-10) * weight;
+            for (int p = 0; p < n_polar; ++p) S_evt[p] = make_float2(0.0f, 0.0f);
+        } else {
+            my_logf = -log(factor) * weight;
+            double inv_f = weight / factor;
+            const float kMaxW = 1e10f;
+            for (int p = 0; p < n_polar; ++p) {
+                float wx = (float)((double)S_evt[p].x * inv_f);
+                float wy = (float)((double)S_evt[p].y * inv_f);
+                wx = fminf(fmaxf(wx, -kMaxW), kMaxW);
+                wy = fminf(fmaxf(wy, -kMaxW), kMaxW);
+                S_evt[p] = make_float2(wx, wy);
+            }
+        }
+    }
+    s_logf_partial[threadIdx.x] = my_logf;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) s_logf_partial[threadIdx.x] += s_logf_partial[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(d_nll, s_logf_partial[0]);
+}
+
+// 就地共轭 float2: y = -y
+__global__ void conjugateF2Kernel(float2* __restrict__ data, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) data[i].y = -data[i].y;
+}
+
+// 每事件 Σ|S|² double 累加（float2 读入）—— phsp 均值 float 变体
+__global__ void computePhspMeanF2Kernel(
+    const float2* __restrict__ d_S, double* __restrict__ d_sum,
+    int nEvents, int n_polar)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ double s_f_partial[256];
+    double my_f = 0.0;
+    if (evt < nEvents) {
+        const float2* S_evt = d_S + (size_t)evt * n_polar;
+        double factor = 0.0;
+        for (int p = 0; p < n_polar; ++p) {
+            double x = (double)S_evt[p].x, y = (double)S_evt[p].y;
+            factor += x * x + y * y;
+        }
+        my_f = factor;
+    }
+    s_f_partial[threadIdx.x] = my_f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) s_f_partial[threadIdx.x] += s_f_partial[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(d_sum, s_f_partial[0]);
+}
+
+// 就地: x_j = conj(S_j)·(w_ev/W_total)（S float2 覆盖为 d_P_vec CGEMV 输入 x）
+__global__ void scaleConjForGradPF2Kernel(
+    float2* __restrict__ d_S, const double* __restrict__ d_w,
+    int nEvents, int nPolar, double inv_W_total)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int nTotal = nEvents * nPolar;
+    if (i >= nTotal) return;
+    int evt = i / nPolar;
+    double scale = (d_w != nullptr) ? d_w[evt] * inv_W_total : inv_W_total;
+    float s = (float)scale;
+    float2 v = d_S[i];
+    d_S[i] = make_float2(s * v.x, -s * v.y);   // conj(S)·scale
+}
+
+// 把 double 耦合 v downcast 成 float2 副本（喂 Sgemv；v 恒 double 真理源）
+__global__ void downcastV2F2Kernel(const ctComplex* __restrict__ v, float2* __restrict__ vf, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) vf[i] = make_float2((float)v[i].x, (float)v[i].y);
+}
+
+// float matvec 结果(float2) 累加进 double 目标（double 归约轨道）
+__global__ void addF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i].x += (double)src[i].x; dst[i].y += (double)src[i].y; }
+}
+
+// float matvec 结果取负累加进 double 目标: dst += -src（梯度 = -A·conj(w)）
+__global__ void negateAddF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { dst[i].x -= (double)src[i].x; dst[i].y -= (double)src[i].y; }
+}
+
+// cublasCgemv 的 float2 视图（float2 与 cuComplex 内存布局一致）
+static void cgemvF2(cublasHandle_t h, cublasOperation_t op, int m, int n,
+    const float2* A, int lda, const float2* x, float2* y, float beta_scale /*0=覆盖,1=累加*/)
+{
+    float2 alpha = make_float2(1.0f, 0.0f);
+    float2 beta = (beta_scale == 0.0f) ? make_float2(0.0f, 0.0f) : make_float2(1.0f, 0.0f);
+    // cublasCgemv 需要 cuComplex*：float2 布局相同（x=re,y=im），reinterpret 安全
+    cublasCgemv(h, op, m, n,
+        reinterpret_cast<const cuComplex*>(&alpha),
+        reinterpret_cast<const cuComplex*>(A), lda,
+        reinterpret_cast<const cuComplex*>(x), 1,
+        reinterpret_cast<const cuComplex*>(&beta),
+        reinterpret_cast<cuComplex*>(y), 1);
+}
+
+// ---- phsp 均值 float 变体: Σ_ev |A·v|²（double 累加），A float2 ----
+double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
+    int nEvents, int n_polar, int n_amplitudes)
+{
+    const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;
+    static std::vector<float2*> s_dS;
+    static std::vector<float2*> s_dv;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_sum;
+    static std::vector<int> s_alloc_n, s_alloc_v;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_dS.size() <= dev) {
+        s_dS.resize(dev + 1, nullptr); s_dv.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr); s_d_sum.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0); s_alloc_v.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < nTotal || s_handle[dev] == nullptr) {
+        if (s_dS[dev]) cudaFree(s_dS[dev]);
+        if (s_d_sum[dev]) cudaFree(s_d_sum[dev]);
+        if (s_handle[dev]) cublasDestroy(s_handle[dev]);
+        cudaMalloc(&s_dS[dev], (size_t)std::max(1, nTotal) * sizeof(float2));
+        cudaMalloc(&s_d_sum[dev], sizeof(double));
+        cublasCreate(&s_handle[dev]);
+        s_alloc_n[dev] = nTotal;
+    }
+    if (s_alloc_v[dev] < n_amplitudes) {
+        if (s_dv[dev]) cudaFree(s_dv[dev]);
+        cudaMalloc(&s_dv[dev], (size_t)std::max(1, n_amplitudes) * sizeof(float2));
+        s_alloc_v[dev] = n_amplitudes;
+    }
+    {
+        int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+    }
+    // S = A^T·v（float Cgemv；A float2 列主序）
+    cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
+        d_amp, (int)strideA, s_dv[dev], s_dS[dev], 0.0f);
+    cudaMemset(s_d_sum[dev], 0, sizeof(double));
+    int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
+    computePhspMeanF2Kernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    double h_sum = 0.0;
+    cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
+    return h_sum;
+}
+
+// ---- free-θ 常驻融合扫描 float 变体（语义同 computePhspMeanSumAndGradP）----
+double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vector,
+    const double* d_w, int nEvents, int n_polar, int n_amplitudes,
+    double inv_W_total, ctComplex* d_P_out)
+{
+    const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;
+    static std::vector<float2*> s_dS;
+    static std::vector<float2*> s_dv;
+    static std::vector<float2*> s_dPtmp;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_sum;
+    static std::vector<int> s_alloc_n, s_alloc_v, s_alloc_p;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_dS.size() <= dev) {
+        s_dS.resize(dev + 1, nullptr); s_dv.resize(dev + 1, nullptr);
+        s_dPtmp.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr); s_d_sum.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0); s_alloc_v.resize(dev + 1, 0); s_alloc_p.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < nTotal || s_handle[dev] == nullptr) {
+        if (s_dS[dev]) cudaFree(s_dS[dev]);
+        if (s_d_sum[dev]) cudaFree(s_d_sum[dev]);
+        if (s_handle[dev]) cublasDestroy(s_handle[dev]);
+        cudaMalloc(&s_dS[dev], (size_t)std::max(1, nTotal) * sizeof(float2));
+        cudaMalloc(&s_d_sum[dev], sizeof(double));
+        cublasCreate(&s_handle[dev]);
+        s_alloc_n[dev] = nTotal;
+    }
+    if (s_alloc_v[dev] < n_amplitudes) {
+        if (s_dv[dev]) cudaFree(s_dv[dev]);
+        cudaMalloc(&s_dv[dev], (size_t)std::max(1, n_amplitudes) * sizeof(float2));
+        s_alloc_v[dev] = n_amplitudes;
+    }
+    if (s_alloc_p[dev] < n_amplitudes) {
+        if (s_dPtmp[dev]) cudaFree(s_dPtmp[dev]);
+        cudaMalloc(&s_dPtmp[dev], (size_t)std::max(1, n_amplitudes) * sizeof(float2));
+        s_alloc_p[dev] = n_amplitudes;
+    }
+    {
+        int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+    }
+    // S = A^T·v（phsp 段 float Cgemv）
+    cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
+        d_amp, (int)strideA, s_dv[dev], s_dS[dev], 0.0f);
+    // phsp_sum = Σ|S|² double 累加
+    cudaMemset(s_d_sum[dev], 0, sizeof(double));
+    int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
+    computePhspMeanF2Kernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    // x = conj(S)·(w/W) 就地（S float2 已用完）
+    int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
+    scaleConjForGradPF2Kernel<<<gridX, kBlockSize>>>(s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
+    // d_P_tmp = A·x（float matvec；float2 部分和）
+    cgemvF2(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal,
+        d_amp, (int)strideA, s_dS[dev], s_dPtmp[dev], 0.0f);
+    // 累加进 double d_P_out 并整体共轭（与 double 版 conjugateKernel 收尾一致）。
+    // d_P_out 调用方未预清零（double 版靠 CGEMV beta=0 覆盖）→ 此处先清零保证覆盖语义
+    cudaMemset(d_P_out, 0, (size_t)std::max(1, n_amplitudes) * sizeof(ctComplex));
+    {
+        int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        addF2ToComplexKernel<<<gOut, kBlockSize>>>(s_dPtmp[dev], d_P_out, n_amplitudes);
+    }
+    {
+        int gC = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        conjugateKernel<<<gC, kBlockSize>>>(d_P_out, n_amplitudes);
+    }
+    double h_sum = 0.0;
+    cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
+    return h_sum;
+}
+
+// ---- data/bkg NLL float 变体（语义同 computeFactorNLL）----
+// d_amp: float2 布局；d_vector: double v（内部 downcast float 副本）；
+// d_grad_out: double 梯度（float 反向 matvec → double 累加）；
+// d_w_out: 可选 float2 w 输出（共振梯度 float 消费用）
+double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
+    ctComplex* d_grad_out,
+    int nEvents, int n_polar, int n_amplitudes,
+    const double* d_weights, float2* d_w_out)
+{
+    const int nTotal = nEvents * n_polar;
+    const long long strideA = (long long)n_amplitudes;
+    static std::vector<float2*> s_dS;
+    static std::vector<float2*> s_dv;
+    static std::vector<float2*> s_dGtmp;
+    static std::vector<cublasHandle_t> s_handle;
+    static std::vector<double*> s_d_nll;
+    static std::vector<int> s_alloc_n, s_alloc_v, s_alloc_g;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if ((int)s_dS.size() <= dev) {
+        s_dS.resize(dev + 1, nullptr); s_dv.resize(dev + 1, nullptr);
+        s_dGtmp.resize(dev + 1, nullptr);
+        s_handle.resize(dev + 1, nullptr); s_d_nll.resize(dev + 1, nullptr);
+        s_alloc_n.resize(dev + 1, 0); s_alloc_v.resize(dev + 1, 0); s_alloc_g.resize(dev + 1, 0);
+    }
+    if (s_alloc_n[dev] < nTotal || s_handle[dev] == nullptr) {
+        if (s_dS[dev]) cudaFree(s_dS[dev]);
+        if (s_d_nll[dev]) cudaFree(s_d_nll[dev]);
+        if (s_handle[dev]) cublasDestroy(s_handle[dev]);
+        cudaMalloc(&s_dS[dev], (size_t)std::max(1, nTotal) * sizeof(float2));
+        cudaMalloc(&s_d_nll[dev], sizeof(double));
+        cublasCreate(&s_handle[dev]);
+        s_alloc_n[dev] = nTotal;
+    }
+    if (s_alloc_v[dev] < n_amplitudes) {
+        if (s_dv[dev]) cudaFree(s_dv[dev]);
+        cudaMalloc(&s_dv[dev], (size_t)std::max(1, n_amplitudes) * sizeof(float2));
+        s_alloc_v[dev] = n_amplitudes;
+    }
+    if (s_alloc_g[dev] < n_amplitudes) {
+        if (s_dGtmp[dev]) cudaFree(s_dGtmp[dev]);
+        cudaMalloc(&s_dGtmp[dev], (size_t)std::max(1, n_amplitudes) * sizeof(float2));
+        s_alloc_g[dev] = n_amplitudes;
+    }
+    {
+        int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+    }
+    // S = A^T·v（float Cgemv）
+    cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
+        d_amp, (int)strideA, s_dv[dev], s_dS[dev], 0.0f);
+    // factor + w + NLL
+    cudaMemset(s_d_nll[dev], 0, sizeof(double));
+    int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
+    computeFactorsAndWeightsF2Kernel<<<gridBlocks, kBlockSize>>>(
+        s_dS[dev], s_d_nll[dev], d_weights, nEvents, n_polar);
+    double raw_nll;
+    cudaMemcpy(&raw_nll, s_d_nll[dev], sizeof(double), cudaMemcpyDeviceToHost);
+
+    if (d_w_out != nullptr) {
+        cudaMemcpy(d_w_out, s_dS[dev], (size_t)nTotal * sizeof(float2), cudaMemcpyDeviceToDevice);
+    }
+
+    // 梯度: grad = -A·conj(w)（float 反向 matvec → float2 部分和 → double 累加）
+    {
+        int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
+        conjugateF2Kernel<<<gradConj, kBlockSize>>>(s_dS[dev], nTotal);   // w → conj(w)
+        // A·conj(w)：beta=0 覆盖写 s_dGtmp（float matvec 单次，无需 chunk）
+        cgemvF2(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal,
+            d_amp, (int)strideA, s_dS[dev], s_dGtmp[dev], 0.0f);
+        // grad_out = -tmp（覆盖语义: double 版首 chunk beta=0 覆盖，调用方不预清零）
+        int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
+        cudaMemset(d_grad_out, 0, (size_t)std::max(1, n_amplitudes) * sizeof(ctComplex));
+        negateAddF2ToComplexKernel<<<gOut, kBlockSize>>>(s_dGtmp[dev], d_grad_out, n_amplitudes);
+        // 共轭约定（与 double 版收尾一致）: 输出再 conj
+        conjugateKernel<<<gOut, kBlockSize>>>(d_grad_out, n_amplitudes);
+    }
+    return raw_nll;
+}
