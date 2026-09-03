@@ -282,8 +282,10 @@ ConfigParser::ConfigParser(const std::string &config_file)
 
         // 链精确整链过滤器（Constraints.chains_exact, TFPWA chains.inp 兼容）：
         // 每条 = 一条完整衰变链串 "[a->b+c, b->d+e, ...]"（中间态名用共振态名替换），
-        // 精确匹配 → 只保留该级联并把匹配 intermediate 修剪到命中共振态（整链唯一）；
-        // 无命中级联 → 剔除。可内联列表或外部文件（每行一条, # 注释）。
+        // 精确匹配 → 该完整组合保留为一个独立链实例（每条命中链串指定了每一级
+        // 共振态, 整链唯一）; 同一级联拓扑命中多条 → 复制为多条单组合实例
+        // （不再按槽取并集: 同一槽多共振态会笛卡尔叉乘出输入没有的组合）;
+        // 无命中 → 剔除。可内联列表或外部文件（每行一条, # 注释）。
         if (config["Constraints"] && config["Constraints"]["chains_exact"]) {
             const auto& ce = config["Constraints"]["chains_exact"];
             if (ce.IsScalar()) {
@@ -353,7 +355,8 @@ ConfigParser::ConfigParser(const std::string &config_file)
         //       → 该 intermediate 内只留匹配共振态, 其余 intermediate 一律保留。
         //  ② Constraints.chains_exact  —— TFPWA chains.inp 兼容（精确整链串）
         //       每条 "[a->b+c, b->d+e, ...]"（中间态名用共振态名替换）精确匹配:
-        //       命中 → 保留该级联并修剪到命中共振态（整链唯一）; 无命中 → 剔除。
+        //       命中 → 该组合作为一个独立链实例保留（同一级联多命中 → 复制成
+        //       多个单组合实例, 输出 == 输入行）; 无命中 → 剔除。
         // ================================================================
         if ((!chain_filter_.empty() || !chain_exact_filter_.empty())
             && !decay_chains_.empty()) {
@@ -412,23 +415,53 @@ ConfigParser::ConfigParser(const std::string &config_file)
             }
 
             // ---- ② Constraints.chains_exact 精确整链过滤（TFPWA 兼容）----
+            // 语义: 每条命中的完整链串 = 一个独立链实例（输出 == 输入行）。
+            // 同一级联拓扑命中多条时, 若仍按槽取并集, 各槽多共振态会笛卡尔
+            // 叉乘出 chains.inp 里没有的组合（如 f2_1950 混入仅 f2_2340 指定的
+            // 二级共振态）; 因此改为复制级联并各自修剪到命中的单组合, 并用
+            // 共振态签名后缀保证实例名唯一。
             if (!chain_exact_filter_.empty()) {
                 std::set<std::string> exact_set;
                 for (const auto& s : chain_exact_filter_)
                     exact_set.insert(s);
                 std::vector<DecayChainConfig> kept;
                 for (auto& dc : decay_chains_) {
-                    std::map<std::string, std::set<std::string>> keep_pairs;
-                    bool any = false;
+                    // 本级联内命中的完整组合（按链串去重: 重复输入行只保留一次）
+                    std::vector<std::map<std::string, std::string>> hits;
+                    std::set<std::string> hit_seen;
                     for (const auto& combo : buildCombos(dc)) {
-                        if (exact_set.count(tfpwaString(dc, combo))) {
-                            any = true;
-                            for (const auto& [iname, r] : combo)
-                                keep_pairs[iname].insert(r);
-                        }
+                        std::string s = tfpwaString(dc, combo);
+                        if (exact_set.count(s) && hit_seen.insert(s).second)
+                            hits.push_back(combo);
                     }
-                    if (!any) continue; // 无精确命中 → 剔除
-                    if (pruneResonances(dc, keep_pairs)) kept.push_back(dc);
+                    if (hits.empty()) continue; // 无精确命中 → 剔除
+                    if (hits.size() == 1) {
+                        // 单命中: 原位修剪（名称与顺序不变, 行为同旧版）
+                        std::map<std::string, std::set<std::string>> kp;
+                        for (const auto& [iname, r] : hits[0])
+                            kp[iname].insert(r);
+                        if (pruneResonances(dc, kp))
+                            kept.push_back(std::move(dc));
+                        continue;
+                    }
+                    // 多命中: 每个命中组合复制一个独立链实例
+                    for (const auto& combo : hits) {
+                        DecayChainConfig inst = dc;
+                        std::map<std::string, std::set<std::string>> kp;
+                        for (const auto& [iname, r] : combo)
+                            kp[iname].insert(r);
+                        if (!pruneResonances(inst, kp)) continue;
+                        // 实例名唯一化: 追加共振态签名（按级联中间态顺序）
+                        std::string sig;
+                        for (const auto& rc : inst.resonance_chains) {
+                            auto it = combo.find(rc.intermediate);
+                            if (it == combo.end()) continue;
+                            if (!sig.empty()) sig += "_";
+                            sig += it->second;
+                        }
+                        if (!sig.empty()) inst.name += "_" + sig;
+                        kept.push_back(std::move(inst));
+                    }
                 }
                 std::cout << "Chain exact filter: " << kept.size() << "/"
                           << decay_chains_.size() << " chains selected" << std::endl;
