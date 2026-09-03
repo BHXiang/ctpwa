@@ -3308,9 +3308,16 @@ public:
                     ctComplex* d_phsp_scaled;
                     cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
                     // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
-                    cudaMemcpy(d_phsp_scaled,
-                        d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
-                        nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                    if (float_amps_) {
+                        const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
+                            + (size_t)c0 * n_polar_ * n_amplitudes_;
+                        castF2ToDouble2Kernel<<<(nTot + 255) / 256, 256>>>(
+                            srcF, reinterpret_cast<cuDoubleComplex*>(d_phsp_scaled), nTot);
+                    } else {
+                        cudaMemcpy(d_phsp_scaled,
+                            d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
+                            nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                    }
                     int grid = (nTot + 255) / 256;
                     scalePhspAmpsKernel<<<grid, 256>>>(d_phsp_scaled,
                         d_w ? d_w + c0 : nullptr, nch, n_polar_, n_amplitudes_,
