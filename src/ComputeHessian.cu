@@ -454,6 +454,28 @@ __global__ void computeSfromAmpsKernel(
     }
 }
 
+// float-A 版 S = A^T·v（A float2 读入、v double、输出交错 ctComplex S——θ 段共振梯度
+// phsp 用，与 CUBLAS_CGEMV 输出布局一致（double2 交错 [re,im]），免整段 double 上转）
+__global__ void computeSFromFloatAmpsKernel(
+    ctComplex* d_S,             // [nEv * nPol] double2 交错输出
+    const float2* d_amp,        // [nEv * nPol * n_amp] float2
+    const ctComplex* d_v,       // [n_amp] double
+    int nEvents, int nPolar, int n_amp)
+{
+    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    if (evt >= nEvents) return;
+    for (int p = 0; p < nPolar; ++p) {
+        double sre = 0.0, sim = 0.0;
+        for (int a = 0; a < n_amp; ++a) {
+            float2 amp_ap = d_amp[evt * nPolar * n_amp + p * n_amp + a];
+            ctComplex v_a = d_v[a];
+            sre += v_a.x * (double)amp_ap.x - v_a.y * (double)amp_ap.y;
+            sim += v_a.x * (double)amp_ap.y + v_a.y * (double)amp_ap.x;
+        }
+        d_S[evt * nPolar + p] = ctMake(sre, sim);
+    }
+}
+
 // ============================================================
 // 单节点 Bf 的 q0 链对共振态质量参数的一阶/二阶对数导数
 // O = Bf(L, q, q0, d), q0 = breakup(m0, md1, md2)；md1/md2 经回退等于某自由
@@ -1609,4 +1631,13 @@ void computeDataHessianContribGN(
 
     cublasDestroy(handle);
     cudaFree(dS); cudaFree(dI);
+}
+
+// float2 A 段 → double2 上转（float_amps_ 模式: A 存 float2, B̄/hessian 消费端按块上转）
+__global__ void castF2ToDouble2Kernel(
+    const float2* __restrict__ src, cuDoubleComplex* __restrict__ dst, int total)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    dst[i] = make_cuDoubleComplex((double)src[i].x, (double)src[i].y);
 }

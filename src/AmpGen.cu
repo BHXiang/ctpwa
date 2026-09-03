@@ -3145,7 +3145,23 @@ void AmpCalc::computeUnifiedHessian(
             int evt_off_c = evt_off + c0;             // 全局绝对事件起点
             // 权重数组按段内事件索引 → 窗口起点偏移 c0（nullptr 原样）
             const double* d_w_c = d_w ? d_w + c0 : nullptr;
-            const ctComplex* d_amp_c = d_amp + (size_t)evt_off_c * nPol * n_amp_total;
+            // float_amps_: A 驻留 float2。hessian kernel 保持 double（读 d_amp 为
+            // double2 语义）→ 本窗口先把 float2 A 段上转成 double 临时（峰值=窗口），
+            // kernel 零改动、数值与 double 逐位一致。double 模式直接用原 A。
+            const ctComplex* d_amp_c;
+            ctComplex* d_amp_dbl = nullptr;
+            if (float_out_) {
+                const float2* srcF = reinterpret_cast<const float2*>(d_amp)
+                    + (size_t)evt_off_c * nPol * n_amp_total;
+                cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(ctComplex));
+                int gUp = (int)(((size_t)nch * nPol * n_amp_total + 255) / 256);
+                castF2ToDouble2Kernel<<<gUp, 256>>>(
+                    srcF, reinterpret_cast<cuDoubleComplex*>(d_amp_dbl),
+                    (int)((size_t)nch * nPol * n_amp_total));
+                d_amp_c = d_amp_dbl;
+            } else {
+                d_amp_c = d_amp + (size_t)evt_off_c * nPol * n_amp_total;
+            }
 
         // Pre-pass: compute full S[p] = Σ_a v[a]·amp[a,e,p] and I[e] from raw amplitudes
         double *d_S_re, *d_S_im, *d_I_full;
@@ -3510,6 +3526,7 @@ void AmpCalc::computeUnifiedHessian(
             if (bt.d_gidx) cudaFree(bt.d_gidx);
         }
         cudaFree(d_S_re); cudaFree(d_S_im); cudaFree(d_I_full);
+        if (d_amp_dbl) cudaFree(d_amp_dbl);
         }  // for (c0 ...) 事件窗口循环
 
         // --- Accumulate remote GPU results to global buffers on primary_dev ---

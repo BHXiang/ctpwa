@@ -149,3 +149,12 @@ __global__ void scalePhspAmpsKernel(
     int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset);
 
 #endif
+
+// float2 A 段 → double2 上转（float_amps_ 模式: A 存 float2, B̄/hessian 消费端上转 double）
+__global__ void castF2ToDouble2Kernel(
+    const float2* __restrict__ src, cuDoubleComplex* __restrict__ dst, int total);
+
+// float-A 版 S=A^T·v（θ 段共振梯度 phsp 用；输出交错 ctComplex，免整段 double 上转）
+__global__ void computeSFromFloatAmpsKernel(
+    ctComplex* d_S, const float2* d_amp, const ctComplex* d_v,
+    int nEvents, int nPolar, int n_amp);
