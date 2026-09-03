@@ -364,8 +364,8 @@ public:
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
     const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
-    // 混合精度: 振幅缓冲按 float2 存储（config precision:float）。由 analysis
-    // initialize 设置；reComputeAmps 的写出与读取按此选实例。
+    // 混合精度: 振幅缓冲按 float2 存储（double .so 上 precision:float 或默认 auto）。
+    // 由 analysis initialize 设置；reComputeAmps 的写出与读取按此选实例。
     void setFloatOutput(bool v) { float_out_ = v; }
     bool floatOutput() const { return float_out_; }
 

@@ -4078,9 +4078,19 @@ public:
             }
 
             auto vg = extended_vector.to(torch::Device(torch::kCUDA, gpu));
-            computeBranchingFractions(d_amps[gpu],
+            // float 模式: 该批振幅缓冲为 float2 → 上转 double 段后再进双精度
+            // computeBranchingFractions（批 ≤ 100k 事件, 临时翻倍有界, 与驻留 A 无关）
+            const ctComplex* d_mat = d_amps[gpu];
+            ctComplex* d_amp_dbl = nullptr;
+            if (float_amps_) {
+                d_amp_dbl = upcastAmpSegToDouble(d_amps[gpu],
+                    (size_t)nt * n_polar_ * n_amplitudes_);
+                d_mat = d_amp_dbl;
+            }
+            computeBranchingFractions(d_mat,
                 reinterpret_cast<const ctComplex*>(vg.data_ptr()),
                 d_p, d_s, d_t, d_sq, d_nsl, npartials, nt, n_amplitudes_, n_polar_);
+            if (d_amp_dbl != nullptr) cudaFree(d_amp_dbl);
 
             std::vector<double> hp(npartials), hs(npartials * npartials); double ht;
             cudaMemcpy(hp.data(), d_p, npartials * sizeof(double), cudaMemcpyDeviceToHost);
@@ -4217,9 +4227,8 @@ public:
     torch::Tensor getFitFractions(torch::Tensor vector,
         torch::Tensor hessian_in)
     {
-        TORCH_CHECK(!float_amps_,
-            "precision:float 的 getFitFractions/getEfficiency（phsp_truth 批振幅积分）"
-            "路径尚未 float 化，请先用 precision:double 调用分支比/效率分析");
+        // computeTruthIntegrals 内已做 float2→double 上转: 两种精度共用双精度积分,
+        // 分支比/效率及 Jacobian 结果与 precision:double 数值一致。
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         if (hessian_in.numel() > 0)
@@ -4506,16 +4515,29 @@ public:
     }
 
     ////////////////////////
+    // 驻留振幅段（gpu0）→ double 复杂张量克隆。float 模式（A 存 float2, 8B/元素）
+    // 时按 元素偏移 上转 double 再克隆——保持 double .so 的 complex128 契约,
+    // 同时不改动双精度路径的任何字节。峰值瞬态 = 该段 float + double, 用完即释放。
+    torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el,
+        int64_t nEl) const
+    {
+        auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA);
+        if (nEl == 0) return torch::empty({0}, opts);
+        if (!float_amps_) {
+            return torch::from_blob(base + offset_el, {nEl}, opts).clone();
+        }
+        const float2* fbase = reinterpret_cast<const float2*>(base) + offset_el;
+        ctComplex* dbl = upcastAmpSegToDouble(
+            reinterpret_cast<const ctComplex*>(fbase), (size_t)nEl);
+        torch::Tensor t = torch::from_blob(dbl, {nEl}, opts).clone();
+        cudaFree(dbl);
+        return t;
+    }
+
     torch::Tensor getDataTensor() const
     {
-        // torch::Tensor output = torch::from_blob(data_fix_, {data_length *
-        // n_gls_},
-        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-        torch::Tensor output = torch::from_blob(d_all_amplitudes_[0] + amp_offsets_[0][1],
-            { events_[0][1] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-
-        return output;
+        return ampSegmentToTensor(d_all_amplitudes_[0], amp_offsets_[0][1],
+            (int64_t)events_[0][1] * n_polar_ * n_amplitudes_);
     }
 
     torch::Tensor getPhspTensor() const
@@ -4523,28 +4545,16 @@ public:
         TORCH_CHECK(!phsp_freed_,
             "Constraints.free_phsp_amplitudes=true 模式下 phsp 振幅不驻留（流式），"
             "getPhspTensor 不可用；请关闭该开关，或用 analysis.getNLL（C++ 路径）拟合");
-        // torch::Tensor output = torch::from_blob(phsp_fix_, {phsp_length *
-        // n_gls_},
-        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-        torch::Tensor output = torch::from_blob(d_all_amplitudes_[0],
-            { events_[0][0] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-
-        return output;
+        return ampSegmentToTensor(d_all_amplitudes_[0], 0,
+            (int64_t)events_[0][0] * n_polar_ * n_amplitudes_);
     }
 
     torch::Tensor getBkgTensor() const
     {
         if (events_[0].size() <= 2 || events_[0][2] == 0)
             return torch::empty({ 0 }, torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA));
-        // torch::Tensor output = torch::from_blob(bkg_fix_, {bkg_length *
-        // n_gls_},
-        // torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-        torch::Tensor output = torch::from_blob(d_all_amplitudes_[0] + amp_offsets_[0][2],
-            { events_[0][2] * n_polar_ * n_amplitudes_ },
-            torch::TensorOptions().dtype(TORCH_COMPLEX).device(torch::kCUDA)).clone();
-
-        return output;
+        return ampSegmentToTensor(d_all_amplitudes_[0], amp_offsets_[0][2],
+            (int64_t)events_[0][2] * n_polar_ * n_amplitudes_);
     }
 
     torch::Tensor getBkgWeightsTensor() const
@@ -4688,7 +4698,7 @@ private:
     // phsp_sum = Re(v^H M_double v)，替代对原始 phsp 振幅的逐 forward 扫描
     cuDoubleComplex* d_phsp_matrix_double_ = nullptr;
     bool phsp_freed_ = false;   // true = phsp 振幅不驻留（流式模式）
-    bool float_amps_ = false;   // true = 混合精度: 驻留振幅矩阵存 float（double .so + config precision:float）
+    bool float_amps_ = false;   // true = 混合精度: 驻留振幅矩阵存 float（double .so 上 precision:float 或 auto 默认）
     std::vector<double*> data_weights_;
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
@@ -4802,8 +4812,11 @@ private:
         n_gpus_ = device_mgr_.numDevices();
 
         // 精度解析（config precision 为"请求精度"）:
-        //   .so 编译 double（默认）: precision:double/auto → 全 double;
-        //                            precision:float → float_amps_=true（内存大户 A 存 float, 核心计算仍 double）
+        //   .so 编译 double（默认）:
+        //     precision:double → 全 double;  precision:float → float_amps_=true
+        //     （内存大户 A 存 float, 核心计算仍 double, NLL 漂移 ~1e-8 相对）
+        //     precision:auto（缺省）→ 同 precision:float——大统计量分波的默认体验
+        //     是省一半显存；需要全 double 数值时显式写 precision: double。
         //   .so 编译 float:          precision:float/auto → 原生 float; precision:double → 报错（float .so 无法提精度）
         {
             const std::string& req = config_parser_.getPrecision();
@@ -4812,17 +4825,24 @@ private:
                           << "\" 无效（仅支持 auto | float | double）" << std::endl;
                 throw std::runtime_error("invalid precision in config");
             }
-            if (req == "float" && std::string(PRECISION_NAME) == "double")
-                float_amps_ = true;   // 混合精度: A 存 float（D1 起生效）, 核心 double
-            else if (req == "double" && std::string(PRECISION_NAME) == "float") {
-                std::cerr << "ERROR: 配置文件请求 precision=double，但当前 .so 编译为 float；"
-                             "请用默认编译（double）重新 build_ext。float .so 仅供大统计量省显存。"
-                          << std::endl;
-                throw std::runtime_error("double requested on float build");
+            const bool double_so = std::string(PRECISION_NAME) == "double";
+            if (req == "double") {
+                if (!double_so) {
+                    std::cerr << "ERROR: 配置文件请求 precision=double，但当前 .so 编译为 float；"
+                                 "请用默认编译（double）重新 build_ext。float .so 仅供大统计量省显存。"
+                              << std::endl;
+                    throw std::runtime_error("double requested on float build");
+                }
+            } else if (double_so) {
+                // double .so 上 float/auto 都走混合精度（auto=默认, 见上）
+                float_amps_ = true;
             }
-            if (float_amps_)
-                std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double"
-                          << std::endl;
+            if (float_amps_) {
+                std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double";
+                if (req == "auto")
+                    std::cout << "（precision:auto 默认; 需全 double 请在 config 写 precision: double）";
+                std::cout << std::endl;
+            }
             amp_calc_.setFloatOutput(float_amps_);
         }
         if (n_gpus_ == 0) {
@@ -5146,11 +5166,22 @@ private:
                     cudaSetDevice(gpu);
                     int nTot = nch * n_polar_ * n_amplitudes_;
 
+                    // float 模式（double .so 混合精度）: 批振幅为 float2（8B/元素），
+                    // 下方"原生 ctComplex 累加"与"double 累加"都按 ctComplex/cuDoubleComplex
+                    // 读——先上转一份 double 段供两处共用（峰值 = 常驻表 + 一批 ×2，
+                    // batch_cap ≤ ~200MB/批 → 有界，与 phsp 总量无关）。
+                    ctComplex* d_batch_up = nullptr;   // 非空 = d_batch_r 指向它的 double 上转段
+                    const ctComplex* d_batch_r = d_batch[gpu];
+                    if (float_amps_) {
+                        d_batch_up = upcastAmpSegToDouble(d_batch[gpu], (size_t)nTot);
+                        d_batch_r = d_batch_up;
+                    }
+
                     // float32 累加（scale 后 CGEMM）
                     {
                         ctComplex* d_scaled;
                         cudaMalloc(&d_scaled, nTot * sizeof(ctComplex));
-                        cudaMemcpy(d_scaled, d_batch[gpu], nTot * sizeof(ctComplex),
+                        cudaMemcpy(d_scaled, d_batch_r, nTot * sizeof(ctComplex),
                                    cudaMemcpyDeviceToDevice);
                         const double* d_w = (gpu < (int)phsp_weights_.size())
                             ? phsp_weights_[gpu] : nullptr;
@@ -5187,8 +5218,16 @@ private:
                     {
                         cuDoubleComplex* d_batch_d;
                         cudaMalloc(&d_batch_d, (size_t)nTot * sizeof(cuDoubleComplex));
-                        int grid2 = (nTot + 255) / 256;
-                        castPhspBatchToDoubleKernel<<<grid2, 256>>>(d_batch[gpu], d_batch_d, nTot);
+                        if (d_batch_up != nullptr) {
+                            // double .so 上 cuDoubleComplex 与 ctComplex 布局相同:
+                            // 直接 D2D 拷贝上转段（值=double 原生, 与 cast kernel 等价）
+                            cudaMemcpy(d_batch_d, d_batch_up,
+                                (size_t)nTot * sizeof(cuDoubleComplex),
+                                cudaMemcpyDeviceToDevice);
+                        } else {
+                            int grid2 = (nTot + 255) / 256;
+                            castPhspBatchToDoubleKernel<<<grid2, 256>>>(d_batch[gpu], d_batch_d, nTot);
+                        }
                         cuDoubleComplex* d_md;
                         cudaMalloc(&d_md, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
                         cuDoubleComplex alpha = make_cuDoubleComplex(1.0, 0.0);
@@ -5215,7 +5254,8 @@ private:
                         cudaFree(d_md);
                     }
 
-                    // 释放批振幅（含占位 GPU 的 1 事件缓冲）
+                    // 释放上转段（本 GPU）与批振幅（含占位 GPU 的 1 事件缓冲）
+                    if (d_batch_up != nullptr) cudaFree(d_batch_up);
                     for (int g = 0; g < n_gpus_; ++g) {
                         if (d_batch[g]) { cudaSetDevice(g); cudaFree(d_batch[g]); }
                     }
