@@ -1424,9 +1424,6 @@ public:
     torch::Tensor getNLL(torch::Tensor params)
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
-        TORCH_CHECK(!(prec_mode_ == PrecMode::Float && amp_calc_.nFreeResParams() > 0),
-            "precision:float 全 float 档的 free-θ（共振态参数重算）链尚未接线（分批进行中），"
-            "请先用 precision:hybrid（A float + double 核心）或 precision:double 拟合自由参数");
 
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
         TORCH_CHECK(params.device().is_cuda() && params.device().index() == primary_dev_,
@@ -4852,6 +4849,8 @@ private:
                 std::cout << std::endl;
             }
             amp_calc_.setFloatOutput(float_amps_);
+            // d_dF 表存储档位: 仅全 float 档存 float2（hybrid 保持 double 语义）
+            amp_calc_.setDFloat(prec_mode_ == PrecMode::Float);
         }
         if (n_gpus_ == 0) {
             std::cerr << "ERROR: 无可用 CUDA 设备。ctpwa 当前仅支持 GPU 计算"

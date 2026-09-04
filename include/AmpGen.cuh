@@ -377,10 +377,14 @@ public:
     // 混合精度: 振幅缓冲按 float2 存储（double .so 上 precision:float 或默认 auto）。
     // 由 analysis initialize 设置；reComputeAmps 的写出与读取按此选实例。
     void setFloatOutput(bool v) { float_out_ = v; }
+    // dF_float_: 常驻 d_dF 表存 float2（仅 Float 档; hybrid 的 dF 保持 double）
+    void setDFloat(bool v) { dF_float_ = v; }
+    bool dFFloat() const { return dF_float_; }
     bool floatOutput() const { return float_out_; }
 
 private:
     bool float_out_ = false;
+    bool dF_float_ = false;   // d_dF 表 float2 存储（precision:float 全 float 档）
     std::vector<std::shared_ptr<AmpCasDecay>> cas_list_;   // 持有所有权，SL 数据不释放
     std::vector<ResBlock> blocks_;
     std::vector<ParamSlot> slots_;
