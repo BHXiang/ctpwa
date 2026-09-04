@@ -743,14 +743,10 @@ public:
             cudaDeviceSynchronize();
             auto t1_reamp = std::chrono::high_resolution_clock::now();
 
-            // 预计算有效耦合 T（复用各 GPU 上的 extended_vector）
-            for (int gpu = 0; gpu < num_gpus; ++gpu) {
-                cudaSetDevice(gpu);
-                const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
-                    extended_vec_per_gpu[gpu].data_ptr());
-                amp_calc->computeEffectiveCoupling(d_v_gpu, extended_n_gls);
-                cudaDeviceSynchronize();
-            }
+            // 预计算有效耦合 T——已停用: d_T 全库无消费者（死代码; 每 forward 全事件
+            // kernel + nEv×nPol×16B/卡 表纯浪费）。若未来 Hessian 需 T 中间量，
+            // 请先实现消费者再恢复此调用。
+            // for (int gpu = 0; gpu < num_gpus; ++gpu) { ... computeEffectiveCoupling ... }
             t2_reamp = std::chrono::high_resolution_clock::now();
             if (getenv("CTPWA_PROF")) printf("[PROF] reComputeAmps: %.2f ms, +T: %.2f ms\n",
                 std::chrono::duration<double, std::milli>(t1_reamp - t0_reamp).count(),
@@ -3600,8 +3596,9 @@ public:
             for (int gpu = 0; gpu < n_gpu; ++gpu) {
                 cudaSetDevice(gpu);
                 torch::Tensor v_gpu = extended_v.to(torch::Device(torch::kCUDA, gpu));
-                amp_calc_.computeEffectiveCoupling(
-                    reinterpret_cast<const ctComplex*>(v_gpu.data_ptr()), n_ext);
+                // computeEffectiveCoupling 已停用（d_T 无消费者，见 forward 处注释）
+                // amp_calc_.computeEffectiveCoupling(
+                //     reinterpret_cast<const ctComplex*>(v_gpu.data_ptr()), n_ext);
                 // Build interleaved per-GPU（dtype 跟随编译精度：float32/float64）
                 torch::Tensor vr = torch::real(v_gpu).to(TORCH_FLOAT);
                 torch::Tensor vi = torch::imag(v_gpu).to(TORCH_FLOAT);
