@@ -191,7 +191,7 @@ private:
   int global_maxL_ = -1; // -1 = no limit; set via Constraints.maxL
   double global_bf_d_ = 3.0; // barrier factor d; set via Constraints.bf_d
   bool global_has_bf_ = true; // 全局势垒开关; set via Constraints.has_bf
-  std::string precision_ = "auto"; // 用户请求精度: "auto" | "float" | "double"
+  std::string precision_ = "auto"; // 用户请求精度: "auto"|"hybrid"|"float"|"double"（hybrid=float-A 混合; float=全 float 档）
                                    // （auto = double .so 上默认混合精度 float-A; float .so 上原生 float）
 
   // ---- 命名变量约束（Constraints 下）----

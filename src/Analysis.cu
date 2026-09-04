@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include "ComplexType.h"
+#include "PrecCpx.h"
 #include <cublas_v2.h>
 #include <fstream>
 #include <iostream>
@@ -1423,6 +1424,10 @@ public:
     torch::Tensor getNLL(torch::Tensor params)
     {
         TORCH_CHECK(initialized_, "analysis not initialized: invalid or missing config file");
+        TORCH_CHECK(!(prec_mode_ == PrecMode::Float && amp_calc_.nFreeResParams() > 0),
+            "precision:float 全 float 档的 free-θ（共振态参数重算）链尚未接线（分批进行中），"
+            "请先用 precision:hybrid（A float + double 核心）或 precision:double 拟合自由参数");
+
         TORCH_CHECK(params.dtype() == torch::kFloat64, "params must be float64");
         TORCH_CHECK(params.device().is_cuda() && params.device().index() == primary_dev_,
             "params 必须位于主 GPU (cuda:" + std::to_string(primary_dev_) + ")，"
@@ -3320,6 +3325,9 @@ public:
 
     // 完整 Hessian: 返回 (2n+P) × (2n+P)，params = [real(v), imag(v), θ] float64
     torch::Tensor getHessian(torch::Tensor params) {
+        TORCH_CHECK(prec_mode_ != PrecMode::Float,
+            "precision:float 全 float 档的 getHessian 尚未接线（分批进行中），"
+            "请先用 precision:hybrid 或 precision:double");
         TORCH_CHECK(params.is_cuda() && params.dtype() == torch::kFloat64,
             "params must be float64 CUDA tensor");
         TORCH_CHECK(params.device().index() == primary_dev_,
@@ -4683,6 +4691,8 @@ private:
     cuDoubleComplex* d_phsp_matrix_double_ = nullptr;
     bool phsp_freed_ = false;   // true = phsp 振幅不驻留（流式模式）
     bool float_amps_ = false;   // true = 混合精度: 驻留振幅矩阵存 float（double .so 上 precision:float 或 auto 默认）
+    PrecMode prec_mode_ = PrecMode::Double;  // 运行期档位（config precision）: Float=全 float;
+                                             // Double=全 double（hybrid/auto 记 Double + float_amps_）
     std::vector<double*> data_weights_;
     std::vector<double*> phsp_weights_;
     std::vector<double*> bkg_weights_;
@@ -4795,21 +4805,23 @@ private:
         device_mgr_.detect();
         n_gpus_ = device_mgr_.numDevices();
 
-        // 精度解析（config precision 为"请求精度"）:
-        //   .so 编译 double（默认）:
-        //     precision:double → 全 double;  precision:float → float_amps_=true
-        //     （内存大户 A 存 float, 核心计算仍 double, NLL 漂移 ~1e-8 相对）
-        //     precision:auto（缺省）→ 同 precision:float——大统计量分波的默认体验
-        //     是省一半显存；需要全 double 数值时显式写 precision: double。
-        //   .so 编译 float:          precision:float/auto → 原生 float; precision:double → 报错（float .so 无法提精度）
+        // 精度解析（运行期档位; .so 编译 double 为默认产物）:
+        //   precision:double → PrecMode::Double 全 double（16B 全表 + double 计算）
+        //   precision:hybrid / auto（缺省）→ 旧 float-A 混合: A 存 float2(8B),
+        //     核心计算仍 double（NLL 相对 double 漂移 ~1e-8）——大统计量默认省显存档
+        //   precision:float   → PrecMode::Float 全 float 档（模板化双实例路线,
+        //     存储与计算均 float; 逐批接线, 未接线入口显式报错）
+        //   .so 编译 float:  precision:float/hybrid/auto → 原生 float 行为;
+        //                    precision:double → 报错（float .so 无法提精度）
         {
             const std::string& req = config_parser_.getPrecision();
-            if (req != "auto" && req != "float" && req != "double") {
+            if (req != "auto" && req != "hybrid" && req != "float" && req != "double") {
                 std::cerr << "ERROR: 配置 precision=\"" << req
-                          << "\" 无效（仅支持 auto | float | double）" << std::endl;
+                          << "\" 无效（仅支持 auto | hybrid | float | double）" << std::endl;
                 throw std::runtime_error("invalid precision in config");
             }
             const bool double_so = std::string(PRECISION_NAME) == "double";
+            prec_mode_ = PrecMode::Double;
             if (req == "double") {
                 if (!double_so) {
                     std::cerr << "ERROR: 配置文件请求 precision=double，但当前 .so 编译为 float；"
@@ -4817,14 +4829,26 @@ private:
                               << std::endl;
                     throw std::runtime_error("double requested on float build");
                 }
-            } else if (double_so) {
-                // double .so 上 float/auto 都走混合精度（auto=默认, 见上）
+            } else if (!double_so) {
+                // float .so: float/hybrid/auto 均原生 float（编译期已定），档位记 Float
+                prec_mode_ = PrecMode::Float;
+                float_amps_ = true;
+            } else if (req == "float") {
+                // double .so 上的"全 float 档"（模板化双实例；接线中）
+                prec_mode_ = PrecMode::Float;
+                float_amps_ = true;   // A 等大表先按 float2 存储（hybrid 同款布局）
+            } else {
+                // double .so 上 hybrid / auto: A float2 + double 核心（默认体验）
+                prec_mode_ = PrecMode::Double;
                 float_amps_ = true;
             }
-            if (float_amps_) {
+            if (prec_mode_ == PrecMode::Float) {
+                std::cout << "[ctpwa] 全 float 档（precision:float）: 存储/计算 float;"
+                             " 尚未接线的入口会显式报错，请先用 precision:hybrid/double" << std::endl;
+            } else if (float_amps_) {
                 std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double";
-                if (req == "auto")
-                    std::cout << "（precision:auto 默认; 需全 double 请在 config 写 precision: double）";
+                if (req == "auto" || req == "hybrid")
+                    std::cout << "（precision:" << req << " 默认; 需全 double 请在 config 写 precision: double）";
                 std::cout << std::endl;
             }
             amp_calc_.setFloatOutput(float_amps_);

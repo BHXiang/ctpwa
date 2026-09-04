@@ -255,3 +255,6 @@ Plot:
     - input: [[Kp, Km], [Kp, eta]]
       bins: [100, 100]; range: [[1.0, 6.8], [1.0, 6.8]]
       display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}\\eta) (GeV^{2}/c^{4})"]
+
+# 精度档位: auto(缺省)/hybrid = A 存 float + double 核心; double = 全 double;
+# float = 全 float 档（模板化双实例, 分批接线中——未接线入口会显式报错）
