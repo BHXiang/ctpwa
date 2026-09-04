@@ -1301,6 +1301,10 @@ public:
                 ms(tF0, tF1), ms(tF1, t2_reamp), ms(t2_reamp, tF3),
                 ms(tF3, t6_nll), ms(t6_nll, t7_rg), ms(t7_rg, tFend));
         }
+        // 恢复主设备再返回：forward 尾部各 per-GPU 段可能把 raw current device
+        // 留在非主卡，torch 缓存又只随 torch 自身调用更新——保持 raw 与 torch
+        // 主设备一致，避免后续 python/torch 的裸/张量操作落到错误物理卡。
+        cudaSetDevice(primary_dev);
         return torch::tensor(loss, torch::kDouble).to(vector.device());
     }
 
@@ -5350,6 +5354,13 @@ private:
         std::cout << "Number of partial waves: " << n_gls_ << std::endl;
         std::cout << "Number of res parameters: " << params_.nFreeTheta() << std::endl;
         std::cout << "Initialization complete." << std::endl;
+
+        // 恢复主设备为当前设备：构造期大量 per-GPU 循环（SL 表/振幅/权重上传/
+        // resident B̄ 构建）会把 raw current device 留在最后一张卡。torch 的
+        // current-device 缓存在其首次 CUDA 调用时从 raw device 懒初始化——
+        // 漏掉此恢复会让随后的 torch.device('cuda')/tensor 落到非主 GPU
+        // （getNLL/getHessian 的 params 位置检查触发，测试套件双卡实测必现）。
+        cudaSetDevice(primary_dev_);
     }
 
     void initializeMultiGPUs(std::vector<int> init_events)
