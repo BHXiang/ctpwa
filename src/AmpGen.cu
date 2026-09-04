@@ -1406,6 +1406,35 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
     }
 }
 
+void AmpCasDecay::releaseStaticData()
+{
+    if (slamp_released_) return;
+    // 释放 slamp 表（nSigma×nSL×nEv×nPol，本 cas 最大的常驻块）与 σ 相关表。
+    // σ=0 恒等动量 d_momenta_ 保留（体积小；本轮只释放大表）。
+    for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
+        cudaSetDevice((int)g);
+        if (d_slamp_tab_[g]) { cudaFree(d_slamp_tab_[g]); d_slamp_tab_[g] = nullptr; }
+        if (g < d_mom_tab_.size() && d_mom_tab_[g]) {
+            cudaFree(d_mom_tab_[g]); d_mom_tab_[g] = nullptr;
+        }
+        if (g < d_sign_tab_.size() && d_sign_tab_[g]) {
+            cudaFree(d_sign_tab_[g]); d_sign_tab_[g] = nullptr;
+        }
+    }
+    // σ≥1 的全同粒子置换重建动量（仅 nSigma>1 的 cas 分配）
+    for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
+        for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g) {
+            cudaSetDevice((int)g);
+            if (d_mom_sigma_[si][g]) {
+                cudaFree(d_mom_sigma_[si][g]);
+                d_mom_sigma_[si][g] = nullptr;
+            }
+        }
+    slamp_released_ = true;
+    fprintf(stderr, "[ctpwa] releaseStaticData: 链 %s 无自由参数，静态 SL 表已释放\n",
+            chain_name_.c_str());
+}
+
 // 振幅输出写入辅助: 计算恒在 double, 输出按 Out 存 float2(混合精度省显存)或 ctComplex(原生)
 template<typename Out>
 __device__ inline Out cplxOut(double re, double im) {
@@ -2365,6 +2394,41 @@ void AmpCalc::applyVarEqual(const std::vector<std::vector<std::string>>& groups)
     }
 }
 
+// 静态 SL 缩减：构造期 A 全部物化后调用。仅保留"含自由参数（含 trans/var_equal
+// 关联）链组合"的 slamp 表；固定链组合的 A 不再重算/求导，其 slamp（大样本下
+// 数 GB/卡）释放。逃生阀 CTPWA_KEEP_SLAMP=1 可关闭（对照/诊断）。
+void AmpCalc::releaseStaticCasData()
+{
+    if (blocks_.empty() || cas_list_.empty()) return;
+    if (getenv("CTPWA_KEEP_SLAMP") != nullptr) {
+        fprintf(stderr, "[ctpwa] CTPWA_KEEP_SLAMP=1: 跳过静态 SL 释放\n");
+        return;
+    }
+    // 需要保留的块：nFree>0（applyVarEqual 后权威，含 var_equal ghost 成员），
+    // 或 conjugate(trans) 关联块且其 owner 有自由参数
+    std::vector<char> keep(blocks_.size(), 0);
+    for (size_t bi = 0; bi < blocks_.size(); ++bi)
+        if (blocks_[bi].nFree > 0) keep[bi] = 1;
+    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+        if (owner_key.first >= 0 && owner_key.first < (int)blocks_.size()
+            && blocks_[owner_key.first].nFree > 0)
+            keep[cj_key.first] = 1;
+    }
+    std::vector<char> cas_keep(cas_list_.size(), 0);
+    for (size_t bi = 0; bi < blocks_.size(); ++bi) {
+        int ci = blocks_[bi].cas_idx;
+        if (keep[bi] && ci >= 0 && ci < (int)cas_list_.size()) cas_keep[ci] = 1;
+    }
+    int freed = 0;
+    for (size_t ci = 0; ci < cas_list_.size(); ++ci)
+        if (!cas_keep[ci] && cas_list_[ci]->hasSLAmps()) {
+            cas_list_[ci]->releaseStaticData();
+            ++freed;
+        }
+    fprintf(stderr, "[ctpwa] releaseStaticCasData: 释放 %d 个无自由参数链组合的静态"
+            " SL 表（保留 %d 个）\n", freed, (int)(cas_list_.size() - freed));
+}
+
 void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             const double* d_params,
                             int n_amplitudes,
@@ -2863,7 +2927,10 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
 
     constexpr int kBlockSize = 256;
 
+    // 仅含自由参数的块需要 T（共振梯度消费）；固定块不重算且其 slamp 已被
+    // releaseStaticCasData 释放，不能读
     for (auto& block : blocks_) {
+        if (block.nFree == 0) continue;
         auto& cas = cas_list_[block.cas_idx];
         int nSL = static_cast<int>(cas->getNSLCombs());
         int nEv  = static_cast<int>(cas->getNEventsVec()[gpu]);

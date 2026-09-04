@@ -4557,6 +4557,9 @@ public:
         auto& cas_list = amp_calc_.casList();
         if (cas_list.empty()) { printf("saveSLAmps: no cas available\n"); return; }
         auto& cas = cas_list[0];
+        TORCH_CHECK(cas->hasSLAmps(),
+            "saveSLAmps: 该链组合无自由参数，静态 SL 表已按最小保存释放"
+            "（A 已物化；如需 SL 数据请以 CTPWA_KEEP_SLAMP=1 重建）");
         int nEv = static_cast<int>(cas->getNEventsVec()[0]);
         int nPol = static_cast<int>(cas->getNPolarizations());
         int nSL = static_cast<int>(cas->getNSLCombs());
@@ -4587,6 +4590,9 @@ public:
         auto acc = result.accessor<c10::complex<double>, 3>();
         int sl_off = 0;
         for (auto& cas : cas_list) {
+            TORCH_CHECK(cas->hasSLAmps(),
+                "getSLAmpsTensor: 该链组合无自由参数，静态 SL 表已按最小保存释放"
+                "（A 已物化；如需 SL 数据请以 CTPWA_KEEP_SLAMP=1 重建）");
             int nSL = static_cast<int>(cas->getNSLCombs());
             int n = nEv * nPol * nSL;
             thrust::complex<double>* h_buf = new thrust::complex<double>[n];
@@ -5323,6 +5329,11 @@ private:
         //     }
         // }
         // delete[] h_phsp;
+
+        // 静态 SL 缩减：仅保留含自由参数（含 trans/var_equal 关联）链组合的 slamp，
+        // 固定链组合的 A 已在构造期物化 → 释放其 slamp（大样本可省数 GB/卡）。
+        // 逃生阀 CTPWA_KEEP_SLAMP=1 可关闭。
+        if (!amp_calc_.empty()) amp_calc_.releaseStaticCasData();
 
         std::cout << "Number of GPUs available: " << n_gpus_ << std::endl;
         std::cout << "Number of partial waves: " << n_gls_ << std::endl;

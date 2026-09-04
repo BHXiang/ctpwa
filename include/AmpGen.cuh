@@ -118,6 +118,7 @@ private:
     // 全同粒子置换拓扑（coset）：
     // d_slamp_tab_[gpu] = [nSigma × nEv×nSL×nPol]，σ=0 行 = 恒等 SL 振幅
     std::vector<thrust::complex<double>*> d_slamp_tab_;  // [gpu]
+    bool slamp_released_ = false;   // true = 静态 SL 表已释放（固定链组合，A 已物化）
     std::vector<std::vector<DeviceMomenta*>> d_mom_sigma_; // [σ][gpu]：σ 拓扑的重建四动量（σ=0 复用 d_momenta_）
     std::vector<DeviceMomenta*> d_mom_tab_;  // [gpu]：[nSigma] DeviceMomenta 值数组（kernel 用）
     std::vector<double*> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
@@ -180,6 +181,12 @@ public:
 
     // 衰变顶点 SL 列表的最小 L（tf 宽度约定 Lmin；未找到返回 0）
     int getNodeLMin(const std::string& mother_name) const;
+
+    // 释放静态 SL 数据（slamp 表及 σ 相关表）——仅当本 cas 不再参与 θ 重算/求导时
+    // 调用（AmpCalc::releaseStaticCasData：固定共振态链组合的 A 构造期已物化）。
+    // 释放后 hasSLAmps()==false；若之后有代码读 slamp 属编程错误（会得到空指针）。
+    void releaseStaticData();
+    bool hasSLAmps() const { return !slamp_released_; }
 
     // Getter函数
     size_t getNSLCombs() const { return nSLCombs_; }
@@ -309,6 +316,9 @@ public:
     // 并在 reComputeAmps 中把 owner 的参数值广播到成员的 DeviceResonance。
     // 必须在所有 addBlock 之后、首次使用参数之前调用。
     void applyVarEqual(const std::vector<std::vector<std::string>>& var_equal_groups);
+    // 构造期 A 全部物化后调用：释放无自由参数链组合的静态 SL 表（大样本省数 GB/卡）。
+    // 逃生阀 CTPWA_KEEP_SLAMP=1 跳过。须在 initialize 尾部（所有 cas->getAmps 之后）。
+    void releaseStaticCasData();
 
     // 用新参数重算所有振幅
     // params_dev: d_params 所在设备（调用方的主 GPU）。不能依赖运行时当前设备——
