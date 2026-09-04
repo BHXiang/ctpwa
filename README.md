@@ -252,3 +252,18 @@ Resonances:
 ## License
 
 MIT License
+## 运行期精度档位（precision: auto | hybrid | float | double）
+
+业务复数类型：`include/PrecCpx.h` 的 PrecMode + ComplexType.h（模板化双实例路线）。
+
+| `precision:` | 档位 | A 表 | d_dF 表 | 计算 | 相对 double 的偏差 | hessian |
+|---|---|---|---|---|---|---|
+| `double` | 全 double | 16B | 16B | double | 基准 | double |
+| `auto`(缺省)/`hybrid` | float-A 混合 | 8B | 16B | double | NLL ~1e-8 | double(A 上转) |
+| `float` | 全 float 档 | 8B | 8B | 共振梯度等 float（F 求值仍 double，见注） | NLL ~1e-9、θ梯度 ~1e-5 | hybrid 同款 ~1e-9 |
+
+注：共振态传播子 F(θ) 符号求值当前为 double（解释器/JIT）；float 档以 double 求值后窄化写出 A/dF（float2）。float 构建（CTPWA_COMPLEX=float）下 float/hybrid/auto 为原生 float，double 报错。
+
+**推荐工作流（初解 float → 精测 double）**：同一 config 只改一行 `precision:`；params 恒 float64，脚本无需分支；float 阶段解出的参数直接作 double 阶段初值（偏差 ~1e-5，double 会快速收敛）。Float 档能力全景（Batch1-3，61da042 起）：NLL+梯度（free-θ/fixed-θ）、getHessian、writeResult、FitFractions/Efficiency 全部可用。
+
+**逃生阀/对照**：CTPWA_KEEP_SLAMP=1（关 slamp 最小保存）、CTPWA_HESS_CHUNK（vv 上转窗口）、CTPWA_SL_BATCH_MB（SL scratch 批上限）、CTPWA_NO_JIT、CTPWA_PROF。**测试**：tests/test_float_mode.py（Float 档行为，需手动同步集群）、test_precision.py 的 hybrid = 原 precision:float 混合语义。
