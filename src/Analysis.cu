@@ -3134,8 +3134,10 @@ public:
         if (!float_amps_) {
             run(d_all_amplitudes_[gpu] + amp_offsets_[gpu][seg], nEv, d_w);
         } else {
-            // 窗口化上转（默认 50k 事件/窗口，与 computeDataHessianContribFast 内部 chunk 同量级）
-            const int kHChunk = 50000;
+            // 窗口化上转（默认 50k 事件/窗口，与 computeDataHessianContribFast 内部 chunk
+            // 同量级；CTPWA_HESS_CHUNK 可调——调大=更少 kernel 启动、临时峰值更高）
+            int kHChunk = 50000;
+            if (const char* e = getenv("CTPWA_HESS_CHUNK")) { int v = atoi(e); if (v > 0) kHChunk = v; }
             const float2* fseg = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
                                 + amp_offsets_[gpu][seg];
             const int segStride = n_polar_ * n_amplitudes_;
