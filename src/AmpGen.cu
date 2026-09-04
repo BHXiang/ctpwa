@@ -847,12 +847,18 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             h_shapes.push_back(dim_j2);
         }
 
-        // 批次大小按 scratch 显存上界（每批 ≤ 2GB），默认 100 万事件/批
+        // 批次大小按 scratch 显存上界（每批默认 ≤ 2GB，可用 CTPWA_SL_BATCH_MB 调低
+        // 以压低构造期峰值——大样本/长链下 scratch_per_sl 可观，单批可达 GB 级），
+        // 默认 100 万事件/批
         int batch_size = 1000000;
         {
             size_t per_batch = (size_t)batch_size * scratch_per_sl *
                 sizeof(thrust::complex<double>);
             size_t cap = ((size_t)2 << 30);
+            if (const char* e = getenv("CTPWA_SL_BATCH_MB")) {
+                int mb = atoi(e);
+                if (mb > 0) cap = (size_t)mb << 20;
+            }
             if (per_batch > cap)
                 batch_size = max(1, (int)(cap /
                     (scratch_per_sl * sizeof(thrust::complex<double>))));
