@@ -3093,6 +3093,67 @@ public:
         return;
     }
 
+
+    // data/bkg 段 Hessian 贡献（多 GPU 循环内逐卡调用）。float-A 模式按窗口上转
+    // A 段（峰值 = 窗口×16B，而非整段 16B double 临时——大样本下整段临时可达
+    // 数百 MB~GB，直接吃掉"省一半显存"的收益）；double 模式直读常驻表。
+    // bkg 段权重取负（与调用点原语义一致）；weights 随窗口偏移传入。
+    void hessianSegmentContrib(int gpu, int seg,
+                               const ctComplex* d_v, double* d_hess,
+                               int n_amp, bool fast)
+    {
+        int nEv = (seg == 1) ? events_[gpu][1]
+                             : ((events_[gpu].size() > 2) ? events_[gpu][2] : 0);
+        if (nEv <= 0) return;
+        const double* d_w = nullptr;
+        double* d_w_own = nullptr;
+        if (seg == 1) {
+            d_w = (gpu < (int)data_weights_.size()) ? data_weights_[gpu] : nullptr;
+        } else {
+            cudaMalloc(&d_w_own, nEv * sizeof(double));
+            if (gpu < (int)bkg_weights_.size() && bkg_weights_[gpu] != nullptr) {
+                std::vector<double> h_w_neg(nEv);
+                cudaMemcpy(h_w_neg.data(), bkg_weights_[gpu],
+                           nEv * sizeof(double), cudaMemcpyDeviceToHost);
+                for (int i = 0; i < nEv; ++i) h_w_neg[i] = -h_w_neg[i];
+                cudaMemcpy(d_w_own, h_w_neg.data(),
+                           nEv * sizeof(double), cudaMemcpyHostToDevice);
+            } else {
+                std::vector<double> h_w_neg(nEv, -1.0);
+                cudaMemcpy(d_w_own, h_w_neg.data(),
+                           nEv * sizeof(double), cudaMemcpyHostToDevice);
+            }
+            d_w = d_w_own;
+        }
+        auto run = [&](const ctComplex* d_amp_seg, int n_ev, const double* d_w_c) {
+            if (fast) computeDataHessianContribFast(
+                d_amp_seg, d_v, d_w_c, d_hess, n_ev, n_polar_, n_amp);
+            else computeDataHessianContrib(
+                d_amp_seg, d_v, d_w_c, d_hess, n_ev, n_polar_, n_amp);
+        };
+        if (!float_amps_) {
+            run(d_all_amplitudes_[gpu] + amp_offsets_[gpu][seg], nEv, d_w);
+        } else {
+            // 窗口化上转（默认 50k 事件/窗口，与 computeDataHessianContribFast 内部 chunk 同量级）
+            const int kHChunk = 50000;
+            const float2* fseg = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
+                                + amp_offsets_[gpu][seg];
+            const int segStride = n_polar_ * n_amplitudes_;
+            for (int off = 0; off < nEv; off += kHChunk) {
+                int nch = std::min(kHChunk, nEv - off);
+                int nTot = nch * segStride;
+                ctComplex* dbl = nullptr;
+                cudaMalloc(&dbl, (size_t)nTot * sizeof(ctComplex));
+                castF2ToDouble2Kernel<<<(nTot + 255) / 256, 256>>>(
+                    fseg + (size_t)off * segStride,
+                    reinterpret_cast<cuDoubleComplex*>(dbl), nTot);
+                run(dbl, nch, d_w ? d_w + off : nullptr);
+                cudaFree(dbl);
+            }
+        }
+        if (d_w_own) cudaFree(d_w_own);
+    }
+
     // ---- 内部 Hessian 计算 ----
 
     // 自由耦合参数 p (complex [n_free]) → 扩展振幅 v (complex [n_amps])
@@ -3172,61 +3233,15 @@ public:
             cudaMemset(d_hess_gpu, 0, hess_sz * sizeof(double));
 
             // --- data ---
-            int nData = events_[gpu][1];
-            if (nData > 0) {
-                totalDataEvents += nData;
-                const double* d_w_data = (gpu < data_weights_.size()) ? data_weights_[gpu] : nullptr;
-                ctComplex* d_amp = nullptr;
-                ctComplex* d_amp_dbl = nullptr;
-                if (float_amps_) {
-                    size_t nElem = (size_t)amp_offsets_[gpu][2] - amp_offsets_[gpu][1];
-                    cudaMalloc(&d_amp_dbl, nElem * sizeof(ctComplex));
-                    castF2ToDouble2Kernel<<<(int)((nElem + 255) / 256), 256>>>(
-                        reinterpret_cast<const float2*>(d_all_amplitudes_[gpu]) + amp_offsets_[gpu][1],
-                        reinterpret_cast<cuDoubleComplex*>(d_amp_dbl), (int)nElem);
-                    d_amp = d_amp_dbl;
-                } else {
-                    d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                }
-                (hessianFastPathEnabled()
-                    ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext)
-                    : computeDataHessianContrib(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext));
-                if (d_amp_dbl) cudaFree(d_amp_dbl);
+            if (events_[gpu][1] > 0) {
+                totalDataEvents += events_[gpu][1];
+                hessianSegmentContrib((int)gpu, 1, d_v_gpu, d_hess_gpu, n_ext,
+                                      hessianFastPathEnabled());
             }
 
             // --- bkg ---
-            int nBkg = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
-            if (nBkg > 0) {
-                double* d_w_bkg;
-                cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
-                if (bkg_weights_[gpu] != nullptr) {
-                    std::vector<double> h_w_neg(nBkg);
-                    cudaMemcpy(h_w_neg.data(), bkg_weights_[gpu], nBkg * sizeof(double), cudaMemcpyDeviceToHost);
-                    for (int i = 0; i < nBkg; ++i) h_w_neg[i] = -h_w_neg[i];
-                    cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
-                }
-                else {
-                    std::vector<double> h_w_neg(nBkg, -1.0);
-                    cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
-                }
-                ctComplex* d_amp = nullptr;
-                ctComplex* d_amp_dbl = nullptr;
-                if (float_amps_) {
-                    size_t nElem = (size_t)amp_offsets_[gpu].back() - amp_offsets_[gpu][2];
-                    cudaMalloc(&d_amp_dbl, nElem * sizeof(ctComplex));
-                    castF2ToDouble2Kernel<<<(int)((nElem + 255) / 256), 256>>>(
-                        reinterpret_cast<const float2*>(d_all_amplitudes_[gpu]) + amp_offsets_[gpu][2],
-                        reinterpret_cast<cuDoubleComplex*>(d_amp_dbl), (int)nElem);
-                    d_amp = d_amp_dbl;
-                } else {
-                    d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                }
-                (hessianFastPathEnabled()
-                    ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext)
-                    : computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext));
-                if (d_amp_dbl) cudaFree(d_amp_dbl);
-                cudaFree(d_w_bkg);
-            }
+            hessianSegmentContrib((int)gpu, 2, d_v_gpu, d_hess_gpu, n_ext,
+                                  hessianFastPathEnabled());
 
             // P2P累加到GPU 0的主hessian
             if (gpu == dev.index()) {
@@ -3486,56 +3501,13 @@ public:
                 int nData = events_[gpu][1];
                 if (nData > 0) {
                     totalDataEvents += nData;
-                    const double* d_w_data = (gpu < data_weights_.size()) ? data_weights_[gpu] : nullptr;
-                    ctComplex* d_amp = nullptr;
-                    ctComplex* d_amp_dbl = nullptr;   // float 模式: A 段上转 double 视图
-                    if (float_amps_) {
-                        size_t nElem = (size_t)amp_offsets_[gpu][2] - amp_offsets_[gpu][1];
-                        cudaMalloc(&d_amp_dbl, nElem * sizeof(ctComplex));
-                        castF2ToDouble2Kernel<<<(int)((nElem + 255) / 256), 256>>>(
-                            reinterpret_cast<const float2*>(d_all_amplitudes_[gpu]) + amp_offsets_[gpu][1],
-                            reinterpret_cast<cuDoubleComplex*>(d_amp_dbl), (int)nElem);
-                        d_amp = d_amp_dbl;
-                    } else {
-                        d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][1];
-                    }
-                    (hessianFastPathEnabled()
-                        ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext)
-                        : computeDataHessianContrib(d_amp, d_v_gpu, d_w_data, d_hess_gpu, nData, n_polar_, n_ext));
-                    if (d_amp_dbl) cudaFree(d_amp_dbl);
+                    hessianSegmentContrib((int)gpu, 1, d_v_gpu, d_hess_gpu, n_ext,
+                                          hessianFastPathEnabled());
                 }
 
-                int nBkg = (events_[gpu].size() > 2) ? events_[gpu][2] : 0;
-                if (nBkg > 0) {
-                    double* d_w_bkg;
-                    cudaMalloc(&d_w_bkg, nBkg * sizeof(double));
-                    if (bkg_weights_[gpu] != nullptr) {
-                        std::vector<double> h_w_neg(nBkg);
-                        cudaMemcpy(h_w_neg.data(), bkg_weights_[gpu], nBkg * sizeof(double), cudaMemcpyDeviceToHost);
-                        for (int i = 0; i < nBkg; ++i) h_w_neg[i] = -h_w_neg[i];
-                        cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
-                    } else {
-                        std::vector<double> h_w_neg(nBkg, -1.0);
-                        cudaMemcpy(d_w_bkg, h_w_neg.data(), nBkg * sizeof(double), cudaMemcpyHostToDevice);
-                    }
-                    ctComplex* d_amp = nullptr;
-                    ctComplex* d_amp_dbl = nullptr;
-                    if (float_amps_) {
-                        size_t nElem = (size_t)amp_offsets_[gpu].back() - amp_offsets_[gpu][2];
-                        cudaMalloc(&d_amp_dbl, nElem * sizeof(ctComplex));
-                        castF2ToDouble2Kernel<<<(int)((nElem + 255) / 256), 256>>>(
-                            reinterpret_cast<const float2*>(d_all_amplitudes_[gpu]) + amp_offsets_[gpu][2],
-                            reinterpret_cast<cuDoubleComplex*>(d_amp_dbl), (int)nElem);
-                        d_amp = d_amp_dbl;
-                    } else {
-                        d_amp = d_all_amplitudes_[gpu] + amp_offsets_[gpu][2];
-                    }
-                    (hessianFastPathEnabled()
-                        ? computeDataHessianContribFast(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext)
-                        : computeDataHessianContrib(d_amp, d_v_gpu, d_w_bkg, d_hess_gpu, nBkg, n_polar_, n_ext));
-                    if (d_amp_dbl) cudaFree(d_amp_dbl);
-                    cudaFree(d_w_bkg);
-                }
+                // bkg 段（无本底事件则内部直接返回）
+                hessianSegmentContrib((int)gpu, 2, d_v_gpu, d_hess_gpu, n_ext,
+                                      hessianFastPathEnabled());
 
                 if (gpu == dev.index()) {
                     double one = 1.0;
