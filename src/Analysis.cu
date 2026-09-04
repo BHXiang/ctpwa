@@ -3318,9 +3318,9 @@ public:
 
     // 完整 Hessian: 返回 (2n+P) × (2n+P)，params = [real(v), imag(v), θ] float64
     torch::Tensor getHessian(torch::Tensor params) {
-        TORCH_CHECK(prec_mode_ != PrecMode::Float,
-            "precision:float 全 float 档的 getHessian 尚未接线（分批进行中），"
-            "请先用 precision:hybrid 或 precision:double");
+        // Float 档 getHessian 走 hybrid 同款路径（A float2 存储 + double 计算 +
+        // 窗口上转）：数值 ≈ hybrid（~1e-8 对 double）；真 float 计算的 UH
+        // 模板化属后续批次。hessian 链不读常驻 d_dF（其 float2 化不影响此处）。
         TORCH_CHECK(params.is_cuda() && params.dtype() == torch::kFloat64,
             "params must be float64 CUDA tensor");
         TORCH_CHECK(params.device().index() == primary_dev_,
