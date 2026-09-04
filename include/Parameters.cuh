@@ -124,6 +124,8 @@ public:
     void setCouplingMatrix(const CouplingMatrixResult& cm);
     const CouplingMatrixResult& couplingMatrix() const { return coupling_matrix_; }
     bool hasCouplingMatrix() const { return has_coupling_matrix_; }
+    // 主设备（表上传与 coupling kernel 固定在其上，防多卡错卡读写）
+    void setPrimaryDevice(int d) { primary_dev_ = d; }
 
     // 拟合参数 → 旧格式: d_in[Re_p, Im_p, θ] → d_out[Re_v, Im_v, θ]
     void extendCouplingParams(const double* d_in, double* d_out, int ncf, int nt) const;
@@ -188,6 +190,8 @@ private:
     std::map<std::string, double> gauss_constr_mu_;
 
 private:
+
+    int primary_dev_ = 0;   // 主设备（analysis 构造时设置；>=0 时 coupling 系列固定其上）
 
     // Device data for coupling kernels
     int* d_amp_chain_ = nullptr;

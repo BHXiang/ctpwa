@@ -1486,6 +1486,7 @@ public:
                      const int is_saved_weight = 0,
                      const std::vector<int>& waves = {})
     {
+        cudaSetDevice(primary_dev_);   // 入口恢复主设备
         TORCH_CHECK(params.is_cuda(), "params must be on CUDA");
 
         int npartials_all = (int)nSLvectors_.size();
@@ -4089,6 +4090,8 @@ public:
             }
             cudaFree(d_p); cudaFree(d_s); cudaFree(d_t); cudaFree(d_nsl);
         }
+        // 多 GPU 循环后恢复主设备（FF/EFF/writeResult 等随后会做 torch/耦合运算）
+        cudaSetDevice(primary_dev_);
     }
 
     // =====================================================================
@@ -4188,6 +4191,7 @@ public:
                 if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
         }
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
+        cudaSetDevice(primary_dev_);   // 恢复主设备（内部多 GPU 循环后 raw 停在最后卡）
         return total_events;
     }
 
@@ -4207,6 +4211,7 @@ public:
     torch::Tensor getFitFractions(torch::Tensor vector,
         torch::Tensor hessian_in)
     {
+        cudaSetDevice(primary_dev_);   // 入口恢复主设备（调用方可能刚从多 GPU 段返回）
         // computeTruthIntegrals 内已做 float2→double 上转: 两种精度共用双精度积分,
         // 分支比/效率及 Jacobian 结果与 precision:double 数值一致。
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
@@ -4348,6 +4353,7 @@ public:
     torch::Tensor getEfficiency(torch::Tensor vector,
         torch::Tensor hessian_in)
     {
+        cudaSetDevice(primary_dev_);   // 入口恢复主设备
         TORCH_CHECK(vector.is_cuda(), "vector must be on CUDA");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         if (hessian_in.numel() > 0)
@@ -4744,6 +4750,11 @@ private:
         // 捕获主 GPU（torch 当前设备）。d_phsp_matrix_ 等跨 GPU 缓冲分配在此设备，
         // 后续所有 params 张量必须位于该设备（getNLL/getHessian 入口有 TORCH_CHECK）
         cudaGetDevice(&primary_dev_);
+        // 立即把 raw device 拉回主设备：前一个 analysis 的任意多 GPU 循环可能把
+        // raw 停在其它卡（第二次构造时尤其危险——耦合表/各类 buffer 会传错卡，
+        // 引发"一个 GPU 访问另一个 GPU"的非法访问，FF/hessian 多卡实测均踩过）
+        cudaSetDevice(primary_dev_);
+        params_.setPrimaryDevice(primary_dev_);
 
         // 初始化粒子信息
         initializeParticles();
