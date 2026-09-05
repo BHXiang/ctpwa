@@ -22,8 +22,10 @@ PY=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/bin/python3
 export LD_LIBRARY_PATH=/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/lib:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/envs/test2/lib/python3.12/site-packages/torch/lib:/usr/local/cuda-12.9/lib64:/usr/local/cuda-13.2/lib64:/usr/lib64/root:/besfs10/groups/jpsi/jpsigroup/user/bhxiang/miniconda3/lib
 export PYTHONPATH="$CTPWA_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-# probe 脚本与本脚本同目录（repo scripts/cluster/）；cd tests 后须显式指回
-HERE="$(cd "$(dirname "$0")" && pwd)"
+# probe 脚本在 repo scripts/cluster/；cd tests 后须显式指回。
+# 注意: SLURM 会把 sbatch 脚本复制到 /var/spool/slurm/... 执行，$0 指向 spool
+# 副本，不能 dirname $0——一律从硬编码 CTPWA_ROOT 推导。
+HERE="$CTPWA_ROOT/scripts/cluster"
 
 cd "$CTPWA_ROOT/tests"
 echo "=== 开始: $(date) ==="
