@@ -10,6 +10,10 @@ probe 脚本均按"自身所在目录"定位（job 脚本内 `HERE=` 解析）�
 | `perf_probe.py` | 各段耗时/显存基准（NLL ×10 / Hessian ×3） |
 | `ff_eff_probe.py` | float 档 FF/EFF/writeResult 冒烟（单测已并入 test_float_mode.py，保留作独立工具） |
 | `sync_to_cluster.sh` | 后备通道（集群无法访问 GitHub 时）：pack/push/pull 文件级同步；`pull` 模式可拉回 `log_*.out` |
+| `debug_tests.sh` | 单卡调试作业：转发任意 pytest 参数（`--tb=long` 拿完整 traceback） |
+
+> SLURM 头（V100 节点）一律用：
+> `#SBATCH --partition=gpu` `#SBATCH --qos=pwanormal` `#SBATCH --account=gpupwa`
 
 ## 集群一次性设置（把已有目录变成 git 仓库）
 
