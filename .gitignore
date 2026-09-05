@@ -15,8 +15,11 @@
 !tests/**
 !scripts/
 !scripts/run_tests.sh
+!scripts/cluster/
+!scripts/cluster/**
 tests/outputs/
 tests/_gen_float_mode/
+tests/_gen_*.yml
 tests/__pycache__/
 tests/data/real_*
 tests/.pytest_cache/
