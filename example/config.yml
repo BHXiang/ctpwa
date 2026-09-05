@@ -22,11 +22,13 @@
 # ============================================================
 
 # ---- 数值精度（可选, 根键 precision; 缺省 auto）----
-# auto（默认）= double .so 上"混合精度": 驻留振幅矩阵 A 存 float
-#   （显存约减半, 核心计算仍 double, NLL 相对漂移 ~1e-9）——大统计量
-#   分波的早期大量测试推荐; float .so 上 auto = 原生 float
-# float    = double .so 上同 auto（显式声明）
-# double   = 全 double 数值（最终参数/分支比报告前验证用; float .so 不支持）
+# auto   （默认）= 混合精度: 驻留振幅矩阵 A 存 float2（显存约减半）+ double
+#   核心计算, NLL 相对全 double 漂移 ~1e-9 —— 大统计量分波默认推荐
+# hybrid         = 同 auto（显式声明）
+# float          = 全 float 计算档（仅 double .so）: A/dF 存 float2 + 逐事件
+#   float 核心, 数值偏差 ~1e-5 量级（真实分析 NLL 偏差 <1e-6 相对）;
+#   Hessian 走 double 上转保持稳定 —— 内存/吞吐优化扫描首选
+# double         = 全 double 数值（仅 double .so; 报告最终参数/分支比前验证用）
 # 需要全 double 时取消下行注释:
 # precision: double
 # ============================================================
@@ -214,47 +216,59 @@ Resonances:
   #   tex: ["BWR", "(custom)"]
 
 # ---- 输出绘图 ----
-# 统一形式 (Plot 直接是观测列表; 1d=一个表达式, 2d=两个; expr 与 expression 等价):
+# 统一形式: Plot 直接是观测列表（1d=一个表达式, 2d=两个; expr 与 expression 等价）:
 #   Plot:
-#     - name: m_KK                          # 输出目录名; 缺省 obsN
+#     - name: m_KK                          # 输出 root 内目录名; 缺省 obs0/obs1/...（按列表序）
 #       expression: "M([Kp,Km])"            # 系统不变质量: [粒子列表] = 系统 (括号可省)
 #       bins: [100]; ranges: [[1.0, 2.6]]
 #       display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events"]
 #     - expression: "Phi([Kp])"             # K+ 在顶层母粒子静系内方位角
 #       bins: [40]; ranges: [[-3.15, 3.15]]
-#     - expression: ["M([Kp,Km])", "CosAngle([Kp], [Kp,Km])"]   # 2d: 质量 × cosβ (逗号同义于分号)
-#       bins: [100, 50]; ranges: [[1.0, 2.6], [-1, 1]]
-#   语法: Func([主体系统], [帧系统]) —— 第二组=帧(缺省=顶层母粒子静系); ";" 与 "," 等价, 括号可省;
-#   函数: M/M2/P/E/Perp/Pt/Theta/Phi/CosTheta/Angle/CosAngle (全部先对系统 4-矢量和);
-#   Angle/CosAngle = 与顶层母粒子动量的夹角(余弦)。中间态名不可用作帧(写成其末态子集)。
-# 旧格式 (mass/cosbeta/dalitz 键) 仍然支持, 语义与上面等价。
+#     - expression: ["M2([Kp,Km])", "CosAngle([Kp], [Kp,Km])"]  # 2d: M² × cosβ
+#       bins: [100, 50]; ranges: [[1.0, 6.8], [-1, 1]]
+#   语法: Func([主体系统], [帧系统], [轴系统]) —— 第2组=帧(boost 到其静系, 缺省=不 boost),
+#   第3组=轴(仅角度类; 缺省=顶层母粒子动量方向); ";" 与 "," 等价, 括号可省;
+#   函数: M/M2/P/E/Perp/Pt/Theta/Phi/CosTheta/Angle/CosAngle (先对主体系统 4-矢量和);
+#   Angle/CosAngle = 与轴(缺省顶层母)的夹角(余弦), 帧与轴同 boost —— 等价旧 cosbeta 公式。
+#   中间态名不可用作帧/轴(写成其末态子集)。
+# 旧格式 (mass/cosbeta/dalitz 键) 仍兼容, 语义与上面等价; 新代码请用统一形式。
 Plot:
-  # 不变质量谱
-  mass:
-    - input: [Kp, Km]
-      bins: 100; range: [1.0, 2.6]
-      display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
-    - input: [Kp, eta]
-      bins: 100; range: [1.0, 2.6]
-      display: ["M(K^{+}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
-    - input: [Km, eta]
-      bins: 100; range: [1.0, 2.6]
-      display: ["M(K^{-}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
-    - input: [pip, pim]
-      bins: 100; range: [0.27, 1.5]
-      display: ["M(\\pi^{+}\\pi^{-}) (GeV/c^{2})", "Events/12.3 MeV/c^{2}"]
+  # 不变质量谱 (1d)
+  - name: m_KK
+    expression: "M([Kp,Km])"
+    bins: [100]
+    ranges: [[1.0, 2.6]]
+    display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
 
-  # 螺旋度角
-  cosbeta:
-    - input: [[Jpsi], [Kp, Km], [Kp]]
-      bins: 100; range: [-1.0, 1.0]
-      display: ["cos\\beta(K^{+}K^{-})", "Events/0.02"]
+  - name: m_Kp_eta
+    expression: "M([Kp,eta])"
+    bins: [100]
+    ranges: [[1.0, 2.6]]
+    display: ["M(K^{+}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
 
-  # Dalitz 图
-  dalitz:
-    - input: [[Kp, Km], [Kp, eta]]
-      bins: [100, 100]; range: [[1.0, 6.8], [1.0, 6.8]]
-      display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}\\eta) (GeV^{2}/c^{4})"]
+  - name: m_Km_eta
+    expression: "M([Km,eta])"
+    bins: [100]
+    ranges: [[1.0, 2.6]]
+    display: ["M(K^{-}\\eta) (GeV/c^{2})", "Events/16 MeV/c^{2}"]
 
-# 精度档位: auto(缺省)/hybrid = A 存 float + double 核心; double = 全 double;
-# float = 全 float 档（模板化双实例, 分批接线中——未接线入口会显式报错）
+  - name: m_pipi
+    expression: "M([pip,pim])"
+    bins: [100]
+    ranges: [[0.27, 1.5]]
+    display: ["M(\\pi^{+}\\pi^{-}) (GeV/c^{2})", "Events/12.3 MeV/c^{2}"]
+
+  # 螺旋度角 cosβ (1d; 帧=[Kp,Km] 静系, 轴缺省=顶层母 J/ψ —— 等价旧
+  # cosbeta: input [[Jpsi], [Kp, Km], [Kp]])
+  - name: cosbeta_KK
+    expression: "CosAngle([Kp], [Kp,Km])"
+    bins: [100]
+    ranges: [[-1.0, 1.0]]
+    display: ["cos\\beta(K^{+}K^{-})", "Events/0.02"]
+
+  # Dalitz 图 (2d: M² × M²)
+  - name: dalitz_KK_Keta
+    expression: ["M2([Kp,Km])", "M2([Kp,eta])"]
+    bins: [100, 100]
+    ranges: [[1.0, 6.8], [1.0, 6.8]]
+    display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}\\eta) (GeV^{2}/c^{4})"]

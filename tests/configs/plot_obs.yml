@@ -1,0 +1,77 @@
+# Plot 新格式回归 config: Plot 直接是观测列表（expr/expression, 1d/2d）
+# —— 与 example/config.yml 的 Plot 段同一套写法（主推格式）。
+# 验证 writeResult 输出 <name>/hdata+hfit（与缺省 name → obs<N> 目录）。
+# 数据相对路径从 tests/ 目录解析（conftest.py 会 chdir 到 tests/）
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [phi1680]
+    legend: [R_KK, " ", eta]
+
+Resonances:
+  phi1680:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    free: [0, 1]
+    tex: ["\\phi(1680)"]
+
+# ---- Plot: 统一观测列表（主推格式; 与 example/config.yml 写法一致）----
+Plot:
+  # 1d 不变质量谱（具名目录）
+  - name: m_KK
+    expression: "M([Kp,Km])"
+    bins: [100]
+    ranges: [[1.0, 2.6]]
+    display: ["M(K^{+}K^{-}) (GeV/c^{2})", "Events"]
+
+  # 1d 螺旋度角 cosβ: 帧=[Kp,Km] 静系, 轴缺省=顶层母 J/ψ
+  - name: cosbeta_KK
+    expression: "CosAngle([Kp], [Kp,Km])"
+    bins: [100]
+    ranges: [[-1.0, 1.0]]
+    display: ["cos\\beta(K^{+}K^{-})", "Events"]
+
+  # 2d Dalitz: M² × M²
+  - name: dalitz2
+    expression: ["M2([Kp,Km])", "M2([Kp,eta])"]
+    bins: [100, 100]
+    ranges: [[1.0, 6.8], [1.0, 6.8]]
+    display: ["M^{2}(K^{+}K^{-}) (GeV^{2}/c^{4})", "M^{2}(K^{+}\\eta) (GeV^{2}/c^{4})"]
+
+  # 缺省 name → obs3 目录（按列表序从 0 编号）
+  - expression: "Theta([Kp], [Kp,Km])"
+    bins: [50]
+    ranges: [[0.0, 3.15]]
