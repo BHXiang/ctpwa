@@ -6,8 +6,8 @@
 #   export CONFIG=<真实分析 config.yml> # 可选: 追加真实分析单步 NLL
 #   sbatch scripts/cluster/job_validate_all.sh
 # 输出 ./log_validate_all.out（sbatch 时 cwd）
-#SBATCH --partition=gpupwa
-#SBATCH --qos=pwadedicate
+#SBATCH --partition=gpu
+#SBATCH --qos=pwanormal
 #SBATCH --account=gpupwa
 #SBATCH --job-name=ctpwa-valall
 #SBATCH --output=./log_validate_all.out

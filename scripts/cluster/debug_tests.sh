@@ -5,8 +5,8 @@
 #   sbatch scripts/cluster/debug_tests.sh test_precision.py::test_fit_fractions_parity --tb=long
 #   sbatch scripts/cluster/debug_tests.sh -k "float"          # 任意 pytest 参数均可
 # 输出 ./log_debug_tests.out（sbatch 时 cwd）
-#SBATCH --partition=gpupwa
-#SBATCH --qos=pwadedicate
+#SBATCH --partition=gpu
+#SBATCH --qos=pwanormal
 #SBATCH --account=gpupwa
 #SBATCH --job-name=ctpwa-dbg
 #SBATCH --output=./log_debug_tests.out
