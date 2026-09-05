@@ -4847,15 +4847,17 @@ private:
                 prec_mode_ = PrecMode::Double;
                 float_amps_ = true;
             }
-            if (prec_mode_ == PrecMode::Float) {
-                std::cout << "[ctpwa] 全 float 档（precision:float）: 存储/计算 float;"
-                             " 尚未接线的入口会显式报错，请先用 precision:hybrid/double" << std::endl;
-            } else if (float_amps_) {
-                std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double";
-                if (req == "auto" || req == "hybrid")
-                    std::cout << "（precision:" << req << " 默认; 需全 double 请在 config 写 precision: double）";
-                std::cout << std::endl;
-            }
+            // 精度档位 banner 注释掉（真实分析每次 ctor 刷屏）:
+            // 精度信息由 DeviceManager.print() 的 "complex precision" 行提供。
+            // if (prec_mode_ == PrecMode::Float) {
+            //     std::cout << "[ctpwa] 全 float 档（precision:float）: 存储/计算 float;"
+            //                  " 尚未接线的入口会显式报错，请先用 precision:hybrid/double" << std::endl;
+            // } else if (float_amps_) {
+            //     std::cout << "[ctpwa] 混合精度模式: A 存 float（省显存）, 核心计算 double";
+            //     if (req == "auto" || req == "hybrid")
+            //         std::cout << "（precision:" << req << " 默认; 需全 double 请在 config 写 precision: double）";
+            //     std::cout << std::endl;
+            // }
             amp_calc_.setFloatOutput(float_amps_);
             // d_dF 表存储档位: 仅全 float 档存 float2（hybrid 保持 double 语义）
             amp_calc_.setDFloat(prec_mode_ == PrecMode::Float);

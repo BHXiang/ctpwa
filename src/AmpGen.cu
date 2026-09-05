@@ -1432,8 +1432,9 @@ void AmpCasDecay::releaseStaticData()
             }
         }
     slamp_released_ = true;
-    fprintf(stderr, "[ctpwa] releaseStaticData: 链 %s 无自由参数，静态 SL 表已释放\n",
-            chain_name_.c_str());
+    // 逐链释放日志注释掉（真实分析每 ctor 刷屏）; 诊断时取消注释
+    // fprintf(stderr, "[ctpwa] releaseStaticData: 链 %s 无自由参数，静态 SL 表已释放\n",
+    //         chain_name_.c_str());
 }
 
 // 振幅输出写入辅助: 计算恒在 double, 输出按 Out 存 float2(混合精度省显存)或 ctComplex(原生)
@@ -2428,8 +2429,9 @@ void AmpCalc::releaseStaticCasData()
             cas_list_[ci]->releaseStaticData();
             ++freed;
         }
-    fprintf(stderr, "[ctpwa] releaseStaticCasData: 释放 %d 个无自由参数链组合的静态"
-            " SL 表（保留 %d 个）\n", freed, (int)(cas_list_.size() - freed));
+    // 汇总释放日志注释掉; 诊断时取消注释
+    // fprintf(stderr, "[ctpwa] releaseStaticCasData: 释放 %d 个无自由参数链组合的静态"
+    //         " SL 表（保留 %d 个）\n", freed, (int)(cas_list_.size() - freed));
 }
 
 void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
