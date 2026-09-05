@@ -1,0 +1,50 @@
+# Custom DSL 模型数值测试 config
+# 表达式 = 恒定宽度 BW × 复数耦合 g0·e^{iφ}，4 个自由参数（>3，走标量 kernel 路径）
+# 数据相对路径从 tests/ 目录解析（conftest.py 会 chdir 到 tests/）
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [custom_res]
+    legend: [R_KK, " ", eta]
+
+Resonances:
+  custom_res:
+    J: 1
+    P: -1
+    model: Custom
+    parameters: [1.66, 0.125, 1.0, 0.5]
+    free: [-1]   # 显式声明拟合（未写 free 的参数默认不拟合）
+    params: [m0, w0, g0, phi]
+    expr: "g0 * exp(1i * phi) / (m0^2 - m^2 - 1i * m0 * w0)"
+    tex: ["R_{custom}"]

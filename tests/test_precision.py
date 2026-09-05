@@ -7,7 +7,8 @@
 
 覆盖：
 1. 默认值：auto 缺省 = 混合精度（启动打印标记），显式 double 不带标记;
-2. 数值奇偶：同一 config 的 precision:float 与 precision:double 实例
+2. 数值奇偶：同一 config 的 precision:hybrid（原 precision:float 的 float-A 混合）
+   与 precision:double 实例
    NLL / 梯度 / Hessian / getFitFractions / getEfficiency 逐值一致
    （实测偏差 ~1e-10..1e-7，容差取 ~1e-5 量级——既留足 float-A 舍入余量，
    又能抓住"float 分支整体读错 A / 忘上转"这类 O(1) 错误）;
@@ -61,7 +62,8 @@ def _analysis(name: str, precision: str):
 
 
 def _pair(name):
-    return _analysis(name, "float"), _analysis(name, "double")
+    # hybrid = 原 precision:float 的"float-A 混合"行为（precision:float 语义已升级为全 float 档）
+    return _analysis(name, "hybrid"), _analysis(name, "double")
 
 
 def _coupling(ana, seed=3):
@@ -82,32 +84,39 @@ def _coupling(ana, seed=3):
 # 默认值：auto → 混合精度 float-A
 # ---------------------------------------------------------------
 
-def test_auto_default_is_hybrid_float(capfd, device):
-    """config 缺省 precision（auto）→ 启动打印混合精度标记；显式 double 无标记。
+def test_auto_default_is_hybrid_float(device):
+    """config 缺省 precision（auto）应等同显式 hybrid（A float2 + double 核心），
+    而非 double。
 
-    打印发生在 analysis 构造期间（std::cout），用 capfd 在 fd 层抓取。
+    用行为断言（NLL 逐位一致）替代打印文本检查——"std::cout 标记 + pytest
+    capfd"组合在 SLURM/libstdc++ 环境下不稳定（直跑有标记、capfd 下偶发丢失，
+    与档位行为无关）。
     """
     import ctpwa
     GEN_DIR.mkdir(parents=True, exist_ok=True)
     base = (TESTS_DIR / "configs" / "simple.yml").read_text()
     cfg_auto = GEN_DIR / "simple_auto_default.yml"
     cfg_auto.write_text(base)  # 无 precision 键 → auto
+    cfg_hybrid = GEN_DIR / "simple_auto_hybrid.yml"
+    cfg_hybrid.write_text("precision: hybrid\n" + base)
     cfg_double = GEN_DIR / "simple_auto_double.yml"
     cfg_double.write_text("precision: double\n" + base)
 
-    capfd.readouterr()  # 清空
-    ctpwa.analysis(str(cfg_auto))
-    out_auto, _ = capfd.readouterr()
-    assert "混合精度模式" in out_auto, (
-        "precision:auto 应默认混合精度(float-A), 实际未打印标记"
+    ana_auto = ctpwa.analysis(str(cfg_auto))
+    ana_hyb = ctpwa.analysis(str(cfg_hybrid))
+    ana_dbl = ctpwa.analysis(str(cfg_double))
+    p = make_params(ana_dbl, device)
+    nll_auto = float(ana_auto.getNLL(p))
+    nll_hyb = float(ana_hyb.getNLL(p))
+    nll_dbl = float(ana_dbl.getNLL(p))
+    # atomic 归约顺序跨调用非确定 → 允许最后几位抖动（rtol 1e-12），
+    # 仍远小于 hybrid-vs-double 的 ~1e-8 量级差
+    assert abs(nll_auto - nll_hyb) / max(abs(nll_hyb), 1e-30) < 1e-12, (
+        "precision:auto 应与 hybrid 一致(rtol 1e-12), "
+        f"auto={nll_auto:.13f} hybrid={nll_hyb:.13f}"
     )
-
-    capfd.readouterr()
-    ctpwa.analysis(str(cfg_double))
-    out_double, _ = capfd.readouterr()
-    assert "混合精度模式" not in out_double, (
-        "precision:double 不应有混合精度标记"
-    )
+    rel = abs(nll_auto - nll_dbl) / max(abs(nll_dbl), 1e-30)
+    assert rel < 1e-6, f"auto(hybrid) 与 double 偏差 rel={rel:.2e}（应 ~1e-8）"
 
 
 # ---------------------------------------------------------------
@@ -190,7 +199,7 @@ def test_efficiency_parity(device):
 # float 模式 writeResult 冒烟（原 gate 语义: FF/EFF 外的低频路径同套上转）
 # ---------------------------------------------------------------
 
-@pytest.mark.parametrize("precision", ["float", "double"])
+@pytest.mark.parametrize("precision", ["hybrid", "double"])
 def test_write_result_smoke(precision, device):
     """两种精度下 writeResult 都正常出文件（防回归到 gate/崩溃）。"""
     af = _analysis("simple", precision)

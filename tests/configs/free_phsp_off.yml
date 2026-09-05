@@ -1,0 +1,58 @@
+# phsp 驻留模式 baseline config（与 free_phsp.yml 物理一致，仅未开开关）
+# 用于对比验证 Constraints.free_phsp_amplitudes 不改变数值结果：
+#   - 本文件 = 默认行为（phsp 振幅驻留，phsp_sum 走 computePhspMeanSum）
+#   - free_phsp.yml = 流式模式（phsp 振幅不驻留，phsp_sum 走 double 矩阵）
+#   - 两者 NLL/梯度应一致（double 矩阵 vs 原始振幅扫描）
+# 要求：所有共振态质量/宽度固定（无 free 参数）
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [phi1020, phi1680]
+    legend: [R_KK, " ", eta]
+
+Resonances:
+  phi1020:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.0195, 0.0045]
+    tex: ["\\phi(1020)"]
+
+  phi1680:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    tex: ["\\phi(1680)"]

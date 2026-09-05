@@ -1,0 +1,49 @@
+# nPolar 保护机制验证 config: 7 个 spin-1（Jpsi + X1..X6）→ nPolar = 3^7 = 2187
+# > A1024 档位 → auto 分派降级 B16 分块；小数据量验证保护路径。
+Particles:
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  X1:   {J: 1, P: +1, mass: 0.0100, tex: ['X_1']}
+  X2:   {J: 1, P: -1, mass: 0.0100, tex: ['X_2']}
+  X3:   {J: 1, P: +1, mass: 0.0100, tex: ['X_3']}
+  X4:   {J: 1, P: -1, mass: 0.0100, tex: ['X_4']}
+  X5:   {J: 1, P: +1, mass: 0.0100, tex: ['X_5']}
+  X6:   {J: 1, P: -1, mass: 0.0100, tex: ['X_6']}
+  piM:  {J: 0, P: -1, mass: 0.1396, tex: ['\\pi^{-}']}
+  pi0:  {J: 0, P: -1, mass: 0.1350, tex: ['\\pi^{0}']}
+
+Data:
+  order: [X1, X2, X3, X4, X5, X6, piM, pi0]
+  data: [dat, "./data/pol2187_data.dat"]
+  phsp: [dat, "./data/pol2187_phsp.dat"]
+
+DecayChains:
+  chain1:
+    Jpsi:
+      - [X1, R1]
+    R1: [X2, R2]
+    R2: [X3, R3]
+    R3: [X4, R4]
+    R4: [X5, R5]
+    R5: [X6, R6]
+    R6: [piM, pi0]
+    intermediates:
+      R1:
+        - [J: 1, P: +1]: [r1]
+      R2:
+        - [J: 1, P: -1]: [r2]
+      R3:
+        - [J: 1, P: +1]: [r3]
+      R4:
+        - [J: 1, P: -1]: [r4]
+      R5:
+        - [J: 1, P: +1]: [r5]
+      R6:
+        - [J: 1, P: -1]: [r6]
+
+Resonances:
+  r1: {J: 1, P: +1, model: BWR, parameters: [3.0, 0.15], free: [0, 1], tex: ['R_1']}
+  r2: {J: 1, P: -1, model: BWR, parameters: [2.5, 0.15], free: [0, 1], tex: ['R_2']}
+  r3: {J: 1, P: +1, model: BWR, parameters: [2.0, 0.10], free: [0, 1], tex: ['R_3']}
+  r4: {J: 1, P: -1, model: BWR, parameters: [1.5, 0.10], free: [0, 1], tex: ['R_4']}
+  r5: {J: 1, P: +1, model: BWR, parameters: [1.0, 0.10], free: [0, 1], tex: ['R_5']}
+  r6: {J: 1, P: -1, model: BWR, parameters: [0.5, 0.05], free: [0, 1], tex: ['R_6']}

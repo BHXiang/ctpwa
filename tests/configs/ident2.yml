@@ -1,0 +1,51 @@
+# 全同粒子测试：2 个 π⁰ 跨子衰变（J/psi → pi01 + R, R → pi02 + eta）
+# pi01/pi02 同组 → coset S₂ = {e, (12)} → 1 个置换拓扑 + 恒等
+# 期望输出: "Identical group (boson): 2 members (1 permutation topologies)"
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  pi01:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\\pi^{0}']
+  pi02:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\\pi^{0}']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\\eta']
+
+Data:
+  order: [pi01, pi02, eta]
+  data: [dat, "./data/ident2_data.dat"]
+  phsp: [dat, "./data/ident2_phsp.dat"]
+  bkg:  [dat, "./data/ident2_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [pi01, R]
+      - R: [pi02, eta]
+    R:
+      - [J: 1, P: -1]: [res1]
+    legend: [R, " ", pi01]
+
+Resonances:
+  res1:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.2, 0.2]
+    free: [0, 1]
+    tex: ["R"]
+
+Constraints:
+  identical: [[pi01, pi02]]

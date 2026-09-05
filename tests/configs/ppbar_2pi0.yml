@@ -1,0 +1,76 @@
+# π⁺π⁻π⁺π⁻ 多模式配对测试（DFS 多分支展开 + 同名兄弟递增去重）:
+# Jpsi→gamma+R_4pi0, R_4pi0→R_2pi0+R_2pi0;
+# R_2pi0 有 4 种模式 [pip1,pim1]/[pip1,pim2]/[pip2,pim1]/[pip2,pim2]。
+# 全同 π⁺π⁻ 下非等价配对恰有 2 种：
+#   decay1_R_4pi0_R_2pi0_0: R_2pi0→pip1+pim1 + R_2pi0→pip2+pim2
+#   decay1_R_4pi0_R_2pi0_1: R_2pi0→pip1+pim2 + R_2pi0→pip2+pim1
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  gamma:
+    J: 1
+    P: -1
+    mass: 0.0
+    tex: ['\gamma']
+  pip1:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{+}']
+  pim1:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{-}']
+  pip2:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{+}']
+  pim2:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{-}']
+
+Data:
+  order: [pip1, pim1, pip2, pim2, gamma]
+  data: [dat, "./data/5body.dat"]
+  phsp: [dat, "./data/5body.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [gamma, R_4pi0]
+    R_4pi0:
+      - [R_2pi0, R_2pi0]
+    R_2pi0:
+      - [pip1, pim1]
+      - [pip1, pim2]
+      - [pip2, pim1]
+      - [pip2, pim2]
+
+    intermediates:
+      R_4pi0:
+        - [J: 0, P: 1]: [X4pi0]
+      R_2pi0:
+        - [J: 0, P: 1]: [X2pi0]
+
+    legends:
+      - ['R_4pi0', 'gamma']
+      - ['R_2pi0', 'R_2pi0']
+
+Resonances:
+  X4pi0:
+    J: 0
+    P: 1
+    model: ONE
+    parameters: [4.0]
+  X2pi0:
+    J: 0
+    P: 1
+    model: ONE
+    parameters: [2.0]

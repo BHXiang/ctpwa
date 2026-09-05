@@ -11,7 +11,12 @@
 !pyproject.toml
 !README.md
 !LICENSE
+!tests/
+!tests/**
+!scripts/
+!scripts/run_tests.sh
 tests/outputs/
+tests/_gen_float_mode/
 tests/__pycache__/
 tests/data/real_*
 tests/.pytest_cache/

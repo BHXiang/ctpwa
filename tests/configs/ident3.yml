@@ -1,0 +1,52 @@
+# 全同粒子测试：3 个 π⁰（J/psi → pi01 + X, X → pi02 + pi03）
+# pi02/pi03 同子衰变（选择定则稳定子）+ pi01 跨子衰变 → coset S₃/⟨(23)⟩ = 3 个陪集
+# 期望输出: "Identical group (boson): 3 members (2 permutation topologies)"
+# 注意: X 必须为 2⁺ —— 1⁻ → π⁰π⁰ 被选择定则禁止（Bose 对称性），0⁺/1⁺ 被宇称拒绝
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  pi01:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\\pi^{0}']
+  pi02:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\\pi^{0}']
+  pi03:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\\pi^{0}']
+
+Data:
+  order: [pi01, pi02, pi03]
+  data: [dat, "./data/ident3_data.dat"]
+  phsp: [dat, "./data/ident3_phsp.dat"]
+  bkg:  [dat, "./data/ident3_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [pi01, X]
+      - X: [pi02, pi03]
+    X:
+      - [J: 2, P: 1]: [res1]
+    legend: [X, " ", pi01]
+
+Resonances:
+  res1:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [1.0, 0.2]
+    free: [0, 1]
+    tex: ["X"]
+
+Constraints:
+  identical: [[pi01, pi02, pi03]]

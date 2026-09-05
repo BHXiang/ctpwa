@@ -1,0 +1,41 @@
+# nPolar 实验 config: 5 个 spin-1 粒子（Jpsi + 终态 X1..X4）→ nPolar = 3^5 = 243
+# 链式两体衰变: Jpsi → X1 R1; R1 → X2 R2; R2 → X3 R3; R3 → X4 R4; R4 → piM pi0
+# 带自旋终态粒子 X_i 在 Particles 段（数据中有其四动量行），
+# 中间共振 R_i 只在 DecayChains.intermediates 声明（参照 ls_filter.yml: rho）。
+Particles:
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  X1:   {J: 1, P: +1, mass: 0.9000, tex: ['X_1']}
+  X2:   {J: 1, P: -1, mass: 0.7000, tex: ['X_2']}
+  X3:   {J: 1, P: +1, mass: 0.6000, tex: ['X_3']}
+  X4:   {J: 1, P: -1, mass: 0.2000, tex: ['X_4']}
+  piM:  {J: 0, P: -1, mass: 0.1396, tex: ['\\pi^{-}']}
+  pi0:  {J: 0, P: -1, mass: 0.1350, tex: ['\\pi^{0}']}
+
+Data:
+  order: [X1, X2, X3, X4, piM, pi0]
+  data: [dat, "./data/pol243_data.dat"]
+  phsp: [dat, "./data/pol243_phsp.dat"]
+
+DecayChains:
+  chain1:
+    Jpsi:
+      - [X1, R1]
+    R1: [X2, R2]
+    R2: [X3, R3]
+    R3: [X4, R4]
+    R4: [piM, pi0]
+    intermediates:
+      R1:
+        - [J: 1, P: +1]: [r1]
+      R2:
+        - [J: 1, P: -1]: [r2]
+      R3:
+        - [J: 1, P: +1]: [r3]
+      R4:
+        - [J: 1, P: -1]: [r4]
+
+Resonances:
+  r1: {J: 1, P: +1, model: BWR, parameters: [2.0, 0.15], free: [0, 1], tex: ['R_1']}
+  r2: {J: 1, P: -1, model: BWR, parameters: [1.2, 0.15], free: [0, 1], tex: ['R_2']}
+  r3: {J: 1, P: +1, model: BWR, parameters: [0.5, 0.10], free: [0, 1], tex: ['R_3']}
+  r4: {J: 1, P: -1, model: BWR, parameters: [0.28, 0.05], free: [0, 1], tex: ['R_4']}

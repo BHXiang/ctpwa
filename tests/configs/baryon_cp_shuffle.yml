@@ -1,0 +1,39 @@
+# 重子 CP 共轭对 + 链 B 共振顺序打乱 + trans:
+# 验证同 rname 全局共享按名字配对（顺序无关），trans 的位置对应
+# 不干扰同名场景（历史 bug: 位置对应在打乱顺序时双向误配）
+Particles:
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  p:    {J: 1/2, P: +1, mass: 0.9383, tex: ['p']}
+  pbar: {J: 1/2, P: -1, mass: 0.9383, tex: ['\\bar{p}']}
+  eta:  {J: 0, P: -1, mass: 0.5479, tex: ['\\eta']}
+
+Data:
+  order: [p, pbar, eta]
+  data: [dat, "./data/baryon_cp_data.dat"]
+  phsp: [dat, "./data/baryon_cp_phsp.dat"]
+
+DecayChains:
+  chainA:
+    Jpsi:
+      - [pbar, NpA]
+    NpA: [p, eta]
+    intermediates:
+      NpA:
+        - [J: 1/2, P: -1]: [N1650]
+        - [J: 1/2, P: +1]: [N1880]
+  chainB:
+    Jpsi:
+      - [p, NmB]
+    NmB: [pbar, eta]
+    intermediates:
+      NmB:
+        - [J: 1/2, P: +1]: [N1880]     # 顺序打乱: N1880 在前
+        - [J: 1/2, P: -1]: [N1650]
+
+Resonances:
+  N1650: {model: BW, parameters: [1.6366, 0.0072], free: [0, 1], tex: ['N(1650)']}
+  N1880: {model: BW, parameters: [1.8017, 0.0217], free: [0, 1], tex: ['N(1880)']}
+
+Constraints:
+  trans:
+    - [chainA, chainB]: 1

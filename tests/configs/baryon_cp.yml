@@ -1,0 +1,40 @@
+# 重子 CP 共轭对测试: J/psi -> pbar N+ (N+ -> p eta) 与 J/psi -> p N- (N- -> pbar eta)
+# 两条链引用同一 Resonance 条目 N（Resonances 段不写 JP —— 量子数由
+# intermediates 各自赋值），验证:
+#   1. JP 从 intermediates 注入（费米子宇称相反链）
+#   2. 同 rname 参数槽全局共享（m0/w0 各 1 个而非 2 个）
+Particles:
+  Jpsi: {J: 1, P: -1, mass: 3.0969, tex: ['J/\\psi']}
+  p:    {J: 1/2, P: +1, mass: 0.9383, tex: ['p']}
+  pbar: {J: 1/2, P: -1, mass: 0.9383, tex: ['\\bar{p}']}
+  eta:  {J: 0, P: -1, mass: 0.5479, tex: ['\\eta']}
+
+Data:
+  order: [p, pbar, eta]
+  data: [dat, "./data/baryon_cp_data.dat"]
+  phsp: [dat, "./data/baryon_cp_phsp.dat"]
+
+DecayChains:
+  chainA:
+    Jpsi:
+      - [pbar, Np]
+    Np: [p, eta]
+    intermediates:
+      Np:
+        - [J: 1/2, P: +1]: [N]
+  chainB:
+    Jpsi:
+      - [p, Nm]
+    Nm: [pbar, eta]
+    intermediates:
+      Nm:
+        - [J: 1/2, P: -1]: [N]
+
+Resonances:
+  N: {model: BWR, parameters: [2.0, 0.15], free: [0, 1], tex: ['N']}
+
+# trans 约束与同 rname 自动共享叠加：参数槽仍应唯一（n_theta == 2）
+Constraints:
+  trans:
+    - [chainA, chainB]: -1
+

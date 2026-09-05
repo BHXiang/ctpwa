@@ -1,0 +1,48 @@
+# LS 分波约束测试（约束版）:
+# 与 ls_filter.yml 相同，但第一步 Jpsi → rho + R_rho 只保留 (S=1, L=1)
+# 期望: nVector = 1（基线版 = 4）
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  rho:
+    J: 1
+    P: -1
+    mass: 0.775
+    tex: ['\\rho']
+  pip:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\\pi^{+}']
+  pim:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\\pi^{-}']
+
+Data:
+  order: [rho, pip, pim]
+  data: [dat, "./data/ident2_sideband.dat"]
+  phsp: [dat, "./data/ident2_sideband.dat"]
+  bkg:  [dat, "./data/ident2_sideband.dat"]
+
+DecayChains:
+  chain1:
+    Jpsi: [[rho, R_rho, {sl: [1, 1]}]]     # 第一步只保留 S=1, L=1
+    R_rho: [pip, pim]
+    intermediates:
+      R_rho:
+        - [J: 1, P: -1]: [res_rho]
+    legend: [R_rho, " ", rho]
+
+Resonances:
+  res_rho:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [0.775, 0.15]
+    free: [0, 1]
+    tex: ["R_\\rho"]

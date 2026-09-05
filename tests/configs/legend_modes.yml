@@ -1,0 +1,90 @@
+# 复现 legends 规则分配 bug 的紧凑格式 config:
+# 母粒子 psip 只有一行 [gamma, R_chic1]，中间态 R_chic1 有 3 种子衰变模式。
+# legends 3 条规则按"展开后的链"顺序对应 3 个模式:
+#   模式0 (chic1→eta+R_KK)      ↔ ['R_KK', 'eta']
+#   模式1 (chic1→Kp+R_Keta)     ↔ ['R_Keta', "^{-}", 'Kp']
+#   模式2 (chic1→Km+R_Keta)     ↔ ['R_Keta', "^{+}", 'Km']
+# 回归1: 规则按展开链顺序分配 → 3 条图例（此前只剩 1 条）。
+# 回归2: R_Keta 是深层多模式中间态, 其子衰变须避开链中已出现的粒子
+#   (旁观者): chic1→Kp+R_Keta 时 R_Keta→Km+eta, chic1→Km+R_Keta 时
+#   R_Keta→Kp+eta（不能恒用模式0 → 否则同一粒子出现两次）。
+Particles:
+  psip:
+    J: 1
+    P: -1
+    mass: 3.0686
+    tex: ['\psi']
+  gamma:
+    J: 1
+    P: -1
+    mass: 0.0
+    tex: ['\gamma']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [gamma, Kp, Km, eta]
+  data: [dat, "./data/test_4body_data.dat"]
+  phsp: [dat, "./data/test_4body_phsp.dat"]
+  bkg:  [dat, "./data/test_4body_sideband.dat"]
+
+DecayChains:
+  decay1:
+    psip:
+      - [gamma, R_chic1, {sl: [1, 0]}]
+    R_chic1:
+      - [eta, R_KK]
+      - [Kp, R_Keta]
+      - [Km, R_Keta]
+    R_KK: [Kp, Km]
+    R_Keta:
+      - [Km, eta]
+      - [Kp, eta]
+
+    intermediates:
+      R_chic1:
+        - [J: 1, P: +1]: [chic1]
+      R_KK:
+        - [J: 2, P: 1]: [f2_1525]
+      R_Keta:
+        - [J: 1, P: -1]: [K1_1410]
+
+    legends:
+      - ['R_KK', 'eta']
+      - ['R_Keta', "^{-}", 'Kp']
+      - ['R_Keta', "^{+}", 'Km']
+
+Resonances:
+  chic1:
+    J: 1
+    P: 1
+    model: ONE
+    parameters: [3.51]
+    tex: ['chi_{c1}']
+
+  f2_1525:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [1.518, 0.082]
+    tex: ['f_{2}(1525)']
+
+  K1_1410:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.44758850, 0.65280994]
+    tex: ["K_{1}", "(1410)"]

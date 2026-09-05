@@ -1,0 +1,54 @@
+# Custom DSL BWR()/Bf() 函数测试 config（对比基准: bf.yml 内置 BWR）
+# bf.yml 内置 BWR 默认 has_bf=true, L=1, d=3.0：
+#   F = BWR(m, m0, g0, L, q, q0, d) × Bf(L, q, q0, d)
+# DSL 等价式: BWR(p0, p1, 1, 3.0) * Bf(1, q, q0, 3.0)
+#   —— m/q/q0/L/d 均由包装内部补全，q0 为复合节点（∂q0/∂p0 ≠ 0）
+# 数据相对路径从 tests/ 目录解析（conftest.py 会 chdir 到 tests/）
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [bwr_func_res]
+    legend: [R_KK, " ", eta]
+
+Resonances:
+  bwr_func_res:
+    J: 1
+    P: -1
+    model: Custom
+    parameters: [1.66, 0.125]
+    free: [-1]   # 显式声明拟合（未写 free 的参数默认不拟合）
+    params: [p0, p1]
+    # BWR(m0, g0, L=1, d=3.0) × Bf(L=1, q, q0, d=3.0)，与内置 BWR 默认逐点一致
+    expr: "BWR(p0, p1, 1, 3.0) * Bf(1, q, q0, 3.0)"
+    tex: ["R_{BWR}"]

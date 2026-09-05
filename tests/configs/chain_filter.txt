@@ -1,0 +1,4 @@
+# 链过滤器测试文件（供 simple_filtered.yml 引用）
+# 每行一个子串；空行与 # 注释被跳过
+chain1
+no_such_chain_pattern

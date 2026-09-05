@@ -1,0 +1,84 @@
+# 深层多中间态 + 对称同名中间态测试:
+# 链A: Jpsi→gamma+R_4pi0, R_4pi0→R_2pi0+R_2pi0, R_2pi0→pi03+pi04 / pi01+pi02
+#      （同名兄弟递增约束 → 两 R_2pi0 自动配对为两种模式各一次）
+# 链B: Jpsi→gamma+R_4pi0, R_4pi0→pi01+R_3pi0, R_3pi0→pi02+R_2pi0, R_2pi0→pi03+pi04
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  gamma:
+    J: 1
+    P: -1
+    mass: 0.0
+    tex: ['\gamma']
+  pi01:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\pi^{0}']
+  pi02:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\pi^{0}']
+  pi03:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\pi^{0}']
+  pi04:
+    J: 0
+    P: -1
+    mass: 0.135
+    tex: ['\pi^{0}']
+
+Data:
+  order: [pi01, pi02, pi03, pi04, gamma]
+  data: [dat, "./data/5body.dat"]
+  phsp: [dat, "./data/5body.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [gamma, R_4pi0]
+    R_4pi0:
+      - [R_2pi0, R_2pi0]
+      - [pi01, R_3pi0]
+    R_3pi0:
+      - [pi02, R_2pi0]
+    R_2pi0:
+      - [pi03, pi04]
+      - [pi01, pi02]
+
+    intermediates:
+      R_4pi0:
+        - [J: 0, P: 1]: [X4pi0]
+      R_3pi0:
+        - [J: 0, P: 1]: [X3pi0]
+      R_2pi0:
+        - [J: 0, P: 1]: [X2pi0]
+
+    legends:
+      - ['R_4pi0', 'gamma']
+      - ['R_2pi0', 'R_2pi0']
+      - ['R_3pi0', 'pi01']
+      - ['R_2pi0', 'pi02']
+
+Resonances:
+  X4pi0:
+    J: 0
+    P: 1
+    model: ONE
+    parameters: [4.0]
+  X3pi0:
+    J: 0
+    P: 1
+    model: ONE
+    parameters: [3.0]
+  X2pi0:
+    J: 0
+    P: 1
+    model: ONE
+    parameters: [2.0]

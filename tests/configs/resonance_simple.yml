@@ -1,0 +1,10 @@
+# 外部共振态文件（供 simple_ext.yml 引用）
+# 内容与 simple.yml 的 Resonances 节一致
+Resonances:
+  phi1680:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    free: [0, 1]
+    tex: ["\\phi(1680)"]

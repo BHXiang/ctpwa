@@ -1,0 +1,53 @@
+# 势垒因子: 共振态名(r1) ≠ 中间态名(R_KK) 的间接查找
+# 全局 bf_d=0.0 + Resonances r1: bf_d=4.0
+# → resolveStepBF 经 resonance_chains 查到 R_KK 槽位对应 r1 → R_KK 节点 = 4.0
+# 与 bf_steps.yml（step 级显式 0.0/4.0）数值一致
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [r1]
+    legend: [R_KK, " ", eta]
+
+Constraints:
+  bf_d: 0.0
+
+Resonances:
+  r1:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    free: [0, 1]
+    bf_d: 4.0
+    tex: ["R"]
