@@ -1381,8 +1381,29 @@ void ConfigParser::parseResonances(const YAML::Node &node)
         else if (props["parameters"])
             res.parameters = props["parameters"].as<std::vector<double>>();
 
-        // 模型选项（Hist: file/bins/range/extrapolate）
+        // 模型选项（Hist: file/bins/range/extrapolate；Interp: file/method）
+        // 支持两种写法（直接键优先于嵌套映射）：
+        //   1) 直接键:   file: xxx  method: linear
+        //   2) 嵌套映射: options: {file: xxx, method: linear}
+        // 旧解析器只读直接键 → tests/configs/interp.yml、example/config.yml 的
+        // options 嵌套写法被静默丢弃（Interp 表读不到 → F≡1）。
+        auto yamlScalarStr = [](const YAML::Node& v) -> std::string {
+            if (v.IsSequence()) {
+                std::string s;
+                for (size_t i = 0; i < v.size(); ++i) {
+                    if (i) s += ",";
+                    s += v[i].as<std::string>();
+                }
+                return s;
+            }
+            return v.as<std::string>();
+        };
+        if (props["options"] && props["options"].IsMap()) {
+            for (const auto& kv : props["options"])
+                res.options[kv.first.as<std::string>()] = yamlScalarStr(kv.second);
+        }
         if (props["file"])        res.options["file"] = props["file"].as<std::string>();
+        if (props["method"])      res.options["method"] = props["method"].as<std::string>();
         if (props["bins"])        res.options["bins"] = props["bins"].as<std::string>();
         if (props["range"]) {
             auto r = props["range"].as<std::vector<double>>();

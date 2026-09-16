@@ -47,6 +47,11 @@ __host__ __device__ auto Flatte(T m, T m0,
 template <typename T>
 __host__ __device__ T computeQ0AD(T m0, T md1, T md2);
 
+// interpEval 前置声明（定义见下方：Interp 统一插值模型查表；computeNodeFactor
+// 的 Interp 分支需要它）
+__device__ inline void interpEval(const double* tab, double x,
+    double& Fr, double& Fi, double* dFr, double* dFi, int P);
+
 // 计算单个 DecayNode 的振幅因子（BWR·Bf / BW / ONE / Flatte·Bf / Bf only）
 // params[0]=mass, params[1]=width (BWR/BW) 或 couplings[0] (Flatte)
 // channels: Flatte 道质量数组指针（非 Flatte 时为 nullptr）
@@ -154,6 +159,15 @@ __device__ auto computeNodeFactor(
             double mval = (double)mm;
             double f = lookupHistTable(mval, aux, aux_offset);
             return ResResult<T>::make(T(f), T(0.0));
+        }
+        case ResModelType::Interp: {
+            // 统一插值表（hist/linear/spline；非等距 spline 回退 hist）。
+            // Interp 无自由参数 → 只取值段 F；梯度由 Hessian/梯度内核单独处理
+            // （nFree==0 时不存在），此处传 P=0 不写 dFr/dFi。
+            if (aux == nullptr) return ResResult<T>::make(T(1.0), T(0.0));
+            double Fr = 1.0, Fi = 0.0, dFr[1] = {0.0}, dFi[1] = {0.0};
+            interpEval(aux + aux_offset, (double)mm, Fr, Fi, dFr, dFi, 0);
+            return ResResult<T>::make(T(Fr), T(Fi));
         }
         case ResModelType::Custom: {
             // DSL 字节码求值（值段 F；∂F/∂θ 由符号微分 aux 在
