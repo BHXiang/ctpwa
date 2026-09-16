@@ -1292,6 +1292,7 @@ __global__ void hessianCrossMixedKernel(
     const double* d_g_B, const double* d_dS_re_B, const double* d_dS_im_B,
     const int* d_gidx_B, int NTb,
     int nSL_A, int site_A,
+    int site_B, int nSL_B,        // 块 B 自身波区间 [site_B, site_B+nSL_B)：stage3 已算同块 vθ → 跳过，避免重复计数
     int nEvents, int nPolar, int n_amp_total,
     double* d_mixed, int mixed_ld,
     double default_weight, const double* d_event_weights,
@@ -1330,6 +1331,10 @@ __global__ void hessianCrossMixedKernel(
         __syncthreads();
 
         for (int a = a0; a < a1; ++a) {
+            // 同块（a ∈ 块 B）的 vθ 项已由 Stage 3 hessianMixedBlockKernel 写入
+            // （且含 Stage 4 没有的 term2）→ 这里必须跳过，否则同块对角 vθ 子块
+            // 被重复累加约 2×，Hessian 不再正定。
+            if (a >= site_B && a < site_B + nSL_B) continue;
             int ga = site_A + a;
             const ctComplex* amp_a = amp_base + ga; // 步长 n_amp_total×p
 

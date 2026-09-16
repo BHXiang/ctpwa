@@ -284,3 +284,57 @@ def test_custom_hessian_vs_fd(make_analysis, device):
         f"，平坦方向 |CT| 最大 {max_flat_abs:.2e}"
         f"\n  CT={H_ct.numpy()}\n  FD={H_fd.numpy()}"
     )
+
+
+def test_custom_hessian_vtheta_vs_fd(make_analysis, device):
+    """vθ 混合块 vs 梯度有限差分（Stage 3/4 分块边界的回归防线）。
+
+    θθ 块由 Stage 1 独立计算，已有的 test_custom_hessian_vs_fd 只覆盖它；
+    vθ 块来自 Stage 3（同块，含 term2）+ Stage 4（跨块，term1+g·term3）。
+    cfb098d 把 Stage 4 从 "bi×bj 双层循环 + 跳过 bi==bj" 重构为"每个 bj 单
+    launch、a 遍历全部波"，漏掉同块排除 → 同块 vθ 子块的 term1+g·term3 被
+    Stage 3/4 各算一次，Hessian 不再正定（且对称性检查抓不到）。
+    """
+    ana = make_analysis("custom")
+    params = make_params(ana, device)
+    n_vec = ana.getNVector()
+    n_th = ana.getNFreeTheta()
+    t0 = 2 * n_vec  # theta 起点；v 行 = [0, t0)
+    n_tot = t0 + n_th
+
+    def grad_at(p):
+        return torch.autograd.grad(ana.getNLL(p.requires_grad_(True)), p)[0]
+
+    H_ct = ana.getHessian(params).detach().cpu().double()
+    p_cpu = params.detach().cpu().double()
+    H_fd = torch.zeros(n_tot, n_th, dtype=torch.float64)
+    for j in range(n_th):
+        step = max(abs(p_cpu[t0 + j].item()) * 1e-4, 1e-4)
+        p_plus = p_cpu.clone().to(device)
+        p_minus = p_cpu.clone().to(device)
+        p_plus[t0 + j] += step
+        p_minus[t0 + j] -= step
+        g_plus = grad_at(p_plus).detach().cpu().double()
+        g_minus = grad_at(p_minus).detach().cpu().double()
+        H_fd[:, j] = (g_plus - g_minus) / (2 * step)
+
+    # 只比较 v 行 × θ 列（vθ 混合块）
+    Hc = H_ct[:t0, t0:]
+    Hf = H_fd[:t0, :]
+    diff = (Hc - Hf).abs()
+    scale = Hf.abs()
+    rel = diff / scale.clamp_min(1e-30)
+    # 只在量级有意义的元素上做相对比较（忽略接近 0 的 FD 噪声项）
+    rel[scale < 1e-3 * scale.max()] = 0
+    # 归一化共动平坦方向：真实 vθ ≡ 0，FD 只剩 float32 噪声 → 绝对容差
+    flat_rows = Hc.abs().max(dim=1).values < 1e-2
+    rel[flat_rows] = 0
+    max_rel = rel.max().item()
+    max_flat = Hc[flat_rows].abs().max().item() if flat_rows.any() else 0.0
+    # v 行的 AD 梯度为 float32，FD 噪声高于 θθ 块；而 2× 重复计数在受影响
+    # 元素上给出数十~百 % 相对误差，远高于此容差。
+    VT_FD_RTOL = 5e-2
+    assert max_rel < VT_FD_RTOL and max_flat < 1e-2, (
+        f"Custom Hessian vθ 块 vs FD 最大相对误差 {max_rel:.2e} > {VT_FD_RTOL}"
+        f"，平坦行 |CT| 最大 {max_flat:.2e}"
+    )

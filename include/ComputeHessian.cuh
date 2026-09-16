@@ -137,6 +137,7 @@ __global__ void hessianCrossMixedKernel(
     const double* d_g_B, const double* d_dS_re_B, const double* d_dS_im_B,
     const int* d_gidx_B, int NTb,
     int nSL_A, int site_A,
+    int site_B, int nSL_B,
     int nEvents, int nPolar, int n_amp_total,
     double* d_mixed, int mixed_ld,
     double default_weight, const double* d_event_weights,

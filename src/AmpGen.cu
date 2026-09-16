@@ -3659,14 +3659,19 @@ void AmpCalc::computeUnifiedHessian(
                 fflush(stdout);
             }
             // Cross-block mixed（单 launch 化: 每个自由块一次 launch, kernel 内
-            // 遍历全部 n_amp_total 个波 a —— 数学上等价于"按块外层循环"的并集
-            // （a ∈ 全波), 但消除 launch 数爆炸: 旧版外层遍历全部块 × 自由块
-            // → 每窗口几十~上百次 launch+sync（A100 实测 stage4 55ms/窗口, 其中
-            // ~53ms 为 launch/同步开销）。kernel 只用 d_amp 波索引与 S/dS,
-            // 与块的 cas/SL 结构无关 → 传 nSL_A=n_amp_total, site_A=0。
+            // 遍历全部 n_amp_total 个波 a —— 覆盖"除本块外"的全部块（旧版
+            // bi≠bj 的并集 = 全波减去块 bj 自身），但消除 launch 数爆炸: 旧版
+            // 外层遍历全部块 × 自由块 → 每窗口几十~上百次 launch+sync（A100
+            // 实测 stage4 55ms/窗口, 其中 ~53ms 为 launch/同步开销）。kernel 只
+            // 用 d_amp 波索引与 S/dS, 与块的 cas/SL 结构无关 → 传
+            // nSL_A=n_amp_total, site_A=0, 并把块 bj 的波区间传入以跳过同块
+            // （同块项由 Stage 3 负责, 否则重复计数破坏 Hessian 正定性）。
             for (size_t bj = 0; bj < blocks_.size(); ++bj) {
                 auto& btB = temps_per_gpu[gpu][bj];
                 if (!btB.d_g) continue;
+                auto& blkB = blocks_[bj];
+                int site_B = blkB.site;
+                int nSL_B = static_cast<int>(cas_list_[blkB.cas_idx]->getNSLCombs());
                 int grid = (nch + kBlockSize - 1) / kBlockSize;
                 // 共享归约槽: 2×ACHUNK(32)×NTb×8B
                 int smem = 2 * 32 * btB.NT * (int)sizeof(double);
@@ -3675,6 +3680,7 @@ void AmpCalc::computeUnifiedHessian(
                     d_amp_c,
                     btB.d_g, btB.d_dS_re, btB.d_dS_im, btB.d_gidx, btB.NT,
                     n_amp_total, 0,
+                    site_B, nSL_B,
                     nch, nPol, n_amp_total,
                     d_mix_g, nFreeResParams(),
                     default_weight, d_w_c, d_msum_g, evt_off_c);
