@@ -1394,9 +1394,13 @@ static ctComplex* upcastAmpSegToDouble(const ctComplex* baseF /*实际为 float2
 class analysis
 {
 public:
-    analysis(const std::string& config_file = "config.yml")
+    analysis(const std::string& config_file = "config.yml", int fit_mode = 0)
         : config_parser_(config_file), n_amplitudes_(0), n_polar_(0), d_all_amplitudes_(), initialized_(false)
     {
+        // fit mode 必须在 initialize()（→ initializeDecayChains）之前定好：
+        // params_ 的耦合映射在那里一次性构建，构造后再 setFitMode 改不动参数化。
+        fit_mode_ = fit_mode;
+        frozen_fit_mode_ = fit_mode;
         if (!config_parser_.isValid()) {
             std::cerr << "Warning: Config file \"" << config_file
                       << "\" is empty or not found. Analysis not initialized." << std::endl;
@@ -1433,7 +1437,19 @@ public:
     }
 
     // ---- fit mode ----
-    void setFitMode(int mode) { fit_mode_ = mode; }
+    // 注意：参数化（params_ 的耦合映射）在构造期 initializeDecayChains() 里一次性
+    // 决定。构造后调用 setFitMode 只能改 getNVector/getParamNames 的语义，改不了
+    // 实际拟合——需要 VSPACE 请用 ctpwa.analysis(config, 1)。
+    void setFitMode(int mode) {
+        if (mode != frozen_fit_mode_) {
+            std::cerr << "[ctpwa] Warning: setFitMode(" << mode << ") 在构造后调用"
+                         "无法改变参数化（构造期为 " << frozen_fit_mode_ << "，"
+                         "params 结构已固定）；如需模式 " << mode
+                      << " 请在构造时指定：ctpwa.analysis(config, " << mode << ")。"
+                      << std::endl;
+        }
+        fit_mode_ = mode;
+    }
     int getFitMode() const { return fit_mode_; }
 
     // legends: config 的 legends 规则按展开后的链顺序解析出的图例名 (getLegends() 结果)
@@ -4849,6 +4865,8 @@ private:
 
     // fit mode: 0 = FREEPARAMS (chain×step, default), 1 = VSPACE (direct amplitudes)
     int fit_mode_ = 0;
+    // 构造期冻结的 fit mode（参数化实际生效的模式）；构造后 setFitMode 只改语义
+    int frozen_fit_mode_ = 0;
 
     void initialize(std::string config_file = "config.yml")
     {

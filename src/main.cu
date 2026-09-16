@@ -116,11 +116,18 @@ PYBIND11_MODULE(ctpwa, m)
             return std::string(PRECISION_NAME); });
 
     pybind11::class_<analysis>(m, "analysis")
-        .def(pybind11::init<const std::string&>(), pybind11::arg("config_file") = "config.yml")
+        .def(pybind11::init<const std::string&, int>(),
+             pybind11::arg("config_file") = "config.yml",
+             pybind11::arg("fit_mode") = 0,
+             "analysis(config_file='config.yml', fit_mode=0): fit_mode 0=FREEPARAMS "
+             "(chain×step, 默认), 1=VSPACE (逐振幅)。参数化在构造期决定，"
+             "需要 VSPACE 必须在此处传 1。")
         .def("getNLL", &analysis::getNLL, pybind11::arg("params"),
              "Compute NLL. params: [real(v), imag(v), theta] float64")
         .def("setFitMode", &analysis::setFitMode, pybind11::arg("mode"),
-             "Set fit mode: 0=FREEPARAMS (chain×step, default), 1=VSPACE (direct amplitudes)")
+             "Set fit mode: 0=FREEPARAMS (chain×step, default), 1=VSPACE (direct amplitudes). "
+             "注意：构造后调用改不了参数化（仅改 getNVector/getParamNames 语义），"
+             "真正启用 VSPACE 请用 ctpwa.analysis(config, 1)。")
         .def("getFitMode", &analysis::getFitMode)
         .def("getNVector", &analysis::getNVector)
         .def("getNFreeTheta", &analysis::getNFreeTheta)
