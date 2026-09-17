@@ -15,6 +15,7 @@
 !tests/**
 !scripts/
 !scripts/run_tests.sh
+!scripts/check_interp_shape.py
 !scripts/cluster/
 !scripts/cluster/**
 tests/outputs/
@@ -30,3 +31,6 @@ tests/.pytest_cache/
 # Python runtime (在白名单 example/** 之后重新忽略)
 example/__pycache__/
 *.pyc
+
+# 本地备份文件不入库
+*.bak
