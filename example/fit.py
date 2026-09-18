@@ -1491,13 +1491,13 @@ def resolve_args(args):
     cfg["max_iter"] = (args.niter if args.niter is not None
                        else _env_int("FIT_NITER", 500))
     cfg["lr"] = (args.lr if args.lr is not None
-                 else _env_float("FIT_LR", 0.9))
+                 else _env_float("FIT_LR", 0.3))
     cfg["tolerance_grad"] = (args.tol_grad if args.tol_grad is not None
-                             else _env_float("FIT_TOL_GRAD", 1e-7))
+                             else _env_float("FIT_TOL_GRAD", 1e-5))
     cfg["tolerance_change"] = (args.tol_change if args.tol_change is not None
-                               else _env_float("FIT_TOL_CHANGE", 1e-9))
+                               else _env_float("FIT_TOL_CHANGE", 1e-5))
     cfg["history_size"] = (args.history_size if args.history_size is not None
-                           else _env_int("FIT_HISTORY_SIZE", 100))
+                           else _env_int("FIT_HISTORY_SIZE", 200))
 
     cfg["v_max"] = (args.vmax if args.vmax is not None
                     else _env_float("FIT_VMAX", 10000.0))
