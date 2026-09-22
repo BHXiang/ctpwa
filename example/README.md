@@ -198,6 +198,17 @@ python fit.py --optimizer projected --runs 5
 | `--optimizer` | 优化器：`reparam`/`projected`/`lbfgs` | `reparam` | `FIT_OPTIMIZER` | — |
 | `--opt-verbose` | 每轮打印 projected 的 `pg/active/ΔNLL` | False | `FIT_OPT_VERBOSE=1` | projected |
 
+### 误差估计（Hessian 非正定回退）
+| 参数 | 说明 | 默认 | 环境变量 |
+|---|---|---|---|
+| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `auto` | `FIT_ERR_MODE` |
+| `--err-tau` | 相对阈值 `τ`（`λ<τ·λmax` 视为平坦/不可测） | `1e-6` | `FIT_ERR_TAU` |
+
+> 当精确 Hessian 近奇异/非正定（本模型常见，存在 ~20–30 维近平坦子空间）时，
+> `auto` 自动退化为伪逆并给出参数误差，同时在日志打印 `mode=... / λmin / λmax /
+> flat(λ<τλmax)=N`；输出会标注这是**秩亏下的可行估计，非严格统计误差**。
+> `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。
+
 ### Warm start
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
@@ -234,7 +245,8 @@ python fit.py --optimizer projected --runs 5
 ```
 FIT_RUNS  FIT_NITER  FIT_LR  FIT_TOL_GRAD  FIT_TOL_CHANGE  FIT_HISTORY_SIZE
 FIT_VMAX  FIT_AMP_MAX  FIT_AMP_LAMBDA  FIT_PROJECT  FIT_OPTIMIZER  FIT_OPT_VERBOSE
-FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA  FIT_CHECKPOINT_INTERVAL
+FIT_ERR_MODE  FIT_ERR_TAU  FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA
+FIT_CHECKPOINT_INTERVAL
 ```
 
 例：`FIT_OPTIMIZER=reparam FIT_AMP_LAMBDA=1e-4 python -u fit.py --runs 20 --niter 3000`
@@ -263,8 +275,10 @@ FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA  FIT_CHECKPOINT_INTERVAL
 1. **必须在含 `config.yml` 的目录运行**（见 §1）。
 2. `reparam` 的 `--amp-lambda` 是作用在**优化 loss** 上的弱先验；报告/保存的 NLL、
    Hessian、误差全部基于**真实 NLL**，不受罚项影响。
-3. 目前结果普遍 `正定性=False`（非活跃子空间 Hessian 非正定）→ **暂无法给出参数误差**。
-   这是既有问题，与优化器无关。
+3. 结果普遍 `正定性=False`：精确 Hessian 存在 ~20–30 维近平坦/简并子空间（诊断显示
+   沿负特征值方向 NLL 两侧都不下降，说明是数值/秩亏而非真鞍点）。参数误差默认由
+   **`--err-mode auto` 自动回退到伪逆**给出，并标注为“可行估计、非严格统计误差”；
+   `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。拟合分数/效率仍以真 PD 为门控。
 4. `--lr` 只对 `reparam`/`lbfgs` 有意义；`projected` 不用 `lr`，其停机由
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议

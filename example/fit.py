@@ -520,7 +520,7 @@ def _reparam_unpack(u, nc, n_res, lower, upper, amp_max,
 class UnifiedPWAOptimizer:
     def __init__(self, ana, free_res_info, params_names,
                  v_max=None, project_grad=None, optimizer_kind="reparam",
-                 amp_max=None, amp_lambda=None):
+                 amp_max=None, amp_lambda=None, err_mode=None, err_tau=None):
         self.analysis = ana
         self.params_names = params_names
         self.device = "cuda"
@@ -552,6 +552,16 @@ class UnifiedPWAOptimizer:
         # 报告 NLL/Hessian 仍用真实 NLL。默认 1e-4（防简并方向漂移到软墙帽）。
         self.amp_lambda = (amp_lambda if amp_lambda is not None
                            else float(os.environ.get("FIT_AMP_LAMBDA", "1e-4")))
+        # 参数误差模式（Hessian 非正定时的回退）:
+        #   auto(默认): PD → 直接求逆；非 PD → 自动退化 pinv
+        #   strict    : 原行为（非 PD 就不给误差）
+        #   pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
+        #   psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
+        _em = (err_mode if err_mode is not None
+               else os.environ.get("FIT_ERR_MODE", "auto")).lower()
+        self.err_mode = _em if _em in ("auto", "strict", "pinv", "psd") else "auto"
+        self.err_tau = (err_tau if err_tau is not None
+                        else float(os.environ.get("FIT_ERR_TAU", "1e-6")))
         # 优化器种类（默认 "reparam"）:
         #   "reparam" (默认)   = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
         #                        sigmoid）+ torch LBFGS(strong_wolfe)，无投影/活跃集
@@ -874,47 +884,15 @@ class UnifiedPWAOptimizer:
         fixed_mask[self.n_coupling_free] = False
         hessian = hessian_full[fixed_mask][:, fixed_mask]
 
-        # 特征值分析
-        try:
-            eigenvalues = torch.linalg.eigvalsh(hessian)
-            # print("Hessian特征值：", eigenvalues)
-            is_pos_def = bool(torch.all(eigenvalues > 0).item())
-            min_eig = eigenvalues[0].item()
-            max_eig = eigenvalues[-1].item()
-            cond_num = max_eig / min_eig if min_eig > 0 else float("inf")
-        except Exception:
-            is_pos_def = False
-            min_eig = max_eig = cond_num = float("nan")
-
-        # 参数误差
-        coupling_real_errors = None
-        coupling_imag_errors = None
-        res_errors = None
-        if is_pos_def:
-            try:
-                covariance = torch.linalg.inv(hessian)
-                std_dev = torch.sqrt(torch.diag(covariance))
-
-                # 耦合参数误差: 前 2*(n_coupling_free-1) 个元素
-                n_c_var = self.n_coupling_free - 1  # 扣除固定的
-                coupling_real_errors = torch.zeros(
-                    self.n_coupling_free, dtype=torch.float32, device=self.device
-                )
-                coupling_imag_errors = torch.zeros(
-                    self.n_coupling_free, dtype=torch.float32, device=self.device
-                )
-
-                # std_dev 前 2*n_c_var 个元素: 实部误差和虚部误差交替
-                for i in range(n_c_var):
-                    coupling_real_errors[i + 1] = std_dev[2 * i].float()
-                    coupling_imag_errors[i + 1] = std_dev[2 * i + 1].float()
-
-                # 共振态参数误差
-                if self.has_free_res:
-                    res_start = 2 * n_c_var
-                    res_errors = std_dev[res_start:].float()
-            except Exception as e:
-                log.error(f"计算参数误差时出错: {e}")
+        # 正定性 + 参数误差（统一走 _errors_from_hessian，含非正定回退 auto/pinv/psd）
+        err = self._errors_from_hessian(hessian_full, final_params)
+        is_pos_def = bool(err["is_pd"])
+        min_eig = err["min_eig"]
+        max_eig = err["max_eig"]
+        cond_num = err["cond_num"]
+        coupling_real_errors = err["coupling_real_errors"]
+        coupling_imag_errors = err["coupling_imag_errors"]
+        res_errors = err["res_errors"]
 
         result = {
             "run_id": run_id,
@@ -935,6 +913,8 @@ class UnifiedPWAOptimizer:
             "coupling_real_errors": coupling_real_errors,
             "coupling_imag_errors": coupling_imag_errors,
             "res_errors": res_errors,
+            "err_mode_used": err["mode_used"],
+            "n_flat_dirs": err["n_flat"],
         }
 
         if final_nll < self.best_nll:
@@ -1205,24 +1185,36 @@ class UnifiedPWAOptimizer:
         return h
 
     # --------------------------------------------------------
-    def compute_param_errors(self, params_phys, tau=1e-8):
-        """在给定参数点用精确 Hessian 求参数误差。
+    def _errors_from_hessian(self, hessian_full, params_phys, mode=None, tau=None):
+        """从统一 Hessian 求参数误差（含非正定回退 auto/pinv/psd）。
 
-        与 polish 保持**同一套判据**: 只在**非活跃子空间**上判正定并求逆。
-        被边界钉住的参数（贴边且梯度朝外）没有统计误差 —— 它们是被
-        free_range 截断的，返回 NaN，并在 res_errors/耦合误差里如实标出。
+        与 polish 共用「非活跃子空间」判据：去掉固定参考(0/nc) + 活跃集剔除，
+        对剩余子空间做对称特征分解，按 mode 构造协方差：
+          auto(默认): 真 PD → 直接求逆；否则 → pinv
+          strict    : 真 PD → 直接求逆；否则不给误差(None)
+          pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
+          psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
+        被 free_range 钉住的参数返回 NaN。
 
-        返回 (coupling_real_errors, coupling_imag_errors, res_errors)。
+        索引映射按分块布局（与 params 一致）:
+          red = [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ_0..θ_{n_res-1}]
+        返回 dict（含 mode_used/n_flat/is_pd/min_eig/max_eig/cond_num）。
         """
-        hessian_full = self._get_hessian_cached(params_phys)
         nc = self.n_coupling_free
+        if mode is None:
+            mode = self.err_mode
+        if tau is None:
+            tau = self.err_tau
+        out = {"coupling_real_errors": None, "coupling_imag_errors": None,
+               "res_errors": None, "mode_used": mode, "n_flat": 0,
+               "is_pd": False, "min_eig": float("nan"),
+               "max_eig": float("nan"), "cond_num": float("nan")}
 
-        # 完整自由索引（排除固定的 re_0 / im_0）
         fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
         fixed_mask[0] = False
         fixed_mask[nc] = False
         red_idx = torch.nonzero(fixed_mask, as_tuple=False).flatten()
-        H_red = hessian_full[fixed_mask][:, fixed_mask]
+        H_red = hessian_full[fixed_mask][:, fixed_mask].double()
 
         # 活跃集: 贴边且下降方向朝外（与 polish / projected_lbfgs 同一条规则）
         p = params_phys.detach()
@@ -1233,8 +1225,7 @@ class UnifiedPWAOptimizer:
         at_lo = (p - lo) <= 1e-8 * w
         at_hi = (hi - p) <= 1e-8 * w
         active_full = ((at_lo & (g > 0)) | (at_hi & (g < 0))) & fixed_mask
-        act_red = active_full[red_idx]
-        keep = ~act_red
+        keep = ~active_full[red_idx]
 
         def _label(full_idx):
             if full_idx < nc:
@@ -1245,24 +1236,52 @@ class UnifiedPWAOptimizer:
 
         if int(keep.sum().item()) == 0:
             log.warning("所有自由方向都被边界钉住，无法给出参数误差")
-            return None, None, None
+            return out
 
-        H_k = H_red[keep][:, keep].double()
-        eig = torch.linalg.eigvalsh(H_k)
-        lmax = eig[-1].abs().clamp(min=1e-30)
-        if eig[0].item() <= tau * lmax.item():
-            log.warning(f"非活跃子空间 Hessian 仍不定: λmin={eig[0].item():.3e}, "
-                        f"λmin/λmax={eig[0].item() / lmax.item():.2e} → 不给误差")
-            return None, None, None
-
-        # 协方差只在非活跃子空间求逆；被钉住的参数留 NaN
+        H_k = H_red[keep][:, keep]
         try:
-            cov = torch.linalg.inv(H_k)
+            eig, vec = torch.linalg.eigh(H_k)
+        except Exception as e:
+            log.error(f"Hessian 特征分解失败: {e}")
+            return out
+        lmax = eig[-1].abs().clamp(min=1e-30)
+        lmin = eig[0].item()
+        out["min_eig"] = lmin
+        out["max_eig"] = eig[-1].item()
+        out["cond_num"] = (eig[-1].item() / lmin) if lmin > 0 else float("inf")
+        is_pd = bool(lmin > tau * lmax.item())
+        out["is_pd"] = is_pd
+        n_flat = int((eig < tau * lmax).sum().item())
+        out["n_flat"] = n_flat
+
+        if mode == "auto":
+            eff = "inv" if is_pd else "pinv"
+        elif mode == "strict":
+            if not is_pd:
+                log.warning(f"非活跃子空间 Hessian 仍不定: λmin={lmin:.3e}, "
+                            f"λmin/λmax={lmin / lmax.item():.2e} → strict: 不给误差")
+                out["mode_used"] = "strict(no-pd)"
+                return out
+            eff = "inv"
+        else:
+            eff = mode  # pinv / psd 强制
+
+        try:
+            if eff == "inv":
+                cov = torch.linalg.inv(H_k)
+            elif eff == "psd":
+                eig2 = torch.clamp(eig, min=tau * lmax)
+                cov = (vec * (1.0 / eig2)) @ vec.t()
+            else:  # pinv
+                inv_eig = torch.where(eig > tau * lmax, 1.0 / eig,
+                                      torch.zeros_like(eig))
+                cov = (vec * inv_eig) @ vec.t()
             sd_keep = torch.sqrt(torch.diag(cov).clamp(min=0.0))
         except Exception as e:
-            log.error(f"计算参数误差时出错: {e}")
-            return None, None, None
+            log.error(f"参数误差协方差求逆失败: {e}")
+            return out
 
+        out["mode_used"] = eff
         sd_red = torch.full((H_red.shape[0],), float("nan"),
                             dtype=torch.float64, device=self.device)
         sd_red[keep] = sd_keep
@@ -1273,21 +1292,39 @@ class UnifiedPWAOptimizer:
                   f"{', '.join(pinned)}")
             print("[errors]   这表示数据想把它们推到范围外 → 放宽该 free_range，"
                   "或按单侧限制报告")
-        print(f"[errors] 非活跃子空间: {int(keep.sum())} 维, "
-              f"λmin={eig[0].item():.3e}, λmin/λmax={eig[0].item() / lmax.item():.2e}")
+        print(f"[errors] mode={eff} (请求 {mode}), λmin={lmin:.3e} "
+              f"λmax={eig[-1].item():.3e} λmin/λmax={lmin / lmax.item():.2e}, "
+              f"flat(λ<τ·λmax)={n_flat}/{len(eig)}, "
+              f"active={int(active_full.sum())}, keep={int(keep.sum())}")
 
         n_c_var = nc - 1
         coupling_real_errors = torch.full((nc,), float("nan"),
                                           dtype=torch.float32, device=self.device)
         coupling_imag_errors = torch.full((nc,), float("nan"),
                                           dtype=torch.float32, device=self.device)
+        # 分块布局: [Re_1..Re_{nc-1}, Im_1..Im_{nc-1}, θ...]
         for i in range(n_c_var):
-            coupling_real_errors[i + 1] = sd_red[2 * i].float()
-            coupling_imag_errors[i + 1] = sd_red[2 * i + 1].float()
+            coupling_real_errors[i + 1] = sd_red[i].float()
+            coupling_imag_errors[i + 1] = sd_red[n_c_var + i].float()
         res_errors = None
         if self.has_free_res:
             res_errors = sd_red[2 * n_c_var:].float()
-        return coupling_real_errors, coupling_imag_errors, res_errors
+        out["coupling_real_errors"] = coupling_real_errors
+        out["coupling_imag_errors"] = coupling_imag_errors
+        out["res_errors"] = res_errors
+        return out
+
+    # --------------------------------------------------------
+    def compute_param_errors(self, params_phys, tau=None):
+        """在给定参数点用精确 Hessian 求参数误差（含非正定回退）。
+
+        具体回退策略见 `_errors_from_hessian`（auto/pinv/psd/strict）。
+        返回 (coupling_real_errors, coupling_imag_errors, res_errors)。
+        """
+        hessian_full = self._get_hessian_cached(params_phys)
+        err = self._errors_from_hessian(hessian_full, params_phys, tau=tau)
+        return (err["coupling_real_errors"], err["coupling_imag_errors"],
+                err["res_errors"])
 
     # --------------------------------------------------------
     def extract_coupling_complex(self, params):
@@ -1677,7 +1714,8 @@ class UnifiedPWAOptimizer:
             f.write("运行结果 (按NLL排序):\n")
             f.write("=" * 100 + "\n")
             f.write(f"{'排名':<4} {'运行ID':<6} {'NLL':<12} {'迭代':<8} "
-                    f"{'耗时':<10} {'Hessian耗时':<12} {'正定':<6} {'优化器状态':<20}\n")
+                    f"{'耗时':<10} {'Hessian耗时':<12} {'正定':<6} "
+                    f"{'误差模式':<12} {'平坦维':<6} {'优化器状态':<20}\n")
             f.write("-" * 120 + "\n")
 
             for rank, res in enumerate(sorted_results):
@@ -1685,6 +1723,8 @@ class UnifiedPWAOptimizer:
                         f"{res['iterations']:<8} {res['time']:<10.2f} "
                         f"{res['hessian_time']:<12.2f} "
                         f"{str(res['is_positive_definite']):<6} "
+                        f"{str(res.get('err_mode_used', '-')):<12} "
+                        f"{str(res.get('n_flat_dirs', '-')):<6} "
                         f"{res.get('optimizer_status', '-'):<20}\n")
 
             if self.best_result.get("is_positive_definite", False):
@@ -1822,6 +1862,14 @@ def build_parser():
     p.add_argument("--amp-lambda", type=float, default=None,
                    help="reparam 幅度罚项 λ·Σ|A|²（只进优化 loss，不进报告 NLL；"
                         "env: FIT_AMP_LAMBDA, 默认: 1e-4；设 0 关闭）")
+    p.add_argument("--err-mode", type=str, default=None,
+                   choices=["auto", "strict", "pinv", "psd"],
+                   help="Hessian 非正定时的参数误差回退: auto=PD 直接求逆, 否则 pinv"
+                        "（默认）; strict=原行为(非PD不给); pinv=伪逆(丢 λ<τλmax 方向);"
+                        " psd=把 λ 截到 τλmax 后求逆(更保守) (env: FIT_ERR_MODE)")
+    p.add_argument("--err-tau", type=float, default=None,
+                   help="误差回退的相对阈值 τ（λ<τ·λmax 视为平坦/不可测）"
+                        " (env: FIT_ERR_TAU, 默认: 1e-6)")
     p.add_argument("--no-project", action="store_true", default=None,
                    help="关闭投影梯度 (env: FIT_PROJECT=0)；只影响 legacy lbfgs 路径")
     p.add_argument("--optimizer", type=str, default=None,
@@ -1890,6 +1938,10 @@ def resolve_args(args):
                       else _env_float("FIT_AMP_MAX", 1000.0))
     cfg["amp_lambda"] = (args.amp_lambda if args.amp_lambda is not None
                          else _env_float("FIT_AMP_LAMBDA", 1e-4))
+    cfg["err_mode"] = (args.err_mode if args.err_mode is not None
+                       else os.environ.get("FIT_ERR_MODE", "auto")).lower()
+    cfg["err_tau"] = (args.err_tau if args.err_tau is not None
+                      else _env_float("FIT_ERR_TAU", 1e-6))
 
     # project_grad: CLI --no-project → False; 否则看 FIT_PROJECT
     if args.no_project is True:
@@ -2010,6 +2062,7 @@ def main():
         print(f"  reparam: coupling=polar(amp=sigmoid, amp_max={cfg['amp_max']}, "
               f"lambda={cfg['amp_lambda']}), res=sigmoid, "
               f"line_search=strong_wolfe")
+    print(f"  err_mode={cfg['err_mode']}, err_tau={cfg['err_tau']:.1e}")
     print(f"  polish={cfg['polish']}")
     print(f"  warm_start={cfg['warm_start_path']}")
     print(f"  waves={cfg['waves'] if cfg['waves'] else '(all)'}")
@@ -2032,6 +2085,8 @@ def main():
         optimizer_kind=cfg["optimizer_kind"],
         amp_max=cfg["amp_max"],
         amp_lambda=cfg["amp_lambda"],
+        err_mode=cfg["err_mode"],
+        err_tau=cfg["err_tau"],
     )
 
     # ---- P4.4: Resume ----
@@ -2116,20 +2171,22 @@ def main():
                 optimizer.best_params = p2.clone()
                 optimizer.best_nll = nll2
                 optimizer.best_result = best_res
-                if pd2:
-                    (best_res["coupling_real_errors"],
-                     best_res["coupling_imag_errors"],
-                     best_res["res_errors"]) = optimizer.compute_param_errors(p2)
-                else:
-                    best_res["coupling_real_errors"] = None
-                    best_res["coupling_imag_errors"] = None
-                    best_res["res_errors"] = None
                 torch.save(p2.cpu(), os.path.join(output_dir, "best_params.pt"))
+            # 无论是否改进，都在当前最佳点上重算误差（含非正定回退 auto/pinv/psd）
+            (best_res["coupling_real_errors"],
+             best_res["coupling_imag_errors"],
+             best_res["res_errors"]) = optimizer.compute_param_errors(
+                 best_res["final_params"])
         except Exception as e:
             log.error(f"抛光失败: {e}")
 
     # ---- 打印最佳参数 ----
-    if best_res["is_positive_definite"] and best_res["coupling_real_errors"] is not None:
+    if best_res["coupling_real_errors"] is not None:
+        if not best_res.get("is_positive_definite", False):
+            log.warning("Hessian 在非活跃子空间非正定；以下误差来自 PSD 回退"
+                        f"（err_mode={cfg['err_mode']}, τ={cfg['err_tau']:.1e}）"
+                        "，是秩亏/近平坦方向下的可行估计，非严格统计误差。"
+                        "详见 [errors] 日志的 λmin/λmax 与平坦方向数。")
         optimizer.print_optimized_parameters(
             best_res["final_params"],
             best_res["coupling_real_errors"],
@@ -2138,8 +2195,8 @@ def main():
             best_res["run_id"],
         )
     else:
-        log.warning("Hessian 在非活跃子空间上仍未正定 → 无法提供参数误差估计"
-                    "（看上面 [errors]/[polish] 的 λmin/λmax 输出）")
+        log.warning("无法提供参数误差估计（err_mode=strict 且 Hessian 非正定，"
+                    "或所有自由方向被边界钉住）；看上面 [errors] 的 λmin/λmax 输出")
         optimizer.print_optimized_parameters(best_res["final_params"],
                                             run_id=best_res["run_id"])
     print(f"{'='*80}")
