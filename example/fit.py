@@ -552,16 +552,6 @@ class UnifiedPWAOptimizer:
         # 报告 NLL/Hessian 仍用真实 NLL。默认 1e-4（防简并方向漂移到软墙帽）。
         self.amp_lambda = (amp_lambda if amp_lambda is not None
                            else float(os.environ.get("FIT_AMP_LAMBDA", "1e-4")))
-        # 参数误差模式（Hessian 非正定时的回退）:
-        #   auto(默认): PD → 直接求逆；非 PD → 自动退化 pinv
-        #   strict    : 原行为（非 PD 就不给误差）
-        #   pinv      : 强制伪逆（丢掉 λ<τλmax 的方向）
-        #   psd       : 强制把 λ 截到 τλmax 后求逆（更保守）
-        _em = (err_mode if err_mode is not None
-               else os.environ.get("FIT_ERR_MODE", "auto")).lower()
-        self.err_mode = _em if _em in ("auto", "strict", "pinv", "psd") else "auto"
-        self.err_tau = (err_tau if err_tau is not None
-                        else float(os.environ.get("FIT_ERR_TAU", "1e-6")))
         # 优化器种类（默认 "reparam"）:
         #   "reparam" (默认)   = 重参数化软墙（耦合 sigmoid 幅度极坐标 + 共振态
         #                        sigmoid）+ torch LBFGS(strong_wolfe)，无投影/活跃集
@@ -573,6 +563,18 @@ class UnifiedPWAOptimizer:
             optimizer_kind if optimizer_kind is not None
             else os.environ.get("FIT_OPTIMIZER", "reparam")
         ).lower()
+        # 参数误差模式（Hessian 非正定时的回退）:
+        #   auto  : PD → 直接求逆；非 PD → 自动退化 pinv
+        #   strict: 原行为（非 PD 就不给误差）
+        #   pinv  : 强制伪逆（丢掉 λ<τλmax 的方向）
+        #   psd   : 强制把 λ 截到 τλmax 后求逆（更保守）
+        # 默认策略 C: 显式值 > FIT_ERR_MODE > (reparam→auto, 其它→strict)
+        _em = err_mode if err_mode is not None else os.environ.get("FIT_ERR_MODE")
+        if _em is None:
+            _em = "auto" if self.optimizer_kind == "reparam" else "strict"
+        self.err_mode = _em if _em in ("auto", "strict", "pinv", "psd") else "strict"
+        self.err_tau = (err_tau if err_tau is not None
+                        else float(os.environ.get("FIT_ERR_TAU", "1e-6")))
         # 每轮打印 projected L-BFGS 的 |pg|/active/ΔNLL（env FIT_OPT_VERBOSE=1）
         self.optimizer_verbose = _env_bool("FIT_OPT_VERBOSE", False)
         # 打印每次 run 的 eval / housekeeping 耗时占比（env FIT_OPT_PROF=1）
@@ -869,6 +871,12 @@ class UnifiedPWAOptimizer:
                 params.data[start:] = torch.clamp(params.data[start:], self._lower, self._upper)
 
         final_params = params.clone().detach()
+
+        # 报告 NLL 用**最终接受点**的真实值：
+        # nll_history[-1] 可能是 strong-Wolfe 最后一次被拒绝的试探点（实测 niter=1
+        # 时会偏），所以这里在 clamp 后的 final_params 上重算一次（~0.3s/run）。
+        with torch.no_grad():
+            final_nll = float(self.analysis.getNLL(final_params).item())
 
         # Hessian
         hessian_start = time.time()
@@ -1428,11 +1436,20 @@ class UnifiedPWAOptimizer:
                 for fi in range(self.n_coupling_free):
                     name = self.params_names[fi]
                     value = params_np[fi]
-                    re_err = real_err_np[fi]
-                    im_err = imag_err_np[fi]
                     magnitude = np.abs(value)
                     phase_rad = np.angle(value)
                     phase_deg = np.degrees(phase_rad)
+                    if fi == 0:
+                        # 固定参考振幅 (Re=1, Im=0)：无统计误差，统一标 (fixed)
+                        f.write(
+                            f"{fi:4d}  {name:50s}  "
+                            f"{value.real:12.8f}  {'(fixed)':>13}  "
+                            f"{value.imag:12.8f}  {'(fixed)':>13}  "
+                            f"{magnitude:12.8f}  {phase_rad:12.8f}  {phase_deg:12.8f}\n"
+                        )
+                        continue
+                    re_err = real_err_np[fi]
+                    im_err = imag_err_np[fi]
                     f.write(
                         f"{fi:4d}  {name:50s}  "
                         f"{value.real:12.8f} ± {re_err:12.8f}  "
@@ -1864,9 +1881,10 @@ def build_parser():
                         "env: FIT_AMP_LAMBDA, 默认: 1e-4；设 0 关闭）")
     p.add_argument("--err-mode", type=str, default=None,
                    choices=["auto", "strict", "pinv", "psd"],
-                   help="Hessian 非正定时的参数误差回退: auto=PD 直接求逆, 否则 pinv"
-                        "（默认）; strict=原行为(非PD不给); pinv=伪逆(丢 λ<τλmax 方向);"
-                        " psd=把 λ 截到 τλmax 后求逆(更保守) (env: FIT_ERR_MODE)")
+                   help="Hessian 非正定时的参数误差回退: auto=PD 直接求逆, 否则 pinv; "
+                        "strict=原行为(非PD不给); pinv=伪逆(丢 λ<τλmax 方向);"
+                        " psd=把 λ 截到 τλmax 后求逆(更保守)。默认: reparam→auto,"
+                        " 其它→strict (env: FIT_ERR_MODE)")
     p.add_argument("--err-tau", type=float, default=None,
                    help="误差回退的相对阈值 τ（λ<τ·λmax 视为平坦/不可测）"
                         " (env: FIT_ERR_TAU, 默认: 1e-6)")
@@ -1938,10 +1956,6 @@ def resolve_args(args):
                       else _env_float("FIT_AMP_MAX", 1000.0))
     cfg["amp_lambda"] = (args.amp_lambda if args.amp_lambda is not None
                          else _env_float("FIT_AMP_LAMBDA", 1e-4))
-    cfg["err_mode"] = (args.err_mode if args.err_mode is not None
-                       else os.environ.get("FIT_ERR_MODE", "auto")).lower()
-    cfg["err_tau"] = (args.err_tau if args.err_tau is not None
-                      else _env_float("FIT_ERR_TAU", 1e-6))
 
     # project_grad: CLI --no-project → False; 否则看 FIT_PROJECT
     if args.no_project is True:
@@ -1952,6 +1966,15 @@ def resolve_args(args):
     # optimizer: CLI --optimizer > FIT_OPTIMIZER > 默认 reparam
     cfg["optimizer_kind"] = (args.optimizer if args.optimizer is not None
                              else os.environ.get("FIT_OPTIMIZER", "reparam")).lower()
+    # err_mode（策略 C）: 显式 > FIT_ERR_MODE > (reparam→auto, 其它→strict)
+    if args.err_mode is not None:
+        cfg["err_mode"] = args.err_mode.lower()
+    elif os.environ.get("FIT_ERR_MODE") is not None:
+        cfg["err_mode"] = os.environ["FIT_ERR_MODE"].lower()
+    else:
+        cfg["err_mode"] = "auto" if cfg["optimizer_kind"] == "reparam" else "strict"
+    cfg["err_tau"] = (args.err_tau if args.err_tau is not None
+                      else _env_float("FIT_ERR_TAU", 1e-6))
     if args.opt_verbose is True:
         os.environ["FIT_OPT_VERBOSE"] = "1"
 

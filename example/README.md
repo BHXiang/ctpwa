@@ -201,12 +201,13 @@ python fit.py --optimizer projected --runs 5
 ### 误差估计（Hessian 非正定回退）
 | 参数 | 说明 | 默认 | 环境变量 |
 |---|---|---|---|
-| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `auto` | `FIT_ERR_MODE` |
+| `--err-mode` | `auto`=PD 直接求逆、否则伪逆；`strict`=原行为(非PD不给)；`pinv`=伪逆(丢 `λ<τλmax` 方向)；`psd`=把 `λ` 截到 `τλmax` 后求逆(更保守) | `reparam`→`auto`，其它→`strict` | `FIT_ERR_MODE` |
 | `--err-tau` | 相对阈值 `τ`（`λ<τ·λmax` 视为平坦/不可测） | `1e-6` | `FIT_ERR_TAU` |
 
 > 当精确 Hessian 近奇异/非正定（本模型常见，存在 ~20–30 维近平坦子空间）时，
 > `auto` 自动退化为伪逆并给出参数误差，同时在日志打印 `mode=... / λmin / λmax /
 > flat(λ<τλmax)=N`；输出会标注这是**秩亏下的可行估计，非严格统计误差**。
+> 默认策略：显式 `--err-mode` > `FIT_ERR_MODE` > (`reparam`→`auto`，其它→`strict`)；
 > `--err-mode strict` 可恢复“非正定就不给误差”的旧行为。
 
 ### Warm start
