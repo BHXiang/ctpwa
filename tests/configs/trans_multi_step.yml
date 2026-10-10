@@ -1,0 +1,96 @@
+# 三电荷道 + 多 SL（含 step 参数）config, 带 trans 约束 —— 链名片段写法。
+#
+# 结构: J/ψ → η + R(1⁺); R → π+ρ 三种电荷道（ω→3π 的类比）。
+# R(1⁺) 与 ρ(1⁻) 使两级衰变各有 2 个 (L,S) 组合 → 出现 step 耦合参数。
+# 约束名 "R_rho0" 是链名 decay1_R_rho0 的片段（真实分析里常见的
+# [omega_Rx_rho0, omega_Rx_rhop, omega_Rx_rhom] 写法）: 应把三条电荷道并成一条,
+# 且被折叠链的 step 参数也共享基准链的 step 参数。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  pi0:
+    J: 0
+    P: -1
+    mass: 0.1350
+    tex: ['\pi^{0}']
+  pip:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{+}']
+  pim:
+    J: 0
+    P: -1
+    mass: 0.1396
+    tex: ['\pi^{-}']
+
+Data:
+  order: [pip, pim, pi0, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [eta, R]
+    R:
+      - [pi0, rho0]
+      - [pip, rhom]
+      - [pim, rhop]
+    rho0: [pip, pim]
+    rhop: [pip, pi0]
+    rhom: [pim, pi0]
+
+    intermediates:
+      R:
+        - [J: 1, P: +1]: [f1_a, f1_b]
+      rho0:
+        - [J: 1, P: -1]: [rho_a]
+      rhop:
+        - [J: 1, P: -1]: [rho_b]
+      rhom:
+        - [J: 1, P: -1]: [rho_b]
+
+    legends:
+      - ['R', ' → ', 'eta']
+
+Constraints:
+  trans:
+    - [R_rho0, R_rhop, R_rhom]: [-1, 1]
+
+Resonances:
+  f1_a:
+    J: 1
+    P: +1
+    model: BWR
+    parameters: [1.285, 0.240]
+    tex: ["f_{1}", "(1285)"]
+
+  f1_b:
+    J: 1
+    P: +1
+    model: BWR
+    parameters: [1.420, 0.210]
+    tex: ["f_{1}", "(1420)"]
+
+  rho_a:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [0.775, 0.149]
+    tex: ["\\rho(770)", "^{0}"]
+
+  rho_b:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [0.775, 0.149]
+    tex: ["\\rho(770)", "^{\\pm}"]

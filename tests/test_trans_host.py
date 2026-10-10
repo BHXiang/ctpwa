@@ -91,6 +91,43 @@ def test_transitive_constraints_chain_fold(tmp_path):
     assert len(_chain_param_names(info)) == 2, _chain_param_names(info)
 
 
+def test_chain_fragment_names_pair(tmp_path):
+    """约束名可以用链名/子链片段（R_rho0 ↔ 链 decay1_R_rho0）。
+
+    实际分析里的常见写法是 [omega_Rx_rho0, omega_Rx_rhop, omega_Rx_rhom]:
+    名字比中间态名长（带母链前缀）。旧实现只按"中间态名"配对, 这类写法会
+    "匹配到链但一对都配不上"（静默不生效）——这里固化该回归。
+    """
+    info = _patched_multi(tmp_path, "  trans:\n    - [R_rho0, R_rhop, R_rhom]: [-1, 1]")
+    chains = _chain_param_names(info)
+    assert len(chains) == 2, chains          # 与 [rho0, rhop, rhom] 等价
+    assert all("rho_a" in n for n in chains), chains
+
+
+def test_chain_fragment_names_partial_scope(tmp_path):
+    """只点名一部分链时, 只折叠那部分（其余保持独立）。"""
+    info = _patched_multi(tmp_path, "  trans:\n    - [R_rho0, R_rhom]: 1")
+    chains = _chain_param_names(info)
+    assert len(chains) == 4, chains          # rho0+rhom 合并 → 2, rhop 仍独立 2
+
+
+def test_chain_fragment_names_with_step_params():
+    """链名片段写法 + 多 SL: 链耦合与 step 耦合一起折（真实 config 的形态）。
+
+    trans_multi_step{,_none}.yml: J/ψ→η+R(1⁺)（2 个 SL）, R→π+ρ（2 个 SL）,
+    三条电荷道。无约束 6 chain + 12 step = 18;约束 [R_rho0,R_rhop,R_rhom]
+    把三条并成一条 → 2 chain + 4 step = 6。
+    """
+    none = ctpwa.DecayInfo(str(CONFIGS / "trans_multi_step_none.yml"))
+    multi = ctpwa.DecayInfo(str(CONFIGS / "trans_multi_step.yml"))
+    n_none, n_multi = [_chain_param_names(i) for i in (none, multi)]
+    step_none = none.nFreeParams() - len(n_none)
+    step_multi = multi.nFreeParams() - len(n_multi)
+    assert (len(n_none), step_none) == (6, 12), (n_none, step_none)
+    assert (len(n_multi), step_multi) == (2, 4), (n_multi, step_multi)
+    assert multi.nFreeParams() == 6
+
+
 def test_trans_cycle_is_broken_safely(tmp_path):
     """自相矛盾的成环约束不应产生无效振幅下标（只告警 + 断环）。"""
     info = _patched_multi(tmp_path, "  trans:\n    - [rho0, rhop]: -1\n    - [rhop, rho0]: -1")
