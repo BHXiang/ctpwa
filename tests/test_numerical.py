@@ -181,6 +181,33 @@ def test_hessian_finite(make_analysis, device):
     assert torch.isfinite(H).all(), "Hessian 存在 NaN/Inf"
 
 
+@pytest.mark.parametrize("config_key", ["simple", "with_trans"])
+def test_phsp_hessian_large_n_fallback(make_analysis, device, monkeypatch, config_key):
+    """phsp Hessian 的 global-memory 回退（大 n）与 shared-memory 快路径必须数值一致。
+
+    回归背景: phspHessianKernel 把 n×n 的 phsp 矩阵放共享内存，需求
+    n²·sizeof(ctComplex) 随分波数平方增长（n=138 → ~300KB），超过单 block
+    动态共享内存上限（V100 96KB）时旧实现 cudaFuncSetAttribute /
+    cudaLaunchKernel 直接返回 cudaErrorInvalidValue，且错误被留到下一个
+    torch CUDA 调用才抛出（表现为 fit.py 中 final_params.clone() 处的假 traceback）。
+    这里把"本卡共享内存上限"人为下调到 1KB，强制走回退分支对比两条路径。
+    """
+    ana = make_analysis(config_key)
+    params = make_params(ana, device)
+
+    H_small = ana.getHessian(params).detach().cpu().double()
+    monkeypatch.setenv("CTPWA_PHSP_HESS_MAX_SMEM", "1024")
+    H_large = ana.getHessian(params).detach().cpu().double()
+
+    assert torch.isfinite(H_large).all(), f"{config_key}: 回退路径 Hessian 含 NaN/Inf"
+    scale = H_small.abs().max().item()
+    diff = (H_large - H_small).abs().max().item()
+    assert diff <= 1e-8 * max(scale, 1.0), (
+        f"{config_key}: phsp Hessian 回退路径与快路径不一致 "
+        f"max|ΔH|={diff:.3e} (|H|max={scale:.3e})"
+    )
+
+
 # ============================================================
 # 异常参数保护（真实拟合场景）
 # ============================================================

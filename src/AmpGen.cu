@@ -3744,6 +3744,24 @@ void AmpCalc::computeUnifiedHessian(
                 int grid = (nch + kBlockSize - 1) / kBlockSize;
                 // 共享归约槽: 2×ACHUNK(32)×NTb×8B
                 int smem = 2 * 32 * btB.NT * (int)sizeof(double);
+                // >48KB 的动态共享内存必须显式放开，否则 launch 直接
+                // cudaErrorInvalidValue（错误会留到下一个 torch 调用才爆，
+                // traceback 指错行）；超过本卡上限（V100 96KB）则立即报清楚。
+                {
+                    int dev_id = 0, smem_optin = 0;
+                    cudaGetDevice(&dev_id);
+                    cudaDeviceGetAttribute(&smem_optin,
+                        cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id);
+                    if (smem > smem_optin)
+                        throw std::runtime_error(
+                            "[ctpwa] hessianCrossMixedKernel 需要 "
+                            + std::to_string(smem) + " B 动态共享内存，超过本卡上限 "
+                            + std::to_string(smem_optin) + " B（NT="
+                            + std::to_string(btB.NT) + "）: 减少自由共振态参数，"
+                            "或改用 global 归约路径");
+                    cudaFuncSetAttribute(hessianCrossMixedKernel,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                }
                 hessianCrossMixedKernel<<<grid, kBlockSize, smem>>>(
                     d_S_re, d_S_im, d_I_full,
                     d_amp_c,

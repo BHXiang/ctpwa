@@ -2,6 +2,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 
 #include <ComputeHessian.cuh>
 #include <CustomExpr.cuh>
@@ -274,18 +277,126 @@ __global__ void phspHessianKernel(
     }
 }
 
+// 大 n 回退：P（n×n）从 global memory 按需读，动态共享内存只放 2n 的 Pu。
+// 数学与 phspHessianKernel 逐项一致（同一公式、同一累加顺序），只是不缓存 P。
+// 触发条件：n²·sizeof(ctComplex)+2n·8 超过单 block 动态共享内存上限
+// （V100 96KB / A100 163KB / H100 227KB）。n=138 时需 ~300KB → 必走此路径。
+__global__ void phspHessianKernelLarge(
+    const ctComplex* __restrict__ P,      // n×n (共轭存储, global)
+    const ctComplex* __restrict__ v,      // n
+    double invT, double weight,
+    double* __restrict__ d_hessian,
+    int n)
+{
+    const int n2 = 2 * n;
+    extern __shared__ double sPu[];
+    double* sPu_real = sPu;               // [0:n]=Re, [n:2n]=Im
+
+    // Pu = P * v（P 从 global 读；L2 命中率高，n=138 时总量 ~300KB）
+    for (int a = threadIdx.x; a < n; a += blockDim.x) {
+        ctComplex pu = ctMake(0, 0);
+        for (int b = 0; b < n; ++b) {
+            ctComplex pb = P[a * n + b], vb = v[b];
+            pu.x += pb.x * vb.x - pb.y * vb.y;
+            pu.y += pb.x * vb.y + pb.y * vb.x;
+        }
+        sPu_real[a] = pu.x;
+        sPu_real[a + n] = pu.y;
+    }
+    __syncthreads();
+
+    double invT2 = invT * invT;
+    for (int idx = threadIdx.x; idx < n2 * n2; idx += blockDim.x) {
+        int i = idx / n2, j = idx % n2;
+        double val = 0.0;
+
+        // -4*w*Pu*Pu^T/T²
+        val += -4.0 * weight * sPu_real[i] * sPu_real[j] * invT2;
+
+        // +2*w*tildeP/T, [[R,C],[-C,R]] 约定（P.x=R, P.y=-C）
+        if (i < n && j < n)
+            val += 2.0 * weight * P[i * n + j].x * invT;
+        else if (i < n && j >= n)
+            val += -2.0 * weight * P[i * n + (j - n)].y * invT;
+        else if (i >= n && j < n)
+            val += 2.0 * weight * P[(i - n) * n + j].y * invT;
+        else
+            val += 2.0 * weight * P[(i - n) * n + (j - n)].x * invT;
+
+        unsigned long long* ptr = (unsigned long long*)(d_hessian + i * n2 + j);
+        unsigned long long old = *ptr, new_val;
+        do {
+            new_val = __double_as_longlong(__longlong_as_double(old) + val);
+        } while (atomicCAS(ptr, old, new_val) != old);
+    }
+}
+
+// CUDA 错误就地抛出：C++ 侧不检查返回值时，cudaErrorInvalidValue 会留在 error
+// state 里，直到下一个 torch CUDA 调用（如 fit.py 的 final_params.clone()）才爆，
+// traceback 指向无关行。这里立刻转成 Python 异常并给出 n / smem / 上限。
+[[noreturn]] static void throwCudaError(const char* what, cudaError_t err,
+                                        int n, size_t smem, int limit)
+{
+    char msg[512];
+    std::snprintf(msg, sizeof(msg),
+        "[ctpwa] %s 失败 (n=%d, 需要动态共享内存 %zu B, 本卡上限 %d B): %s",
+        what, n, smem, limit, cudaGetErrorString(err));
+    throw std::runtime_error(msg);
+}
+
 void computePhspHessian(
     const ctComplex* d_phsp_matrix, const ctComplex* d_vector,
     double phsp_factor, double weight,
     double* d_hessian, int n)
 {
     double invT = 1.0 / phsp_factor;
-    {
-        size_t shm = (size_t)(n * n) * sizeof(ctComplex)
-                   + (size_t)(2 * n) * sizeof(double);
-        cudaFuncSetAttribute(phspHessianKernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
-        phspHessianKernel<<<1, 256, shm>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+
+    // n×n 常数矩阵常驻 shared memory 的快速版；需求  n²·sizeof(ctComplex) + 2n·8
+    // 随 n² 增长，n 大时必须回退到 global 版（否则 cudaFuncSetAttribute 与
+    // cudaLaunchKernel 都返回 cudaErrorInvalidValue）。
+    const size_t shm_full = (size_t)(n * n) * sizeof(ctComplex)
+                          + (size_t)(2 * n) * sizeof(double);
+    int dev = 0, smem_optin = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    // 调试/测试用：把"本卡上限"人为下调 → 小 n 也能强制走回退路径（A/B 数值对照）
+    if (const char* cap = std::getenv("CTPWA_PHSP_HESS_MAX_SMEM")) {
+        int v = std::atoi(cap);
+        if (v > 0 && v < smem_optin) smem_optin = v;
+    }
+
+    // 调试用：CTPWA_PHSP_HESS=small|large 强制走某条路径（A/B 数值对照）
+    const char* mode = std::getenv("CTPWA_PHSP_HESS");
+    const bool force_large = (mode != nullptr && std::strcmp(mode, "large") == 0);
+    const bool force_small = (mode != nullptr && std::strcmp(mode, "small") == 0);
+
+    bool small_ok = false;
+    if (!force_large && (force_small || shm_full <= (size_t)smem_optin)) {
+        small_ok = cudaFuncSetAttribute(phspHessianKernel,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       (int)shm_full) == cudaSuccess;
+        // last-error 是粘性的：这里失败会把错误留在 error state，若不读掉，
+        // 回退路径 launch 后的 cudaGetLastError 会读到这个陈旧错误 → 假报错。
+        (void)cudaGetLastError();
+    }
+
+    if (small_ok) {
+        // launch 前先清历史 last-error，保证下面的检查只反映本次 launch
+        (void)cudaGetLastError();
+        phspHessianKernel<<<1, 256, shm_full>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) throwCudaError("phspHessianKernel", err, n, shm_full, smem_optin);
+    } else {
+        const size_t shm_pu = (size_t)(2 * n) * sizeof(double);
+        if (force_small)
+            std::fprintf(stderr, "[ctpwa] CTPWA_PHSP_HESS=small 但共享内存不足 "
+                "(n=%d, 需 %zu B > 上限 %d B)，已回退 large 路径\n", n, shm_full, smem_optin);
+        cudaFuncSetAttribute(phspHessianKernelLarge,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm_pu);
+        (void)cudaGetLastError();   // 清历史 last-error（含上面失败的 attribute 调用）
+        phspHessianKernelLarge<<<1, 256, shm_pu>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) throwCudaError("phspHessianKernelLarge", err, n, shm_pu, smem_optin);
     }
 }
 
