@@ -369,6 +369,8 @@ void computePhspHessian(
     const char* mode = std::getenv("CTPWA_PHSP_HESS");
     const bool force_large = (mode != nullptr && std::strcmp(mode, "large") == 0);
     const bool force_small = (mode != nullptr && std::strcmp(mode, "small") == 0);
+    // 调试用：CTPWA_PHSP_HESS_DEBUG=1 每次调用打一行"走了哪条路"（默认全静默）
+    const bool dbg = std::getenv("CTPWA_PHSP_HESS_DEBUG") != nullptr;
 
     bool small_ok = false;
     if (!force_large && (force_small || shm_full <= (size_t)smem_optin)) {
@@ -381,6 +383,9 @@ void computePhspHessian(
     }
 
     if (small_ok) {
+        if (dbg)
+            std::fprintf(stderr, "[ctpwa] phsp Hessian: n=%d need=%.1fKB limit=%.1fKB "
+                "-> shared (fast) path\n", n, shm_full / 1024.0, smem_optin / 1024.0);
         // launch 前先清历史 last-error，保证下面的检查只反映本次 launch
         (void)cudaGetLastError();
         phspHessianKernel<<<1, 256, shm_full>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
@@ -388,6 +393,10 @@ void computePhspHessian(
         if (err != cudaSuccess) throwCudaError("phspHessianKernel", err, n, shm_full, smem_optin);
     } else {
         const size_t shm_pu = (size_t)(2 * n) * sizeof(double);
+        if (dbg)
+            std::fprintf(stderr, "[ctpwa] phsp Hessian: n=%d need=%.1fKB limit=%.1fKB "
+                "-> global (fallback) path, smem=%.1fKB\n",
+                n, shm_full / 1024.0, smem_optin / 1024.0, shm_pu / 1024.0);
         if (force_small)
             std::fprintf(stderr, "[ctpwa] CTPWA_PHSP_HESS=small 但共享内存不足 "
                 "(n=%d, 需 %zu B > 上限 %d B)，已回退 large 路径\n", n, shm_full, smem_optin);
