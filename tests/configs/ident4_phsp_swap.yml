@@ -1,0 +1,92 @@
+# ident4 的 phsp 标签交换变体（同一批事件，Ks1 ↔ Ks2 对调）。
+# 用途: test_identical.py::test_model_intensity_symmetric —— 逐事件模型强度必须
+# 对标签交换不变（w(x) == w(σx)）；data 与其它设置与 ident4.yml 完全相同。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  omega:
+    J: 1
+    P: -1
+    mass: 0.782
+    tex: ['\\omega']
+  Ks1:
+    J: 0
+    P: -1
+    mass: 0.4976
+    tex: ['K_{S1}']
+  Ks2:
+    J: 0
+    P: -1
+    mass: 0.4976
+    tex: ['K_{S2}']
+
+Data:
+  order: [Ks1, Ks2, omega]
+  data: [dat, "./data/ident4_data.dat"]
+  phsp: [dat, "./data/ident4_phsp_swapped.dat"]
+  bkg:  [dat, "./data/ident4_sideband.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [omega, R_KK]
+      - [Ks1, R_Komega]
+    R_KK: [Ks1, Ks2]
+    R_Komega:
+      - [Ks2, omega]
+    intermediates:
+      R_KK:
+        - [J: 0, P: 1]: [f0_1710]
+      R_Komega:
+        - [J: 1, P: 1]: [K1_1270]
+
+Resonances:
+  f0_1710:
+    J: 0
+    P: 1
+    model: BWR
+    parameters: [1.7, 0.13]
+    free: [0, 1]
+    tex: ["f_{0}(1710)"]
+
+  K1_1270:
+    J: 1
+    P: 1
+    model: BWR
+    parameters: [1.3, 0.1]
+    free: [0, 1]
+    tex: ["K_{1}(1270)"]
+
+Constraints:
+  identical:
+    - [Ks1, Ks2]
+  maxL: 3
+  bf_d: 3.0
+
+Plot:
+  - name: mass0_Ks1_Ks2
+    expression: "M([Ks1,Ks2])"
+    bins: [40]
+    ranges: [[0.99, 2.40]]
+    display:
+      - "M(K_{S1}K_{S2})"
+      - "Events"
+
+  - name: mass1_Ks1_omega
+    expression: "M([Ks1,omega])"
+    bins: [40]
+    ranges: [[1.10, 2.70]]
+    display:
+      - "M(K_{S1}\\omega)"
+      - "Events"
+
+  - name: mass2_Ks2_omega
+    expression: "M([Ks2,omega])"
+    bins: [40]
+    ranges: [[1.10, 2.70]]
+    display:
+      - "M(K_{S2}\\omega)"
+      - "Events"

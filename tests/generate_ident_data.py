@@ -6,7 +6,9 @@
 产出:
     tests/data/ident2_{data,phsp,sideband}.dat   (pi01, pi02, eta)
     tests/data/ident3_{data,phsp,sideband}.dat   (pi01, pi02, pi03)
+    tests/data/ident4_{data,phsp,sideband}.dat   (Ks1, Ks2, omega)
     tests/data/ident2_swapped.dat                (pi01↔pi02 交换后的数据，对称性检验用)
+    tests/data/ident4_swapped.dat                (Ks1↔Ks2 交换后的数据)
 固定 seed，可复现。
 """
 import argparse
@@ -19,6 +21,8 @@ TESTS_DIR = Path(__file__).resolve().parent
 M_JPSI = 3.0969
 M_PI = 0.13498
 M_ETA = 0.5478
+M_KS = 0.4976
+M_OMEGA = 0.782
 
 
 def three_body_flat(N, seed, m1, m2, m3):
@@ -29,8 +33,15 @@ def three_body_flat(N, seed, m1, m2, m3):
     while len(results) < N:
         m12 = rng.uniform(m1 + m2, M_JPSI - m3)
         m23 = rng.uniform(m2 + m3, M_JPSI - m1)
-        m13_sq = M2 + m1**2 + m2**2 + m3**2 - m12**2 - m23**2 - m1**2 - m2**2 - m3**2 + 2*m1*m2 + 2*m2*m3 - 2*m1*m3  # noqa
-        m13 = np.sqrt(max(m13_sq, (m1 + m3)**2))
+        # 三体运动学关系: m12² + m23² + m13² = M² + m1² + m2² + m3²
+        # 注意: 这里必须用精确关系（不能省 m1²+m2²+m3² 项，也不能用 2m_i m_j 近似），
+        # 否则接受域在 1 ↔ 2 交换下不再不变 → 生成的 phsp 样本系统性破坏全同粒子
+        # 对称性（200k 事件实测 <m1-m2> 偏 -9.8σ），会把"模型投影不对称"这一
+        # MC 样本伪影误诊成振幅 bug。
+        m13_sq = M2 + m1**2 + m2**2 + m3**2 - m12**2 - m23**2
+        if m13_sq <= 0:
+            continue
+        m13 = np.sqrt(m13_sq)
         if m13 < (m1 + m3) or m13 > (M_JPSI - m2):
             continue
         # 在 J/psi 系构造：先 (23) 子系
@@ -100,7 +111,7 @@ def write_dat(path, events):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n_data", type=int, default=1000)
+    ap.add_argument("--n_data", type=int, default=800)
     ap.add_argument("--n_phsp", type=int, default=10000)
     args = ap.parse_args()
     data_dir = TESTS_DIR / "data"
@@ -118,6 +129,23 @@ def main():
     write_dat(data_dir / "ident3_data.dat", ev3)
     write_dat(data_dir / "ident3_phsp.dat", three_body_flat(args.n_phsp, 53, M_PI, M_PI, M_PI))
     write_dat(data_dir / "ident3_sideband.dat", three_body_flat(100, 54, M_PI, M_PI, M_PI))
+    # 交换 pi01 ↔ pi02（对称性检验；旧版遗漏此项 → 重跑生成器后 swap 数据与
+    # data 事件数不一致，test_nll_symmetric_under_swap 会以"事件集不同"而误报）
+    write_dat(data_dir / "ident3_swapped.dat", [(e[1], e[0], e[2]) for e in ev3])
+
+    # J/psi → Ks1 Ks2 omega（J/psi → omega K_S K_S 分析的最小复刻）
+    ev4 = three_body_flat(args.n_data, 62, M_KS, M_KS, M_OMEGA)
+    write_dat(data_dir / "ident4_data.dat", ev4)
+    write_dat(data_dir / "ident4_phsp.dat",
+              three_body_flat(args.n_phsp, 63, M_KS, M_KS, M_OMEGA))
+    # 标签交换后的 phsp：逐事件强度对称性检验用（w(x) == w(σx)，精确到浮点）
+    write_dat(data_dir / "ident4_phsp_swapped.dat",
+              [(e[1], e[0], e[2]) for e in three_body_flat(args.n_phsp, 63, M_KS, M_KS, M_OMEGA)])
+    write_dat(data_dir / "ident4_sideband.dat",
+              three_body_flat(100, 64, M_KS, M_KS, M_OMEGA))
+    # 交换 Ks1 ↔ Ks2（对称性检验）
+    write_dat(data_dir / "ident4_swapped.dat", [(e[1], e[0], e[2]) for e in ev4])
+
     print("ident data written")
 
 

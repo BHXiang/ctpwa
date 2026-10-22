@@ -1,0 +1,101 @@
+# 全同粒子回归：J/psi → omega K_S K_S 的最小复刻。
+#
+# Ks1/Ks2 同时以两种身份出现（正是真实分析 J/psi → omega K_S K_S 的结构）：
+#   (a) 兄弟对: R_KK → Ks1 Ks2        —— 该换位是选择定则稳定子
+#   (b) 跨子衰变: J/psi → Ks1 + R_Komega, R_Komega → Ks2 omega
+# 两条链各自做置换求和，总和必须对 Ks1 ↔ Ks2 严格对称。
+#
+# 回归目标: 模型投影 M(Ks1 omega) 与 M(Ks2 omega) 必须逐 bin 相等
+# （见 test_identical.py::test_model_projection_symmetric）。
+# 历史 bug: convertToDeviceMomenta 在批内每次调用都释放上一批 per-σ 动量缓冲，
+# σ≥1 的 cudaMalloc 复用同一地址 → 所有 σ 别名到最后一个置换，
+# Σ_σ A(x_σ) 退化成 2·A(x_swap)，强度不再对称（v0.3.10/v0.3.11 中招）。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  omega:
+    J: 1
+    P: -1
+    mass: 0.782
+    tex: ['\\omega']
+  Ks1:
+    J: 0
+    P: -1
+    mass: 0.4976
+    tex: ['K_{S1}']
+  Ks2:
+    J: 0
+    P: -1
+    mass: 0.4976
+    tex: ['K_{S2}']
+
+Data:
+  order: [Ks1, Ks2, omega]
+  data: [dat, "./data/ident4_data.dat"]
+  phsp: [dat, "./data/ident4_phsp.dat"]
+  bkg:  [dat, "./data/ident4_sideband.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [omega, R_KK]
+      - [Ks1, R_Komega]
+    R_KK: [Ks1, Ks2]
+    R_Komega:
+      - [Ks2, omega]
+    intermediates:
+      R_KK:
+        - [J: 0, P: 1]: [f0_1710]
+      R_Komega:
+        - [J: 1, P: 1]: [K1_1270]
+
+Resonances:
+  f0_1710:
+    J: 0
+    P: 1
+    model: BWR
+    parameters: [1.7, 0.13]
+    free: [0, 1]
+    tex: ["f_{0}(1710)"]
+
+  K1_1270:
+    J: 1
+    P: 1
+    model: BWR
+    parameters: [1.3, 0.1]
+    free: [0, 1]
+    tex: ["K_{1}(1270)"]
+
+Constraints:
+  identical:
+    - [Ks1, Ks2]
+  maxL: 3
+  bf_d: 3.0
+
+Plot:
+  - name: mass0_Ks1_Ks2
+    expression: "M([Ks1,Ks2])"
+    bins: [40]
+    ranges: [[0.99, 2.40]]
+    display:
+      - "M(K_{S1}K_{S2})"
+      - "Events"
+
+  - name: mass1_Ks1_omega
+    expression: "M([Ks1,omega])"
+    bins: [40]
+    ranges: [[1.10, 2.70]]
+    display:
+      - "M(K_{S1}\\omega)"
+      - "Events"
+
+  - name: mass2_Ks2_omega
+    expression: "M([Ks2,omega])"
+    bins: [40]
+    ranges: [[1.10, 2.70]]
+    display:
+      - "M(K_{S2}\\omega)"
+      - "Events"
