@@ -1,0 +1,64 @@
+# 回归: 同一 intermediate 下出现两个 **相同 [J,P]** 的块。
+#
+#   R_KK:
+#     - [J: 1, P: -1]: [phi1680]
+#     - [J: 1, P: -1]: [phi2170]     ← 同 J/P 的第二个块
+#
+# 历史 bug (Info.cu): intermediate_resonance_map 用赋值而非累加，第二块覆盖第一块
+# → phi1680 整条丢失，而 phi2170 被列两次（图例名/振幅重复、干涉矩阵出现逐元素
+# 相同的两行、Hessian 出现精确零方向）。实测受影响: J/psi → omega K_S K_S 里
+# R_Ksomega 的 {[1+]: K1_1400, [1+]: K1_1270} → K1_1400 消失、K1_1270 ×2。
+#
+# 正确行为: 两块合并成一组 {phi1680, phi2170}，各出现一次、各带自己的振幅。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+    tex: ['J/\\psi']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [Kp, Km, eta]
+  data: [dat, "./data/test_data.dat"]
+  phsp: [dat, "./data/test_phsp.dat"]
+  bkg:  [dat, "./data/test_sideband.dat"]
+
+DecayChains:
+  chain1:
+    decay:
+      - Jpsi: [eta, R_KK]
+      - R_KK: [Kp, Km]
+    R_KK:
+      - [J: 1, P: -1]: [phi1680]
+      - [J: 1, P: -1]: [phi2170]
+
+Resonances:
+  phi1680:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [1.66, 0.125]
+    free: [0, 1]
+    tex: ["\\phi(1680)"]
+
+  phi2170:
+    J: 1
+    P: -1
+    model: BWR
+    parameters: [2.17, 0.16]
+    tex: ["\\phi(2170)"]

@@ -111,8 +111,27 @@ void DecayInfo::buildDecayChains(
                         }
                     }
                 }
-                intermediate_resonance_map[{rc.intermediate, {(int)sc.spin_parity[0], (int)sc.spin_parity[1]}}] = rlist;
-                particles_jp.push_back(ip);
+                // 同一 intermediate 下出现多个 **相同 [J,P]** 的块 = 同一组的共振态并集。
+                // 旧实现用赋值 (=) → 后一覆盖前一：前一块的共振态整条丢失，而
+                // particles_jp 仍为每个块 push 一个 JP 选择 → 组合数翻倍，后一块的
+                // 共振态被列两次（图例/干涉矩阵出现逐元素相同的两行，振幅也变成
+                // 两条全同的复制 → Hessian 出现精确零方向）。
+                // 例: J/psi → omega K_S K_S 里 R_Ksomega 有
+                //   - [J: 1, P: 1]: [K1_1400]
+                //   - [J: 1, P: 1]: [K1_1270]
+                // 两个块 → 必须合并成 {K1_1400, K1_1270} 一组、只算一个 JP 选择。
+                auto jp_key = std::make_pair(rc.intermediate,
+                                             std::vector<int>{(int)sc.spin_parity[0],
+                                                              (int)sc.spin_parity[1]});
+                auto& jp_slot = intermediate_resonance_map[jp_key];
+                jp_slot.insert(jp_slot.end(), rlist.begin(), rlist.end());
+                bool jp_seen = false;
+                for (const auto& p : particles_jp)
+                    if (p.name == ip.name && p.spin == ip.spin && p.parity == ip.parity) {
+                        jp_seen = true;
+                        break;
+                    }
+                if (!jp_seen) particles_jp.push_back(ip);
             }
             intermediate_particles.push_back(particles_jp);
         }

@@ -39,6 +39,34 @@ def test_external_resonance_equivalent(make_analysis):
     )
 
 
+def test_same_jp_blocks_merge(make_analysis=None):
+    """同一 intermediate 下两个相同 [J,P] 块必须合并：不丢共振态、不重复。
+
+    回归背景（Info.cu）: intermediate_resonance_map 用赋值而非累加，后一个
+    [J,P] 块覆盖前一个 → 前一块的共振态整条丢失，后一块被列两次。症状:
+    图例名重复、干涉矩阵出现逐元素相同的两行、振幅成为全同复制（Hessian
+    出现精确零方向）。真实案例: J/psi → omega K_S K_S 的 R_Ksomega 写成
+      - [J: 1, P: 1]: [K1_1400]
+      - [J: 1, P: 1]: [K1_1270]
+    → K1_1400 消失、K1_1270 振幅 ×2。
+
+    这是纯 host 侧结构测试（DecayInfo 只解析 config，不需要数据/GPU）。
+    """
+    import ctpwa
+    from conftest import CONFIGS_DIR
+
+    di = ctpwa.DecayInfo(str(CONFIGS_DIR / "dupjp.yml"))
+    waves = list(di.resonanceNames())
+    amps = list(di.amplitudeNames())
+
+    assert len(waves) == len(set(waves)), f"wave 名重复（索引撞车）: {waves}"
+    assert len(amps) == len(set(amps)), "振幅名重复"
+    assert sum("phi1680" in w for w in waves) == 1, f"phi1680 应恰好 1 条 wave: {waves}"
+    assert sum("phi2170" in w for w in waves) == 1, f"phi2170 应恰好 1 条 wave: {waves}"
+    assert any("phi1680" in a for a in amps), "phi1680 的振幅被丢掉了"
+    assert any("phi2170" in a for a in amps), "phi2170 的振幅被丢掉了"
+
+
 def test_ls_filter_reduces_waves(make_analysis):
     """sl 分波白名单应减少 SL 组合数（4 → 1），并保持其余结构一致。"""
     ana_base = make_analysis("ls_filter")
