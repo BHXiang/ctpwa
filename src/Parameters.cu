@@ -486,36 +486,45 @@ __global__ void hessianFullTransformKernel(
             }
         }
 
-        // ---- second-order gradient term: Σ_a g_v[a] × ∂²v_a/(∂p_j ∂p_k) ----
-        // Only non-zero for mixed chain×step derivatives
-        if (d_g_v && jCh != kCh) {
+        // ---- 二阶项: Σ_a g_v[a] · ∂²v_a/(∂p_j ∂p_k) ----
+        // v_a = ratio_a · Π_{f ∈ factors(a)} p_f   (每个因子幂次 1) ⇒
+        //   · j == k, 或 j/k 中有一个不是 a 的因子  →  0;
+        //   · j ≠ k 且都是 a 的因子  →  ∂²v_a/∂p_j∂p_k = v_a / (p_j · p_k)
+        //     (复数; trans 的 ratio 已经含在 v_a 里, 不需要额外处理)
+        // 统一处理 chain×step **与 step×step**; 旧版只做前者、把后者整类跳过,
+        // 并把 z = v_a/(p_j p_k) 硬编码成 1 —— 只在"每个振幅恰 2 个因子且 ratio=1"
+        // 时才正确, 这就是 >=3 因子 / ratio≠1 时 Hessian 错的原因。
+        // (VSPACE 下每个振幅只有 1 个因子 → 这里自动恒为 0, 与真值一致。)
+        if (d_g_v && j != k) {
             double gt = 0.0;
-            int chain_j = jCh ? jc : kc;     // which is the chain
-            int step_j  = jCh ? kc : jc;     // which is the step
-            bool row_is_chain = jCh;
             for (int a = 0; a < na; ++a) {
-                if (d_amp_chain[a] != chain_j) continue;
-                bool uses_step = false;
-                for (int ss = d_step_offsets[a]; ss < d_step_offsets[a + 1]; ++ss)
-                    if (d_step_data[ss] == step_j) { uses_step = true; break; }
-                if (!uses_step) continue;
-                double g_re = d_g_v[a], g_im = d_g_v[na + a];
-                // ∂²v/∂p_j∂p_k in Re/Im grouped format:
-                // ∂²Re/∂Re(c)∂Re(s)=1, ∂²Im/∂Re(c)∂Im(s)=1,
-                // ∂²Im/∂Im(c)∂Re(s)=1, ∂²Re/∂Im(c)∂Im(s)=-1
-                // All other combos = 0
-                if (row_is_chain) {
-                    if (cr == 0 && cc == 0) gt += g_re;        // Re_c×Re_s → +g_re
-                    else if (cr == 0 && cc == 1) gt += g_im;   // Re_c×Im_s → +g_im
-                    else if (cr == 1 && cc == 0) gt += g_im;   // Im_c×Re_s → +g_im
-                    else if (cr == 1 && cc == 1) gt -= g_re;   // Im_c×Im_s → -g_re
-                } else {
-                    // row is step, col is chain — symmetric
-                    if (cr == 0 && cc == 0) gt += g_re;
-                    else if (cr == 1 && cc == 0) gt += g_im;
-                    else if (cr == 0 && cc == 1) gt += g_im;
-                    else if (cr == 1 && cc == 1) gt -= g_re;
-                }
+                auto is_factor = [&](int pidx) -> bool {
+                    if (pidx < nch) return d_amp_chain[a] == pidx;
+                    int sc = pidx - nch;            // step_data 存的是去掉 nch 的偏移
+                    for (int ss = d_step_offsets[a]; ss < d_step_offsets[a + 1]; ++ss)
+                        if (d_step_data[ss] == sc) return true;
+                    return false;
+                };
+                if (!is_factor(j) || !is_factor(k)) continue;
+                // z = v_a / (p_j · p_k)
+                double pr = d_p_re[j], pi = d_p_im[j];
+                double qr = d_p_re[k], qi = d_p_im[k];
+                double dr = pr * qr - pi * qi;
+                double di = pr * qi + pi * qr;
+                double dsq = dr * dr + di * di;
+                if (dsq < 1e-300) dsq = 1e-300;
+                double vr = d_v_re[a], vi = d_v_im[a];
+                double zr = (vr * dr + vi * di) / dsq;
+                double zi = (vi * dr - vr * di) / dsq;
+                // 实坐标 8 块, 系数 = Re/Im(z) (j==k 已排除)
+                //   ∂²V_r: (Re,Re)=+zr (Re,Im)=-zi (Im,Re)=-zi (Im,Im)=-zr
+                //   ∂²V_i: (Re,Re)=+zi (Re,Im)=+zr (Im,Re)=+zr (Im,Im)=-zi
+                double d2Vr, d2Vi;
+                if (cr == 0 && cc == 0)      { d2Vr =  zr; d2Vi =  zi; }
+                else if (cr == 0 && cc == 1) { d2Vr = -zi; d2Vi =  zr; }
+                else if (cr == 1 && cc == 0) { d2Vr = -zi; d2Vi =  zr; }
+                else                         { d2Vr = -zr; d2Vi = -zi; }
+                gt += d_g_v[a] * d2Vr + d_g_v[na + a] * d2Vi;
             }
             sum += gt;
         }

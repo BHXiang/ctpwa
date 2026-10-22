@@ -1,0 +1,79 @@
+# 乘法链 (chain×step) Hessian 回归 config —— 存在 3 个自由乘法因子的振幅。
+#
+# 拓扑 (4 体数据 psip → gamma Kp Km eta, 复用 test_4body_*.dat):
+#   psip(1-) → gamma(1-) + R_X     R_X(2,+1): P=-1=(-1)(+1)(-1)^L → L 奇, S=1,2,3
+#                                  → (L,S)=(1,1)(1,2)(3,2)(3,3) 共 4 个 LS → 3 个自由 step 参数
+#   R_X(2,+1) → Kp(0-) + R_Y       R_Y(2,+1): P=+1=(-1)(+1)(-1)^L → L 奇, S=2
+#                                  → (L,S)=(1,2)(3,2) 共 2 个 LS → 1 个自由 step 参数
+#   R_Y(2,+1) → Km(0-) + eta(0-)   S=0, J=2 → L=2 → 1 个 LS (钉住, 无参数)
+#
+# 于是 n_free = 1 chain + 3 + 1 = 5; 同时取"非首个 LS"的振幅 = chain × step × step = 3 因子。
+# 注意: 顶层只用奇 L, 避开目前 production 顶点 L=2 触发的 NaN (见 with_deep_trans:
+#       Jpsi→eta+chic1(1,+) 的 L=0/L=2 顶层 → NLL 恒为 1e30, 该 config 从未被 NLL 级测试覆盖)。
+Particles:
+  psip:
+    J: 1
+    P: -1
+    mass: 3.0686
+    tex: ['\psi']
+  gamma:
+    J: 1
+    P: -1
+    mass: 0.0
+    tex: ['\gamma']
+  eta:
+    J: 0
+    P: -1
+    mass: 0.5478
+    tex: ['\eta']
+  Kp:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{+}']
+  Km:
+    J: 0
+    P: -1
+    mass: 0.4937
+    tex: ['K^{-}']
+
+Data:
+  order: [gamma, Kp, Km, eta]
+  data: [dat, "./data/test_4body_data.dat"]
+  phsp: [dat, "./data/test_4body_phsp.dat"]
+  bkg:  [dat, "./data/test_4body_sideband.dat"]
+
+DecayChains:
+  decay1:
+    psip:
+      - [gamma, R_X]
+    R_X:
+      - [Kp, R_Y]
+    R_Y:
+      - [Km, eta]
+
+    intermediates:
+      R_X:
+        - [J: 2, P: 1]: [X2]
+      R_Y:
+        - [J: 2, P: 1]: [Y2]
+
+    legends:
+      - ['R_X', 'gamma']
+      - ['R_Y', 'Kp']
+      - ['R_Y', 'Km']
+
+Resonances:
+  X2:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [2.4, 0.15]
+    tex: ["X_{2}"]
+
+  Y2:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [1.5, 0.1]
+    tex: ["Y_{2}"]

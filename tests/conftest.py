@@ -40,6 +40,8 @@ def config_paths():
         "no_trans": str(CONFIGS_DIR / "no_trans.yml"),
         "with_trans": str(CONFIGS_DIR / "with_trans.yml"),
         "with_deep_trans": str(CONFIGS_DIR / "with_deep_trans.yml"),
+        # 乘法链 (chain×step) Hessian 回归: 含 3 因子振幅, 见 test_numerical.py
+        "hess_mult": str(CONFIGS_DIR / "hess_mult.yml"),
     }
 
 
