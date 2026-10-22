@@ -550,14 +550,10 @@ std::vector<std::vector<SL>> AmpCasDecay::getSLCombinations() const
 //     return nPolar;
 // }
 
-std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
-    const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta,
-    const std::map<std::string, int>& particleToIndex,
-    const std::vector<DecayNodeHost>& decayChain)
+// 释放本实例此前分配的每-GPU 四动量缓冲。必须在**一批 computeSLAmps 的开头**
+// 调用一次（而不是每次 convertToDeviceMomenta 里），原因见该函数注释。
+void AmpCasDecay::releaseMomentaBuffers()
 {
-    // 释放上一次调用留下的缓冲（旧代码把 d_momenta_i / d_momenta_array 分配后
-    // 直接返回，调用方用完即弃却从不释放 → 每次调用泄漏；issue #3 实测每次
-    // getFitFractions 因此增长数百 MB～GB 级）
     for (auto& [dev, ptr] : d_momenta_structs_) {
         cudaSetDevice(dev);
         if (ptr) cudaFree(ptr);
@@ -568,6 +564,19 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
     }
     d_momenta_structs_.clear();
     d_momenta_arrays_.clear();
+}
+
+std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
+    const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta,
+    const std::map<std::string, int>& particleToIndex,
+    const std::vector<DecayNodeHost>& decayChain)
+{
+    // ⚠ 这里**不再**释放上一批缓冲：同一次 computeSLAmps 会为 σ=0 与每个置换
+    // 拓扑各调一次本函数，若在此处释放，则 σ=0 及 σ<n-1 的缓冲会在仍被
+    // d_momenta_/d_mom_sigma_ 引用时被释放（use-after-free）。cudaMalloc 通常
+    // 复用刚释放的块 → 所有 σ 别名到最后一个置换 → 全同粒子求和退化成单拓扑、
+    // 交换标签后 NLL 不再不变（tests/test_identical.py::test_nll_symmetric_under_swap[ident2]）。
+    // 本批所有缓冲由下次 computeSLAmps 开头的 releaseMomentaBuffers() 统一释放。
 
     std::vector<DeviceMomenta*> d_momenta(finalMomenta.size(), nullptr);
     // cudaMalloc(&d_momenta, sizeof(DeviceMomenta));
@@ -750,6 +759,8 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
     // 全同粒子置换拓扑（在权威 index 空间内生成）
     buildPermTopologies();
     int nSigma = static_cast<int>(h_signs_.size());
+    // 本批开始：释放上一批遗留的每-σ 四动量缓冲（见 releaseMomentaBuffers 注释）
+    releaseMomentaBuffers();
     // 所有四动量都入设备端
     d_momenta_ = convertToDeviceMomenta(finalMomenta, particleToIndex_, decayChain_);
     // 每 σ 拓扑的重建四动量（σ=0 复用 d_momenta_；σ≥1 用交换映射重建——

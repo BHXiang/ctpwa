@@ -152,6 +152,8 @@ private:
     size_t nPolarizations_;
 
     void addParticleIfNotExists(const std::string& name, int spin, int parity, double mass);
+    // 释放本实例此前分配的每-GPU 四动量缓冲（一批 computeSLAmps 开头调用一次）
+    void releaseMomentaBuffers();
     std::vector<DeviceMomenta*> convertToDeviceMomenta(
         const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta,
         const std::map<std::string, int>& particleToIndex,
