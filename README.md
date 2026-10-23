@@ -108,6 +108,27 @@ Resonances:
 | `getParamNames()` | 参数名（trans 折叠后唯一） |
 | `writeResult(params, file)` | 保存拟合结果 |
 | `DeviceManager` | GPU 检测 / 显存容量检查 / 精度查询 |
+| `PhaseSpaceGenerator(config)` | DIYMC：产生平坦 n 体相空间（CPU，不需 data/GPU） |
+
+## DIYMC：产生平坦相空间 MC（P1）
+
+`PhaseSpaceGenerator` 只解析 config 的 `Particles` / `Data.order` / `DecayChains`，
+**不读 data/phsp 文件，也不需要 GPU**：
+
+```python
+import torch, ctpwa
+
+gen = ctpwa.PhaseSpaceGenerator("config.yml")   # 或 mother="Jpsi"
+flat = gen.generate(100_000, seed=42)            # [N, n_final, 4]，(E, px, py, pz)
+gen.write(flat, "flat.dat")                      # 或 "flat.root"
+```
+
+- 产生的是**平坦相空间**：内部用 GENBOD 的 `wt` 做舍选（`u < wt`），不是直接
+  收下所有 `Generate()` 事例。
+- 末态顺序 = `Data.order`；母粒子默认静止系，四动量守恒/质量壳由测试保证。
+- `gen.generateWeighted(n, seed)` 返回 `(events, weights)`。
+- 振幅加权（舍选）将在 P2/P3 通过 `analysis.getIntensity` / `analysis.generateMC`
+  接入；当前版本尚未提供。
 
 ## 大 phsp 低显存模式（`Constraints.free_phsp_amplitudes: true`）
 
@@ -243,6 +264,27 @@ Resonances:
 | `getParamNames()` | parameter names (unique after trans folding) |
 | `writeResult(params, file)` | save fit results |
 | `DeviceManager` | GPU detection / memory capacity check / precision query |
+| `PhaseSpaceGenerator(config)` | DIYMC: flat n-body phase space (CPU, no data/GPU) |
+
+## DIYMC: flat phase-space generation (P1)
+
+`PhaseSpaceGenerator` only reads `Particles` / `Data.order` / `DecayChains` from
+config; it **does not open data/phsp files and does not need a GPU**:
+
+```python
+import torch, ctpwa
+
+gen = ctpwa.PhaseSpaceGenerator("config.yml")   # or mother="Jpsi"
+flat = gen.generate(100_000, seed=42)            # [N, n_final, 4], (E, px, py, pz)
+gen.write(flat, "flat.dat")                      # or "flat.root"
+```
+
+- Flat phase space: GENBOD events are accepted with probability `wt` (`u < wt`),
+  not simply all `Generate()` events.
+- Final-state order = `Data.order`; the mother is at rest by default.
+- `gen.generateWeighted(n, seed)` returns `(events, weights)`.
+- Amplitude-weighted generation (accept-reject) will be exposed later through
+  `analysis.getIntensity` / `analysis.generateMC` (P2/P3, not in this version).
 
 ## Performance (RTX 5060, 500k events)
 

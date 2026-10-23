@@ -18,6 +18,9 @@
 #include <Config.cuh>
 // Config inline (host-only, no device code)
 #include "Config.cu"
+#include <PhaseSpace.cuh>
+// PhaseSpace inline (host-only; needs ConfigParser definitions above)
+#include "PhaseSpace.cu"
 #include <Figure.cuh>
 // Analysis inline (no header for analysis class)
 #include "Analysis.cu"
@@ -36,7 +39,48 @@
 
 PYBIND11_MODULE(ctpwa, m)
 {
+    // Ensure torch's Python-side bindings exist before any at::Tensor is
+    // returned.  Without this, `import ctpwa` (without a prior `import
+    // torch`) can crash inside pybind's at::Tensor type caster.
+    pybind11::module_::import("torch");
+
     m.doc() = "ctpwa";
+
+    // ---- DIYMC phase-space generator (native GENBOD) ----
+    pybind11::class_<PhaseSpaceGenerator>(m, "PhaseSpaceGenerator")
+        .def(pybind11::init<const std::string&, const std::string&>(),
+             pybind11::arg("config_file"), pybind11::arg("mother") = "",
+             "PhaseSpaceGenerator(config_file, mother=''): generate flat "
+             "n-body phase space from config.yml. Only Particles/Data.order/"
+             "DecayChains are read; data files are not opened.")
+        .def("mother", &PhaseSpaceGenerator::mother)
+        .def("motherMass", &PhaseSpaceGenerator::motherMass)
+        .def("setMotherMass", &PhaseSpaceGenerator::setMotherMass,
+             pybind11::arg("mass"))
+        .def("finalStates", &PhaseSpaceGenerator::finalStates)
+        .def("nFinal", &PhaseSpaceGenerator::nFinal)
+        .def("weightMax", &PhaseSpaceGenerator::weightMax)
+        .def("lastTrials", &PhaseSpaceGenerator::lastTrials)
+        .def("generate", &PhaseSpaceGenerator::generate,
+             pybind11::arg("n"), pybind11::arg("seed") = 0,
+             "generate(n, seed=0): flat phase-space events, float64 CPU "
+             "[n, n_final, 4] in (E, px, py, pz), final states in Data.order.")
+        .def("generateWeighted", &PhaseSpaceGenerator::generateWeighted,
+             pybind11::arg("n"), pybind11::arg("seed") = 0,
+             "generateWeighted(n, seed=0): GENBOD events + weights "
+             "(events, weights).")
+        .def("write",
+             [](const PhaseSpaceGenerator& g, const torch::Tensor& events,
+                 const std::string& filename, pybind11::object weights) {
+                 if (weights.is_none())
+                     g.write(events, filename);
+                 else
+                     g.write(events, filename, weights.cast<torch::Tensor>());
+             },
+             pybind11::arg("events"), pybind11::arg("filename"),
+             pybind11::arg("weights") = pybind11::none(),
+             "write(events, filename, weights=None): .dat (E px py pz) or "
+             ".root (TTree 'mc' with TLorentzVector branches).");
 
     pybind11::class_<ChainView>(m, "ChainView")
         .def_readonly("name", &ChainView::name)
