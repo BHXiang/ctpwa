@@ -1,4 +1,5 @@
 #include <ComputeNLL.cuh>
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH(_SERIAL) / 双后端
 #include <complex>
 #include <chrono>
 #include "ComplexType.h"
@@ -18,15 +19,19 @@ constexpr int kWPBlock = kBlockSize / kWarpSize;
 //////////////////////////
 
 // Kernel: 每event计算|S|²→factor, 写w=S/factor, 累加-log(factor)*weight到NLL
-__global__ void computeFactorsAndWeightsKernel(
+CTPWA_KERNEL void computeFactorsAndWeightsKernel(
     ctComplex* __restrict__ d_S,          // 输入S=A^T·v；输出w=S/factor（含权重）
     double* __restrict__ d_nll,
     const double* __restrict__ d_weights, // 每event权重（null则=1）
     int nEvents, int n_polar)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+#if defined(CTPWA_HAS_CUDA)
 
+    const int evt = CTPWA_TID();
+
+#if defined(CTPWA_HAS_CUDA)
     __shared__ double s_logf_partial[256];
+#endif
     double my_logf = 0.0;
 
     if (evt < nEvents) {
@@ -66,6 +71,7 @@ __global__ void computeFactorsAndWeightsKernel(
         }
     }
 
+#if defined(CTPWA_HAS_CUDA)
     // 块内归约 my_logf
     s_logf_partial[threadIdx.x] = my_logf;
     __syncthreads();
@@ -81,24 +87,66 @@ __global__ void computeFactorsAndWeightsKernel(
     if (threadIdx.x == 0) {
         atomicAdd(d_nll, s_logf_partial[0]);
     }
+#else
+    atomicAdd(d_nll, my_logf);   // CPU: 每工作项直接累加（GPU 侧同样是 atomicAdd）
+#endif
+
+#else
+    // ---- CPU：单次调用，按事件顺序串行累加（逐位可复现）----
+    const ctFloat kMaxW = CTF(1e10);
+    double total = 0.0;
+    for (int evt = 0; evt < nEvents; ++evt) {
+        ctComplex* S_evt = d_S + evt * n_polar;
+        const ctFloat2* S_f2 = reinterpret_cast<const ctFloat2*>(S_evt);
+        ctFloat factor = CTF(0.0);
+        for (int p = 0; p < n_polar; ++p) {
+            ctFloat2 sv = S_f2[p];
+            factor += sv.x * sv.x + sv.y * sv.y;
+        }
+        ctFloat weight = (d_weights != nullptr) ? ctCastFloat(d_weights[evt]) : CTF(1.0);
+        if (factor == CTF(0.0)) {
+            total += (double)(-ctLog(CTF(1e-10)) * weight);
+            for (int p = 0; p < n_polar; ++p) { S_evt[p].x = CTF(0.0); S_evt[p].y = CTF(0.0); }
+        } else {
+            total += (double)(-ctLog(factor) * weight);
+            const ctFloat inv_f = weight / factor;
+            for (int p = 0; p < n_polar; ++p) {
+                ctFloat2 sv = S_f2[p];
+                S_evt[p].x = ctFmin(ctFmax(sv.x * inv_f, -kMaxW), kMaxW);
+                S_evt[p].y = ctFmin(ctFmax(sv.y * inv_f, -kMaxW), kMaxW);
+            }
+        }
+    }
+    atomicAdd(d_nll, total);
+#endif
 }
 
 // 就地共轭kernel: y[i] = conj(x[i])
-__global__ void conjugateKernel(ctComplex* __restrict__ data, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void conjugateKernel(ctComplex* __restrict__ data, int N) {
+    const int i = CTPWA_TID();
     if (i < N) data[i].y = -data[i].y;
 }
 
-// 小向量axpy: y[i] += alpha * x[i], 单block
-__global__ void axpyComplexKernel(ctComplex* y, const ctComplex* __restrict__ x, ctComplex alpha, int n) {
+// 小向量axpy: y[i] += alpha * x[i]，单 block 步进循环。
+// ⚠️ 启动配置是 <<<1, 64>>>：线程数远小于 n，**必须**用 stride 循环覆盖全部元素。
+// 早期把它改成"一线程一元素"导致 n>64 时梯度被截断（NLL 正常、梯度和 Hessian 错），
+// 见 tests/test_cpu_numerics.py 的 hess_mult 回归。
+CTPWA_KERNEL void axpyComplexKernel(ctComplex* y, const ctComplex* __restrict__ x, ctComplex alpha, int n) {
+#if defined(CTPWA_HAS_CUDA)
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         y[i] = ctMake(
             y[i].x + alpha.x * x[i].x - alpha.y * x[i].y,
             y[i].y + alpha.x * x[i].y + alpha.y * x[i].x);
+#else
+    for (int i = 0; i < n; ++i)   // CPU：单次调用串行扫完
+        y[i] = ctMake(
+            y[i].x + alpha.x * x[i].x - alpha.y * x[i].y,
+            y[i].y + alpha.x * x[i].y + alpha.y * x[i].x);
+#endif
 }
 
 void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n) {
-    axpyComplexKernel << <1, 64 >> > (y, x, alpha, n);
+    CTPWA_LAUNCH_SERIAL(axpyComplexKernel, 1, 64, 0, y, x, alpha, n);
 }
 
 
@@ -107,11 +155,12 @@ void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n) {
 // ===========================================================================
 
 template<int NP>
-__global__ void kern_fused_fwd(
+CTPWA_KERNEL void kern_fused_fwd(
     const ctComplex* __restrict__ A, int nA, int nE,
     const ctComplex* __restrict__ v, const double* __restrict__ W,
     ctComplex* __restrict__ w, double* __restrict__ N)
 {
+#if defined(CTPWA_HAS_CUDA)
     int warp = threadIdx.x / kWarpSize, lane = threadIdx.x % kWarpSize;
     int evt = blockIdx.x * kWPBlock + warp, base = evt * NP;
     extern __shared__ ctFloat sbuf[];
@@ -166,6 +215,40 @@ __global__ void kern_fused_fwd(
         val += ctShflDown(val, 1);
         if (lane == 0) atomicAdd(N, val);
     }
+#else
+    // ---- CPU：单次调用扫描全部事件（S = A^T v → |S|² → log → w）----
+    // 不做 warp 分块：GPU 那套 4 事件/warp + shuffle 归约在 CPU 上只有开销。
+    double total = 0.0;
+    for (int evt = 0; evt < nE; ++evt) {
+        const int base = evt * NP;
+        double Sr[NP] = {0.0}, Si[NP] = {0.0};
+        for (int i = 0; i < nA; ++i) {
+            const double vx = v[i].x, vy = v[i].y;
+            for (int p = 0; p < NP; ++p) {
+                const ctComplex a = A[(std::ptrdiff_t)i + (std::ptrdiff_t)(base + p) * nA];
+                Sr[p] += a.x * vx - a.y * vy;
+                Si[p] += a.x * vy + a.y * vx;
+            }
+        }
+        double f = 0.0;
+        for (int p = 0; p < NP; ++p) f += Sr[p] * Sr[p] + Si[p] * Si[p];
+        const double wt = (W != nullptr) ? W[evt] : 1.0;
+        if (f == 0.0) {
+            total += -std::log(1e-10) * wt;
+            for (int p = 0; p < NP; ++p) w[base + p] = ctMake(0.0, 0.0);
+        } else {
+            total += -std::log(f) * wt;
+            const double inv = wt / f;
+            for (int p = 0; p < NP; ++p) {
+                double wx = Sr[p] * inv, wy = Si[p] * inv;
+                wx = std::min(std::max(wx, -1e10), 1e10);
+                wy = std::min(std::max(wy, -1e10), 1e10);
+                w[base + p] = ctMake(wx, wy);
+            }
+        }
+    }
+    atomicAdd(N, total);
+#endif
 }
 
 static void launch_fused_fwd(int nP, int nA, int nE,
@@ -174,7 +257,7 @@ static void launch_fused_fwd(int nP, int nA, int nE,
 {
     int g = (nE + kWPBlock - 1) / kWPBlock;
     int shm = nA * (int)sizeof(ctComplex) + kWPBlock * (int)sizeof(double);
-    auto L = [&](auto* k) { k<<<g, kBlockSize, shm>>>(dA, nA, nE, dv, dW, dw, dN); };
+    auto L = [&](auto* k) { CTPWA_LAUNCH_SERIAL(k, g, kBlockSize, shm, dA, nA, nE, dv, dW, dw, dN); };
     switch (nP) {
         case 2: L(&kern_fused_fwd<2>); break;   case 3: L(&kern_fused_fwd<3>); break;
         case 4: L(&kern_fused_fwd<4>); break;   case 5: L(&kern_fused_fwd<5>); break;
@@ -189,7 +272,7 @@ static void launch_fused_fwd(int nP, int nA, int nE,
             ctComplex alpha=ctMake(1,0), beta=ctMake(0,0);
             CUBLAS_CGEMV(h, CUBLAS_OP_T, nA, nE*nP, &alpha, dA, nA, dv, 1, &beta, d_S, 1);
             int gb=(nE+kBlockSize-1)/kBlockSize;
-            computeFactorsAndWeightsKernel<<<gb,kBlockSize>>>(d_S,dN,dW,nE,nP);
+            CTPWA_LAUNCH_SERIAL(computeFactorsAndWeightsKernel, gb, kBlockSize, 0, d_S,dN,dW,nE,nP);
             cudaMemcpy(dw, d_S, nE*nP*sizeof(ctComplex), cudaMemcpyDeviceToDevice);
             cudaFree(d_S); cublasDestroy(h);
         } break;
@@ -243,11 +326,11 @@ static int tuneChunkCount(cublasHandle_t h, int nA, int nT,
 // -----------------------------------------------------------------------------
 // 就地: x_j = conj(S_j) · (w_ev/W_total)（S 用完覆盖为 d_P_vec 的 CGEMV 输入 x）
 // 布局: S 为 [nEvents × n_polar]，每事件 n_polar 个极化相邻；权重按事件索引。
-__global__ void scaleConjForGradPKernel(
+CTPWA_KERNEL void scaleConjForGradPKernel(
     ctComplex* __restrict__ d_S, const double* __restrict__ d_w,
     int nEvents, int nPolar, double inv_W_total)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = CTPWA_TID();
     int nTotal = nEvents * nPolar;
     if (i >= nTotal) return;
     int evt = i / nPolar;   // 极化快变 → 事件 = i/nPolar
@@ -257,13 +340,17 @@ __global__ void scaleConjForGradPKernel(
     d_S[i] = ctMake(s * v.x, -s * v.y);   // conj(S)·scale
 }
 
-__global__ void computePhspMeanKernel(
+CTPWA_KERNEL void computePhspMeanKernel(
     const ctComplex* __restrict__ d_S,   // S = A^T·v [nEvents × n_polar]
     double* __restrict__ d_sum,          // Σ f_ev（double 累加）
     int nEvents, int n_polar)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+#if defined(CTPWA_HAS_CUDA)
+
+    const int evt = CTPWA_TID();
+#if defined(CTPWA_HAS_CUDA)
     __shared__ double s_f_partial[kBlockSize];
+#endif
     double my_f = 0.0;
     if (evt < nEvents) {
         const ctComplex* S_evt = d_S + evt * n_polar;
@@ -276,6 +363,7 @@ __global__ void computePhspMeanKernel(
         }
         my_f = factor;
     }
+#if defined(CTPWA_HAS_CUDA)
     s_f_partial[threadIdx.x] = my_f;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -283,6 +371,23 @@ __global__ void computePhspMeanKernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) atomicAdd(d_sum, s_f_partial[0]);
+#else
+    atomicAdd(d_sum, my_f);
+#endif
+
+#else
+    // ---- CPU：按事件顺序串行累加（逐位可复现）----
+    double total = 0.0;
+    for (int evt = 0; evt < nEvents; ++evt) {
+        const ctComplex* S_evt = d_S + evt * n_polar;
+        const ctFloat2* S_f2 = reinterpret_cast<const ctFloat2*>(S_evt);
+        for (int p = 0; p < n_polar; ++p) {
+            ctFloat2 sv = S_f2[p];
+            total += (double)sv.x * sv.x + (double)sv.y * sv.y;
+        }
+    }
+    atomicAdd(d_sum, total);
+#endif
 }
 
 // 一次 phsp 扫描同时给出:
@@ -325,10 +430,10 @@ double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vec
     // phsp_sum = Σ|S|² double 累加
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computePhspMeanKernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
     // x = conj(S)·(w/W) 就地（S 已用完）
     int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
-    scaleConjForGradPKernel<<<gridX, kBlockSize>>>(s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
+    CTPWA_LAUNCH(scaleConjForGradPKernel, gridX, kBlockSize, 0, s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
     // d_P_out = A·x（每 GPU 局部和；n_amplitudes 输出）
     CUBLAS_CGEMV(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal, &a1,
                  d_amp, strideA, s_dS[dev], 1, &b0, d_P_out, 1);
@@ -336,7 +441,7 @@ double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vec
     // 上面 A·conj(S) = conj(conj(A)·S)，故对输出再取共轭得 conj(A)·S（与 data 梯度同向）。
     {
         int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        conjugateKernel<<<gOut, kBlockSize>>>(d_P_out, n_amplitudes);
+        CTPWA_LAUNCH(conjugateKernel, gOut, kBlockSize, 0, d_P_out, n_amplitudes);
     }
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
@@ -374,7 +479,7 @@ double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
                  d_amp, strideA, d_vector, 1, &b0, s_dS[dev], 1);
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computePhspMeanKernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h_sum;
@@ -431,6 +536,19 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
                                  d_amp, d_vector, dS);
     }
 
+#if defined(CTPWA_BACKEND_CPU)
+    if (getenv("CTPWA_CPU_DEBUG")) {
+        ctComplex hA[3] = {ctMake(-999,-999),ctMake(-999,-999),ctMake(-999,-999)};
+        ctComplex hv = ctMake(-999,-999);
+        cudaMemcpy(hA, d_amp, 3 * sizeof(ctComplex), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&hv, d_vector, sizeof(ctComplex), cudaMemcpyDeviceToHost);
+        std::printf("[CPU-DBG] pre-gemv: nch=%d nA=%d nTotal=%d strideA=%lld "
+                    "A=(%.6g,%.6g)(%.6g,%.6g)(%.6g,%.6g) v=(%.6g,%.6g)\n",
+                    nchunks, n_amplitudes, nTotal, strideA,
+                    (double)hA[0].x,(double)hA[0].y,(double)hA[1].x,(double)hA[1].y,
+                    (double)hA[2].x,(double)hA[2].y,(double)hv.x,(double)hv.y);
+    }
+#endif
     // ----- 第一步：S = A^T·v (cublas 分块) -----
     const int nch = nchunks;
     const int cp = nTotal / nch;
@@ -445,10 +563,28 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
                     dS + k * cp, 1);
     }
 
+#if defined(CTPWA_BACKEND_CPU)
+    if (getenv("CTPWA_CPU_DEBUG")) {
+        std::vector<ctComplex> hS(std::min(nTotal, 6));
+        cudaMemcpy(hS.data(), dS, hS.size() * sizeof(ctComplex), cudaMemcpyDeviceToHost);
+        std::printf("[CPU-DBG] computeFactorNLL: nch=%d cp=%d nA=%d nTotal=%d S[0..]=",
+                    nch, cp, n_amplitudes, nTotal);
+        for (size_t i = 0; i < hS.size(); ++i)
+            std::printf("(%.6g,%.6g)", (double)hS[i].x, (double)hS[i].y);
+        if (d_weights) {
+            double w[3] = {0, 0, 0};
+            cudaMemcpy(w, d_weights, 3 * sizeof(double), cudaMemcpyDeviceToHost);
+            std::printf(" weights=%.6g,%.6g,%.6g", w[0], w[1], w[2]);
+        } else {
+            std::printf(" weights=null");
+        }
+        std::printf("\n");
+    }
+#endif
     // ----- 第二步: factor + w + NLL (float logf/div, 一次性处理全部 S) -----
     cudaMemset(dnll, 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computeFactorsAndWeightsKernel<<<gridBlocks, kBlockSize>>>(
+    CTPWA_LAUNCH_SERIAL(computeFactorsAndWeightsKernel, gridBlocks, kBlockSize, 0, 
         dS, dnll, d_weights, nEvents, n_polar);
 
     double raw_nll;
@@ -461,7 +597,7 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
     // ----- 第三步: 梯度 grad = -A·conj(w) (cublas 分块, 第一块覆盖, 后续累加) -----
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
-        conjugateKernel<<<gradConj, kBlockSize>>>(dS, nTotal);
+        CTPWA_LAUNCH(conjugateKernel, gradConj, kBlockSize, 0, dS, nTotal);
 
         ctComplex alpha = ctMake(-1.0f, 0.0f);
         ctComplex beta0 = ctMake(0.0f, 0.0f);
@@ -474,7 +610,7 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
         }
 
         int gradZero = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        conjugateKernel<<<gradZero, kBlockSize>>>(d_grad_out, n_amplitudes);
+        CTPWA_LAUNCH(conjugateKernel, gradZero, kBlockSize, 0, d_grad_out, n_amplitudes);
     }
 
     return raw_nll;
@@ -485,13 +621,14 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector,
 //////////////////////////
 
 // n<=64: 单block，M和v全放共享内存，warp shuffle规约
-__global__ void quadratic_form_small(
+CTPWA_KERNEL void quadratic_form_small(
     const ctComplex* __restrict__ M,
     const ctComplex* __restrict__ v,
     ctComplex* __restrict__ d_P_vec,
     ctPhspReal* __restrict__ result_r,
     ctPhspReal* __restrict__ result_i,
     int n)
+#if defined(CTPWA_HAS_CUDA)
 {
     // 动态共享内存（float 版 64×64=16KB，double 版 64×64=64KB 超 48KB 上限，
     // 由调用方按 n 分配并设置 cudaFuncAttributeMaxDynamicSharedMemorySize）
@@ -568,15 +705,36 @@ __global__ void quadratic_form_small(
         if (lane_id == 0) { *result_r = fr; *result_i = fi; }
     }
 }
+#else
+{
+    // ---- CPU：O(n²) 复 matvec + 二次型，单次调用直接算完 ----
+    double fr2 = 0.0, fi2 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double yr = 0.0, yi = 0.0;
+        for (int j = 0; j < n; ++j) {
+            const ctComplex m = M[(std::ptrdiff_t)i * n + j];
+            const ctComplex vj = v[j];
+            yr += m.x * vj.x - m.y * vj.y;
+            yi += m.x * vj.y + m.y * vj.x;
+        }
+        if (d_P_vec) d_P_vec[i] = ctMake(yr, yi);
+        fr2 += v[i].x * yr + v[i].y * yi;
+        fi2 += v[i].x * yi - v[i].y * yr;
+    }
+    *result_r = (ctPhspReal)fr2;
+    *result_i = (ctPhspReal)fi2;
+}
+#endif
 
 // n>64: 多block，v放共享内存，M从全局用__ldg读取，atomicAdd归并结果
-__global__ void quadratic_form_large(
+CTPWA_KERNEL void quadratic_form_large(
     const ctComplex* __restrict__ M,
     const ctComplex* __restrict__ v,
     ctComplex* __restrict__ d_P_vec,
     ctPhspReal* __restrict__ result_r,
     ctPhspReal* __restrict__ result_i,
     int n)
+#if defined(CTPWA_HAS_CUDA)
 {
     extern __shared__ ctComplex sv[];
     int tid = threadIdx.x;
@@ -645,6 +803,26 @@ __global__ void quadratic_form_large(
         }
     }
 }
+#else
+{
+    // ---- CPU：O(n²) 复 matvec + 二次型，单次调用直接算完 ----
+    double fr2 = 0.0, fi2 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double yr = 0.0, yi = 0.0;
+        for (int j = 0; j < n; ++j) {
+            const ctComplex m = M[(std::ptrdiff_t)i * n + j];
+            const ctComplex vj = v[j];
+            yr += m.x * vj.x - m.y * vj.y;
+            yi += m.x * vj.y + m.y * vj.x;
+        }
+        if (d_P_vec) d_P_vec[i] = ctMake(yr, yi);
+        fr2 += v[i].x * yr + v[i].y * yi;
+        fi2 += v[i].x * yi - v[i].y * yr;
+    }
+    *result_r = (ctPhspReal)fr2;
+    *result_i = (ctPhspReal)fi2;
+}
+#endif
 
 void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
     ctComplex* d_P_vec, ctPhspReal* d_phsp_r, ctPhspReal* d_phsp_i, int n)
@@ -655,7 +833,7 @@ void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
         // double 版 64×64×16B=64KB 超过默认 48KB，需显式允许
         cudaFuncSetAttribute(quadratic_form_small,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
-        quadratic_form_small << <1, blk, shm >> > (d_M, d_v, d_P_vec, d_phsp_r, d_phsp_i, n);
+        CTPWA_LAUNCH_SERIAL(quadratic_form_small, 1, blk, shm, d_M, d_v, d_P_vec, d_phsp_r, d_phsp_i, n);
     }
     else {
         int blk = 256;
@@ -665,7 +843,7 @@ void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
         if (grid > 256) grid = 256;
         cudaMemsetAsync(d_phsp_r, 0, sizeof(ctPhspReal));
         cudaMemsetAsync(d_phsp_i, 0, sizeof(ctPhspReal));
-        quadratic_form_large << <grid, blk, n * sizeof(ctComplex) >> > (
+        CTPWA_LAUNCH_SERIAL(quadratic_form_large, grid, blk, n * sizeof(ctComplex), 
             d_M, d_v, d_P_vec, d_phsp_r, d_phsp_i, n);
     }
 }
@@ -677,21 +855,22 @@ void computeQuadraticForm(const ctComplex* d_M, const ctComplex* d_v,
 // 仅主 GPU 调用（M_double 固定在主 GPU），当前设备由调用方设置。
 // -----------------------------------------------------------------------------
 // 把 ctComplex 向量拆成实/虚两个 double 数组（供 doublePhspSumKernel 共享内存用）
-__global__ void castComplexSplitKernel(
+CTPWA_KERNEL void castComplexSplitKernel(
     const ctComplex* __restrict__ src, double* __restrict__ vr, double* __restrict__ vi, int n)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = CTPWA_TID();
     if (i >= n) return;
     vr[i] = (double)src[i].x;
     vi[i] = (double)src[i].y;
 }
 
 // 每线程负责若干行: w_i = Σ_j M_ij v_j, 累加 Re(v_i^* w_i); 多块时 atomicAdd
-__global__ void doublePhspSumKernel(
+CTPWA_KERNEL void doublePhspSumKernel(
     const cuDoubleComplex* __restrict__ M,
     const double* __restrict__ vr,
     const double* __restrict__ vi,
     int n, double* __restrict__ out)
+#if defined(CTPWA_HAS_CUDA)
 {
     extern __shared__ double s_vrvi[];  // [2n]: vr, vi
     int tid = threadIdx.x;
@@ -723,6 +902,22 @@ __global__ void doublePhspSumKernel(
         if (tid == 0) atomicAdd(out, v);
     }
 }
+#else
+{
+    // ---- CPU：w = M·v，累加 Re(v_i^* w_i)，单次调用直接算完 ----
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double yr = 0.0, yi = 0.0;
+        for (int j = 0; j < n; ++j) {
+            const cuDoubleComplex m = M[(std::ptrdiff_t)i * n + j];
+            yr += m.x * vr[j] - m.y * vi[j];
+            yi += m.x * vi[j] + m.y * vr[j];
+        }
+        acc += vr[i] * yr + vi[i] * yi;
+    }
+    atomicAdd(out, acc);
+}
+#endif
 
 double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, int n)
 {
@@ -749,12 +944,12 @@ double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, in
     }
     int grid = (n + 255) / 256;
     if (grid > 64) grid = 64;
-    castComplexSplitKernel<<<grid, 256>>>(d_v, s_vr[dev], s_vi[dev], n);
+    CTPWA_LAUNCH(castComplexSplitKernel, grid, 256, 0, d_v, s_vr[dev], s_vi[dev], n);
     cudaMemset(s_out[dev], 0, sizeof(double));
     size_t shm = (size_t)2 * n * sizeof(double);
     cudaFuncSetAttribute(doublePhspSumKernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
-    doublePhspSumKernel<<<grid, 256, shm>>>(d_M, s_vr[dev], s_vi[dev], n, s_out[dev]);
+    CTPWA_LAUNCH_SERIAL(doublePhspSumKernel, grid, 256, shm, d_M, s_vr[dev], s_vi[dev], n, s_out[dev]);
     double h = 0.0;
     cudaMemcpy(&h, s_out[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h;
@@ -771,14 +966,18 @@ double computeDoublePhspSum(const cuDoubleComplex* d_M, const ctComplex* d_v, in
 
 // 逐事件: factor=Σ|S|²（double 累加, float2 读入）; 输出 w=S·weight/factor (float2);
 // NLL = -Σ log(factor)·weight（double 累加）—— 与 computeFactorsAndWeightsKernel 同语义
-__global__ void computeFactorsAndWeightsF2Kernel(
+CTPWA_KERNEL void computeFactorsAndWeightsF2Kernel(
     float2* __restrict__ d_S,          // 输入 S=A^T·v (float2)；输出 w (float2)
     double* __restrict__ d_nll,
     const double* __restrict__ d_weights, // 每event权重（null则=1）
     int nEvents, int n_polar)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+#if defined(CTPWA_HAS_CUDA)
+
+    const int evt = CTPWA_TID();
+#if defined(CTPWA_HAS_CUDA)
     __shared__ double s_logf_partial[256];
+#endif
     double my_logf = 0.0;
     if (evt < nEvents) {
         float2* S_evt = d_S + (size_t)evt * n_polar;
@@ -811,20 +1010,27 @@ __global__ void computeFactorsAndWeightsF2Kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) atomicAdd(d_nll, s_logf_partial[0]);
+
+#else
+    // CPU 后端固定 double 精度（CTPWA_DOUBLE_COMPLEX），float2 路径不可达。
+    std::abort();
+#endif
 }
 
 // 就地共轭 float2: y = -y
-__global__ void conjugateF2Kernel(float2* __restrict__ data, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void conjugateF2Kernel(float2* __restrict__ data, int N) {
+    const int i = CTPWA_TID();
     if (i < N) data[i].y = -data[i].y;
 }
 
 // 每事件 Σ|S|² double 累加（float2 读入）—— phsp 均值 float 变体
-__global__ void computePhspMeanF2Kernel(
+CTPWA_KERNEL void computePhspMeanF2Kernel(
     const float2* __restrict__ d_S, double* __restrict__ d_sum,
     int nEvents, int n_polar)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+#if defined(CTPWA_HAS_CUDA)
+
+    const int evt = CTPWA_TID();
     __shared__ double s_f_partial[256];
     double my_f = 0.0;
     if (evt < nEvents) {
@@ -836,6 +1042,7 @@ __global__ void computePhspMeanF2Kernel(
         }
         my_f = factor;
     }
+#if defined(CTPWA_HAS_CUDA)
     s_f_partial[threadIdx.x] = my_f;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -843,14 +1050,22 @@ __global__ void computePhspMeanF2Kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) atomicAdd(d_sum, s_f_partial[0]);
+#else
+    atomicAdd(d_sum, my_f);
+#endif
+
+#else
+    // CPU 后端固定 double 精度（CTPWA_DOUBLE_COMPLEX），float2 路径不可达。
+    std::abort();
+#endif
 }
 
 // 就地: x_j = conj(S_j)·(w_ev/W_total)（S float2 覆盖为 d_P_vec CGEMV 输入 x）
-__global__ void scaleConjForGradPF2Kernel(
+CTPWA_KERNEL void scaleConjForGradPF2Kernel(
     float2* __restrict__ d_S, const double* __restrict__ d_w,
     int nEvents, int nPolar, double inv_W_total)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = CTPWA_TID();
     int nTotal = nEvents * nPolar;
     if (i >= nTotal) return;
     int evt = i / nPolar;
@@ -861,20 +1076,20 @@ __global__ void scaleConjForGradPF2Kernel(
 }
 
 // 把 double 耦合 v downcast 成 float2 副本（喂 Sgemv；v 恒 double 真理源）
-__global__ void downcastV2F2Kernel(const ctComplex* __restrict__ v, float2* __restrict__ vf, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void downcastV2F2Kernel(const ctComplex* __restrict__ v, float2* __restrict__ vf, int n) {
+    const int i = CTPWA_TID();
     if (i < n) vf[i] = make_float2((float)v[i].x, (float)v[i].y);
 }
 
 // float matvec 结果(float2) 累加进 double 目标（double 归约轨道）
-__global__ void addF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void addF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
+    const int i = CTPWA_TID();
     if (i < n) { dst[i].x += (double)src[i].x; dst[i].y += (double)src[i].y; }
 }
 
 // float matvec 结果取负累加进 double 目标: dst += -src（梯度 = -A·conj(w)）
-__global__ void negateAddF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void negateAddF2ToComplexKernel(const float2* __restrict__ src, ctComplex* __restrict__ dst, int n) {
+    const int i = CTPWA_TID();
     if (i < n) { dst[i].x -= (double)src[i].x; dst[i].y -= (double)src[i].y; }
 }
 
@@ -927,14 +1142,14 @@ double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
     }
     {
         int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+        CTPWA_LAUNCH(downcastV2F2Kernel, gv, kBlockSize, 0, d_vector, s_dv[dev], n_amplitudes);
     }
     // S = A^T·v（float Cgemv；A float2 列主序）
     cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
         d_amp, (int)strideA, s_dv[dev], s_dS[dev], 0.0f);
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computePhspMeanF2Kernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h_sum;
@@ -982,7 +1197,7 @@ double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vecto
     }
     {
         int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+        CTPWA_LAUNCH(downcastV2F2Kernel, gv, kBlockSize, 0, d_vector, s_dv[dev], n_amplitudes);
     }
     // S = A^T·v（phsp 段 float Cgemv）
     cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
@@ -990,10 +1205,10 @@ double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vecto
     // phsp_sum = Σ|S|² double 累加
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computePhspMeanF2Kernel<<<gridBlocks, kBlockSize>>>(s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
     // x = conj(S)·(w/W) 就地（S float2 已用完）
     int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
-    scaleConjForGradPF2Kernel<<<gridX, kBlockSize>>>(s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
+    CTPWA_LAUNCH(scaleConjForGradPF2Kernel, gridX, kBlockSize, 0, s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
     // d_P_tmp = A·x（float matvec；float2 部分和）
     cgemvF2(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal,
         d_amp, (int)strideA, s_dS[dev], s_dPtmp[dev], 0.0f);
@@ -1002,11 +1217,11 @@ double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vecto
     cudaMemset(d_P_out, 0, (size_t)std::max(1, n_amplitudes) * sizeof(ctComplex));
     {
         int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        addF2ToComplexKernel<<<gOut, kBlockSize>>>(s_dPtmp[dev], d_P_out, n_amplitudes);
+        CTPWA_LAUNCH(addF2ToComplexKernel, gOut, kBlockSize, 0, s_dPtmp[dev], d_P_out, n_amplitudes);
     }
     {
         int gC = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        conjugateKernel<<<gC, kBlockSize>>>(d_P_out, n_amplitudes);
+        CTPWA_LAUNCH(conjugateKernel, gC, kBlockSize, 0, d_P_out, n_amplitudes);
     }
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
@@ -1059,7 +1274,7 @@ double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
     }
     {
         int gv = (n_amplitudes + kBlockSize - 1) / kBlockSize;
-        downcastV2F2Kernel<<<gv, kBlockSize>>>(d_vector, s_dv[dev], n_amplitudes);
+        CTPWA_LAUNCH(downcastV2F2Kernel, gv, kBlockSize, 0, d_vector, s_dv[dev], n_amplitudes);
     }
     // S = A^T·v（float Cgemv）
     cgemvF2(s_handle[dev], CUBLAS_OP_T, n_amplitudes, nTotal,
@@ -1067,7 +1282,7 @@ double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
     // factor + w + NLL
     cudaMemset(s_d_nll[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    computeFactorsAndWeightsF2Kernel<<<gridBlocks, kBlockSize>>>(
+    CTPWA_LAUNCH(computeFactorsAndWeightsF2Kernel, gridBlocks, kBlockSize, 0, 
         s_dS[dev], s_d_nll[dev], d_weights, nEvents, n_polar);
     double raw_nll;
     cudaMemcpy(&raw_nll, s_d_nll[dev], sizeof(double), cudaMemcpyDeviceToHost);
@@ -1079,16 +1294,16 @@ double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
     // 梯度: grad = -A·conj(w)（float 反向 matvec → float2 部分和 → double 累加）
     {
         int gradConj = (nTotal + kBlockSize - 1) / kBlockSize;
-        conjugateF2Kernel<<<gradConj, kBlockSize>>>(s_dS[dev], nTotal);   // w → conj(w)
+        CTPWA_LAUNCH(conjugateF2Kernel, gradConj, kBlockSize, 0, s_dS[dev], nTotal);   // w → conj(w)
         // A·conj(w)：beta=0 覆盖写 s_dGtmp（float matvec 单次，无需 chunk）
         cgemvF2(s_handle[dev], CUBLAS_OP_N, n_amplitudes, nTotal,
             d_amp, (int)strideA, s_dS[dev], s_dGtmp[dev], 0.0f);
         // grad_out = -tmp（覆盖语义: double 版首 chunk beta=0 覆盖，调用方不预清零）
         int gOut = (n_amplitudes + kBlockSize - 1) / kBlockSize;
         cudaMemset(d_grad_out, 0, (size_t)std::max(1, n_amplitudes) * sizeof(ctComplex));
-        negateAddF2ToComplexKernel<<<gOut, kBlockSize>>>(s_dGtmp[dev], d_grad_out, n_amplitudes);
+        CTPWA_LAUNCH(negateAddF2ToComplexKernel, gOut, kBlockSize, 0, s_dGtmp[dev], d_grad_out, n_amplitudes);
         // 共轭约定（与 double 版收尾一致）: 输出再 conj
-        conjugateKernel<<<gOut, kBlockSize>>>(d_grad_out, n_amplitudes);
+        CTPWA_LAUNCH(conjugateKernel, gOut, kBlockSize, 0, d_grad_out, n_amplitudes);
     }
     return raw_nll;
 }

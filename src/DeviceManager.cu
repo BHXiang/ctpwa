@@ -8,12 +8,17 @@
 
 #include <DeviceManager.cuh>
 #include <ComplexType.h>
+#include <Backend.h>
 
+#if defined(CTPWA_HAS_CUDA)
 #include <cuda_runtime.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <thread>
 
 namespace {
 
@@ -38,16 +43,44 @@ std::string formatBytes(double bytes)
 // 设备检测
 // ============================================================
 
+DeviceType DeviceManager::backend() const
+{
+#if defined(CTPWA_BACKEND_CPU)
+    return DeviceType::CPU;
+#else
+    return DeviceType::GPU;
+#endif
+}
+
 void DeviceManager::detect()
 {
     devices_.clear();
 
+#if defined(CTPWA_BACKEND_CPU)
+    // ---- CPU 后端：一个伪设备。"显存"用 RAM 替代，容量检查语义不变 ----
+    DeviceInfo d;
+    d.index = 0;
+    d.type = DeviceType::CPU;
+    d.available = true;
+    {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        d.name = "CPU (" + std::to_string(hw) + " threads)";
+    }
+    d.cc_major = 0;
+    d.cc_minor = 0;
+    d.total_memory = ctpwa::total_memory();
+    d.free_memory = ctpwa::available_memory();
+    devices_.push_back(d);
+    return;
+#else
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess || count <= 0) {
         std::fprintf(stderr,
-            "DeviceManager: no CUDA devices detected (%s). "
-            "CPU backend is not implemented yet.\n",
+            "DeviceManager: no CUDA devices detected (%s).\n"
+            "  当前 .so 是 CUDA 后端，无法在无卡机器上运行；请安装 CPU 版"
+            "（CTPWA_BACKEND=cpu 构建）。\n",
             cudaGetErrorString(err));
         return;  // devices_ 为空
     }
@@ -94,6 +127,7 @@ void DeviceManager::detect()
 
     // ⚠️ 关键：遍历后恢复主设备，避免后续操作跑错设备
     cudaSetDevice(primary);
+#endif  // CTPWA_BACKEND_CPU
 }
 
 const DeviceInfo& DeviceManager::device(int i) const
@@ -120,6 +154,9 @@ bool DeviceManager::setDevice(int i) const
                      i, (int)devices_.size());
         return false;
     }
+#if defined(CTPWA_BACKEND_CPU)
+    return i == 0;   // CPU 后端只有设备 0
+#else
     cudaError_t err = cudaSetDevice(i);
     if (err != cudaSuccess) {
         std::fprintf(stderr, "DeviceManager: cudaSetDevice(%d) failed: %s\n",
@@ -127,13 +164,18 @@ bool DeviceManager::setDevice(int i) const
         return false;
     }
     return true;
+#endif
 }
 
 int DeviceManager::currentDevice() const
 {
+#if defined(CTPWA_BACKEND_CPU)
+    return 0;
+#else
     int dev = 0;
     cudaGetDevice(&dev);
     return dev;
+#endif
 }
 
 // ============================================================
@@ -159,11 +201,18 @@ void DeviceManager::print() const
         double used = (size_t)d.index < estimated_usage_.size()
                           ? estimated_usage_[d.index]
                           : (double)d.free_memory;
-        std::printf("  [%d] %s (sm_%d%d), memory %s / %s%s\n",
-                    d.index, d.name.c_str(), d.cc_major, d.cc_minor,
-                    formatBytes(used).c_str(),
-                    formatBytes((double)d.total_memory).c_str(),
-                    d.available ? "" : " [unavailable]");
+        if (d.type == DeviceType::CPU) {
+            std::printf("  [%d] %s, memory %s / %s%s\n",
+                        d.index, d.name.c_str(), formatBytes(used).c_str(),
+                        formatBytes((double)d.total_memory).c_str(),
+                        d.available ? "" : " [unavailable]");
+        } else {
+            std::printf("  [%d] %s (sm_%d%d), memory %s / %s%s\n",
+                        d.index, d.name.c_str(), d.cc_major, d.cc_minor,
+                        formatBytes(used).c_str(),
+                        formatBytes((double)d.total_memory).c_str(),
+                        d.available ? "" : " [unavailable]");
+        }
     }
     // complex_precision_ 是预留枚举(默认 Float, 从未接线)——直接打印会误导
     // (double .so 下显示 "float (16 B/value)")。这里只报告编译事实;

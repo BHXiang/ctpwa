@@ -1,4 +1,4 @@
-#include "ComplexType.h"
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_TID / CTPWA_LAUNCH / 双后端
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -25,7 +25,7 @@ static inline void bfCheckCublas(cublasStatus_t s, const char* what)
 // 每事件/极化: 按nSLvectors分组SL分量到各粒子，累加模方和散射矩阵
 // 关键: 不除以total_result（与computeModWithInterference不同），产出原始散射矩阵
 template <int N_PARTIALS>
-__global__ void computeBFKernel(
+CTPWA_KERNEL void computeBFKernel(
     const ctComplex* __restrict__ result_matrix,  // [nEvents × npolar × ngls]
     double* __restrict__ d_partial_integral,       // [npartials]
     double* __restrict__ d_scattering_matrix,      // [npartials × npartials]
@@ -34,7 +34,7 @@ __global__ void computeBFKernel(
     const int* __restrict__ d_nSLvectors,          // [npartials]
     int npartials, int nEvents, int ngls, int npolar)
 {
-    int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int event_idx = CTPWA_TID();
     if (event_idx >= nEvents) return;
 
     double partial_real[N_PARTIALS];
@@ -136,17 +136,17 @@ void computeBranchingFractions(
     int gridSize = (nEvents + kBlockSize - 1) / kBlockSize;
 
     if (npartials <= 50)
-        computeBFKernel<50><<<gridSize, kBlockSize>>>(
+        CTPWA_LAUNCH(computeBFKernel<50>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
     else if (npartials <= 200)
-        computeBFKernel<200><<<gridSize, kBlockSize>>>(
+        CTPWA_LAUNCH(computeBFKernel<200>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);
     else
-        computeBFKernel<1000><<<gridSize, kBlockSize>>>(
+        CTPWA_LAUNCH(computeBFKernel<1000>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
             d_total_integral, d_square_integral, d_nSLvectors,
             npartials, nEvents, ngls, npolar);

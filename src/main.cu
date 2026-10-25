@@ -2,6 +2,8 @@
 
 #include <pybind11/pybind11.h>
 
+#include "Backend.h"   // ctpwa::backend_name() 等
+
 #include <Amplitude.cuh>
 
 #include <DeviceManager.cuh>
@@ -45,6 +47,23 @@ PYBIND11_MODULE(ctpwa, m)
     pybind11::module_::import("torch");
 
     m.doc() = "ctpwa";
+
+    // 当前 .so 的后端与编译信息（用户报问题时第一手信息；测试据此跳过不适用的用例）
+    m.def("backend", &ctpwa::backend_name,
+          "编译进本 .so 的后端：'cpu' 或 'cuda'");
+    m.def("build_info", []() {
+        pybind11::dict d;
+        d["backend"] = ctpwa::backend_name();
+        d["precision"] = PRECISION_NAME;
+        d["complex_bytes"] = (int)sizeof(ctComplex);
+        d["has_cuda"] =
+#if defined(CTPWA_HAS_CUDA)
+            true;
+#else
+            false;
+#endif
+        return d;
+    }, "本 .so 的构建信息（backend / precision / complex_bytes / has_cuda）");
 
     // ---- DIYMC phase-space generator (native GENBOD) ----
     pybind11::class_<PhaseSpaceGenerator>(m, "PhaseSpaceGenerator")
@@ -198,11 +217,16 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getExtendedVector", [](analysis& a, const torch::Tensor& v) {
                  // 折叠表在构造期上传到主 GPU，coupling kernel 固定在其上 →
                  // 传别的卡的向量会跨卡读表（多卡下非法访问）。这里显式挡住。
+#if defined(CTPWA_BACKEND_CPU)
+                 TORCH_CHECK(v.device().is_cpu(),
+                             "coupling_vector must be a CPU tensor (CPU backend)");
+#else
                  TORCH_CHECK(v.is_cuda(), "coupling_vector must be on CUDA");
                  TORCH_CHECK(v.device().index() == a.getParams().primaryDevice(),
                      "coupling_vector 必须位于主 GPU (cuda:",
                      a.getParams().primaryDevice(), ")，当前在 cuda:",
                      v.device().index(), "（折叠表固定在主卡）");
+#endif
                  return a.freeParamsToAmplitudes(v);
              },
              pybind11::arg("coupling_vector"),

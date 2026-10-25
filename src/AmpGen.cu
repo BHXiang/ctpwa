@@ -1,4 +1,5 @@
 #include <AmpGen.cuh>
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH(_P) / 双后端
 #include "PrecCpx.h"
 #include <ComputeHessian.cuh>
 #include <CustomExpr.cuh>
@@ -8,6 +9,7 @@
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <iostream>
 
 // ============================================================
@@ -958,7 +960,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
 
                 thrust::complex<double>* d_amp_buffer;
                 cudaMalloc(&d_amp_buffer, n_events * scratch_per_sl * sizeof(thrust::complex<double>));
-                computeSLAmpKernel << <numBlocks, blockSize >> > (
+                CTPWA_LAUNCH(computeSLAmpKernel, numBlocks, blockSize, 0, 
                     target, d_amp_buffer, dm, d_decayNodes_[i], d_dimj, d_dimj1,
                     d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
                     decayChain_.size(), (int)scratch_per_sl, n_events, start,
@@ -1115,7 +1117,7 @@ contract(const thrust::complex<double>* A, const int* shape_A, int rank_A,
     }
 }
 
-__global__ void computeSLAmpKernel(
+CTPWA_KERNEL void computeSLAmpKernel(
     thrust::complex<double>* d_amp, thrust::complex<double>* d_amp_buffer,
     const DeviceMomenta* d_momenta, const DecayNode* d_decayNodes,
     const int* d_dimj, const int* d_dimj1, const int* d_dimj2,
@@ -1124,7 +1126,7 @@ __global__ void computeSLAmpKernel(
     int start_events,
     const int* d_polarization_map, int num_polar_total)
 {
-    int eventIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int eventIdx = CTPWA_TID();
 
     if (eventIdx >= num_batchs)
     {
@@ -1388,7 +1390,9 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
 
         // 设置核函数配置
         dim3 blockDim(256);
-        dim3 gridDim(nSLCombs_, (nEvents_[i] + blockDim.x - 1) / blockDim.x);
+        // 一维化：工作项数 = SL 组合数 × 事件数（kernel 内用 tid/nEvents 还原二维下标）
+        dim3 gridDim((static_cast<size_t>(nSLCombs_) * nEvents_[i] + blockDim.x - 1) /
+                     blockDim.x);
 
         // skip empty calls (no SL combos or no resonances for this combination)
         if (nEvents_[i] == 0 || nSLCombs_ == 0 || resonance_count == 0) {
@@ -1410,9 +1414,12 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
         }
         // 输出精度由第一实参推导（ctComplex*/float2*）——switch 只写一份，双实例化
         auto launchAmps = [&](auto* out_amp) {
+            // 模板实参 Out 原本由实参推导；CTPWA_LAUNCH_P 取函数指针后无法推导，
+            // 因此这里显式给出（float2* → float2，ctComplex* → ctComplex）。
+            using OutA = std::remove_pointer_t<decltype(out_amp)>;
             switch (m) {
             case 2:
-                computeAmpsKernelT<0, 512><<<gridDim, blockDim>>>(
+                CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 512, OutA>), gridDim, blockDim, 0, 
                     out_amp, d_momenta_[i], d_slCombination_[i],
                     d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                     d_resonances, resonance_count, d_all_params, d_all_channels,
@@ -1421,7 +1428,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                     n_amplitudes, site, 0);
                 break;
             case 3:
-                computeAmpsKernelT<0, 1024><<<gridDim, blockDim>>>(
+                CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 1024, OutA>), gridDim, blockDim, 0, 
                     out_amp, d_momenta_[i], d_slCombination_[i],
                     d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                     d_resonances, resonance_count, d_all_params, d_all_channels,
@@ -1431,7 +1438,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                 break;
             case 4:
                 for (int k0 = 0; k0 < nPol_here; k0 += 8)
-                    computeAmpsKernelT<8, 8><<<gridDim, blockDim>>>(
+                    CTPWA_LAUNCH_P((&computeAmpsKernelT<8, 8, OutA>), gridDim, blockDim, 0, 
                         out_amp, d_momenta_[i], d_slCombination_[i],
                         d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                         d_resonances, resonance_count, d_all_params, d_all_channels,
@@ -1441,7 +1448,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                 break;
             case 5:
                 for (int k0 = 0; k0 < nPol_here; k0 += 16)
-                    computeAmpsKernelT<16, 16><<<gridDim, blockDim>>>(
+                    CTPWA_LAUNCH_P((&computeAmpsKernelT<16, 16, OutA>), gridDim, blockDim, 0, 
                         out_amp, d_momenta_[i], d_slCombination_[i],
                         d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                         d_resonances, resonance_count, d_all_params, d_all_channels,
@@ -1450,7 +1457,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                         n_amplitudes, site, 0);
                 break;
             default:  // 1 = A256：全量单 launch
-                computeAmpsKernelT<0, 256><<<gridDim, blockDim>>>(
+                CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 256, OutA>), gridDim, blockDim, 0, 
                     out_amp, d_momenta_[i], d_slCombination_[i],
                     d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
                     d_resonances, resonance_count, d_all_params, d_all_channels,
@@ -1526,7 +1533,7 @@ __device__ inline Out cplxOut(double re, double im) {
 
 // nPolar 分块实验变体（与 computeCustomAmpsKernelT 同语义；CTPWA_POL_MODE 分派）
 template<int CHUNK, int MAXPOL, typename Out>
-__global__ void
+CTPWA_KERNEL void
 computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
     const DeviceMomenta* d_momenta,        // 所有事件的四动量数据
     const SL* slCombinations,              // SL组合数据
@@ -1543,13 +1550,14 @@ computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
     const int* amp_offsets, const int* event_offsets,
     int num_offsets, int n_amplitudes, int site, int k_start)
 {
-    // int event_idx = threadIdx.x * blockDim.x + threadIdx.x;
-    int sl_idx = blockIdx.x;
-    int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
+    // (sl, event) 二维网格 → 一维工作项：启动配置已改为 1D，
+    // CPU / CUDA 共用同一套索引（见 CTPWA_LAUNCH 的 grid_threads）。
+    const int tid = CTPWA_TID();
+    const int sl_idx = tid / nEvents;
+    const int event_idx = tid - sl_idx * nEvents;
 
     if (sl_idx >= nSLComb || event_idx >= nEvents)
     {
-        // if (event_idx >= nEvents)
         return;
     }
 
@@ -1573,7 +1581,7 @@ computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
     const int MAX_POL = MAXPOL;
     if (CHUNK == 0 && nPolar > MAX_POL) {
         // auto 分派保证不触发；触发即档位选择错误（调试覆盖 CTPWA_POL_MODE）
-        if (blockIdx.x == 0 && threadIdx.x == 0)
+        if (tid == 0)
             printf("[ctpwa] computeAmpsKernel: nPolar=%d > MAXPOL=%d —— 档位选择错误\n",
                    nPolar, MAX_POL);
         return;
@@ -1726,14 +1734,15 @@ computeAmpsKernelT(Out* amplitudes,                      // 输出振幅
 //               输出按全局 k 覆盖写，无跨 launch 依赖；F 因子每 launch 重算，
 //               开销即实验量化的分块代价（B8/B16 均慢于 A）。
 template<int CHUNK, int MAXPOL, typename Out = ctComplex, typename OutF = Out>
-__global__ void computeCustomAmpsKernelT(
+CTPWA_KERNEL void computeCustomAmpsKernelT(
     Out* amplitudes,
-    const ADBlockDesc* desc, int nblocks, int nSL_total,
+    const ADBlockDesc* desc, int nblocks, int nSL_total, int n_evt_max,
     const int* amp_offsets, const int* event_offsets, int num_offsets,
     int n_amplitudes, int k_start)
 {
-    int slg = blockIdx.x;
-    int event_idx = threadIdx.x + blockDim.x * blockIdx.y;
+    const int tid = CTPWA_TID();
+    const int slg = tid / n_evt_max;
+    const int event_idx = tid - slg * n_evt_max;
 
     int bi = 0;
     while (bi + 1 < nblocks && desc[bi + 1].sl_start <= slg) ++bi;
@@ -1763,7 +1772,7 @@ __global__ void computeCustomAmpsKernelT(
     const int MAX_POL = MAXPOL;
     if (CHUNK == 0 && B.nPolar > MAX_POL) {
         // auto 分派保证不触发；触发即档位选择错误（调试覆盖 CTPWA_POL_MODE）
-        if (blockIdx.x == 0 && threadIdx.x == 0)
+        if (tid == 0)
             printf("[ctpwa] computeCustomAmpsKernel: nPolar=%d > MAXPOL=%d —— 档位选择错误\n",
                    B.nPolar, MAX_POL);
         return;
@@ -2071,12 +2080,12 @@ __global__ void computeCustomAmpsKernelT(
 
 // 跨链全同粒子: 将交换拓扑的 SL 振幅就地累加到原始振幅
 // d_amp += sign * d_add,  sign = +1 (Bose) or -1 (Fermi)
-__global__ void addSLAmpsKernel(
+CTPWA_KERNEL void addSLAmpsKernel(
     thrust::complex<double>* d_amp,
     const thrust::complex<double>* d_add,
     int total_size, double sign)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = CTPWA_TID();
     if (idx >= total_size) return;
     d_amp[idx] = thrust::complex<double>(
         d_amp[idx].real() + sign * d_add[idx].real(),
@@ -2088,7 +2097,7 @@ __global__ void addSLAmpsKernel(
 // ============================================================
 
 // 小 kernel：将自由参数写入 device 端的 d_all_params 数组
-__global__ void updateResonanceParamsKernel(
+CTPWA_KERNEL void updateResonanceParamsKernel(
     double* d_all_params,               // flat 自由参数数组
     const DeviceResonance* d_resonances,
     int resonance_count,
@@ -2098,7 +2107,7 @@ __global__ void updateResonanceParamsKernel(
     const int* d_global_offset,         // 每个本block自由参数 → 全局slot下标
     int n_local_free)                   // 本 block 涉及的自由参数数
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = CTPWA_TID();
     if (i >= n_local_free) return;
     int r = d_res_idx[i];
     int p = d_param_idx[i];
@@ -2661,7 +2670,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             int n_local = static_cast<int>(block.free_global_idx.size());
             if (n_local == 0 || !block.d_res_idx_[gpu]) continue;
             int grid = (n_local + blockSize - 1) / blockSize;
-            updateResonanceParamsKernel<<<grid, blockSize>>>(
+            CTPWA_LAUNCH(updateResonanceParamsKernel, grid, blockSize, 0, 
                 block.d_all_params[gpu], block.d_resonances[gpu],
                 block.resonance_count,
                 d_params_per_gpu_[gpu], block.d_res_idx_[gpu],
@@ -2880,8 +2889,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             int nblocks = static_cast<int>(h_desc.size());
             cudaMemcpy(d_ad_desc_[gpu], h_desc.data(), nblocks * sizeof(ADBlockDesc),
                        cudaMemcpyHostToDevice);
-            dim3 gridC(static_cast<unsigned int>(sl_start),
-                       (static_cast<unsigned int>(max_evt) + 255) / 256);
+            // 一维化：工作项数 = SL 总数 × 每 block 最大事件数
+            dim3 gridC(static_cast<unsigned int>(
+                (static_cast<size_t>(sl_start) * max_evt + 255) / 256));
             // 档位选择用各 block 的最大 nPolar（防御 block 间不一致；正常全局一致）
             int nPol_first = 0;
             for (const auto& d : h_desc) nPol_first = max(nPol_first, d.nPolar);
@@ -2900,30 +2910,30 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 using OutF = std::remove_pointer_t<decltype(dF_tag)>;
                 switch (m) {
                 case 2:
-                    computeCustomAmpsKernelT<0, 512, OutA, OutF> <<<gridC, blockSize>>>(
-                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                    CTPWA_LAUNCH_P((&computeCustomAmpsKernelT<0, 512, OutA, OutF>), gridC, blockSize, 0, 
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start, max_evt,
                         d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
                     break;
                 case 3:
-                    computeCustomAmpsKernelT<0, 1024, OutA, OutF> <<<gridC, blockSize>>>(
-                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                    CTPWA_LAUNCH_P((&computeCustomAmpsKernelT<0, 1024, OutA, OutF>), gridC, blockSize, 0, 
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start, max_evt,
                         d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
                     break;
                 case 4:
                     for (int k0 = 0; k0 < nPol_first; k0 += 8)
-                        computeCustomAmpsKernelT<8, 8, OutA, OutF> <<<gridC, blockSize>>>(
-                            out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                        CTPWA_LAUNCH_P((&computeCustomAmpsKernelT<8, 8, OutA, OutF>), gridC, blockSize, 0, 
+                            out_amp, d_ad_desc_[gpu], nblocks, sl_start, max_evt,
                             d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
                     break;
                 case 5:
                     for (int k0 = 0; k0 < nPol_first; k0 += 16)
-                        computeCustomAmpsKernelT<16, 16, OutA, OutF> <<<gridC, blockSize>>>(
-                            out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                        CTPWA_LAUNCH_P((&computeCustomAmpsKernelT<16, 16, OutA, OutF>), gridC, blockSize, 0, 
+                            out_amp, d_ad_desc_[gpu], nblocks, sl_start, max_evt,
                             d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, k0);
                     break;
                 default:  // 1 = A256：全量单 launch
-                    computeCustomAmpsKernelT<0, 256, OutA, OutF> <<<gridC, blockSize>>>(
-                        out_amp, d_ad_desc_[gpu], nblocks, sl_start,
+                    CTPWA_LAUNCH_P((&computeCustomAmpsKernelT<0, 256, OutA, OutF>), gridC, blockSize, 0, 
+                        out_amp, d_ad_desc_[gpu], nblocks, sl_start, max_evt,
                         d_amp_offsets, d_event_offsets, num_offsets, n_amplitudes, 0);
                     break;
                 }
@@ -2957,12 +2967,12 @@ __device__ double breakup_momentum(double m, double m1, double m2) {
 }
 
 // UH 诊断空跑: 保留 launch/同步形状, 只读 pre-pass S（防止 stage1 计算成本）
-__global__ void uhProbeNoopKernel(const double* __restrict__ d_S_re_full,
+CTPWA_KERNEL void uhProbeNoopKernel(const double* __restrict__ d_S_re_full,
                                   const double* __restrict__ d_S_im_full,
                                   double* __restrict__ d_g_out,
                                   int nEvents, int nPolar, int Npr)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     double I = 0.0;
     for (int p = 0; p < nPolar; ++p) {
@@ -2976,14 +2986,14 @@ __global__ void uhProbeNoopKernel(const double* __restrict__ d_S_re_full,
 
 // T 计算 kernel: T[e,p] = Σ_sl v[site+sl] * slamps[sl, e, p]
 // ---------------------------------------------------------------------------
-__global__ void computeEffectiveCouplingKernel(
+CTPWA_KERNEL void computeEffectiveCouplingKernel(
     ctComplex* d_T,
     const thrust::complex<double>* d_slamps,
     const ctComplex* d_v,
     int nSL, int nTotal,
     int sl_start, int sl_end)  // SL range: only sum over these SL channels
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = CTPWA_TID();
     if (idx >= nTotal) return;
 
     double re = 0.0, im = 0.0;
@@ -3000,7 +3010,7 @@ __global__ void computeEffectiveCouplingKernel(
 // CT = dF 存储复数类型（Float 档 float2 / Double 档 double2）; w/v/slamp 恒以
 // double(16B) 存储读入，按档位 real 参与运算（Float 档数学为 float）。
 template <typename CT>
-__global__ void resonanceGradientKernelRuntime(
+CTPWA_KERNEL void resonanceGradientKernelRuntime(
     const ctComplex* d_w,
     const thrust::complex<double>* d_slamp_tab,  // [nSigma × nSL×nPol×nEv_total]
     const ctComplex* d_v,
@@ -3011,11 +3021,13 @@ __global__ void resonanceGradientKernelRuntime(
     int evt_off, int site, int n_events_total,
     int nSigma, const double* d_sign_tab, int Nfree)
 {
+#if defined(CTPWA_HAS_CUDA)
     __shared__ double shm[16];
     for (int j = 0; j < Nfree; ++j) shm[j] = 0.0;
     __syncthreads();
+#endif
 
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt < nEvents) {
         int global_evt = evt + evt_off;
         double acc[16];
@@ -3057,6 +3069,7 @@ __global__ void resonanceGradientKernelRuntime(
                 }
             }
         }
+#if defined(CTPWA_HAS_CUDA)
         for (int j = 0; j < Nfree; ++j)
             atomicAdd(&shm[j], acc[j]);
     }
@@ -3064,6 +3077,13 @@ __global__ void resonanceGradientKernelRuntime(
     if (threadIdx.x == 0)
         for (int j = 0; j < Nfree; ++j)
             atomicAdd(&d_grad[d_global_idx[j]], shm[j]);
+#else
+        // CPU 没有 block 概念：本事件的贡献直接并入全局梯度。
+        // ⚠️ 原子累加顺序不定 → 该路径不保证逐位可复现（见 doc §4.2，待改每线程局部）。
+        for (int j = 0; j < Nfree; ++j)
+            atomicAdd(&d_grad[d_global_idx[j]], acc[j]);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -3092,7 +3112,7 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
         }
 
         int grid = (nTotal + kBlockSize - 1) / kBlockSize;
-        computeEffectiveCouplingKernel<<<grid, kBlockSize>>>(
+        CTPWA_LAUNCH(computeEffectiveCouplingKernel, grid, kBlockSize, 0, 
             block.d_T[gpu], cas->getSLAmps()[gpu],
             d_v + block.site, nSL, nTotal, 0, nSL);
         // 无 sync：同 stream 隐式顺序；调用方负责最终同步
@@ -3100,17 +3120,17 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
 }
 
 // 小 kernel：双精度数组累加 y[i] += alpha * x[i]
-__global__ void daxpy_kernel(double* y, const double* x, double alpha, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void daxpy_kernel(double* y, const double* x, double alpha, int n) {
+    const int i = CTPWA_TID();
     if (i < n) y[i] += alpha * x[i];
 }
 
 // 计算 w[e,p] = sign * S[e,p] / I[e]（用于梯度计算：g = A^H * w）
-__global__ void computeGradWeightKernel(
+CTPWA_KERNEL void computeGradWeightKernel(
     ctComplex* d_w, const ctComplex* d_S, double* d_I,
     int nEv, int nPol, double sign)
 {
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int e = CTPWA_TID();
     if (e >= nEv) return;
     double I_val = 0.0;
     for (int p = 0; p < nPol; ++p) {
@@ -3126,10 +3146,10 @@ __global__ void computeGradWeightKernel(
 }
 
 // 对 bkg 事件乘上权重
-__global__ void applyBkgWeightsKernel(
+CTPWA_KERNEL void applyBkgWeightsKernel(
     ctComplex* d_w, const double* d_weights, int nEv, int nPol)
 {
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    const int e = CTPWA_TID();
     if (e >= nEv) return;
     double wgt = d_weights ? d_weights[e] : 1.0;
     for (int p = 0; p < nPol; ++p) {
@@ -3211,14 +3231,14 @@ void AmpCalc::computeResonanceGradient(
             // 写入 [nSigma × nEv×nSL×Nfree] 布局，梯度统一走运行时 Nfree kernel
             // dF 存储随档位（dF_float_ 仅 Float 档 → float2），kernel 双实例分发
             if (dF_float_) {
-                resonanceGradientKernelRuntime<float2><<<grid, kBlockSize>>>(
+                CTPWA_LAUNCH(resonanceGradientKernelRuntime<float2>, grid, kBlockSize, 0, 
                     d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu,
                     reinterpret_cast<const float2*>(block.d_dF[gpu]),
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
                     cas->getNSigma(), d_sign_tab, Nlocal);
             } else {
-                resonanceGradientKernelRuntime<ctComplex><<<grid, kBlockSize>>>(
+                CTPWA_LAUNCH(resonanceGradientKernelRuntime<ctComplex>, grid, kBlockSize, 0, 
                     d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu,
                     reinterpret_cast<const ctComplex*>(block.d_dF[gpu]),
                     d_global_idx, d_grad_per_gpu_[gpu],
@@ -3255,7 +3275,7 @@ void AmpCalc::computeResonanceGradient(
         if (gpu == primary_dev) {
             cudaSetDevice(primary_dev);
             int grid = (n_free + 255) / 256;
-            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_grad_per_gpu_[primary_dev], 1.0, n_free);
+            CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_grad_res, d_grad_per_gpu_[primary_dev], 1.0, n_free);
             cudaDeviceSynchronize();
         } else {
             std::vector<double> h_temp(n_free);
@@ -3267,7 +3287,7 @@ void AmpCalc::computeResonanceGradient(
             cudaMalloc(&d_temp, n_free * sizeof(double));
             cudaMemcpy(d_temp, h_temp.data(), n_free * sizeof(double), cudaMemcpyHostToDevice);
             int grid = (n_free + 255) / 256;
-            daxpy_kernel<<<grid, 256>>>(d_grad_res, d_temp, 1.0, n_free);
+            CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_grad_res, d_temp, 1.0, n_free);
             cudaDeviceSynchronize();
             cudaFree(d_temp);
         }
@@ -3391,7 +3411,7 @@ void AmpCalc::computeUnifiedHessian(
                     + (size_t)evt_off_c * nPol * n_amp_total;
                 cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(ctComplex));
                 int gUp = (int)(((size_t)nch * nPol * n_amp_total + 255) / 256);
-                castF2ToDouble2Kernel<<<gUp, 256>>>(
+                CTPWA_LAUNCH(castF2ToDouble2Kernel, gUp, 256, 0, 
                     srcF, reinterpret_cast<cuDoubleComplex*>(d_amp_dbl),
                     (int)((size_t)nch * nPol * n_amp_total));
                 d_amp_c = d_amp_dbl;
@@ -3411,7 +3431,7 @@ void AmpCalc::computeUnifiedHessian(
                 t3_re = d_t3_g;
                 t3_im = d_t3_g + n_amp_total;
             }
-            computeSfromAmpsKernel<<<grid, kBlockSize>>>(
+            CTPWA_LAUNCH_SEQ(computeSfromAmpsKernel, grid, kBlockSize, 0, 
                 d_S_re, d_S_im, d_I_full,
                 d_amp_c,
                 d_v, nch, nPol, n_amp_total,
@@ -3595,10 +3615,10 @@ void AmpCalc::computeUnifiedHessian(
                 // Custom / 符号微分标量路径（P 运行时无上限；多共振态）
                 bool use_bwr_spec = !getenv("CTPWA_NO_BWR_SPEC");
                 if (getenv("CTPWA_UH_PROBE")) {
-                    uhProbeNoopKernel<<<grid, kBlockSize>>>(
+                    CTPWA_LAUNCH(uhProbeNoopKernel, grid, kBlockSize, 0, 
                         d_S_re, d_S_im, bt.d_g, nch, nPol, Npr);
                 } else {
-                computeCustomHessianKernel<<<grid, kBlockSize>>>(
+                CTPWA_LAUNCH_SEQ(computeCustomHessianKernel, grid, kBlockSize, 0, 
                     cas->getSLAmpsTab()[gpu], d_v_blk,
                     cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
                     cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
@@ -3659,7 +3679,7 @@ void AmpCalc::computeUnifiedHessian(
                 if (!btB.d_g) continue;
 
                 int grid = (nch + kBlockSize - 1) / kBlockSize;
-                hessianCrossBlockKernel<<<grid, kBlockSize>>>(
+                CTPWA_LAUNCH_SEQ(hessianCrossBlockKernel, grid, kBlockSize, 0, 
                     btA.d_g, btA.d_dS_re, btA.d_dS_im,
                     btB.d_g, btB.d_dS_re, btB.d_dS_im,
                     d_I_full, btA.d_gidx, btB.d_gidx,
@@ -3718,7 +3738,7 @@ void AmpCalc::computeUnifiedHessian(
                 if (Npr < 1) continue;
                 int nTotal_slamp = static_cast<int>(cas_list_[blk.cas_idx]->getNEventsVec()[gpu]) * nPol;
                 int grid = (nch + kBlockSize - 1) / kBlockSize;
-                hessianMixedBlockKernel<<<grid, kBlockSize>>>(
+                CTPWA_LAUNCH_SEQ(hessianMixedBlockKernel, grid, kBlockSize, 0, 
                     d_S_re, d_S_im, d_I_full,
                     d_amp_c,
                     cas_list_[blk.cas_idx]->getSLAmpsTab()[gpu],
@@ -3773,7 +3793,7 @@ void AmpCalc::computeUnifiedHessian(
                     cudaFuncSetAttribute(hessianCrossMixedKernel,
                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
                 }
-                hessianCrossMixedKernel<<<grid, kBlockSize, smem>>>(
+                CTPWA_LAUNCH_SEQ(hessianCrossMixedKernel, grid, kBlockSize, smem, 
                     d_S_re, d_S_im, d_I_full,
                     d_amp_c,
                     btB.d_g, btB.d_dS_re, btB.d_dS_im, btB.d_gidx, btB.NT,
@@ -3890,7 +3910,7 @@ void AmpCalc::computeUnifiedHessian(
 // d_params: [Re_0..Re_{n-1}, Im_0..Im_{n-1}] (all Re, all Im)
 // ============================================================
 
-__global__ void multiplicativeCouplingKernel(
+CTPWA_KERNEL void multiplicativeCouplingKernel(
     ctComplex* d_v, const double* d_params,
     const int* d_amp_chain,
     const int* d_step_offsets,
@@ -3898,7 +3918,7 @@ __global__ void multiplicativeCouplingKernel(
     const double* d_amp_chain_ratio,
     int n_amps, int n_step_free, int n_free)
 {
-    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    const int a = CTPWA_TID();
     if (a >= n_amps) return;
 
     double ratio = d_amp_chain_ratio[a];
@@ -3923,7 +3943,7 @@ __global__ void multiplicativeCouplingKernel(
 // Gradient transform: ∂L/∂p using Wirtinger calculus
 // ∂L/∂p_j* = (1/p_j) Σ_{a∈A_j} grad_v[a]* · v[a]
 // d_params, d_grad_p: [Re_0..Re_{n-1}, Im_0..Im_{n-1}] (all Re, all Im)
-__global__ void multiplicativeGradientKernel(
+CTPWA_KERNEL void multiplicativeGradientKernel(
     double* d_grad_p,           // output [2·n_free] — [Re, Im] format
     const ctComplex* d_grad_v,  // ∂L/∂v [n_amps]
     const ctComplex* d_v,       // current v [n_amps]
@@ -3933,7 +3953,7 @@ __global__ void multiplicativeGradientKernel(
     const int* d_step_data,     // flat step param indices
     int n_amps, int n_step_free, int n_free)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = CTPWA_TID();
     if (j >= n_free) return;
 
     int nch = n_free - n_step_free;

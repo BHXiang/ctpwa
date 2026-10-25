@@ -20,10 +20,13 @@
 #include <utility>
 #include <cstddef>
 
-// 设备类型（预留 CPU 后端，当前仅 GPU）
+// 设备类型
+//   GPU: CUDA 设备（CTPWA_BACKEND_CUDA 构建）
+//   CPU: 伪设备（CTPWA_BACKEND_CPU 构建）。只有一个，index==0，
+//        "显存"用可用 RAM 替代，容量检查语义不变。
 enum class DeviceType {
     GPU = 0,
-    CPU = 1   // 预留：CPU 计算能力尚未实现
+    CPU = 1
 };
 
 // Complex 精度模式（预留 double 精度，当前仅 float）
@@ -35,12 +38,13 @@ enum class ComplexPrecision {
 // 单个设备的静态信息
 struct DeviceInfo {
     int    index;              // 设备索引
-    std::string name;          // 型号名，如 "NVIDIA GeForce RTX 3060"
-    int    cc_major;           // 算力主版本 (sm_86 → 8)
-    int    cc_minor;           // 算力次版本 (sm_86 → 6)
-    size_t total_memory;       // 总显存 (bytes)
-    size_t free_memory;        // detect() 时的空闲显存快照 (bytes)
+    std::string name;          // 型号名，如 "NVIDIA GeForce RTX 3060" / "CPU (16 threads)"
+    int    cc_major;           // 算力主版本 (sm_86 → 8)；CPU 为 0
+    int    cc_minor;           // 算力次版本 (sm_86 → 6)；CPU 为 0
+    size_t total_memory;       // 总显存 (bytes)；CPU 为总 RAM
+    size_t free_memory;        // detect() 时的空闲显存快照 (bytes)；CPU 为可用 RAM
     bool   available;          // 是否可达
+    DeviceType type = DeviceType::GPU;  // 设备类型（CPU 后端为 CPU）
 };
 
 class DeviceManager {
@@ -49,9 +53,14 @@ public:
     // 设备检测
     // ============================================================
 
-    // 枚举所有 GPU，记录型号/算力/显存。GPU 为 0 时 devices_ 为空。
-    // 预留：未来 CPU 后端在此追加 CPU 设备到 types_。
+    // 枚举设备。
+    //   CTPWA_BACKEND_CUDA: 枚举 GPU（GPU 为 0 时 devices_ 为空）
+    //   CTPWA_BACKEND_CPU:  固定一个 CPU 伪设备（index 0）
     void detect();
+
+    // 当前构建的后端类型（由构建宏决定，与是否有卡无关）
+    DeviceType backend() const;
+    bool isCpu() const { return backend() == DeviceType::CPU; }
 
     int numDevices() const { return static_cast<int>(devices_.size()); }
     bool hasDevices() const { return !devices_.empty(); }

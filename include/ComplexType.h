@@ -29,11 +29,30 @@
 
 #pragma once
 
+#include "CudaCompat.h"       // 非 CUDA 构建: float2/cuComplex/属性替身（CUDA 下为空）
+
+#ifdef CTPWA_HAS_CUDA
 #include <cuComplex.h>        // cuComplex / cuDoubleComplex
 #include <cublas_v2.h>        // cublasCgemv / cublasZgemv
-#include <cuda_fp16.h>        // __shfl_down_sync
-#include <cmath>              // log / logf, fmin / fminf, fmax / fmaxf
 #include <thrust/complex.h>   // thrust::complex<>
+#  ifdef __CUDACC__
+#include <cuda_fp16.h>        // __shfl_down_sync（仅 device 代码使用）
+#  endif
+#else
+// CPU 后端: thrust::complex<T> 只是"复数"的别名，业务代码只用 .real()/.imag()/
+// 构造，std::complex 完全等价（布局同为 {re, im} 连续 16B）。
+#  include <complex>
+#  ifndef CTPWA_THRUST_COMPLEX_DEFINED
+#    define CTPWA_THRUST_COMPLEX_DEFINED 1
+namespace thrust {
+template <class T>
+using complex = std::complex<T>;
+using std::exp;
+}  // namespace thrust
+#  endif
+#endif
+
+#include <cmath>              // log / logf, fmin / fminf, fmax / fmaxf
 #include <torch/types.h>      // kComplexFloat / kComplexDouble
 
 // ====================================================================
@@ -62,6 +81,8 @@ using ctFloat2 = double2;
 inline __host__ __device__ double ctCastFloat(double d) { return d; }  // 不窄化
 
 // warp 规约: double 用 hi/lo 拆位两路 shfl（保持精度）
+// 只在 nvcc 下存在：CPU 后端没有 warp 语义（用到它的 kernel 都属 T3，按循环重写）
+#ifdef __CUDACC__
 inline __device__ double ctShflDown(double v, int off, int width = 32)
 {
     unsigned hi = __double2hiint(v);
@@ -70,6 +91,7 @@ inline __device__ double ctShflDown(double v, int off, int width = 32)
     lo = __shfl_down_sync(0xffffffffu, lo, off, width);
     return __hiloint2double(hi, lo);
 }
+#endif
 
 using ctResAmp = thrust::complex<double>;  // resAmp 与 slamps 同精度
 using ctPhspReal = double;                 // quadratic form 输出
@@ -105,11 +127,13 @@ using ctFloat2 = float2;
 #define ctFmax(x, y) fmaxf(x, y)
 inline __host__ __device__ float ctCastFloat(double d) { return (float)d; }  // double→float 窄化
 
-// warp 规约: float 直接 shfl
+// warp 规约: float 直接 shfl（仅 nvcc）
+#ifdef __CUDACC__
 inline __device__ float ctShflDown(float v, int off, int width = 32)
 {
     return __shfl_down_sync(0xffffffffu, v, off, width);
 }
+#endif
 
 using ctResAmp = thrust::complex<float>;   // 窄化点（float 版行为）
 using ctPhspReal = float;

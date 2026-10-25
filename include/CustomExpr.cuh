@@ -1,6 +1,8 @@
 #ifndef CUSTOM_EXPR_CUH
 #define CUSTOM_EXPR_CUH
 
+#include "CudaCompat.h"   // __host__ / __device__ 属性（CUDA 下为空操作）
+
 #include <string>
 #include <vector>
 

@@ -1,4 +1,6 @@
 #include <Parameters.cuh>
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_TID / CTPWA_LAUNCH / 双后端
+#include <cuda_runtime.h>  // CPU 后端由 include/cpu_shims 接手
 #include <AmpGen.cuh>
 
 #include <algorithm>
@@ -261,7 +263,7 @@ void Parameters::uploadCouplingData()
 //   d_out: [Re(v_0)..Re(v_{na-1}),   Im(v_0)..Im(v_{na-1}),   θ_0..θ_{P-1}]
 // ============================================================
 
-__global__ void extendCouplingParamsKernel(
+CTPWA_KERNEL void extendCouplingParamsKernel(
     double* d_out, const double* d_in,
     const int* d_amp_chain,
     const int* d_step_offsets,
@@ -269,7 +271,7 @@ __global__ void extendCouplingParamsKernel(
     const double* d_amp_chain_ratio,
     int n_amps, int n_step_free, int ncf, int nt)
 {
-    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    const int a = CTPWA_TID();
     if (a >= n_amps) {
         int t = a - n_amps;
         if (t < nt)
@@ -308,7 +310,7 @@ void Parameters::extendCouplingParams(
     int total_threads = cm.n_amps + nt;
     int grid = (total_threads + 255) / 256;
     if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);
-    extendCouplingParamsKernel<<<grid, 256>>>(
+    CTPWA_LAUNCH(extendCouplingParamsKernel, grid, 256, 0, 
         d_out, d_in,
         d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
         cm.n_amps, cm.n_step_free, ncf, nt);
@@ -321,7 +323,7 @@ void Parameters::applyCouplingMatrix(const double* d_params, ctComplex* d_v_out)
     const auto& cm = coupling_matrix_;
     int grid = (cm.n_amps + 255) / 256;
     if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);   // 耦合 kernel 固定主设备（防多卡错卡）
-    multiplicativeCouplingKernel<<<grid, 256>>>(
+    CTPWA_LAUNCH(multiplicativeCouplingKernel, grid, 256, 0, 
         d_v_out, d_params,
         d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
         cm.n_amps, cm.n_step_free, cm.n_free);
@@ -336,7 +338,7 @@ void Parameters::transformCouplingGradient(
     const auto& cm = coupling_matrix_;
     int grid = (cm.n_free + 255) / 256;
     if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);
-    multiplicativeGradientKernel<<<grid, 256>>>(
+    CTPWA_LAUNCH(multiplicativeGradientKernel, grid, 256, 0, 
         d_grad_p, d_grad_v, d_v, d_params,
         d_amp_chain_, d_step_offsets_, d_step_data_,
         cm.n_amps, cm.n_step_free,
@@ -349,7 +351,7 @@ void Parameters::transformCouplingGradient(
 // ============================================================
 
 // Precompute w[a][j] = v[a] / p[j], plus v[a] and p[j] values
-__global__ void precomputeJacobianKernel(
+CTPWA_KERNEL void precomputeJacobianKernel(
     double* d_jac_re, double* d_jac_im,
     double* d_p_re, double* d_p_im,
     double* d_v_re, double* d_v_im,
@@ -359,7 +361,7 @@ __global__ void precomputeJacobianKernel(
     const double* d_amp_chain_ratio,
     int n_amps, int n_step_free, int n_free, int ncf)
 {
-    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    const int a = CTPWA_TID();
     if (a >= n_amps) return;
 
     int nch = n_free - n_step_free;
@@ -422,7 +424,7 @@ void Parameters::precomputeJacobian(const double* d_params)
     cudaMalloc(&d_v_im_, cm.n_amps * sizeof(double));
 
     int grid = (cm.n_amps + 255) / 256;
-    precomputeJacobianKernel<<<grid, 256>>>(
+    CTPWA_LAUNCH(precomputeJacobianKernel, grid, 256, 0, 
         d_jac_re_, d_jac_im_, d_jac_p_re_, d_jac_p_im_,
         d_v_re_, d_v_im_, d_params,
         d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
@@ -431,7 +433,7 @@ void Parameters::precomputeJacobian(const double* d_params)
 }
 
 // Single kernel: H_fit = J_full^T · H_ext · J_full + sum g·grad^2 v
-__global__ void hessianFullTransformKernel(
+CTPWA_KERNEL void hessianFullTransformKernel(
     double* H_out, const double* H_ext,
     const double* d_jac_re, const double* d_jac_im,
     const double* d_p_re, const double* d_p_im,
@@ -440,10 +442,13 @@ __global__ void hessianFullTransformKernel(
     const int* d_amp_chain, const int* d_step_offsets, const int* d_step_data,
     int na, int ncf, int n_step_free, int jac_chain_base, int nt)
 {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int n_out = 2 * ncf + nt;
-    if (row >= n_out || col >= n_out) return;
+    // 二维 (row, col) 在 CPU 后端摊平成一维工作项：row = tid / n_out。
+    // CUDA 下同样成立（1D 启动），两端共用一套索引。
+    const int n_out = 2 * ncf + nt;
+    const int tid = CTPWA_TID();
+    const int row = tid / n_out;
+    const int col = tid - row * n_out;
+    if (row >= n_out) return;
 
     int n_ext = 2 * na + nt;
     bool rowV = (row < 2 * ncf), colV = (col < 2 * ncf);
@@ -581,9 +586,11 @@ void Parameters::transformExtendedHessian(
     if (!has_coupling_matrix_) return;
     int jcb = step_data_len_;
     int n_out = 2*ncf + nt;
-    dim3 block(16, 16);
-    dim3 grid((n_out+15)/16, (n_out+15)/16);
-    hessianFullTransformKernel<<<grid, block>>>(
+    const int total = n_out * n_out;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    CTPWA_LAUNCH(hessianFullTransformKernel, grid, block, 0,
+        
         d_H_fitting, d_H_ext,
         d_jac_re_, d_jac_im_,
         d_jac_p_re_, d_jac_p_im_,

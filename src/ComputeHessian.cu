@@ -1,4 +1,5 @@
 #include "ComplexType.h"
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH(_SERIAL) / 双后端
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -11,8 +12,8 @@
 #include "AmpGen.cuh"
 
 // 就地共轭kernel
-__global__ void conjKernel(ctComplex* data, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void conjKernel(ctComplex* data, int N) {
+    const int i = CTPWA_TID();
     if (i < N) data[i].y = -data[i].y;
 }
 
@@ -22,13 +23,14 @@ __global__ void conjKernel(ctComplex* data, int N) {
 //   Bu[0:n]  = R*vr - C*vi  = Re(B·v)
 //   Bu[n:2n] = C*vr + R*vi  = Im(B·v)
 // H = 4w·Bu·Bu^T/S² - 2w·tildeB/S（S = u^T·Bu = |Av|²）
-__global__ void perEventHessianKernel(
+CTPWA_KERNEL void perEventHessianKernel(
     const ctComplex* __restrict__ d_B,       // chunk × n²
     const ctComplex* __restrict__ d_v,       // n
     const double* __restrict__ d_weights,    // chunk
     double* __restrict__ d_hessian_chunk,    // chunk × 4n² (output, per-event slot)
     int nEvents, int n)
 {
+#if defined(CTPWA_HAS_CUDA)
     const int n2 = 2 * n;
     const int hess_sz = n2 * n2;
     const int evt = blockIdx.x;
@@ -115,14 +117,57 @@ __global__ void perEventHessianKernel(
         }
         hess_out[idx] = val;
     }
+#else
+    // ---- CPU：串行处理全部事件（无 shared memory / 无原子操作）----
+    const int n2 = 2 * n;
+    const int hess_sz = n2 * n2;
+    std::vector<double> svr((size_t)n), svi((size_t)n), sBu((size_t)n2);
+    for (int evt = 0; evt < nEvents; ++evt) {
+        const ctComplex* Bk = d_B + (std::ptrdiff_t)evt * n * n;
+        for (int i = 0; i < n; ++i) { svr[i] = d_v[i].x; svi[i] = d_v[i].y; }
+
+        // Bu = tildeB @ u（sB 为共轭存储：.x = R, .y = -C）
+        for (int i = 0; i < n2; ++i) {
+            double sum = 0.0;
+            if (i < n) {
+                for (int j = 0; j < n; ++j)
+                    sum += Bk[i * n + j].x * svr[j] + Bk[i * n + j].y * svi[j];
+            } else {
+                const int ii = i - n;
+                for (int j = 0; j < n; ++j)
+                    sum += -Bk[ii * n + j].y * svr[j] + Bk[ii * n + j].x * svi[j];
+            }
+            sBu[i] = sum;
+        }
+
+        double S = 0.0;
+        for (int i = 0; i < n; ++i) S += svr[i] * sBu[i] + svi[i] * sBu[n + i];
+        if (S <= 0.0) S = 1e-30;
+        const double invS = 1.0 / S, invS2 = invS * invS;
+        const double weight = (d_weights != nullptr) ? d_weights[evt] : 1.0;
+        double* hess_out = d_hessian_chunk + (std::ptrdiff_t)evt * hess_sz;
+
+        for (int idx = 0; idx < hess_sz; ++idx) {
+            const int i = idx / n2, j = idx % n2;
+            double val = 4.0 * weight * sBu[i] * sBu[j] * invS2;
+            int a, b2;
+            if (i < n && j < n)        { a = i;     b2 = j;     val += -2.0 * weight * Bk[a * n + b2].x * invS; }
+            else if (i < n && j >= n)  { a = i;     b2 = j - n; val += -2.0 * weight * Bk[a * n + b2].y * invS; }
+            else if (i >= n && j < n)  { a = i - n; b2 = j;     val +=  2.0 * weight * Bk[a * n + b2].y * invS; }
+            else                       { a = i - n; b2 = j - n; val += -2.0 * weight * Bk[a * n + b2].x * invS; }
+            hess_out[idx] = val;
+        }
+    }
+#endif
 }
 
 // Step C: 沿events维度归约 per-event Hessian → 单次atomicAdd到全局
-__global__ void reduceHessianKernel(
+CTPWA_KERNEL void reduceHessianKernel(
     const double* __restrict__ d_hessian_chunk,  // nEvents × 4n²
     double* __restrict__ d_hessian_global,        // 4n²
     int nEvents, int n)
 {
+#if defined(CTPWA_HAS_CUDA)
     const int n2 = 2 * n;
     const int hess_sz = n2 * n2;
     const int elem = blockIdx.x;   // 0..hess_sz-1, 每个block归约一个(i,j)
@@ -147,6 +192,17 @@ __global__ void reduceHessianKernel(
             new_val = __double_as_longlong(__longlong_as_double(old) + s_partial[0]);
         } while (atomicCAS(ptr, old, new_val) != old);
     }
+#else
+    // ---- CPU：按元素顺序累加所有事件（逐位可复现）----
+    const int n2 = 2 * n;
+    const int hess_sz = n2 * n2;
+    for (int elem = 0; elem < hess_sz; ++elem) {
+        double sum = 0.0;
+        for (int evt = 0; evt < nEvents; ++evt)
+            sum += d_hessian_chunk[(std::ptrdiff_t)evt * hess_sz + elem];
+        d_hessian_global[elem] += sum;
+    }
+#endif
 }
 
 void computeDataHessianContrib(
@@ -193,7 +249,7 @@ void computeDataHessianContrib(
             &alpha, A_chunk, n, stride_amp, A_chunk, n, stride_amp,
             &beta, d_B, n, stride_B, chunk);
         int grid = (chunk * stride_B + kBlockSize - 1) / kBlockSize;
-        conjKernel<<<grid, kBlockSize>>>(d_B, chunk * stride_B);
+        CTPWA_LAUNCH(conjKernel, grid, kBlockSize, 0, d_B, chunk * stride_B);
 
         // 2. Per-event Hessian (含S和Bu计算；B 已共轭 → 标准约定 [[R,-C],[C,R]])
         {
@@ -201,12 +257,12 @@ void computeDataHessianContrib(
                        + (size_t)(5 * n) * sizeof(double);
             cudaFuncSetAttribute(perEventHessianKernel,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
-            perEventHessianKernel<<<chunk, kBlockSize, shm>>>(d_B, d_vector, w_chunk,
+            CTPWA_LAUNCH_SERIAL(perEventHessianKernel, chunk, kBlockSize, shm, d_B, d_vector, w_chunk,
                 d_hessian_chunk, chunk, n);
         }
 
         // 3. 归约 per-event → 全局（每chunk仅 4n² 次atomicAdd）
-        reduceHessianKernel<<<hess_sz, kBlockSize>>>(d_hessian_chunk, d_hessian,
+        CTPWA_LAUNCH_SERIAL(reduceHessianKernel, hess_sz, kBlockSize, 0, d_hessian_chunk, d_hessian,
             chunk, n);
     }
 
@@ -221,13 +277,14 @@ void computeDataHessianContrib(
 //   Im(P*v) = R_true*vi - C_true*vr  = (tildeB_old @ u)_bot
 // tildeP贡献同理用 [[R,C],[-C,R]] 约定（与Pu一致，公式自洽）:
 //   H_00,H_11 += 2wR/T, H_01 += +2wC/T, H_10 += -2wC/T
-__global__ void phspHessianKernel(
+CTPWA_KERNEL void phspHessianKernel(
     const ctComplex* __restrict__ P,      // n×n (共轭存储)
     const ctComplex* __restrict__ v,      // n
     double invT, double weight,
     double* __restrict__ d_hessian,
     int n)
 {
+#if defined(CTPWA_HAS_CUDA)
     const int n2 = 2 * n;
     // 动态共享内存（double 版 64×64×16B=64KB 超限）
     extern __shared__ ctFloat hsmem[];
@@ -275,19 +332,44 @@ __global__ void phspHessianKernel(
             new_val = __double_as_longlong(__longlong_as_double(old) + val);
         } while (atomicCAS(ptr, old, new_val) != old);
     }
+#else
+    // ---- CPU：Pu = P·v，逐元素写 Hessian（串行，无原子）----
+    const int n2 = 2 * n;
+    std::vector<double> Pu((size_t)n2);
+    for (int a = 0; a < n; ++a) {
+        double re = 0.0, im = 0.0;
+        for (int b = 0; b < n; ++b) {
+            const ctComplex pb = P[a * n + b], vb = v[b];
+            re += pb.x * vb.x - pb.y * vb.y;
+            im += pb.x * vb.y + pb.y * vb.x;
+        }
+        Pu[a] = re; Pu[a + n] = im;
+    }
+    const double invT2 = invT * invT;
+    for (int idx = 0; idx < n2 * n2; ++idx) {
+        const int i = idx / n2, j = idx % n2;
+        double val = -4.0 * weight * Pu[i] * Pu[j] * invT2;
+        if (i < n && j < n)        val +=  2.0 * weight * P[i * n + j].x * invT;
+        else if (i < n && j >= n)  val += -2.0 * weight * P[i * n + (j - n)].y * invT;
+        else if (i >= n && j < n)  val +=  2.0 * weight * P[(i - n) * n + j].y * invT;
+        else                       val +=  2.0 * weight * P[(i - n) * n + (j - n)].x * invT;
+        d_hessian[i * n2 + j] += val;
+    }
+#endif
 }
 
 // 大 n 回退：P（n×n）从 global memory 按需读，动态共享内存只放 2n 的 Pu。
 // 数学与 phspHessianKernel 逐项一致（同一公式、同一累加顺序），只是不缓存 P。
 // 触发条件：n²·sizeof(ctComplex)+2n·8 超过单 block 动态共享内存上限
 // （V100 96KB / A100 163KB / H100 227KB）。n=138 时需 ~300KB → 必走此路径。
-__global__ void phspHessianKernelLarge(
+CTPWA_KERNEL void phspHessianKernelLarge(
     const ctComplex* __restrict__ P,      // n×n (共轭存储, global)
     const ctComplex* __restrict__ v,      // n
     double invT, double weight,
     double* __restrict__ d_hessian,
     int n)
 {
+#if defined(CTPWA_HAS_CUDA)
     const int n2 = 2 * n;
     extern __shared__ double sPu[];
     double* sPu_real = sPu;               // [0:n]=Re, [n:2n]=Im
@@ -329,6 +411,30 @@ __global__ void phspHessianKernelLarge(
             new_val = __double_as_longlong(__longlong_as_double(old) + val);
         } while (atomicCAS(ptr, old, new_val) != old);
     }
+#else
+    // ---- CPU：Pu = P·v，逐元素写 Hessian（串行，无原子）----
+    const int n2 = 2 * n;
+    std::vector<double> Pu((size_t)n2);
+    for (int a = 0; a < n; ++a) {
+        double re = 0.0, im = 0.0;
+        for (int b = 0; b < n; ++b) {
+            const ctComplex pb = P[a * n + b], vb = v[b];
+            re += pb.x * vb.x - pb.y * vb.y;
+            im += pb.x * vb.y + pb.y * vb.x;
+        }
+        Pu[a] = re; Pu[a + n] = im;
+    }
+    const double invT2 = invT * invT;
+    for (int idx = 0; idx < n2 * n2; ++idx) {
+        const int i = idx / n2, j = idx % n2;
+        double val = -4.0 * weight * Pu[i] * Pu[j] * invT2;
+        if (i < n && j < n)        val +=  2.0 * weight * P[i * n + j].x * invT;
+        else if (i < n && j >= n)  val += -2.0 * weight * P[i * n + (j - n)].y * invT;
+        else if (i >= n && j < n)  val +=  2.0 * weight * P[(i - n) * n + j].y * invT;
+        else                       val +=  2.0 * weight * P[(i - n) * n + (j - n)].x * invT;
+        d_hessian[i * n2 + j] += val;
+    }
+#endif
 }
 
 // CUDA 错误就地抛出：C++ 侧不检查返回值时，cudaErrorInvalidValue 会留在 error
@@ -388,7 +494,7 @@ void computePhspHessian(
                 "-> shared (fast) path\n", n, shm_full / 1024.0, smem_optin / 1024.0);
         // launch 前先清历史 last-error，保证下面的检查只反映本次 launch
         (void)cudaGetLastError();
-        phspHessianKernel<<<1, 256, shm_full>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+        CTPWA_LAUNCH_SERIAL(phspHessianKernel, 1, 256, shm_full, d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) throwCudaError("phspHessianKernel", err, n, shm_full, smem_optin);
     } else {
@@ -403,7 +509,7 @@ void computePhspHessian(
         cudaFuncSetAttribute(phspHessianKernelLarge,
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm_pu);
         (void)cudaGetLastError();   // 清历史 last-error（含上面失败的 attribute 调用）
-        phspHessianKernelLarge<<<1, 256, shm_pu>>>(d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
+        CTPWA_LAUNCH_SERIAL(phspHessianKernelLarge, 1, 256, shm_pu, d_phsp_matrix, d_vector, invT, weight, d_hessian, n);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) throwCudaError("phspHessianKernelLarge", err, n, shm_pu, smem_optin);
     }
@@ -413,7 +519,7 @@ void computePhspHessian(
 // J是n_ext×n_orig的对角块矩阵: J[2*eid][2*oid]=cr, J[2*eid+1][2*oid+1]=ci
 // 与extendVectorWithConstraints的实/虚部分离比例约定一致
 // d_H_in: 2·n_ext × 2·n_ext 扩展Hessian (只读), d_H_out: 2·n_orig × 2·n_orig 输出
-__global__ void reduceHessianKernel(
+CTPWA_KERNEL void reduceHessianKernel(
     const double* __restrict__ H_in,             // 2·n_ext × 2·n_ext (只读)
     double* __restrict__ H_out,                  // 2·n_orig × 2·n_orig (输出)
     const int* __restrict__ d_origin_ids,        // n_constraints
@@ -424,9 +530,11 @@ __global__ void reduceHessianKernel(
 {
     const int n2o = 2 * n_orig;
     const int n2e = 2 * n_ext;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= n2o || j >= n2o) return;
+    // 二维 (i, j) 摊平成一维工作项（启动配置已一维化），CPU / CUDA 共用
+    const int tid = CTPWA_TID();
+    const int i = tid / n2o;
+    const int j = tid - i * n2o;
+    if (i >= n2o) return;
 
     // 1. 读取origin-origin块 (identity mapping)
     double val = H_in[i * n2e + j];
@@ -496,9 +604,10 @@ void reduceHessianWithConstraints(
     int n_constraints, int n_orig, int n_ext)
 {
     const int n2o = 2 * n_orig;
-    dim3 block(16, 16);
-    dim3 grid((n2o + 15) / 16, (n2o + 15) / 16);
-    reduceHessianKernel<<<grid, block>>>(
+    const int total = n2o * n2o;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    CTPWA_LAUNCH(reduceHessianKernel, grid, block, 0, 
         d_hessian_ext, d_hessian_out,
         d_origin_ids, d_ext_ids,
         d_re_ratios, d_im_ratios,
@@ -528,7 +637,7 @@ void reduceHessianWithConstraints(
  // amp: [nEv * nPol * n_amp] layout, v: [n_amp] interleaved
  // Outputs S_re[nEv*nPol], S_im[nEv*nPol], I[nEv]
  // ============================================================
-__global__ void computeSfromAmpsKernel(
+CTPWA_KERNEL void computeSfromAmpsKernel(
     double* d_S_re, double* d_S_im, double* d_I,
     const ctComplex* d_amp,   // [nEv * nPol * n_amp]
     const ctComplex* d_v,     // [n_amp]
@@ -536,7 +645,7 @@ __global__ void computeSfromAmpsKernel(
     double* d_phsp_t3_re = nullptr,   // [n_amp]
     double* d_phsp_t3_im = nullptr)   // [n_amp]
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
 
     // S 全量存全局输出（nPolar 无上限，不用栈数组）；I 与 term3 消费
@@ -576,13 +685,13 @@ __global__ void computeSfromAmpsKernel(
 
 // float-A 版 S = A^T·v（A float2 读入、v double、输出交错 ctComplex S——θ 段共振梯度
 // phsp 用，与 CUBLAS_CGEMV 输出布局一致（double2 交错 [re,im]），免整段 double 上转）
-__global__ void computeSFromFloatAmpsKernel(
+CTPWA_KERNEL void computeSFromFloatAmpsKernel(
     ctComplex* d_S,             // [nEv * nPol] double2 交错输出
     const float2* d_amp,        // [nEv * nPol * n_amp] float2
     const ctComplex* d_v,       // [n_amp] double
     int nEvents, int nPolar, int n_amp)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     for (int p = 0; p < nPolar; ++p) {
         double sre = 0.0, sim = 0.0;
@@ -833,7 +942,7 @@ __device__ void bwrSpecEval(double m0, double g0, double m, double q,
     d2Fr[3] = Rgg * Bv;
     d2Fi[3] = Igg * Bv;
 }
-__global__ void computeCustomHessianKernel(
+CTPWA_KERNEL void computeCustomHessianKernel(
     const thrust::complex<double>* d_slamp_tab,
     const ctComplex* d_v,
     const DeviceMomenta* d_momenta,
@@ -863,7 +972,7 @@ __global__ void computeCustomHessianKernel(
     const double* d_sign_tab,
     const double* d_jit_out_full,  // JIT 物化 F/dF/d2F（null → 解释器）
     bool use_bwr_spec) {          // BWR 解析特化旁路（差分二阶）
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     int evt_abs = evt + evt_offset;
     int nTotal = d_momenta->n_events * nPolar;
@@ -1210,7 +1319,7 @@ __global__ void computeCustomHessianKernel(
 // Stage 2: cross-block kernel — Term A + Term B between blocks
 // Reconstructs I from d_I buffer; d_I[evt] holds I_e for each event.
 // ============================================================
-__global__ void hessianCrossBlockKernel(
+CTPWA_KERNEL void hessianCrossBlockKernel(
     const double* d_g_A,        // [nEv * NTA]
     const double* d_dS_re_A,    // [nEv * NTA * nPolar]
     const double* d_dS_im_A,
@@ -1228,7 +1337,7 @@ __global__ void hessianCrossBlockKernel(
     double* d_phsp_hessA = nullptr,
     int phsp_ld = 1)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     double weight = d_event_weights ? d_event_weights[evt] : default_weight;
 
@@ -1301,7 +1410,7 @@ __global__ void hessianCrossBlockKernel(
 // H[Re(v_a),θ_j] = -2w/I·[Re(conj(dS_j)·amp_a) + Re(conj(S)·slamp_a·dF_j) + g_j·Re(conj(S)·amp_a)]
 // H[Im(v_a),θ_j] = +2w/I·[Im(conj(dS_j)·amp_a) + Im(conj(S)·slamp_a·dF_j) + g_j·Im(conj(S)·amp_a)]
 // ============================================================
-__global__ void hessianMixedBlockKernel(
+CTPWA_KERNEL void hessianMixedBlockKernel(
     const double* d_S_re, const double* d_S_im,   // [nEv*nPolar]
     const double* d_I,                             // [nEv]
     const ctComplex* d_amp,                        // [nEv_total*nPolar*n_amp_total]
@@ -1318,7 +1427,7 @@ __global__ void hessianMixedBlockKernel(
     int evt_offset = 0,
     int nSigma = 1, const double* d_sign_tab = nullptr)
 {
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     int evt_abs = evt + evt_offset;
     double w = d_event_weights ? d_event_weights[evt] : default_weight;
@@ -1405,7 +1514,7 @@ __global__ void hessianMixedBlockKernel(
 // - a 按 ACHUNK 分块（shared 槽上限 2×ACHUNK×NTb; nAmp 任意大）
 // - pol 仅出现在逐事件项内层（无 pol 维数组）→ nPol 任意（3 或 200 同构）
 // - d_amp 每 (a,p) 只读一次（旧版在 term3 与 term1 重复读）
-__global__ void hessianCrossMixedKernel(
+CTPWA_KERNEL void hessianCrossMixedKernel(
     const double* d_S_re, const double* d_S_im,
     const double* d_I,
     const ctComplex* d_amp,
@@ -1419,11 +1528,12 @@ __global__ void hessianCrossMixedKernel(
     double* d_phsp_sum = nullptr,
     int evt_offset = 0)
 {
+#if defined(CTPWA_HAS_CUDA)
     constexpr int ACHUNK = 32;                 // a 分块（shared 槽上限）
     extern __shared__ double sm[];             // [2][ACHUNK][NTb], NTb ≤ 16 时 ≤ 8KB
     int nslot = 2 * ACHUNK * NTb;
 
-    int evt = blockIdx.x * blockDim.x + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     double w = d_event_weights ? d_event_weights[evt] : default_weight;
     double I_val = d_I[evt];
@@ -1509,22 +1619,82 @@ __global__ void hessianCrossMixedKernel(
         }
         __syncthreads();
     }
+#else
+    // ---- CPU：去掉 a 分块与 shared 暂存，直接 atomicAdd 到全局 ----
+    const int evt = CTPWA_TID();
+    if (evt >= nEvents) return;
+    const double w = d_event_weights ? d_event_weights[evt] : default_weight;
+    const double I_val = d_I[evt];
+    if (I_val < 1e-30) return;
+    const double inv_I = 1.0 / I_val;
+    const bool is_phsp = (default_weight == 0.0 && d_phsp_sum != nullptr);
+
+    const double* Sr_ptr = d_S_re + evt * nPolar;
+    const double* Si_ptr = d_S_im + evt * nPolar;
+    const double* gB_ptr = d_g_B + evt * NTb;
+    const double* dS_reB_ptr = d_dS_re_B + evt * NTb * nPolar;
+    const double* dS_imB_ptr = d_dS_im_B + evt * NTb * nPolar;
+    const ctComplex* amp_base = d_amp + evt * nPolar * n_amp_total;
+    double* out = is_phsp ? d_phsp_sum : d_mixed;
+
+    for (int a = 0; a < nSL_A; ++a) {
+        // 同块 vθ 项已由 Stage 3 hessianMixedBlockKernel 写入 → 跳过
+        if (a >= site_B && a < site_B + nSL_B) continue;
+        const int ga = site_A + a;
+        const ctComplex* amp_a = amp_base + ga;
+
+        double term3_re = 0.0, term3_im = 0.0;
+        for (int p = 0; p < nPolar; ++p) {
+            const ctComplex amp_ap = amp_a[p * n_amp_total];
+            const double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+            const double sr = Sr_ptr[p], si = Si_ptr[p];
+            term3_re += sr * ar + si * ai;
+            term3_im += sr * ai - si * ar;
+        }
+
+        for (int jb = 0; jb < NTb; ++jb) {
+            const int gjb = d_gidx_B[jb];
+            if (gjb < 0) continue;
+            const double gj_val = gB_ptr[jb];
+            double t1_re = 0.0, t1_im = 0.0;
+            for (int p = 0; p < nPolar; ++p) {
+                const ctComplex amp_ap = amp_a[p * n_amp_total];
+                const double ar = (double)amp_ap.x, ai = (double)amp_ap.y;
+                const int ds_idx = jb * nPolar + p;
+                const double ds_re = dS_reB_ptr[ds_idx], ds_im = dS_imB_ptr[ds_idx];
+                t1_re += ds_re * ar + ds_im * ai;
+                t1_im += ds_re * ai - ds_im * ar;
+            }
+            double v_re, v_im;
+            if (is_phsp) {
+                v_re = t1_re;
+                v_im = t1_im;
+            } else {
+                const double coeff = w * 2.0 * inv_I;
+                v_re = -coeff * (t1_re + gj_val * term3_re);
+                v_im =  coeff * (t1_im + gj_val * term3_im);
+            }
+            atomicAdd(&out[(0 * n_amp_total + ga) * mixed_ld + gjb], v_re);
+            atomicAdd(&out[(1 * n_amp_total + ga) * mixed_ld + gjb], v_im);
+        }
+    }
+#endif
 }
 
 // Trivial kernel: negate per-event weights in-place (out[i] = -in[i])
-__global__ void negateWeightsKernel(double* out, const double* in, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+CTPWA_KERNEL void negateWeightsKernel(double* out, const double* in, int n) {
+    const int i = CTPWA_TID();
     if (i < n) out[i] = -in[i];
 }
 
 // Scale phsp amplitudes by per-event weight: amp[e,p,a] *= sqrt(weight[e] / W_total)
 // Applied to ALL nPol*nAmp entries for each event, so the subsequent CUBLAS_CGEMM
 // computes A_weighted^H A_weighted = A^H diag(w) A / W_total.
-__global__ void scalePhspAmpsKernel(
+CTPWA_KERNEL void scalePhspAmpsKernel(
     ctComplex* d_amp, const double* d_weights,
     int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = CTPWA_TID();
     int total = nEvents * nPolar * nAmp;
     if (idx >= total) return;
 
@@ -1539,17 +1709,18 @@ __global__ void scalePhspAmpsKernel(
 }
 
 // Reorder vv block from interleaved [Re0,Im0,Re1,Im1,...] to grouped [Re0..Re_n, Im0..Im_n]
-__global__ void reorderVVBlockKernel(
+CTPWA_KERNEL void reorderVVBlockKernel(
     const double* __restrict__ H_in, double* __restrict__ H_out,
     int nv, int in_stride, int out_stride)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int n2 = 2 * nv;
-    if (i >= n2 || j >= n2) return;
+    const int n2 = 2 * nv;
+    const int tid = CTPWA_TID();
+    const int i = tid / n2;
+    const int j = tid - i * n2;
+    if (i >= n2) return;
 
-    int in_row = (i < nv) ? 2 * i : 2 * (i - nv) + 1;
-    int in_col = (j < nv) ? 2 * j : 2 * (j - nv) + 1;
+    const int in_row = (i < nv) ? 2 * i : 2 * (i - nv) + 1;
+    const int in_col = (j < nv) ? 2 * j : 2 * (j - nv) + 1;
 
     H_out[i * out_stride + j] = H_in[in_row * in_stride + in_col];
 }
@@ -1561,9 +1732,10 @@ void reorderVVBlockInterleavedToGrouped(double* H, int nv, int stride)
     cudaMalloc(&d_tmp, n2 * stride * sizeof(double));
     cudaMemcpy(d_tmp, H, n2 * stride * sizeof(double), cudaMemcpyDeviceToDevice);
 
-    dim3 block(16, 16);
-    dim3 grid((n2 + 15) / 16, (n2 + 15) / 16);
-    reorderVVBlockKernel<<<grid, block>>>(d_tmp, H, nv, stride, stride);
+    const int total = n2 * n2;
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    CTPWA_LAUNCH(reorderVVBlockKernel, grid, block, 0, d_tmp, H, nv, stride, stride);
     cudaDeviceSynchronize();
     cudaFree(d_tmp);
 }
@@ -1589,11 +1761,11 @@ void reorderVVBlockInterleavedToGrouped(double* H, int nv, int stride)
 constexpr int kFastBlock = 256;
 
 // I[e] = Σ_p |S[e,p]|² (S pre-computed by CUBLAS_CGEMV)
-__global__ void computeIntensityKernel(
+CTPWA_KERNEL void computeIntensityKernel(
     const ctComplex* __restrict__ dS, ctFloat* __restrict__ dI,
     int nEvents, int nPolar)
 {
-    int evt = blockIdx.x * kFastBlock + threadIdx.x;
+    const int evt = CTPWA_TID();
     if (evt >= nEvents) return;
     ctFloat sum = CTF(0.0);
     const ctComplex* Se = dS + evt * nPolar;
@@ -1605,14 +1777,14 @@ __global__ void computeIntensityKernel(
 // Scale A for the weighted Gram matrix. Negative weights (bkg contribution)
 // can't be absorbed by a real sqrt, so split into positive/negative parts:
 //   Σ_e (w_e/I_e)·B_e = A+^H A+ − A−^H A−,  A± = A·sqrt(|w_e|/I_e) for ±w_e > 0
-__global__ void scaleAmpsForGramKernel(
+CTPWA_KERNEL void scaleAmpsForGramKernel(
     ctComplex* __restrict__ dA_pos, ctComplex* __restrict__ dA_neg,
     const ctComplex* __restrict__ dA_src, const ctFloat* __restrict__ dI,
     const double* __restrict__ dW,
     int nEvents, int nPolar, int nAmp)
 {
     // NOTE: dA_src/dI/dW all point into the current chunk (event 0..nEvents-1)
-    int idx = blockIdx.x * kFastBlock + threadIdx.x;
+    const int idx = CTPWA_TID();
     int total = nEvents * nPolar * nAmp;
     if (idx >= total) return;
     int evt = (idx / nAmp) / nPolar;
@@ -1630,8 +1802,8 @@ __global__ void scaleAmpsForGramKernel(
 }
 
 // a[i] -= b[i]
-__global__ void subComplexKernel(ctComplex* a, const ctComplex* b, int n) {
-    int i = blockIdx.x * kFastBlock + threadIdx.x;
+CTPWA_KERNEL void subComplexKernel(ctComplex* a, const ctComplex* b, int n) {
+    const int i = CTPWA_TID();
     if (i < n) { a[i].x -= b[i].x; a[i].y -= b[i].y; }
 }
 
@@ -1640,11 +1812,12 @@ __global__ void subComplexKernel(ctComplex* a, const ctComplex* b, int n) {
 // Each block: BLK_EVENTS events → Bu in shared → tile-accumulate H in shared →
 // one atomicAdd pass to global.
 template<int NP, int BLK_EVENTS, int TILE>
-__global__ void gnBlockReduceKernel(
+CTPWA_KERNEL void gnBlockReduceKernel(
     const ctComplex* __restrict__ dA, const ctComplex* __restrict__ dS,
     const ctFloat* __restrict__ dI, const double* __restrict__ dW,
     double* __restrict__ dH, int nEv, int nA)
 {
+#if defined(CTPWA_HAS_CUDA)
     const int n2 = 2 * nA;
     const int hess_sz = n2 * n2;
     const int blk = blockIdx.x;
@@ -1736,31 +1909,66 @@ __global__ void gnBlockReduceKernel(
         }
         __syncthreads();
     }
+
+#else
+    // ---- CPU：逐事件直接累加到 dH（跳过 shared 分块/暂存，串行、可复现）----
+    const int n2 = 2 * nA;
+    std::vector<double> Bu((size_t)n2);
+    for (int evt = 0; evt < nEv; ++evt) {
+        const ctComplex* A_evt = dA + (std::ptrdiff_t)evt * NP * nA;
+        const double Ival = (double)dI[evt];
+        if (Ival <= 0.0) continue;
+        const double w = (dW != nullptr) ? dW[evt] : 1.0;
+
+        double Sp_re[NP], Sp_im[NP];
+        for (int p = 0; p < NP; ++p) {
+            Sp_re[p] = (double)dS[evt * NP + p].x;
+            Sp_im[p] = (double)dS[evt * NP + p].y;
+        }
+        for (int i = 0; i < n2; ++i) {
+            double acc = 0.0;
+            if (i < nA) {
+                for (int p = 0; p < NP; ++p) {
+                    const ctComplex a = A_evt[p * nA + i];
+                    acc += (double)a.x * Sp_re[p] + (double)a.y * Sp_im[p];
+                }
+            } else {
+                const int ii = i - nA;
+                for (int p = 0; p < NP; ++p) {
+                    const ctComplex a = A_evt[p * nA + ii];
+                    acc += (double)a.x * Sp_im[p] - (double)a.y * Sp_re[p];
+                }
+            }
+            Bu[i] = acc;
+        }
+
+        const double s4 = 4.0 * w / (Ival * Ival);
+        for (int idx = 0; idx < n2 * n2; ++idx) {
+            const int i = idx / n2, j = idx % n2;
+            dH[idx] += s4 * Bu[i] * Bu[j];
+        }
+    }
+#endif
 }
 
 // Add -2·tildeB(B_total) to H. Standard convention [[R,-C],[C,R]] (matches
 // the conj'ed-B baseline):
 //   H_00,H_11 += -2·R ; H_01 += +2·C ; H_10 += -2·C
-__global__ void addTildeBStdKernel(
+CTPWA_KERNEL void addTildeBStdKernel(
     const ctComplex* __restrict__ dB, double* __restrict__ dH, int n)
 {
     const int n2 = 2 * n;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n2 || j >= n2) return;
+    const int tid = CTPWA_TID();
+    const int i = tid / n2;
+    const int j = tid - i * n2;
+    if (i >= n2) return;
+
     double val = 0.0;
     if (i < n && j < n)       val = -2.0 * (double)dB[i * n + j].x;         // R
     else if (i < n && j >= n) val = +2.0 * (double)dB[i * n + (j - n)].y;   // +C
     else if (i >= n && j < n) val = -2.0 * (double)dB[(i - n) * n + j].y;   // -C
     else                      val = -2.0 * (double)dB[(i - n) * n + (j - n)].x;  // R
-    unsigned long long* p = (unsigned long long*)(dH + i * n2 + j);
-    unsigned long long old = *p, nv;
-    do {
-        nv = __double_as_longlong(__longlong_as_double(old) + val);
-        unsigned long long prev = atomicCAS(p, old, nv);
-        if (prev == old) break;
-        old = prev;
-    } while (true);
+    atomicAdd(&dH[i * n2 + j], val);
 }
 
 // Template dispatch for gnBlockReduceKernel by n_polar and BLK_EVENTS
@@ -1770,8 +1978,8 @@ static void launchGNBlockReduce(int blkEvt, int shm, int nBlk,
     const double* dW, double* dH, int nEv, int nA)
 {
     auto L = [&](auto* k) {
-        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, shm);
-        k<<<nBlk, kFastBlock, shm>>>(dA, dS, dI, dW, dH, nEv, nA);
+        CTPWA_SMEM_ATTR(k, shm);
+        CTPWA_LAUNCH_SERIAL(k, nBlk, kFastBlock, shm, dA, dS, dI, dW, dH, nEv, nA);
     };
     switch (blkEvt) {
         case 8:  L(&gnBlockReduceKernel<NP,8,4096>);  break;
@@ -1856,11 +2064,11 @@ void computeDataHessianContribFast(
         // 1. S = A^T·v (CUBLAS_CGEMV), I = |S|²
         CUBLAS_CGEMV(handle, CUBLAS_OP_T, n, chunk * n_polar,
             &alpha, Achunk, n, d_vector, 1, &beta0, dS, 1);
-        computeIntensityKernel<<<(chunk + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+        CTPWA_LAUNCH(computeIntensityKernel, (chunk + kFastBlock - 1) / kFastBlock, kFastBlock, 0, 
             dS, dI, chunk, n_polar);
 
         // 2. scale A into +/− buffers
-        scaleAmpsForGramKernel<<<(chunk * n_polar * n + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+        CTPWA_LAUNCH(scaleAmpsForGramKernel, (chunk * n_polar * n + kFastBlock - 1) / kFastBlock, kFastBlock, 0, 
             dA_pos, dA_neg, Achunk, dI, Wchunk, chunk, n_polar, n);
         cudaDeviceSynchronize();
 
@@ -1870,7 +2078,7 @@ void computeDataHessianContribFast(
         CUBLAS_CGEMM(handle, CUBLAS_OP_N, CUBLAS_OP_C, n, n, chunk * n_polar,
             &alpha, dA_neg, n, dA_neg, n, &beta0, dB_neg, n);
         cudaDeviceSynchronize();
-        subComplexKernel<<<(n * n + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+        CTPWA_LAUNCH(subComplexKernel, (n * n + kFastBlock - 1) / kFastBlock, kFastBlock, 0, 
             dB_total, dB_neg, n * n);
 
         // 4. outer product 4w·Bu·Bu^T/I² (block-reduce)
@@ -1882,8 +2090,11 @@ void computeDataHessianContribFast(
 
         // 5. −2·tildeB(B_total)
         {
-            dim3 blk2(16, 16), grd2((n2 + 15) / 16, (n2 + 15) / 16);
-            addTildeBStdKernel<<<grd2, blk2>>>(dB_total, d_hessian, n);
+            // (i,j) 摊平成一维工作项（kernel 内 i = tid / n2）
+            const int total2 = n2 * n2;
+            const int blk2 = 256;
+            const int grd2 = (total2 + blk2 - 1) / blk2;
+            CTPWA_LAUNCH(addTildeBStdKernel, grd2, blk2, 0, dB_total, d_hessian, n);
         }
     }
 
@@ -1941,7 +2152,7 @@ void computeDataHessianContribGN(
 
         CUBLAS_CGEMV(handle, CUBLAS_OP_T, n, chunk * n_polar,
             &alpha, Achunk, n, d_vector, 1, &beta0, dS, 1);
-        computeIntensityKernel<<<(chunk + kFastBlock - 1) / kFastBlock, kFastBlock>>>(
+        CTPWA_LAUNCH(computeIntensityKernel, (chunk + kFastBlock - 1) / kFastBlock, kFastBlock, 0, 
             dS, dI, chunk, n_polar);
 
         int nBlk = (chunk + blkEvt - 1) / blkEvt;
@@ -1954,10 +2165,10 @@ void computeDataHessianContribGN(
 }
 
 // float2 A 段 → double2 上转（float_amps_ 模式: A 存 float2, B̄/hessian 消费端按块上转）
-__global__ void castF2ToDouble2Kernel(
+CTPWA_KERNEL void castF2ToDouble2Kernel(
     const float2* __restrict__ src, cuDoubleComplex* __restrict__ dst, int total)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i = CTPWA_TID();
     if (i >= total) return;
     dst[i] = make_cuDoubleComplex((double)src[i].x, (double)src[i].y);
 }

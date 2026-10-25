@@ -1,13 +1,16 @@
 #include <Figure.cuh>
+#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH(_SERIAL) / 双后端
+#include <cuda_runtime.h>  // CPU 后端由 include/cpu_shims 接手
+#include <cublas_v2.h>
 // #include <Amplitude.cuh>
 
 // CUDA核函数：填充直方图（有权重）
-__global__ void fillHistogramKernel(const double *values, const double *weights,
+CTPWA_KERNEL void fillHistogramKernel(const double *values, const double *weights,
                                     int n_events, double *hist_bins, int n_bins,
                                     double min_bin, double max_bin,
                                     double bin_width)
 {
-    int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int event_idx = CTPWA_TID();
 
     if (event_idx < n_events) {
         double value = values[event_idx];
@@ -29,12 +32,12 @@ __global__ void fillHistogramKernel(const double *values, const double *weights,
 }
 
 // CUDA核函数：计算每个事件的质量
-__global__ void MassCalculator(const LorentzVector *momenta,
+CTPWA_KERNEL void MassCalculator(const LorentzVector *momenta,
                                const int *particle_indices,
                                int n_particles_in_config, int total_particles,
                                int n_events, double *masses)
 {
-    int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int event_idx = CTPWA_TID();
 
     if (event_idx < n_events) {
         LorentzVector total;
@@ -125,7 +128,7 @@ void CalculateMassHist(LorentzVector *device_momenta,
         double *device_masses;
         cudaMalloc(&device_masses, nEvents * sizeof(double));
 
-        MassCalculator<<<gridSize, blockSize>>>(
+        CTPWA_LAUNCH(MassCalculator, gridSize, blockSize, 0, 
             device_momenta, device_particle_indices, particleIndices.size(),
             nParticles, nEvents, device_masses);
         cudaDeviceSynchronize();
@@ -135,7 +138,7 @@ void CalculateMassHist(LorentzVector *device_momenta,
         cudaMalloc(&device_hist_bins, n_bins * sizeof(double));
         cudaMemset(device_hist_bins, 0, n_bins * sizeof(double));
 
-        fillHistogramKernel<<<gridSize, blockSize>>>(
+        CTPWA_LAUNCH(fillHistogramKernel, gridSize, blockSize, 0, 
             device_masses, device_weights, nEvents, device_hist_bins, n_bins,
             min_bin, max_bin, bin_width);
         cudaDeviceSynchronize();
@@ -162,12 +165,12 @@ void CalculateMassHist(LorentzVector *device_momenta,
 }
 
 // 角度计算核函数
-__global__ void AngleCalculator(const LorentzVector *momenta,
+CTPWA_KERNEL void AngleCalculator(const LorentzVector *momenta,
                                 const int *particle_indices,
                                 int *n_particles_in_config, int total_particles,
                                 int n_events, double *angles)
 {
-    int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int event_idx = CTPWA_TID();
 
     if (event_idx < n_events) {
         int idx_offset = 0;
@@ -310,7 +313,7 @@ void CalculateAngleHist(LorentzVector *device_momenta,
         double *device_angles;
         cudaMalloc(&device_angles, nEvents * sizeof(double));
 
-        AngleCalculator<<<gridSize, blockSize>>>(
+        CTPWA_LAUNCH(AngleCalculator, gridSize, blockSize, 0, 
             device_momenta, device_particle_indices, device_group_sizes,
             nParticles, nEvents, device_angles);
         cudaDeviceSynchronize();
@@ -320,7 +323,7 @@ void CalculateAngleHist(LorentzVector *device_momenta,
         cudaMalloc(&device_hist_bins, n_bins * sizeof(double));
         cudaMemset(device_hist_bins, 0, n_bins * sizeof(double));
 
-        fillHistogramKernel<<<gridSize, blockSize>>>(
+        CTPWA_LAUNCH(fillHistogramKernel, gridSize, blockSize, 0, 
             device_angles, device_weights, nEvents, device_hist_bins, n_bins,
             min_bin, max_bin, bin_width);
         cudaDeviceSynchronize();
@@ -346,7 +349,7 @@ void CalculateAngleHist(LorentzVector *device_momenta,
     }
 }
 
-__global__ void
+CTPWA_KERNEL void
 fill2DHistogramKernel(const LorentzVector *momenta, const int *particle_indices,
                       const int *group_sizes, const int n_particles,
                       const double *weights, int n_events, double *hist_bins,
@@ -354,7 +357,7 @@ fill2DHistogramKernel(const LorentzVector *momenta, const int *particle_indices,
                       double y_min, double y_max, double x_bin_width,
                       double y_bin_width)
 {
-    int event_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int event_idx = CTPWA_TID();
 
     if (event_idx < n_events) {
         int idx_offset = 0;
@@ -496,7 +499,7 @@ void CalculateDalitzHist(LorentzVector *device_momenta,
         // double *device_angles;
         // cudaMalloc(&device_angles, nEvents * sizeof(double));
 
-        // AngleCalculator<<<gridSize, blockSize>>>(device_momenta,
+        // CTPWA_LAUNCH(AngleCalculator, gridSize, blockSize, 0, device_momenta,
         // device_particle_indices, device_group_sizes, nParticles, nEvents,
         // device_angles); cudaDeviceSynchronize();
 
@@ -505,7 +508,7 @@ void CalculateDalitzHist(LorentzVector *device_momenta,
         cudaMalloc(&device_hist_bins, x_bins * y_bins * sizeof(double));
         cudaMemset(device_hist_bins, 0, x_bins * y_bins * sizeof(double));
 
-        fill2DHistogramKernel<<<gridSize, blockSize>>>(
+        CTPWA_LAUNCH(fill2DHistogramKernel, gridSize, blockSize, 0, 
             device_momenta, device_particle_indices, device_group_sizes,
             nParticles, device_weights, nEvents, device_hist_bins, x_bins,
             y_bins, x_min, x_max, y_min, y_max, x_bin_width, y_bin_width);
@@ -542,12 +545,12 @@ void CalculateDalitzHist(LorentzVector *device_momenta,
 //   Theta/Phi/CosTheta: boost 系内的球坐标/极角（boost 子系缺省 = 帧不变）
 //   Angle/CosAngle: 与顶层母粒子动量的夹角(余弦) —— 等价旧 cosbeta 公式
 // ============================================================================
-__global__ void ObservableKernel(
+CTPWA_KERNEL void ObservableKernel(
     const LorentzVector* __restrict__ momenta, int n_particles,
     const int* __restrict__ d_idx, int nargs, int nboost, int naxis, int func,
     int mother_idx, int n_events, double* __restrict__ out)
 {
-    int ev = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ev = CTPWA_TID();
     if (ev >= n_events) return;
     const LorentzVector* p = momenta + (size_t)ev * n_particles;
 
@@ -598,14 +601,14 @@ __global__ void ObservableKernel(
 }
 
 // 通用 2d 分箱（value 数组版）
-__global__ void fill2DValuesKernel(
+CTPWA_KERNEL void fill2DValuesKernel(
     const double* __restrict__ vx, const double* __restrict__ vy,
     const double* __restrict__ weights, int n_events,
     double* __restrict__ hist_bins, int x_bins, int y_bins,
     double x_min, double x_max, double y_min, double y_max,
     double x_bin_width, double y_bin_width)
 {
-    int ev = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ev = CTPWA_TID();
     if (ev >= n_events) return;
     double weight = (weights != nullptr) ? weights[ev] : 1.0;
     double x = vx[ev], y = vy[ev];
@@ -685,7 +688,7 @@ void CalculateObsHist(LorentzVector* device_momenta,
             int nargs = (int)cfg.obs[d].args.size();
             int nboost = (int)cfg.obs[d].boost.size();
             int naxis = (int)cfg.obs[d].axis.size();
-            ObservableKernel<<<gridSize, blockSize>>>(
+            CTPWA_LAUNCH(ObservableKernel, gridSize, blockSize, 0, 
                 device_momenta, nParticles, d_idx[d], nargs, nboost, naxis,
                 cfg.obs[d].func, motherIdx, nEvents, vals[d]);
         }
@@ -697,7 +700,7 @@ void CalculateObsHist(LorentzVector* device_momenta,
             double* d_hist;
             cudaMalloc(&d_hist, x_bins * sizeof(double));
             cudaMemset(d_hist, 0, x_bins * sizeof(double));
-            fillHistogramKernel<<<gridSize, blockSize>>>(vals[0], weights,
+            CTPWA_LAUNCH(fillHistogramKernel, gridSize, blockSize, 0, vals[0], weights,
                 nEvents, d_hist, x_bins, x_min, x_max,
                 (x_max - x_min) / x_bins);
             cudaDeviceSynchronize();
@@ -715,7 +718,7 @@ void CalculateObsHist(LorentzVector* device_momenta,
             double* d_hist;
             cudaMalloc(&d_hist, (size_t)x_bins * y_bins * sizeof(double));
             cudaMemset(d_hist, 0, (size_t)x_bins * y_bins * sizeof(double));
-            fill2DValuesKernel<<<gridSize, blockSize>>>(
+            CTPWA_LAUNCH(fill2DValuesKernel, gridSize, blockSize, 0, 
                 vals[0], vals[1], weights, nEvents, d_hist,
                 x_bins, y_bins, x_min, x_max, y_min, y_max,
                 (x_max - x_min) / x_bins, (y_max - y_min) / y_bins);

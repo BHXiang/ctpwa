@@ -64,6 +64,30 @@ def make_analysis():
     return _make
 
 
+def is_cpu_build() -> bool:
+    """当前导入的 ctpwa.so 是否为 CPU 后端构建。
+
+    旧版 .so 没有 backend() 入口，按 CUDA 处理（保持向后兼容）。
+    """
+    import ctpwa
+
+    fn = getattr(ctpwa, "backend", None)
+    return bool(fn is not None and fn() == "cpu")
+
+
+CPU_BUILD = is_cpu_build()
+#: 用于只在 CPU 构建下运行的用例（GPU 构建下整体 skip）
+cpu_only = pytest.mark.skipif(
+    not CPU_BUILD,
+    reason="仅 CPU 后端构建（当前构建: %s）" % ("cpu" if CPU_BUILD else "cuda"),
+)
+
+
+@pytest.fixture(scope="session")
+def cpu_device():
+    return torch.device("cpu")
+
+
 @pytest.fixture(scope="session")
 def device():
     assert torch.cuda.is_available(), "ctpwa 需要 CUDA GPU"
