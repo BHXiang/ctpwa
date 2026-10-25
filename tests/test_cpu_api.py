@@ -16,6 +16,46 @@ pytestmark = cpu_only
 CPU = torch.device("cpu")
 
 
+# ---------------------------------------------------------------- 公开 API
+def test_facade_forwards_every_backend_symbol():
+    """门面必须把选中后端的**全部**公开名字转发出来。
+
+    为什么不能只校验几个固定名字：0.3.15 的门面只转发了 4 个
+    （analysis / PhaseSpaceGenerator / backend / build_info），把
+    DecayInfo / ChainView / DeviceManager 漏掉了。而当时的 CPU 测试恰好一个都
+    没用到（tests/test_structure.py、test_trans_host.py 等 6 个文件在用），
+    全量测试又因为需要 GPU 没跑 → 缺陷直接发到了 PyPI。
+
+    这里直接与后端模块的 dir() 对齐，以后新增绑定也不会再"忘了转发"。
+    """
+    import importlib
+
+    impl = importlib.import_module(f"ctpwa._{ctpwa.BACKEND}")
+    missing = [n for n in dir(impl)
+               if not n.startswith("_") and not hasattr(ctpwa, n)]
+    assert not missing, f"门面漏转发: {missing}"
+
+    not_in_all = [n for n in dir(impl)
+                  if not n.startswith("_") and n not in ctpwa.__all__]
+    assert not not_in_all, f"__all__ 缺: {not_in_all}"
+
+
+def test_documented_api_present():
+    """文档/示例里出现过的名字，必须能在顶层直接访问。"""
+    for name in ("analysis", "PhaseSpaceGenerator", "DecayInfo", "ChainView",
+                 "DeviceManager", "backend", "build_info"):
+        assert hasattr(ctpwa, name), f"ctpwa.{name} 缺失"
+
+
+def test_decay_info_usable():
+    """DecayInfo 不只是"有这个名字"，要真的能构造。"""
+    ana = ctpwa.analysis(str(CONFIGS_DIR / "simple.yml"))
+    info = ana.getDecayInfo() if hasattr(ana, "getDecayInfo") else None
+    if info is None:
+        pytest.skip("analysis 未暴露 getDecayInfo")
+    assert isinstance(info, ctpwa.DecayInfo)
+
+
 # ---------------------------------------------------------------- 构建标识
 def test_backend_string():
     assert ctpwa.backend() == "cpu"

@@ -35,24 +35,25 @@
 报 ``type ... is already registered``。公开入口只有 ``import ctpwa``。
 """
 
-import os
-import sys
+import os as _os
+import sys as _sys
 
-__version__ = "0.3.15"
+__version__ = "0.3.16"
 
-__all__ = ["analysis", "PhaseSpaceGenerator", "backend", "build_info", "BACKEND"]
+#: 运行时按后端模块实际暴露的名字生成（见文件末尾）
+__all__ = []
 
-_REQUESTED = os.environ.get("CTPWA_DEVICE", "auto").strip().lower()
+_REQUESTED = _os.environ.get("CTPWA_DEVICE", "auto").strip().lower()
 if _REQUESTED not in ("auto", "cuda", "cpu"):
     raise ValueError(
         f"CTPWA_DEVICE={_REQUESTED!r} 无效；只能是 'auto' | 'cuda' | 'cpu'")
 
-_QUIET = os.environ.get("CTPWA_QUIET", "") not in ("", "0", "false", "False")
+_QUIET = _os.environ.get("CTPWA_QUIET", "") not in ("", "0", "false", "False")
 
 
 def _say(msg):
     if not _QUIET:
-        print(f"[ctpwa] {msg}", file=sys.stderr)
+        print(f"[ctpwa] {msg}", file=_sys.stderr)
 
 
 def _cuda_probe():
@@ -144,13 +145,20 @@ def _select():
 
 _impl, _FALLBACK_REASON = _select()
 
-# ---- 转发选中后端的全部公开接口 ----
-analysis = _impl.analysis
-PhaseSpaceGenerator = _impl.PhaseSpaceGenerator
-backend = _impl.backend
-build_info = _impl.build_info
+# ---- 转发选中后端的**全部**公开接口 ----
+# 不能只列核心几个：扩展模块还把 DecayInfo / ChainView / DeviceManager 暴露为
+# 公开 API（历史上 ``import ctpwa`` 就能拿到）。0.3.15 只转发了 analysis /
+# PhaseSpaceGenerator / backend / build_info，导致这几个名字消失 → 0.3.16 修复。
+for _name in dir(_impl):
+    if not _name.startswith("_"):
+        globals()[_name] = getattr(_impl, _name)
 
 BACKEND = _impl.backend()          # 'cuda' / 'cpu'，便于脚本判断
 
 #: auto 模式下的回退原因（BACKEND == 'cpu' 且原本可用 GPU 判断时为非空）
 FALLBACK_REASON = _FALLBACK_REASON
+
+#: 顶层可用的全部名字 = 后端模块的公开名字 + 本门面新增的两个
+__all__ = sorted(n for n in dir(_impl) if not n.startswith("_")) + [
+    "BACKEND", "FALLBACK_REASON",
+]
