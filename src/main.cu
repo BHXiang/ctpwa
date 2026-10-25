@@ -39,7 +39,19 @@
 // Resonance inline (host-only, no device code)
 #include "Resonance.cu"
 
-PYBIND11_MODULE(ctpwa, m)
+
+// ---------------------------------------------------------------------------
+// 后端探针：_probe() 供 ctpwa/__init__.py 在 import 时决定用哪个后端。
+// 只做 alloc 或 torch.cuda.is_available() 都不够——「驱动看得见卡、但 kernel 起不来」
+// （编译架构与卡不匹配、卡被 MIG 切分或占满）必须靠真启动一次才能发现。
+// ---------------------------------------------------------------------------
+CTPWA_KERNEL void ctpwaProbeKernel(ctComplex* out)
+{
+    const int i = CTPWA_TID();
+    if (i == 0) out[0] = ctMake(1.0, 0.0);
+}
+
+static void bind_ctpwa(pybind11::module_& m)
 {
     // Ensure torch's Python-side bindings exist before any at::Tensor is
     // returned.  Without this, `import ctpwa` (without a prior `import
@@ -47,6 +59,29 @@ PYBIND11_MODULE(ctpwa, m)
     pybind11::module_::import("torch");
 
     m.doc() = "ctpwa";
+
+    // 分配 → 启动 1 个工作项的探针 kernel → 同步 → 读回校验。
+    // 任一步失败（无卡 / 驱动不匹配 / 架构不符 / 卡被占）都返回 false，
+    // 由 Python 门面回退到 CPU 后端。
+    m.def("_probe", []() -> bool {
+        ctComplex* d = static_cast<ctComplex*>(ctpwa::alloc(sizeof(ctComplex)));
+        if (!d) return false;
+        bool ok = true;
+        CTPWA_LAUNCH(ctpwaProbeKernel, 1, 1, 0, d);
+        CTPWA_SYNC();
+#if defined(CTPWA_HAS_CUDA)
+        ok = (cudaGetLastError() == cudaSuccess);
+        if (ok) {
+            ctComplex h = ctMake(0.0, 0.0);
+            ok = (cudaMemcpy(&h, d, sizeof(ctComplex), cudaMemcpyDeviceToHost) ==
+                  cudaSuccess) && (h.x == 1.0);
+        }
+#else
+        ok = (d[0].x == 1.0);
+#endif
+        ctpwa::dealloc(d);
+        return ok;
+    }, "后端自检：分配 + 启动探针 kernel + 读回。失败即视为该后端不可用");
 
     // 当前 .so 的后端与编译信息（用户报问题时第一手信息；测试据此跳过不适用的用例）
     m.def("backend", &ctpwa::backend_name,
@@ -273,3 +308,18 @@ PYBIND11_MODULE(ctpwa, m)
         .def("getFreeResParams", &analysis::getFreeResParams)
         .def("isValid", &analysis::isValid);
 }
+
+// ---------------------------------------------------------------------------
+// 模块入口：同一个源码树编出三个可能的模块名
+//   -DCTPWA_MODULE_CUDA → _cuda.so   （GPU 后端）
+//   -DCTPWA_MODULE_CPU  → _cpu.so    （CPU 后端，纯 g++ 构建）
+//   都不定义            → ctpwa.so   （旧式单模块，兼容本地开发）
+// pybind11 的文件名与 PyInit_<name> 必须一致，故这里用字面量而不是宏拼接。
+// ---------------------------------------------------------------------------
+#if defined(CTPWA_MODULE_CUDA)
+PYBIND11_MODULE(_cuda, m) { bind_ctpwa(m); }
+#elif defined(CTPWA_MODULE_CPU)
+PYBIND11_MODULE(_cpu, m) { bind_ctpwa(m); }
+#else
+PYBIND11_MODULE(ctpwa, m) { bind_ctpwa(m); }
+#endif

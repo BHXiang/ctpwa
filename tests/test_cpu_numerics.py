@@ -1,6 +1,6 @@
 """CPU 后端数值正确性：梯度/Hessian 对有限差分、对称性、重参数化等价。
 
-只在 ``CTPWA_BACKEND=cpu`` 构建下运行。
+只在**当前进程选中 CPU 后端**时运行（GPU 机器上请用 ``CTPWA_DEVICE=cpu``）。
 
 判据（与 doc/cpu-backend-plan.md 的验收口径一致）:
 - 梯度 vs FD：θ 分量相对差 < 1e-6

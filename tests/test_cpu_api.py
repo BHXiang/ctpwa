@@ -1,6 +1,6 @@
 """CPU 后端的 Python API 行为：构建标识、设备校验、精度映射、扩展向量。
 
-只在 ``CTPWA_BACKEND=cpu`` 构建下运行。
+只在**当前进程选中 CPU 后端**时运行（GPU 机器上请用 ``CTPWA_DEVICE=cpu``）。
 """
 
 import os

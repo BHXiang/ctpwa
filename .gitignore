@@ -5,6 +5,10 @@
 !src/**
 !include/
 !include/**
+!ctpwa/
+!ctpwa/**
+# 但包里的编译产物不入库
+ctpwa/*.so
 !setup.py
 !example/
 !example/**

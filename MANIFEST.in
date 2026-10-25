@@ -1,6 +1,7 @@
 # sdist 内容清单：setup.py 自动包含 ext sources (src/main.cu) 和 packages (tests)，
 # 但被 main.cu #include 的 .cu 和头文件不会自动包含——必须显式列出，
 # 否则其他机器 pip install 编译失败。
+recursive-include ctpwa *.py
 recursive-include include *.cuh *.h
 recursive-include src *.cu *.cuh *.h
 recursive-include doc *

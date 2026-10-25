@@ -1,11 +1,14 @@
 """CPU 后端冒烟测试：能构造、NLL 有限、对 golden、可复现。
 
-只在 ``CTPWA_BACKEND=cpu`` 构建下运行；GPU 构建下整体 skip。
+只在**当前进程选中 CPU 后端**时运行（GPU 机器上请用 ``CTPWA_DEVICE=cpu`` 跑）；
+否则整体 skip。
 
 运行::
 
-    CTPWA_BACKEND=cpu python3 setup.py build_ext --inplace
+    # 无卡机器
     python3 -m pytest tests/test_cpu_backend.py -v
+    # 有卡机器上专门测 CPU 后端
+    CTPWA_DEVICE=cpu python3 -m pytest tests/test_cpu_backend.py -v
 
 说明：本文件刻意**不使用** conftest 的 ``device`` fixture（那个 fixture 断言有 CUDA），
 所有张量都显式建在 CPU 上。

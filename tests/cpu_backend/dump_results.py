@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """dump_results.py — 把一组 config 的 NLL / 梯度 / Hessian 存成 npz，供 CPU vs GPU 对比
 
-用法:
-    PYTHONPATH=<含 ctpwa.so 的目录> python3 tests/cpu_backend/dump_results.py out.npz
+用法（在仓库根目录）:
+    CTPWA_DEVICE=cuda python3 tests/cpu_backend/dump_results.py out_gpu.npz
+    CTPWA_DEVICE=cpu  python3 tests/cpu_backend/dump_results.py out_cpu.npz --double
+    python3 tests/cpu_backend/compare_results.py out_cpu.npz out_gpu.npz
 
-对比时分别用 CPU 版和 GPU 版 .so 各跑一次，再用 compare_results.py 比较。
-注意：两个 .so 同名，只能在两个进程里分别跑。
+wheel 里同时带 _cuda.so 与 _cpu.so，用 CTPWA_DEVICE 选后端即可；两个后端
+不能在同一进程里加载（pybind11 类型注册是解释器全局的），所以分两个进程跑。
 """
 import os
 import sys
@@ -64,11 +66,12 @@ def _config_for(name, force_double):
 
 def main(out_path, device=None, force_double=False):
     os.chdir(TESTS)   # config 里的相对 data 路径按 tests/ 解析
-    # 设备必须显式给：机器上有卡时 torch.cuda.is_available() 恒为 True，
-    # 但 CPU 版 .so 必须喂 CPU 张量（否则内核会解引用 CUDA 指针）。
+    # 设备由当前选中的后端决定（torch.cuda.is_available() 只说明"有没有卡"，
+    # 不说明本进程实际用哪个后端）。
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("[dump] module=%s device=%s" % (ctpwa.__file__, device))
+        device = "cuda" if ctpwa.BACKEND == "cuda" else "cpu"
+    print("[dump] module=%s backend=%s device=%s"
+          % (ctpwa.__file__, ctpwa.BACKEND, device))
 
     data = {}
     for name in NAMES:

@@ -5,12 +5,17 @@
 用于高能物理分波分析：基于协变张量理论构建衰变振幅，
 用 CUDA 在 GPU 上并行计算。
 
+同一个 wheel 同时带 **GPU 后端**与**纯 CPU 后端**：`import ctpwa` 时自动探测，
+有可用 GPU 就用 GPU，没有（或驱动/架构不匹配）就回退 CPU 并明确告警。
+
 ---
 
 ## 特性
 
 - **协变张量分波**：两体衰变振幅（自旋-轨道耦合、势垒因子、宇称约束），支持级联衰变链
 - **GPU 并行**：振幅、SL 振幅、共振态因子全部 CUDA kernel 实现，多 GPU 支持
+- **CPU 后端**：同一份源码可编出纯 CPU 版（OpenMP + 自实现 BLAS，不依赖 OpenBLAS/MKL），
+  与 GPU 版数值一致（NLL ~1e-11、梯度 ~1e-10、Hessian ~1e-12 相对差）
 - **拟合**：NLL + 梯度（解析/AutoDiff）+ Hessian，接入 PyTorch autograd 优化器
 
 ## 系统要求
@@ -18,7 +23,7 @@
 | 依赖 | 版本 | 说明 |
 |---|---|---|
 | Linux x86_64 | glibc ≥ 2.34 | AlmaLinux 9.8 / RHEL 9 / Ubuntu 22.04+ |
-| NVIDIA GPU | sm_70 及以上 | V100、A100、RTX 20~50 系、H100 |
+| NVIDIA GPU | sm_70 及以上 | **可选**：没有 GPU 时自动使用 CPU 后端 |
 | CUDA Toolkit | 12.9 | 运行时需对应驱动 |
 | PyTorch | 2.12+（cu126） | 官方 legacy 构建（仅 download.pytorch.org） |
 | ROOT | 6.26+ | 读取 .root 数据（`source thisroot.sh`） |
@@ -37,9 +42,32 @@ conda install -c conda-forge yaml-cpp=0.8
 # PyTorch
 pip install torch==2.12.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 
-# CTPWA（manylinux_2_34 wheel，内置 sm_70~sm_120）
+# CTPWA（manylinux_2_34 wheel，内置 sm_70~sm_120 与 CPU 后端）
 pip install ctpwa
 ```
+
+### 选哪个后端
+
+```python
+import ctpwa
+ctpwa.backend()      # 'cuda' 或 'cpu'（实际使用的）
+ctpwa.build_info()   # {'backend': ..., 'precision': ..., 'capabilities': ...}
+```
+
+| 环境变量 | 作用 |
+|---|---|
+| `CTPWA_DEVICE=auto`（默认） | 有可用 GPU 用 GPU，否则回退 CPU（会打印原因与耗时提醒） |
+| `CTPWA_DEVICE=cuda` | 强制 GPU；不可用时**直接报错**，不静默降级 |
+| `CTPWA_DEVICE=cpu` | 强制 CPU |
+| `CTPWA_QUIET=1` | 抑制导入期提示 |
+
+回退判定不只看 `torch.cuda.is_available()`，还会真启动一次 kernel ——
+"驱动看得见卡但 kernel 起不来"（编译架构与卡不匹配、卡被 MIG 切分或占满）
+只有真跑才能发现。显存不足（OOM）**不会**回退：那是配置问题，应减小 phsp
+事例数或开 `free_phsp_amplitudes`。
+
+> CPU 后端比 GPU 慢 20~60 倍（事例越多差距越大），适合无卡机器、CI 与调试；
+> 生产规模拟合仍建议用 GPU。
 
 ### 源码编译（开发 / 老系统）
 
