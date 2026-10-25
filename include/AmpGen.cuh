@@ -328,6 +328,12 @@ public:
     // 逃生阀 CTPWA_KEEP_SLAMP=1 跳过。须在 initialize 尾部（所有 cas->getAmps 之后）。
     void releaseStaticCasData();
 
+    // 显式释放本实例持有的全部持久化设备缓冲，并清空 block/slot/cas 状态。
+    // 供 DIYMC 的“临时 AmpCalc”在每批强度计算后调用：析构函数故意不 free
+    // （进程退出期 CUDA 上下文已销毁，裸 cudaFree 会段错误），长进程必须显式 release。
+    // 调用后实例可再次 addBlock 复用。
+    void release();
+
     // 用新参数重算所有振幅
     // params_dev: d_params 所在设备（调用方的主 GPU）。不能依赖运行时当前设备——
     // torch 的 .to(cuda:1) 等操作会把它切走，导致广播从错误设备读取（双卡 NaN 根因）。

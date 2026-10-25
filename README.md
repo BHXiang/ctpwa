@@ -137,8 +137,13 @@ Resonances:
 | `writeResult(params, file)` | 保存拟合结果 |
 | `DeviceManager` | GPU 检测 / 显存容量检查 / 精度查询 |
 | `PhaseSpaceGenerator(config)` | DIYMC：产生平坦 n 体相空间（CPU，不需 data/GPU） |
+| `getIntensity(momenta, params)` | 任意四动量逐事件强度（CPU 输入，CPU 返回） |
+| `generateMC(n, params, ...)` | 振幅加权 MC：unweighted 舍选 / weighted |
+| `writeMC(events, file, weights=None)` | 写 DIYMC 样本（DAT/ROOT） |
 
-## DIYMC：产生平坦相空间 MC（P1）
+## DIYMC：平坦相空间 + 振幅加权 MC
+
+### 平坦相空间（P1）
 
 `PhaseSpaceGenerator` 只解析 config 的 `Particles` / `Data.order` / `DecayChains`，
 **不读 data/phsp 文件，也不需要 GPU**：
@@ -155,8 +160,29 @@ gen.write(flat, "flat.dat")                      # 或 "flat.root"
   收下所有 `Generate()` 事例。
 - 末态顺序 = `Data.order`；母粒子默认静止系，四动量守恒/质量壳由测试保证。
 - `gen.generateWeighted(n, seed)` 返回 `(events, weights)`。
-- 振幅加权（舍选）将在 P2/P3 通过 `analysis.getIntensity` / `analysis.generateMC`
-  接入；当前版本尚未提供。
+
+### 振幅加权 MC（P2/P3）
+
+在已构造的 `analysis` 上用拟合参数产生满足 |M|² 的样本：
+
+```python
+res = ana.generateMC(
+    10_000, params, seed=42,
+    mode="unweighted",   # 或 "weighted"
+    batch=50_000,        # 每批平坦事例数
+)
+print(res["stats"])
+ana.writeMC(res["events"], "mc.root")   # weighted 时传 weights=res["weights"]
+```
+
+- `unweighted`：平坦相空间 → `I=|M|²` → `u*Imax < I` 舍选，返回等权样本。
+- `weighted`：返回全部平坦事例 + `I` 权重（不做舍选）。
+- `max_weight` 可给 `Imax` 初值；`None` 时用首批 pilot 自适应（抬高时按保存的
+  `u` 精确重判已接受事例）。`max_trials` 限制平坦事例数（安全检查）。
+- `getIntensity(momenta, params)` 是低层原语：`momenta` 为 CPU
+  `float64 [N, n_final, 4]`，返回 CPU `float64 [N]`；归一化任意，只保证相对值。
+- 两者都使用**局部 `AmpCalc`**，不改变拟合状态（调用前后 `getNLL` 不变），
+  GPU / CPU 后端均可用。
 
 ## 大 phsp 低显存模式（`Constraints.free_phsp_amplitudes: true`）
 
@@ -293,8 +319,13 @@ Resonances:
 | `writeResult(params, file)` | save fit results |
 | `DeviceManager` | GPU detection / memory capacity check / precision query |
 | `PhaseSpaceGenerator(config)` | DIYMC: flat n-body phase space (CPU, no data/GPU) |
+| `getIntensity(momenta, params)` | per-event intensity for arbitrary momenta |
+| `generateMC(n, params, ...)` | amplitude-weighted MC (unweighted / weighted) |
+| `writeMC(events, file, weights=None)` | write a DIYMC sample (DAT/ROOT) |
 
-## DIYMC: flat phase-space generation (P1)
+## DIYMC: flat phase space + amplitude-weighted MC
+
+### Flat phase space (P1)
 
 `PhaseSpaceGenerator` only reads `Particles` / `Data.order` / `DecayChains` from
 config; it **does not open data/phsp files and does not need a GPU**:
@@ -311,8 +342,31 @@ gen.write(flat, "flat.dat")                      # or "flat.root"
   not simply all `Generate()` events.
 - Final-state order = `Data.order`; the mother is at rest by default.
 - `gen.generateWeighted(n, seed)` returns `(events, weights)`.
-- Amplitude-weighted generation (accept-reject) will be exposed later through
-  `analysis.getIntensity` / `analysis.generateMC` (P2/P3, not in this version).
+
+### Amplitude-weighted MC (P2/P3)
+
+From an initialized `analysis` and fitted parameters:
+
+```python
+res = ana.generateMC(
+    10_000, params, seed=42,
+    mode="unweighted",   # or "weighted"
+    batch=50_000,        # flat events per batch
+)
+print(res["stats"])
+ana.writeMC(res["events"], "mc.root")   # pass weights=res["weights"] if weighted
+```
+
+- `unweighted`: flat phase space → `I=|M|²` → `u*Imax < I` (equal-weight sample).
+- `weighted`: all flat events plus their `I` weights (no rejection).
+- `max_weight` optionally seeds `Imax`; `None` uses a pilot batch and raises it
+  adaptively, re-checking previously accepted events with the saved `u`.
+  `max_trials` bounds the number of flat events (safety).
+- `getIntensity(momenta, params)` is the low-level primitive: `momenta` is CPU
+  `float64 [N, n_final, 4]`; returns CPU `float64 [N]` (arbitrary normalization,
+  only ratios are meaningful).
+- Both use a **local `AmpCalc`**, so the fit state is untouched (`getNLL` is
+  unchanged before/after); works on both CUDA and CPU backends.
 
 ## Performance (RTX 5060, 500k events)
 

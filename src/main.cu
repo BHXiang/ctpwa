@@ -304,6 +304,36 @@ static void bind_ctpwa(pybind11::module_& m)
         .def("getConstraintsValues", &analysis::getConstraintsValues)
         .def("getAmplitudeNames", &analysis::getAmplitudeNames)
         .def("getNPolarizations", &analysis::getNPolarizations)
+        .def("getIntensity", &analysis::getIntensity,
+             pybind11::arg("momenta"), pybind11::arg("params"),
+             "getIntensity(momenta, params): 任意四动量的逐事件强度 "
+             "Σ_pol |Σ_i A_i v_i|²。momenta 为 CPU float64 [N, n_final, 4] "
+             "(E,px,py,pz)，末态顺序 = Data.order；返回 CPU float64 [N]。"
+             "归一化任意，只保证相对值。")
+        .def("generateMC", &analysis::generateMC,
+             pybind11::arg("n"), pybind11::arg("params"),
+             pybind11::arg("seed") = 0,
+             pybind11::arg("mode") = "unweighted",
+             pybind11::arg("batch") = 100000,
+             pybind11::arg("max_weight") = pybind11::none(),
+             pybind11::arg("max_trials") = pybind11::none(),
+             "generateMC(n, params, seed=0, mode='unweighted', batch=100000, "
+             "max_weight=None, max_trials=None): 用当前模型产生 MC。"
+             "unweighted = 平坦相空间 + |M|² 舍选（等权）；"
+             "weighted = 平坦事例 + I 权重。返回 dict: "
+             "{'events': [N,n_final,4], 'weights': [N] 或空, 'stats': {...}}。")
+        .def("writeMC",
+             [](analysis& a, torch::Tensor events, const std::string& filename,
+                 pybind11::object weights) {
+                 if (weights.is_none())
+                     a.writeMC(events, filename);
+                 else
+                     a.writeMC(events, filename, weights);
+             },
+             pybind11::arg("events"), pybind11::arg("filename"),
+             pybind11::arg("weights") = pybind11::none(),
+             "writeMC(events, filename, weights=None): .dat (E px py pz) 或 "
+             ".root (TTree 'mc'，TLorentzVector 分支)。")
         .def("reCalcAmp", &analysis::reCalcAmp)
         .def("getFreeResParams", &analysis::getFreeResParams)
         .def("isValid", &analysis::isValid);

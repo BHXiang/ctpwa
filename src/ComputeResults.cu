@@ -333,3 +333,75 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
     cublasDestroy(handle);
 }
 
+// ---------------------------------------------------------------------------
+// DIYMC: 逐事件总强度，不分配 result_matrix / partial / interference。
+// 与 computeResults 的 computeModTotalWeight 语义一致：
+//   S[e,p] = Σ_i A[e,p,i] v_i,  out[e] = Σ_p |S[e,p]|²
+// 矩阵布局与 A 表一致：[nEvents*npolar × ngls]，列主序。
+// ---------------------------------------------------------------------------
+void computeTotalIntensity(const ctComplex* d_matrix, const ctComplex* d_vector,
+    double* d_total_result, int nEvents, int ngls, int npolar)
+{
+    if (nEvents <= 0) return;
+    if ((long long)nEvents * (long long)npolar > 2147483647LL)
+        throw std::runtime_error(
+            "computeTotalIntensity: nEvents*npolar exceeds INT_MAX; "
+            "reduce the batch size");
+
+    auto fail = [](const char* what, cudaError_t e) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "computeTotalIntensity: %s 失败: %s", what,
+                 cudaGetErrorString(e));
+        throw std::runtime_error(buf);
+    };
+
+    cublasHandle_t handle = nullptr;
+    if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("computeTotalIntensity: cublasCreate 失败");
+
+    ctComplex* d_complex = nullptr;
+    cudaError_t e = cudaMalloc(&d_complex,
+        (size_t)nEvents * (size_t)npolar * sizeof(ctComplex));
+    if (e != cudaSuccess) {
+        cublasDestroy(handle);
+        fail("complex_result cudaMalloc", e);
+    }
+
+    double* d_sum = nullptr;
+    e = cudaMalloc(&d_sum, sizeof(double));
+    if (e != cudaSuccess) {
+        cudaFree(d_complex);
+        cublasDestroy(handle);
+        fail("sum cudaMalloc", e);
+    }
+    cudaMemset(d_sum, 0, sizeof(double));
+
+    const ctComplex alpha = ctMake(1.0, 0.0);
+    const ctComplex beta = ctMake(0.0, 0.0);
+    cublasStatus_t st = CUBLAS_CGEMV(handle, CUBLAS_OP_T, ngls,
+        nEvents * npolar, &alpha, d_matrix, ngls, d_vector, 1, &beta,
+        d_complex, 1);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        cudaFree(d_sum);
+        cudaFree(d_complex);
+        cublasDestroy(handle);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "computeTotalIntensity: CUBLAS_CGEMV 失败 (cublas err %d)",
+                 (int)st);
+        throw std::runtime_error(buf);
+    }
+
+    const int blockSize = 128;
+    const int gridSize = (nEvents + blockSize - 1) / blockSize;
+    CTPWA_LAUNCH(computeModTotalWeight, gridSize, blockSize, 0,
+        d_complex, d_total_result, d_sum, nEvents, npolar);
+    cudaDeviceSynchronize();
+    e = cudaGetLastError();
+
+    cudaFree(d_sum);
+    cudaFree(d_complex);
+    cublasDestroy(handle);
+    if (e != cudaSuccess) fail("computeModTotalWeight", e);
+}
+

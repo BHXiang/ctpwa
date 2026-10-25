@@ -33,6 +33,12 @@ void computeResults(const ctComplex *d_matrix, const ctComplex *d_vector,
                     int *d_nSLvectors, int npartials, int nEvents, int ngls,
                     int npolar);
 
+// 只算逐事件总强度 Σ_pol |Σ_i A_{e,p,i} v_i|²：cgemv + computeModTotalWeight，
+// 不物化 partial/干涉矩阵（DIYMC 的振幅加权舍选用）。
+void computeTotalIntensity(const ctComplex *d_matrix, const ctComplex *d_vector,
+                           double *d_total_result, int nEvents, int ngls,
+                           int npolar);
+
 // void computeInterference(
 //     const ctComplex *d_M,          // 矩阵 M [ngls][nEvents*npolar]
 //     const ctComplex *d_v,          // 参数向量 v [ngls]

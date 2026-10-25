@@ -45,6 +45,7 @@ static inline bool ctpwa_on_primary(const torch::Tensor& t, int primary)
 // #include <ComputeGrad.cuh>
 #include <ComputeNLL.cuh>
 #include <ComputeResults.cuh>
+#include <PhaseSpace.cuh>
 #include <Config.cuh>
 #include <Figure.cuh>
 #include <ComputeHessian.cuh>
@@ -4919,6 +4920,376 @@ public:
             params.device().index());
     }
 
+    // ---- DIYMC: 任意四动量的逐事件强度 Σ_pol |Σ_i A_i v_i|² ----
+    //
+    // momenta: CPU float64 [N, n_final, 4] (E, px, py, pz)，末态顺序 = Data.order。
+    // params:  当前后端设备上的统一参数 [Re(v), Im(v), θ]（与 getNLL 同布局）。
+    //
+    // 内部用局部 AmpCalc（不污染拟合用的 amp_calc_）：临时替换
+    // events_offsets_/amp_offsets_ → calculateAmplitudes → reComputeAmps(θ)
+    // → computeTotalIntensity → 释放 + 恢复。返回 CPU float64 [N]。
+    // 归一化任意（只保证相对值），供舍选/诊断使用。
+    torch::Tensor getIntensity(torch::Tensor momenta, torch::Tensor params)
+    {
+        TORCH_CHECK(initialized_, "analysis not initialized");
+        TORCH_CHECK(momenta.defined() && momenta.dim() == 3 &&
+                momenta.size(2) == 4,
+            "getIntensity: momenta must have shape [N, n_final, 4] "
+            "(E, px, py, pz)");
+        TORCH_CHECK(momenta.scalar_type() == torch::kFloat64,
+            "getIntensity: momenta must be float64");
+        TORCH_CHECK(momenta.device().is_cpu(),
+            "getIntensity: momenta must be a CPU tensor");
+        TORCH_CHECK(ctpwa_is_cuda_like(params),
+            "getIntensity: params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
+        TORCH_CHECK(params.dtype() == torch::kFloat64 && params.dim() == 1,
+            "getIntensity: params must be 1-D float64");
+        TORCH_CHECK(ctpwa_on_primary(params, primary_dev_),
+            "getIntensity: params 必须位于主设备 (primary=" +
+                std::to_string(primary_dev_) + ")");
+        TORCH_CHECK(params.numel() == getNParams(),
+            "getIntensity: params size mismatch: got ", params.numel(),
+            ", expected ", getNParams());
+
+        const auto& data_order = config_parser_.getDataOrder();
+        TORCH_CHECK(momenta.size(1) == static_cast<int64_t>(data_order.size()),
+            "getIntensity: momenta final-state count ", momenta.size(1),
+            " != Data.order size ", data_order.size());
+
+        const int64_t N = momenta.size(0);
+        auto opts = torch::TensorOptions().dtype(torch::kFloat64);
+        if (N == 0) return torch::empty({ 0 }, opts);
+
+        auto mom = momenta.contiguous();
+        auto acc = mom.accessor<double, 3>();
+
+        // N < n_gpus 时只启用前 N 个 GPU；每个启用 GPU 至少 1 个事例。
+        const int n_gpu = static_cast<int>(
+            std::min<int64_t>(static_cast<int64_t>(n_gpus_), N));
+        std::vector<int> counts(static_cast<size_t>(n_gpu), 0);
+        const int base = static_cast<int>(N / n_gpu);
+        const int rem = static_cast<int>(N % n_gpu);
+        for (int g = 0; g < n_gpu; ++g) counts[g] = base + (g < rem ? 1 : 0);
+
+        std::vector<std::map<std::string, std::vector<LorentzVector>>>
+            Vp4(static_cast<size_t>(n_gpu));
+        int ev_off = 0;
+        for (int g = 0; g < n_gpu; ++g) {
+            const int ng = counts[g];
+            for (size_t a = 0; a < data_order.size(); ++a) {
+                auto& v = Vp4[g][data_order[a]];
+                v.resize(static_cast<size_t>(ng));
+                for (int e = 0; e < ng; ++e) {
+                    const int64_t i = ev_off + e;
+                    v[e] = LorentzVector(acc[i][a][0], acc[i][a][1],
+                        acc[i][a][2], acc[i][a][3]);
+                }
+            }
+            ev_off += ng;
+        }
+
+        auto saved_ev = events_offsets_;
+        auto saved_amp = amp_offsets_;
+
+        AmpCalc tmp;
+        std::vector<ctComplex*> amps;
+        std::vector<ctComplex*> upcast;
+        std::vector<ctComplex*> d_vec(static_cast<size_t>(n_gpu), nullptr);
+        std::vector<double*> d_out(static_cast<size_t>(n_gpu), nullptr);
+        std::vector<torch::Tensor> v_hold;
+        bool released = false;
+
+        auto cleanup = [&]() {
+            for (int g = 0; g < static_cast<int>(upcast.size()); ++g)
+                if (upcast[g]) { cudaSetDevice(g); cudaFree(upcast[g]); }
+            upcast.clear();
+            for (int g = 0; g < static_cast<int>(amps.size()); ++g)
+                if (amps[g]) { cudaSetDevice(g); cudaFree(amps[g]); }
+            amps.clear();
+            for (int g = 0; g < static_cast<int>(d_out.size()); ++g)
+                if (d_out[g]) { cudaSetDevice(g); cudaFree(d_out[g]); }
+            d_out.clear();
+            d_vec.clear();
+            if (!released) {
+                tmp.release();
+                released = true;
+            }
+            events_offsets_ = saved_ev;
+            amp_offsets_ = saved_amp;
+            cudaSetDevice(primary_dev_);
+        };
+
+        try {
+            events_offsets_.assign(static_cast<size_t>(n_gpu),
+                std::vector<int>{});
+            amp_offsets_.assign(static_cast<size_t>(n_gpu),
+                std::vector<int>{});
+            for (int g = 0; g < n_gpu; ++g) {
+                events_offsets_[g] = { 0, counts[g] };
+                amp_offsets_[g] = { 0, counts[g] * n_polar_ * n_amplitudes_ };
+            }
+
+            // 临时 AmpCalc 必须与 analysis 的存储档位一致：calculateAmplitudes
+            // 按 float_amps_ 分配 A 表，reComputeAmps 按 tmp.float_out_/dF_float_
+            // 选择写入布局；不一致会把 double 写进 float2 表（实测全 NaN）。
+            tmp.setFloatOutput(float_amps_);
+            tmp.setDFloat(prec_mode_ == PrecMode::Float);
+
+            amps = calculateAmplitudes(Vp4, &tmp, n_gpu);
+            TORCH_CHECK(static_cast<int>(amps.size()) == n_gpu,
+                "getIntensity: calculateAmplitudes returned ", amps.size(),
+                " amplitude tables, expected ", n_gpu);
+
+            torch::Tensor vector, theta;
+            std::tie(vector, theta) = params_.splitParams(params);
+            torch::Tensor v_ext = freeParamsToAmplitudes(vector);
+            TORCH_CHECK(v_ext.numel() == n_amplitudes_,
+                "getIntensity: extended vector size ", v_ext.numel(),
+                " != n_amplitudes ", n_amplitudes_);
+            TORCH_CHECK(theta.numel() == tmp.nFreeResParams(),
+                "getIntensity: theta size ", theta.numel(),
+                " != free resonance params ", tmp.nFreeResParams());
+            if (tmp.nFreeResParams() > 0) {
+                tmp.reComputeAmps(amps, theta.data_ptr<double>(),
+                    n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
+                    primary_dev_);
+            }
+
+            v_hold.reserve(static_cast<size_t>(n_gpu));
+            for (int g = 0; g < n_gpu; ++g) {
+                v_hold.push_back(v_ext.to(ctpwa_dev(g)));
+                d_vec[g] =
+                    reinterpret_cast<ctComplex*>(v_hold.back().data_ptr());
+            }
+
+            for (int g = 0; g < n_gpu; ++g) {
+                cudaSetDevice(g);
+                ctComplex* a = amps[g];
+                if (float_amps_ && a) {
+                    const size_t n_el = static_cast<size_t>(counts[g]) *
+                        static_cast<size_t>(n_polar_) *
+                        static_cast<size_t>(n_amplitudes_);
+                    ctComplex* dbl = upcastAmpSegToDouble(a, n_el);
+                    upcast.push_back(dbl);
+                    a = dbl;
+                }
+                cudaError_t e = cudaMalloc(&d_out[g],
+                    static_cast<size_t>(counts[g]) * sizeof(double));
+                TORCH_CHECK(e == cudaSuccess,
+                    "getIntensity: cudaMalloc(out) 失败: ",
+                    cudaGetErrorString(e));
+                computeTotalIntensity(a, d_vec[g], d_out[g], counts[g],
+                    n_amplitudes_, n_polar_);
+            }
+
+            torch::Tensor out = torch::empty({ N }, opts);
+            double* host = out.data_ptr<double>();
+            int off = 0;
+            for (int g = 0; g < n_gpu; ++g) {
+                cudaSetDevice(g);
+                cudaError_t e = cudaMemcpy(host + off, d_out[g],
+                    static_cast<size_t>(counts[g]) * sizeof(double),
+                    cudaMemcpyDeviceToHost);
+                TORCH_CHECK(e == cudaSuccess,
+                    "getIntensity: cudaMemcpy(D2H) 失败: ",
+                    cudaGetErrorString(e));
+                off += counts[g];
+            }
+            cleanup();
+            return out;
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+    }
+
+    // ---- DIYMC: 用当前模型参数产生振幅加权 MC ----
+    //
+    // mode="unweighted": 平坦相空间 → I=getIntensity → u*Imax < I 舍选；
+    //                    返回等权事件。
+    // mode="weighted":   返回全部平坦事例 + I 权重（不做舍选）。
+    // batch: 每次产生/计算的平坦事例数；max_weight=None 时用首批 pilot 自适应；
+    // max_trials: 平坦事例数上限（None=不设）。
+    // 返回 {"events": [N,n_final,4], "weights": [N] 或空, "stats": {...}}。
+    pybind11::dict generateMC(int64_t n, torch::Tensor params,
+        uint64_t seed = 0, std::string mode = "unweighted",
+        int64_t batch = 100000, pybind11::object max_weight = pybind11::none(),
+        pybind11::object max_trials = pybind11::none())
+    {
+        TORCH_CHECK(initialized_, "generateMC: analysis not initialized");
+        TORCH_CHECK(n > 0, "generateMC: n must be positive");
+        TORCH_CHECK(ctpwa_is_cuda_like(params),
+            "generateMC: params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
+        TORCH_CHECK(params.dtype() == torch::kFloat64 && params.dim() == 1,
+            "generateMC: params must be 1-D float64");
+        TORCH_CHECK(params.numel() == getNParams(),
+            "generateMC: params size mismatch: got ", params.numel(),
+            ", expected ", getNParams());
+        TORCH_CHECK(mode == "unweighted" || mode == "weighted",
+            "generateMC: mode must be 'unweighted' or 'weighted'");
+        if (batch < 1) batch = 1;
+
+        const bool weighted = (mode == "weighted");
+        auto opts = torch::TensorOptions().dtype(torch::kFloat64);
+
+        PhaseSpaceGenerator ps(config_parser_);
+        std::vector<torch::Tensor> ev_chunks, u_chunks, i_chunks;
+        int64_t total_flat = 0;
+        int64_t total_genbod = 0;
+        int64_t accepted_total = 0;
+        bool truncated = false;
+
+        bool have_max = !max_weight.is_none();
+        double Imax = have_max ? max_weight.cast<double>() : 0.0;
+        TORCH_CHECK(!have_max || (Imax > 0.0 && std::isfinite(Imax)),
+            "generateMC: max_weight must be positive and finite");
+
+        const int64_t max_trials_val =
+            max_trials.is_none() ? -1 : max_trials.cast<int64_t>();
+
+        std::mt19937_64 urng(seed ^ 0xD1B54A32D192ED03ULL);
+        std::uniform_real_distribution<double> unif(0.0, 1.0);
+
+        int64_t iter = 0;
+        while (true) {
+            int64_t want = batch;
+            if (max_trials_val >= 0) {
+                const int64_t left = max_trials_val - total_flat;
+                if (left <= 0) {
+                    truncated = true;
+                    break;
+                }
+                want = std::min(want, left);
+            }
+            if (weighted) want = std::min(want, n - total_flat);
+            if (want <= 0) {
+                truncated = true;
+                break;
+            }
+
+            const uint64_t batch_seed =
+                seed + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(iter + 1);
+            torch::Tensor flat = ps.generate(want, batch_seed);
+            total_genbod += ps.lastTrials();
+            torch::Tensor I = getIntensity(flat, params);
+            total_flat += flat.size(0);
+
+            if (weighted) {
+                TORCH_CHECK(torch::isfinite(I).all().item<bool>(),
+                    "generateMC: non-finite intensity in weighted mode "
+                    "(check params/model)");
+                ev_chunks.push_back(flat);
+                i_chunks.push_back(I);
+                if (total_flat >= n) break;
+                if (max_trials_val >= 0 && total_flat >= max_trials_val) {
+                    truncated = true;
+                    break;
+                }
+                ++iter;
+                continue;
+            }
+
+            const double bmax = I.max().item<double>();
+            TORCH_CHECK(std::isfinite(bmax) && bmax > 0.0,
+                "generateMC: all/部分 intensity 非有限或为零 "
+                "(bmax=", bmax, "); 检查 params/模型");
+            if (!have_max || bmax * 1.05 > Imax) {
+                const double new_max = std::max(bmax * 1.05, 1e-300);
+                if (have_max && new_max > Imax) {
+                    // Imax 抬高后，已接受事例按保存的 u 精确重判：
+                    // 最终判据统一为 u*Imax_final < I，样本无偏。
+                    for (size_t c = 0; c < ev_chunks.size(); ++c) {
+                        auto keep = (u_chunks[c] * new_max < i_chunks[c]);
+                        ev_chunks[c] = ev_chunks[c].index({ keep });
+                        u_chunks[c] = u_chunks[c].index({ keep });
+                        i_chunks[c] = i_chunks[c].index({ keep });
+                    }
+                    accepted_total = 0;
+                    for (const auto& t : ev_chunks) accepted_total += t.size(0);
+                }
+                Imax = new_max;
+                have_max = true;
+            }
+
+            std::vector<double> u(static_cast<size_t>(want));
+            for (auto& x : u) x = unif(urng);
+            torch::Tensor u_t =
+                torch::from_blob(u.data(), { want }, opts).clone();
+            auto keep = (u_t * Imax < I);
+            torch::Tensor ev_keep = flat.index({ keep });
+            ev_chunks.push_back(ev_keep);
+            u_chunks.push_back(u_t.index({ keep }));
+            i_chunks.push_back(I.index({ keep }));
+            accepted_total += ev_keep.size(0);
+
+            if (accepted_total >= n) break;
+            if (max_trials_val >= 0 && total_flat >= max_trials_val) {
+                truncated = true;
+                break;
+            }
+            ++iter;
+        }
+
+        torch::Tensor events, weights;
+        const int64_t nf = ps.nFinal();
+        if (ev_chunks.empty()) {
+            events = torch::empty({ 0, nf, 4 }, opts);
+            weights = torch::empty({ 0 }, opts);
+        } else if (weighted) {
+            events = torch::cat(ev_chunks, 0);
+            weights = torch::cat(i_chunks, 0);
+            if (events.size(0) > n) {
+                events = events.narrow(0, 0, n);
+                weights = weights.narrow(0, 0, n);
+            }
+        } else {
+            events = torch::cat(ev_chunks, 0);
+            if (events.size(0) > n) events = events.narrow(0, 0, n);
+            weights = torch::empty({ 0 }, opts);
+        }
+
+        double max_w = Imax;
+        if (weighted && weights.numel() > 0)
+            max_w = weights.max().item<double>();
+
+        pybind11::dict stats;
+        stats["mode"] = mode;
+        stats["n_requested"] = n;
+        stats["n_events"] = events.size(0);
+        stats["n_flat"] = total_flat;
+        stats["n_genbod_trials"] = total_genbod;
+        stats["n_accepted"] = events.size(0);
+        stats["acceptance"] = total_flat > 0
+            ? static_cast<double>(events.size(0)) /
+                static_cast<double>(total_flat)
+            : 0.0;
+        stats["flat_acceptance"] = total_genbod > 0
+            ? static_cast<double>(total_flat) /
+                static_cast<double>(total_genbod)
+            : 0.0;
+        stats["max_weight"] = max_w;
+        stats["truncated"] = truncated;
+        stats["seed"] = seed;
+
+        pybind11::dict out;
+        out["events"] = events;
+        out["weights"] = weights;
+        out["stats"] = stats;
+        return out;
+    }
+
+    // 把 generateMC 的结果写成 DAT/ROOT（末态顺序 = Data.order；ROOT 分支 =
+    // 粒子名，与 readMomentaFromDat 的约定一致）。weights 为空 = unweighted。
+    void writeMC(torch::Tensor events, const std::string& filename,
+        pybind11::object weights = pybind11::none()) const
+    {
+        PhaseSpaceGenerator ps(config_parser_);
+        if (weights.is_none())
+            ps.write(events, filename);
+        else
+            ps.write(events, filename, weights.cast<torch::Tensor>());
+    }
+
     torch::Tensor getFreeResParams() const
     {
         const auto& slots = amp_calc_.slots();
@@ -5982,11 +6353,18 @@ private:
         }
     }
 
-    std::vector<ctComplex*> calculateAmplitudes(const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4, AmpCalc* amp_calc = nullptr) const
+    std::vector<ctComplex*> calculateAmplitudes(
+        const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4,
+        AmpCalc* amp_calc = nullptr, int n_gpus_used = -1) const
     {
+        // n_gpus_used < 0 = 现有行为（全部 GPU）；getIntensity 在 N < n_gpus_ 时
+        // 只启用前 N 个 GPU，避免空分片让 computeSLAmps 解引用空 map。
+        const int n_gpu_eff = (n_gpus_used > 0)
+            ? std::min(n_gpus_used, n_gpus_) : n_gpus_;
+
         // 多GPU支持：为每个GPU分配振幅内存
         // int num_gpus = events_.size();
-        std::vector<ctComplex*> d_all_amplitudes_vec(n_gpus_, nullptr);
+        std::vector<ctComplex*> d_all_amplitudes_vec(n_gpu_eff, nullptr);
 
         // 计算每个GPU的总事件数
         // std::vector<int> nEvents_per_gpu(n_gpus_, 0);
@@ -5999,7 +6377,7 @@ private:
         // 为每个GPU分配设备内存（float_amps_: A 存 float2 → 字节减半；元素偏移
         // amp_offsets 语义不变，消费端按 float2* reinterpret 读取）
         size_t amp_elem_bytes = float_amps_ ? sizeof(float2) : sizeof(ctComplex);
-        for (int gpu = 0; gpu < n_gpus_; ++gpu) {
+        for (int gpu = 0; gpu < n_gpu_eff; ++gpu) {
             if (amp_offsets_[gpu].back() > 0) {
                 cudaSetDevice(gpu);
                 cudaMalloc(&d_all_amplitudes_vec[gpu], amp_offsets_[gpu].back() * amp_elem_bytes);

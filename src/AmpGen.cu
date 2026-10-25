@@ -2129,6 +2129,102 @@ AmpCalc::~AmpCalc()
     // cas_list_ 由 shared_ptr 自动释放
 }
 
+void AmpCalc::release()
+{
+    // 显式释放所有持久化缓冲。与析构函数不同：这里只应在进程仍持有有效
+    // CUDA/CPU 后端上下文时调用（DIYMC 每批强度计算结束后）。
+    int saved_dev = 0;
+    cudaGetDevice(&saved_dev);
+
+    auto bump = [](int& n, size_t v) {
+        if (static_cast<int>(v) > n) n = static_cast<int>(v);
+    };
+
+    for (auto& b : blocks_) {
+        int ng = 0;
+        bump(ng, b.d_resonances.size());
+        bump(ng, b.d_all_params.size());
+        bump(ng, b.d_all_channels.size());
+        bump(ng, b.d_T.size());
+        bump(ng, b.d_dF.size());
+        bump(ng, b.d_res_idx_.size());
+        bump(ng, b.d_param_idx_.size());
+        bump(ng, b.d_global_offset_.size());
+        bump(ng, b.d_param_map_.size());
+        bump(ng, b.d_global_idx_.size());
+        bump(ng, b.jit.grad_buf.size());
+        bump(ng, b.jit.full_buf.size());
+        bump(ng, b.jit.grad_slice.size());
+        bump(ng, b.jit.res_off_dev.size());
+
+        for (int g = 0; g < ng; ++g) {
+            cudaSetDevice(g);
+            auto free_at = [g](auto& vec) {
+                if (g < static_cast<int>(vec.size()) && vec[g]) {
+                    cudaFree(vec[g]);
+                    vec[g] = nullptr;
+                }
+            };
+            free_at(b.d_resonances);
+            free_at(b.d_all_params);
+            free_at(b.d_all_channels);
+            free_at(b.d_T);
+            free_at(b.d_dF);
+            free_at(b.d_res_idx_);
+            free_at(b.d_param_idx_);
+            free_at(b.d_global_offset_);
+            free_at(b.d_param_map_);
+            free_at(b.d_global_idx_);
+            free_at(b.jit.grad_buf);
+            free_at(b.jit.full_buf);
+            free_at(b.jit.grad_slice);
+            free_at(b.jit.res_off_dev);
+        }
+        b.jit = JitBlockState{};
+    }
+
+    auto free_double_vec = [](std::vector<double*>& v) {
+        for (size_t g = 0; g < v.size(); ++g) {
+            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+        }
+        v.clear();
+    };
+    auto free_int_vec = [](std::vector<int*>& v) {
+        for (size_t g = 0; g < v.size(); ++g) {
+            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+        }
+        v.clear();
+    };
+    auto free_ad_vec = [](std::vector<ADBlockDesc*>& v) {
+        for (size_t g = 0; g < v.size(); ++g) {
+            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+        }
+        v.clear();
+    };
+
+    free_double_vec(d_params_per_gpu_);
+    free_double_vec(d_grad_per_gpu_);
+    free_int_vec(d_ev_off_cache_);
+    free_int_vec(d_amp_off_cache_);
+    free_ad_vec(d_ad_desc_);
+    d_ad_desc_cap_ = 0;
+
+    cached_ev_off_.clear();
+    cached_amp_off_.clear();
+    blocks_.clear();
+    slots_.clear();
+    h_templates_.clear();
+    h_param_templates_.clear();
+    h_channel_templates_.clear();
+    conjugate_broadcast_.clear();
+    var_equal_ghosts_.clear();
+    resonance_owners_.clear();
+    // cas_list_ 由 shared_ptr 自动释放（AmpCasDecay 析构会 free SL/momenta 表）
+    cas_list_.clear();
+
+    cudaSetDevice(saved_dev);
+}
+
 // 辅助：根据 free_indices 将自由参数的 params[] 下标展开
 // free_indices: {-1}=全扫, {0,1}=扫params[0]和[1], 空=不拟合
 static std::vector<int> expandFreeIndices(
