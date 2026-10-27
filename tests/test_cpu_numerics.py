@@ -130,3 +130,41 @@ def test_hessian_eigenvalues_real(make_analysis):
     w = torch.linalg.eigvalsh(H)
     assert w.numel() == H.shape[0]
     assert np.isfinite(w.numpy()).all()
+
+
+def test_bkg_sign_in_coupling_hessian(tmp_path):
+    """回归：bkg 在耦合变换二阶项里的符号。
+
+    旧 `getHessian` 对 bkg 无条件 `axpy(-1)`：有 `bkg_weights` 时
+    `d_neg_w=-w` 已翻一次符号，再乘 -1 → `Σ g_v·∂²v` 的 bkg 项整体反号；
+    无权重时 kernel 用单位正权重，-1 反而正确。
+    无 bkg 或 bkg 很小时 FD 测试看不出来；把 bkg 权重放大到 20 后，
+    hess_mult（3 因子振幅 + 耦合变换）旧代码解析 Hessian 与 FD 的
+    最大相对差 ~1.3，新代码 <1e-2。
+    """
+    import ctpwa
+    import fd_utils
+    from conftest import CONFIGS_DIR
+
+    data_dir = CONFIGS_DIR.parent / "data"
+    src = (CONFIGS_DIR / "hess_mult.yml").read_text()
+    for name in ("test_4body_data.dat", "test_4body_phsp.dat",
+                 "test_4body_sideband.dat"):
+        src = src.replace(f'"./data/{name}"', f'"{data_dir / name}"')
+
+    # 300 个 bkg 事例（1200 行 / 4 粒子），权重 20 → bkg 项与 data 同量级
+    wpath = tmp_path / "bkgw.dat"
+    wpath.write_text("\n".join(["20.0"] * 300) + "\n")
+    bkg_line = f'  bkg:  [dat, "{data_dir / "test_4body_sideband.dat"}"]'
+    assert bkg_line in src
+    src = src.replace(bkg_line, bkg_line + f'\n  bkg_weights: [dat, "{wpath}"]')
+
+    cfg = tmp_path / "hess_mult_bkgw.yml"
+    cfg.write_text(src)
+    ana = ctpwa.analysis(str(cfg))
+    p = make_params(ana, CPU)
+    H, idxs = fd_utils.analysis_hessian_block(ana, p)
+    rep = fd_utils.compare_hessian(
+        H, fd_utils.analysis_grad_fn(ana), p, idxs,
+        h_judge=1e-3, rtol=0.05)
+    assert rep.verdict != "FAIL", rep.summary()

@@ -4071,7 +4071,15 @@ public:
                     double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
                     cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
                     int grid = (2 * na + 255) / 256;
-                    CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, -1.0, 2 * na);  // subtract: loss = data - bkg
+                    // bkg 的 g_v 符号分两种情况（很容易翻错）:
+                    //  * 有 bkg_weights: d_neg_w = -w，computeFactorNLL 对权重
+                    //    线性 → 已翻一次；这里 +1。
+                    //  * 无 bkg_weights: d_neg_w=nullptr，kernel 用单位正权重 →
+                    //    没翻；这里 -1（loss = data - bkg）。
+                    // 旧代码无条件 -1：无权重时正确，带权重时把二阶项
+                    // Σ g_v·∂²v 的 bkg 贡献加反（J/psi→ωηη' 69 振幅案例）。
+                    const double bkg_axpy = (d_neg_w != nullptr) ? 1.0 : -1.0;
+                    CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, bkg_axpy, 2 * na);
                     cudaFree(d_tmp); cudaFree(d_g_gpu);
                 }
 
