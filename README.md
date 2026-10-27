@@ -141,6 +141,59 @@ Resonances:
 | `generateMC(n, params, ...)` | 振幅加权 MC：unweighted 舍选 / weighted |
 | `writeMC(events, file, weights=None)` | 写 DIYMC 样本（DAT/ROOT） |
 
+### Hessian 正定性与盒约束（重要）
+
+`getHessian` 返回的是**无约束** NLL 的精确 Hessian，布局
+`[Re(p), Im(p), θ]`。其中固定参考耦合 `Re_0=1` / `Im_0=0` 对应两行、两列
+恒为 0（规范方向），求特征值前必须剔除，否则 `eigvalsh(...).min()` 必然
+看到零/负的数值噪声。
+
+拟合参数带 `free_range` / `v_max` 时，最优点可能落在边界上。此时沿
+**朝外方向** Hessian 为负是正常的边界效应，不代表拟合点不是约束极小。
+正确判据（KKT 二阶条件）是：先剔除"贴边且梯度朝外"的活跃参数，再在
+**可行子空间**判正定。
+
+```python
+from ctpwa.diagnostics import analyze_hessian
+
+rep = analyze_hessian(H, params, grad, lower, upper, fixed_mask)
+print(rep.summary(param_names))
+rep.reduced_pd        # ← 应该看的那个（可行子空间）
+rep.free_pd           # 旧口径（含贴边参数，会假报警）
+rep.active_idx        # 被边界钉住的参数
+```
+
+`example/fit.py` 已按这套判据输出 `is_positive_definite`（可行子空间）
+与 `is_positive_definite_full`（旧口径），并列出 `active_params`。
+对 `J/ψ→K⁺K⁻η` 这类单 LS 过程，`getHessian` 本身是精确的：随机点/真极小点
+的解析-FD 一致性由 `tests/test_cpu_numerics.py` / `tests/test_numerical.py`
+覆盖；本次还在生产拟合点上沿最负的 5 个特征方向做了二阶差分校验
+（相对差 < 0.5%）。多 LS + 大 bkg 的符号 bug 见下。
+
+**DIYMC 闭包注意**：phsp 样本必须能分辨最窄的共振。实测 4.5 MeV 宽的
+φ(1020) + 仅 10k phsp 时，toy 真值不是 NLL 极小（拟合把宽度推到边界），
+真值处 Hessian 出现负本征值；同一 toy 数据只把 phsp 增到 200k，BFGS 极小
+（ΔNLL=4.3）处 H 已正定、θ 回到真值。这是归一化 MC 的统计分辨率不足，
+不是 getHessian 写错。
+
+**多 LS + 大 bkg 的专门回归**：`J/ψ→ωηη′`（9 链、69 振幅、21 耦合，
+3074 bkg / 2024 data）在旧版上 H 有 9 个负本征值（λmin=-533），FD 却是
+PSD。根因是 `getHessian` 耦合变换二阶项里 bkg 的 `g_v` 被翻了两次符号
+（有权重时 `d_neg_w` 一次 + `axpy(-1)` 一次；无权重时 kernel 用单位正权重），
+已在 `src/Analysis.cu` 按是否有 `bkg_weights` 选择 `axpy(+1/-1)`。修复后 H 与 FD 逐元一致（max rel 0.48%），λmin=+0.002，
+0 个负本征值。回归见
+`tests/test_cpu_numerics.py::test_bkg_sign_in_coupling_hessian`（把
+`hess_mult` 的 bkg 权重放大到 20；旧版 FAIL max_rel=1.28，新版 PASS
+max_rel=9e-3）。GPU（RTX 5060）复测：该过程 H 从 9 个负本征值变为 0，
+λmin=+0.00244，FD 0 负；全量 `pytest tests/` 为 **208 passed, 50 skipped,
+1 xfailed**。**有 bkg_weights 的用户需要重新编译 `_cuda.so` / `_cpu.so`：**
+
+```bash
+MAX_JOBS=1 CTPWA_BACKEND=cuda python3 setup.py build_ext --inplace
+MAX_JOBS=4 CTPWA_BACKEND=cpu  python3 setup.py build_ext --inplace
+```
+
+
 ## DIYMC：平坦相空间 + 振幅加权 MC
 
 ### 平坦相空间（P1）
@@ -322,6 +375,44 @@ Resonances:
 | `getIntensity(momenta, params)` | per-event intensity for arbitrary momenta |
 | `generateMC(n, params, ...)` | amplitude-weighted MC (unweighted / weighted) |
 | `writeMC(events, file, weights=None)` | write a DIYMC sample (DAT/ROOT) |
+
+### Hessian positive-definiteness with box constraints (important)
+
+`getHessian` is the **unconstrained** NLL Hessian in layout
+`[Re(p), Im(p), θ]`. The fixed reference couplings `Re_0=1` / `Im_0=0`
+give two exactly-zero rows/columns (gauge directions); drop them before
+calling `eigvalsh`, or numerical zeros will look like "not PD".
+
+When parameters have `free_range` / `v_max`, the optimum may sit on a
+bound. Negative curvature along the **outward** direction is then a
+boundary effect, not an unstable fit. The correct test (KKT second-order
+condition) removes "at bound AND gradient points outward" parameters and
+checks the **feasible subspace**:
+
+```python
+from ctpwa.diagnostics import analyze_hessian
+
+rep = analyze_hessian(H, params, grad, lower, upper, fixed_mask)
+print(rep.summary(param_names))
+rep.reduced_pd        # <- the meaningful one
+rep.free_pd           # legacy check (includes bound-active params)
+rep.active_idx        # parameters pinned by bounds
+```
+
+`example/fit.py` now reports `is_positive_definite` (feasible subspace)
+and `is_positive_definite_full` (legacy), plus `active_params`.
+For single-LS processes such as J/psi→K+K-eta, `getHessian` is exact:
+analytic-vs-FD agreement at random points and true minima is covered by
+`tests/test_cpu_numerics.py` / `tests/test_numerical.py`; we additionally
+checked the five most negative eigen-directions at a production fit point
+(relative difference < 0.5%). The multi-LS + large-bkg sign bug is below.
+
+**DIYMC closure caveat**: the phsp sample must resolve the narrowest
+resonance. With a 4.5 MeV φ(1020) and only 10k phsp events, the toy truth
+was not the NLL minimum (the fit pushed widths to the bounds) and the
+truth-point Hessian had negative eigenvalues; using the same toy data
+with 200k phsp, the BFGS minimum (ΔNLL=4.3) had a PD Hessian and θ back
+at truth. That is MC normalization resolution, not a `getHessian` bug.
 
 ## DIYMC: flat phase space + amplitude-weighted MC
 

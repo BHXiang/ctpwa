@@ -6,6 +6,7 @@ import sys
 import argparse
 import logging
 import ctpwa
+from ctpwa.diagnostics import analyze_hessian, map_errors_to_params
 
 log = logging.getLogger("pwa-fit")
 
@@ -893,6 +894,15 @@ class UnifiedPWAOptimizer:
 
         final_params = params.clone().detach()
 
+        # ---- 终态 NLL/梯度：以 final_params 为准 ----
+        # reparam 的 nll_history[-1] 是最后一次 closure 的值，可能早于 optimizer
+        # 真正落地的最后一步；报告/正定性必须用同一个点。梯度还用于判断
+        # "贴边参数是否真的被边界钉住"（活跃集）。
+        q_eval = final_params.clone().requires_grad_(True)
+        nll_final_t = self.analysis.getNLL(q_eval)
+        grad_final = torch.autograd.grad(nll_final_t, q_eval)[0].detach()
+        final_nll = float(nll_final_t.item())
+
         # Hessian
         hessian_start = time.time()
         hessian_full = self.analysis.getHessian(final_params)
@@ -901,53 +911,46 @@ class UnifiedPWAOptimizer:
         # 播种缓存: 同一最佳点后续要 Hessian（正定性/误差/分支比）直接复用
         self._hess_cache = (final_params.clone(), hessian_full)
 
-        # 去除固定参数 (index 0 和 n_coupling_free)
+        # 去除固定参数 (index 0 和 n_coupling_free) —— 仅用于兼容旧字段
         fixed_mask = torch.ones(self.n_params, dtype=torch.bool, device=self.device)
         fixed_mask[0] = False
         fixed_mask[self.n_coupling_free] = False
         hessian = hessian_full[fixed_mask][:, fixed_mask]
 
-        # 特征值分析
+        # 正定性: 在"非固定 + 非活跃边界"的可行子空间上判（KKT 二阶条件）。
+        # 旧代码对全自由块直接 all(eig>0)：贴边参数的朝外负曲率/零曲率会让
+        # 一个合法的约束极小被误报成"不定"。
         try:
-            eigenvalues = torch.linalg.eigvalsh(hessian)
-            # print("Hessian特征值：", eigenvalues)
-            is_pos_def = bool(torch.all(eigenvalues > 0).item())
-            min_eig = eigenvalues[0].item()
-            max_eig = eigenvalues[-1].item()
-            cond_num = max_eig / min_eig if min_eig > 0 else float("inf")
-        except Exception:
-            is_pos_def = False
-            min_eig = max_eig = cond_num = float("nan")
+            report, _, _ = self._hessian_diagnosis(
+                final_params, hessian_full, grad=grad_final, nll=final_nll)
+            fields = self._hessian_fields(report)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"Hessian 子空间诊断失败: {e}")
+            report = None
+            fields = {
+                "is_positive_definite": False,
+                "is_positive_definite_full": False,
+                "min_eigenvalue": float("nan"),
+                "max_eigenvalue": float("nan"),
+                "condition_number": float("inf"),
+                "full_min_eigenvalue": float("nan"),
+                "full_max_eigenvalue": float("nan"),
+                "n_negative_reduced": 0,
+                "n_negative_full": 0,
+                "n_active": 0,
+                "active_params": [],
+                "kkt_grad_max": float("nan"),
+                "kkt_ok": False,
+            }
+        is_pos_def = bool(fields["is_positive_definite"])
 
-        # 参数误差
+        # 参数误差：只在可行子空间求逆；grouped [Re..., Im..., θ] 映射回参数名
         coupling_real_errors = None
         coupling_imag_errors = None
         res_errors = None
-        if is_pos_def:
-            try:
-                covariance = torch.linalg.inv(hessian)
-                std_dev = torch.sqrt(torch.diag(covariance))
-
-                # 耦合参数误差: 前 2*(n_coupling_free-1) 个元素
-                n_c_var = self.n_coupling_free - 1  # 扣除固定的
-                coupling_real_errors = torch.zeros(
-                    self.n_coupling_free, dtype=torch.float32, device=self.device
-                )
-                coupling_imag_errors = torch.zeros(
-                    self.n_coupling_free, dtype=torch.float32, device=self.device
-                )
-
-                # std_dev 前 2*n_c_var 个元素: 实部误差和虚部误差交替
-                for i in range(n_c_var):
-                    coupling_real_errors[i + 1] = std_dev[2 * i].float()
-                    coupling_imag_errors[i + 1] = std_dev[2 * i + 1].float()
-
-                # 共振态参数误差
-                if self.has_free_res:
-                    res_start = 2 * n_c_var
-                    res_errors = std_dev[res_start:].float()
-            except Exception as e:
-                log.error(f"计算参数误差时出错: {e}")
+        if is_pos_def and report is not None:
+            coupling_real_errors, coupling_imag_errors, res_errors = \
+                self._errors_from_hessian_report(report, hessian_full)
 
         result = {
             "run_id": run_id,
@@ -961,10 +964,7 @@ class UnifiedPWAOptimizer:
             "initial_params": initial_params.clone().detach(),
             "hessian_full": hessian_full,
             "hessian": hessian,
-            "is_positive_definite": is_pos_def,
-            "min_eigenvalue": min_eig,
-            "max_eigenvalue": max_eig,
-            "condition_number": cond_num,
+            **fields,
             "coupling_real_errors": coupling_real_errors,
             "coupling_imag_errors": coupling_imag_errors,
             "res_errors": res_errors,
@@ -1236,6 +1236,81 @@ class UnifiedPWAOptimizer:
         h = self.analysis.getHessian(params)
         self._hess_cache = (params.clone(), h)
         return h
+
+    # --------------------------------------------------------
+    def _hessian_diagnosis(self, params, hessian_full=None, grad=None, nll=None,
+                           tau=1e-8, bound_margin=1e-8, kkt_tol=1e-2):
+        """在**有界拟合的正确子空间**上判 Hessian 正定。
+
+        旧实现直接对 ``hessian[fixed_mask]`` 取 ``eigvalsh`` 并判 ``all(>0)``：
+        * 固定参考耦合（Re_0/Im_0）的两行/列是恒零，必须去掉；
+        * 贴边且梯度朝外的参数（free_range 钉住）对应的"朝外方向"不可行，
+          它的负曲率是**边界效应**，不是拟合点不稳定。
+
+        这里复用 ``ctpwa.diagnostics.analyze_hessian``：返回的 ``reduced_pd``
+        才是 KKT 二阶条件；``free_pd`` 保留旧口径供对照。
+        """
+        if hessian_full is None:
+            hessian_full = self._get_hessian_cached(params)
+        if grad is None or nll is None:
+            q = params.detach().clone().requires_grad_(True)
+            nll_t = self.analysis.getNLL(q)
+            grad = torch.autograd.grad(nll_t, q)[0].detach()
+            nll = float(nll_t.item())
+        lo, hi = self.bounds(params)
+        fixed = torch.zeros(self.n_params, dtype=torch.bool, device=self.device)
+        fixed[0] = True
+        fixed[self.n_coupling_free] = True
+        report = analyze_hessian(
+            hessian_full, params, grad, lo, hi, fixed_mask=fixed,
+            tau=tau, bound_margin=bound_margin, kkt_tol=kkt_tol)
+        return report, grad, nll
+
+    def _hessian_fields(self, report):
+        """把诊断报告摊平成 result/JSON 字段（不依赖 torch.Tensor 序列化）。"""
+        evf = report.ev_free
+        evr = report.ev_reduced
+        rm = report.reduced_min_eigenvalue
+        rx = report.reduced_max_eigenvalue
+        cond = (rx / rm) if (rm == rm and rm > 0) else float("inf")
+        return {
+            "is_positive_definite": bool(report.reduced_pd),
+            "is_positive_definite_full": bool(report.free_pd),
+            "min_eigenvalue": rm,
+            "max_eigenvalue": rx,
+            "condition_number": cond,
+            "full_min_eigenvalue": report.free_min_eigenvalue,
+            "full_max_eigenvalue": report.free_max_eigenvalue,
+            "n_negative_reduced": int((evr < 0).sum().item()) if evr.numel() else 0,
+            "n_negative_full": int((evf < 0).sum().item()) if evf.numel() else 0,
+            "n_active": report.n_active,
+            "active_params": [self._coord_name(int(i)) for i in
+                              report.active_idx.tolist()],
+            "kkt_grad_max": float(report.kkt_max),
+            "kkt_ok": bool(report.kkt_ok),
+        }
+
+    def _errors_from_hessian_report(self, report, hessian_full):
+        """按**可行子空间**求逆并映射回 grouped 布局的耦合误差。
+
+        修复旧代码的两处错误：
+          1. 拿全自由块（含贴边参数）求逆；
+          2. 把 grouped 的 ``[Re_1.., Im_1..]`` 当成交错的 ``[Re,Im,Re,Im]``，
+             导致 Re/Im 误差互相错位。
+        """
+        nc, nt = self.n_coupling_free, self.n_res_free
+        idx = report.reduced_idx
+        if idx.numel() == 0:
+            return map_errors_to_params(
+                torch.zeros(0, device=self.device), idx, nc, nt)
+        Hk = hessian_full[idx][:, idx].double()
+        try:
+            cov = torch.linalg.inv(0.5 * (Hk + Hk.t()))
+            sd = torch.sqrt(torch.diag(cov).clamp(min=0.0))
+        except Exception as e:  # noqa: BLE001
+            log.error(f"可行子空间 Hessian 求逆失败: {e}")
+            return None, None, None
+        return map_errors_to_params(sd, idx, nc, nt)
 
     # --------------------------------------------------------
     def compute_param_errors(self, params_phys, tau=1e-8):
@@ -1832,7 +1907,11 @@ class UnifiedPWAOptimizer:
 
                 print(f"第 {i} 次优化完成!")
                 print(f"  NLL = {result['final_nll']:.6f}")
-                print(f"  正定性 = {result['is_positive_definite']}")
+                print(f"  正定(可行子空间) = {result['is_positive_definite']} "
+                      f"(全自由块={result['is_positive_definite_full']}, "
+                      f"active={result['n_active']}, "
+                      f"λmin_full={result['full_min_eigenvalue']:.2e}, "
+                      f"|pg|={result['kkt_grad_max']:.1e})")
                 print(f"  优化器状态 = {result.get('optimizer_status', '?')}")
                 if (str(result.get("optimizer_status", "")).endswith("tol-stop")
                         and not getattr(self, "_warned_tol_stop", False)):
@@ -2429,7 +2508,8 @@ def main():
         print(f"运行 {res['run_id']:2d}: NLL = {res['final_nll']:12.6f}, "
               f"迭代 = {res['iterations']:3d}, "
               f"耗时 = {res['time']:6.2f}s, Hessian = {res['hessian_time']:6.2f}s, "
-              f"正定 = {res['is_positive_definite']}, "
+              f"正定(active) = {res['is_positive_definite']} "
+              f"[full={res['is_positive_definite_full']}], "
               f"优化器 = {res.get('optimizer_status', '-')}")
 
     print(f"\n{'='*80}")
@@ -2451,17 +2531,34 @@ def main():
             print(f"抛光耗时 = {_t_polish:.2f}s, steps = {_ps.get('steps', '?')}, "
                   f"Hessian 次数 = {_ps.get('n_hess', '?')}, "
                   f"polish 内求值 = {_ps.get('n_evals', '?')}")
-            if nll2 < best_res["final_nll"]:
-                print(f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
-                      f"(Δ={nll2 - best_res['final_nll']:.3f}), 正定={pd2}")
+            _old_pd = bool(best_res["is_positive_definite"])
+            # 抛光即使 NLL 只降/升 1e-6 量级，只要把"贴边活跃"处理对，
+            # 正定判据就该更新——旧代码只在 nll2 严格更小时才采纳，导致
+            # 一个 PD 的抛光点被丢弃、误差仍然是空的。
+            if nll2 <= best_res["final_nll"] + 1e-6 or (pd2 and not _old_pd):
+                if nll2 > best_res["final_nll"]:
+                    print(f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                          f"(Δ=+{nll2 - best_res['final_nll']:.2e})，"
+                          f"但可行子空间正定 {_old_pd} → {pd2}；采纳抛光点以便报误差")
+                else:
+                    print(f"抛光: NLL {best_res['final_nll']:.6f} → {nll2:.6f} "
+                          f"(Δ={nll2 - best_res['final_nll']:.3f}), "
+                          f"可行子空间正定={pd2}")
                 best_res["final_params"] = p2.clone()
                 best_res["final_nll"] = nll2
-                best_res["is_positive_definite"] = pd2
                 # 同步优化器内部状态：否则摘要里的"最佳共振态参数"表仍然打印
                 # polish *之前* 的 self.best_params，与同一张表的 NLL/正定列不一致
                 optimizer.best_params = p2.clone()
                 optimizer.best_nll = nll2
                 optimizer.best_result = best_res
+                # 抛光终点的 Hessian 已在 polish 内算过（缓存命中），重算子空间字段
+                try:
+                    H2 = optimizer._get_hessian_cached(p2)
+                    rep2, _, _ = optimizer._hessian_diagnosis(p2, H2)
+                    best_res.update(optimizer._hessian_fields(rep2))
+                except Exception as _e:  # noqa: BLE001
+                    log.warning(f"抛光后 Hessian 子空间诊断失败: {_e}")
+                    best_res["is_positive_definite"] = pd2
                 if pd2:
                     (best_res["coupling_real_errors"],
                      best_res["coupling_imag_errors"],
