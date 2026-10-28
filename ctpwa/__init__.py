@@ -38,7 +38,7 @@
 import os as _os
 import sys as _sys
 
-__version__ = "0.3.17"
+__version__ = "0.3.18"
 
 #: 运行时按后端模块实际暴露的名字生成（见文件末尾）
 __all__ = []
