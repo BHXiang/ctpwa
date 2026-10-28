@@ -342,8 +342,9 @@ CTPWA_KERNEL void scaleConjForGradPKernel(
 
 CTPWA_KERNEL void computePhspMeanKernel(
     const ctComplex* __restrict__ d_S,   // S = A^T·v [nEvents × n_polar]
-    double* __restrict__ d_sum,          // Σ f_ev（double 累加）
-    int nEvents, int n_polar)
+    double* __restrict__ d_sum,          // Σ w_ev·f_ev（double 累加）
+    int nEvents, int n_polar,
+    const double* __restrict__ d_w)      // nullptr = 单位权重
 {
 #if defined(CTPWA_HAS_CUDA)
 
@@ -361,7 +362,7 @@ CTPWA_KERNEL void computePhspMeanKernel(
             ctFloat2 s = S_f2[p];
             factor += (double)s.x * s.x + (double)s.y * s.y;
         }
-        my_f = factor;
+        my_f = factor * (d_w ? d_w[evt] : 1.0);
     }
 #if defined(CTPWA_HAS_CUDA)
     s_f_partial[threadIdx.x] = my_f;
@@ -381,17 +382,19 @@ CTPWA_KERNEL void computePhspMeanKernel(
     for (int evt = 0; evt < nEvents; ++evt) {
         const ctComplex* S_evt = d_S + evt * n_polar;
         const ctFloat2* S_f2 = reinterpret_cast<const ctFloat2*>(S_evt);
+        double factor = 0.0;
         for (int p = 0; p < n_polar; ++p) {
             ctFloat2 sv = S_f2[p];
-            total += (double)sv.x * sv.x + (double)sv.y * sv.y;
+            factor += (double)sv.x * sv.x + (double)sv.y * sv.y;
         }
+        total += factor * (d_w ? d_w[evt] : 1.0);
     }
     atomicAdd(d_sum, total);
 #endif
 }
 
 // 一次 phsp 扫描同时给出:
-//   (1) phsp_sum = Σ_ev,p |S_ev,p|²（double 累加，语义与 computePhspMeanSum 完全一致）
+//   (1) phsp_sum = Σ_ev,p w_ev·|S_ev,p|²（double 累加，语义与 computePhspMeanSum 一致）
 //   (2) d_P_out = Σ_ev,p (w_ev/W)·A_ev,p·conj(S_ev,p)（每 GPU 局部和）
 // 数学身份: d_P_out ≡ B̄·v̄（B̄ = Σ(w/W)AA^H），免去每 forward 的 7.2GB B̄ 加权副本重建
 //（S = A^T·v 一次 CGEMV → Σ|S|² → x = conj(S)·scale → d_P_out = A·x 第二次 CGEMV）。
@@ -430,7 +433,7 @@ double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vec
     // phsp_sum = Σ|S|² double 累加
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar, d_w);
     // x = conj(S)·(w/W) 就地（S 已用完）
     int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
     CTPWA_LAUNCH(scaleConjForGradPKernel, gridX, kBlockSize, 0, s_dS[dev], d_w, nEvents, n_polar, inv_W_total);
@@ -449,7 +452,7 @@ double computePhspMeanSumAndGradP(const ctComplex* d_amp, const ctComplex* d_vec
 }
 
 double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
-    int nEvents, int n_polar, int n_amplitudes)
+    int nEvents, int n_polar, int n_amplitudes, const double* d_w)
 {
     const int nTotal = nEvents * n_polar;
     const long long strideA = (long long)n_amplitudes;
@@ -479,7 +482,7 @@ double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
                  d_amp, strideA, d_vector, 1, &b0, s_dS[dev], 1);
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH_SERIAL(computePhspMeanKernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar, d_w);
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h_sum;
@@ -1026,7 +1029,7 @@ CTPWA_KERNEL void conjugateF2Kernel(float2* __restrict__ data, int N) {
 // 每事件 Σ|S|² double 累加（float2 读入）—— phsp 均值 float 变体
 CTPWA_KERNEL void computePhspMeanF2Kernel(
     const float2* __restrict__ d_S, double* __restrict__ d_sum,
-    int nEvents, int n_polar)
+    int nEvents, int n_polar, const double* __restrict__ d_w)
 {
 #if defined(CTPWA_HAS_CUDA)
 
@@ -1040,7 +1043,7 @@ CTPWA_KERNEL void computePhspMeanF2Kernel(
             double x = (double)S_evt[p].x, y = (double)S_evt[p].y;
             factor += x * x + y * y;
         }
-        my_f = factor;
+        my_f = factor * (d_w ? d_w[evt] : 1.0);
     }
 #if defined(CTPWA_HAS_CUDA)
     s_f_partial[threadIdx.x] = my_f;
@@ -1110,7 +1113,7 @@ static void cgemvF2(cublasHandle_t h, cublasOperation_t op, int m, int n,
 
 // ---- phsp 均值 float 变体: Σ_ev |A·v|²（double 累加），A float2 ----
 double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
-    int nEvents, int n_polar, int n_amplitudes)
+    int nEvents, int n_polar, int n_amplitudes, const double* d_w)
 {
     const int nTotal = nEvents * n_polar;
     const long long strideA = (long long)n_amplitudes;
@@ -1149,7 +1152,7 @@ double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
         d_amp, (int)strideA, s_dv[dev], s_dS[dev], 0.0f);
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar, d_w);
     double h_sum = 0.0;
     cudaMemcpy(&h_sum, s_d_sum[dev], sizeof(double), cudaMemcpyDeviceToHost);
     return h_sum;
@@ -1205,7 +1208,7 @@ double computePhspMeanSumAndGradPF(const float2* d_amp, const ctComplex* d_vecto
     // phsp_sum = Σ|S|² double 累加
     cudaMemset(s_d_sum[dev], 0, sizeof(double));
     int gridBlocks = (nEvents + kBlockSize - 1) / kBlockSize;
-    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar);
+    CTPWA_LAUNCH(computePhspMeanF2Kernel, gridBlocks, kBlockSize, 0, s_dS[dev], s_d_sum[dev], nEvents, n_polar, d_w);
     // x = conj(S)·(w/W) 就地（S float2 已用完）
     int gridX = (nTotal + kBlockSize - 1) / kBlockSize;
     CTPWA_LAUNCH(scaleConjForGradPF2Kernel, gridX, kBlockSize, 0, s_dS[dev], d_w, nEvents, n_polar, inv_W_total);

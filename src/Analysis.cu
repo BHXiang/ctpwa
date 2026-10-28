@@ -673,6 +673,22 @@ CTPWA_KERNEL void castPhspBatchToDoubleKernel(
 }
 
 
+// phsp θ 梯度: S_ev,p ← S_ev,p · (w_ev / W_total)
+// （computeResonanceGradient 把 S 当"逐事件权重"消费；先乘 w/W 即得
+//  Σ (w/W) ∂f/∂θ，配合 phsp_sign=-N_eff/phsp_factor）
+CTPWA_KERNEL void scalePhspSByWeightKernel(
+    ctComplex* __restrict__ d_S, const double* __restrict__ d_w,
+    int nEvents, int nPolar, double inv_W)
+{
+    const int evt = CTPWA_TID();
+    if (evt >= nEvents) return;
+    const double s = (d_w ? d_w[evt] : 1.0) * inv_W;
+    for (int p = 0; p < nPolar; ++p) {
+        const int idx = evt * nPolar + p;
+        d_S[idx] = ctMake(d_S[idx].x * s, d_S[idx].y * s);
+    }
+}
+
 // y += x（cuDoubleComplex 版 axpy）
 CTPWA_KERNEL void axpyZComplexKernel(
     cuDoubleComplex* __restrict__ y, const cuDoubleComplex* __restrict__ x, int n)
@@ -820,6 +836,22 @@ public:
         cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
         double phsp_sum = 0.0;
         int total_phsp_evts = 0;
+        // phsp 归一化分母: Σ w（无权重 = 事件数）。与 d_phsp_matrix_ 的
+        // 1/W_total 以及梯度 d_P_vec 的 w/W_total 必须用同一个 W_total。
+        double W_total = 0.0;
+        for (int gpu = 0; gpu < num_gpus; ++gpu) {
+            int nP = events_list[gpu][0];
+            if (nP == 0) continue;
+            if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
+                cudaSetDevice(gpu);
+                thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
+                W_total += thrust::reduce(dp, dp + nP);
+            } else {
+                W_total += (double)nP;
+            }
+        }
+        if (W_total <= 0.0) W_total = 1.0;
+        bool phsp_stream_raw = false;   // 流式 double 矩阵是 Σ|S|²（未除 N）
         if (d_phsp_matrix_double_ != nullptr) {
             // phsp 流式模式: 原始 phsp 振幅不驻留，phsp_sum = Re(v^H M_double v)（主 GPU）
             TORCH_CHECK(n_free_res == 0,
@@ -829,6 +861,7 @@ public:
                 extended_vector.data_ptr());
             phsp_sum = computeDoublePhspSum(d_phsp_matrix_double_, d_v_primary,
                                             n_amplitudes_);
+            phsp_stream_raw = true;
             for (int gpu = 0; gpu < num_gpus; ++gpu) total_phsp_evts += events_list[gpu][0];
             // fixed-θ（n_free_res==0 必成立）: 构造期预建 B̄ → matvec
             ctPhspReal* d_phsp_r, * d_phsp_i;
@@ -844,20 +877,7 @@ public:
             cudaFree(d_phsp_i);
         } else if (free_theta) {
             // free-θ 常驻: phsp_factor 与 d_P_vec 一次融合扫描（免 B̄ 重建）
-            //（phsp_factor 语义与 computePhspMeanSum 一致: double 累加 Σ|S|²）
-            double W_total = 0.0;
-            for (int gpu = 0; gpu < num_gpus; ++gpu) {
-                int nP = events_list[gpu][0];
-                if (nP == 0) continue;
-                if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
-                    cudaSetDevice(gpu);
-                    thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
-                    W_total += thrust::reduce(dp, dp + nP);
-                } else {
-                    W_total += (double)nP;
-                }
-            }
-            if (W_total <= 0.0) W_total = 1.0;
+            //（phsp_factor 语义与 computePhspMeanSum 一致: Σ w|S|²，下面除 W_total）
             cudaSetDevice(primary_dev);
             if ((int)s_d_P_part.size() < num_gpus) {
                 s_d_P_part.resize(num_gpus, nullptr);
@@ -925,27 +945,32 @@ public:
             }
             cudaFree(d_phsp_r);
             cudaFree(d_phsp_i);
-            // phsp_factor = mean f: Σ f_ev 用 double 累加（float32 phsp 矩阵求和在
-            // 50 万事件上有 ~1e-4 相对系统偏差 → NLL 与 tf-pwa (float64) 差 ~2.4）
+            // phsp_factor = Σ w f / Σ w：Σ w f 用 double 累加（float32 phsp 矩阵
+            // 求和在 50 万事件上有 ~1e-4 相对系统偏差）
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nP = events_list[gpu][0];
                 if (nP == 0) continue;
                 cudaSetDevice(gpu);
                 const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
                     extended_vec_per_gpu[gpu].data_ptr());
+                const double* d_w = (gpu < (int)d_phsp_weights_list.size())
+                    ? d_phsp_weights_list[gpu] : nullptr;
                 bool fA = amp_calc && amp_calc->floatOutput();
                 if (fA) {
                     const float2* d_ampF = reinterpret_cast<const float2*>(d_all_amplitudes_list[gpu]);
                     phsp_sum += computePhspMeanSumF(d_ampF, d_v_gpu,
-                                                   nP, n_polar_, n_amplitudes_);
+                                                   nP, n_polar_, n_amplitudes_, d_w);
                 } else {
                     phsp_sum += computePhspMeanSum(d_all_amplitudes_list[gpu], d_v_gpu,
-                                                   nP, n_polar_, n_amplitudes_);
+                                                   nP, n_polar_, n_amplitudes_, d_w);
                 }
                 total_phsp_evts += nP;
             }
         }
-        double phsp_factor = (total_phsp_evts > 0) ? phsp_sum / total_phsp_evts : 0.0;
+        // 加权 phsp 均值: Σ w f / Σ w。流式 double 矩阵是未加权的 Σ|S|²，
+        // 保持旧语义除以事件数（该路径目前不支持 phsp_weights）。
+        double phsp_denom = phsp_stream_raw ? (double)total_phsp_evts : W_total;
+        double phsp_factor = (phsp_denom > 0.0) ? phsp_sum / phsp_denom : 0.0;
         cudaSetDevice(primary_dev);
         tF3 = std::chrono::high_resolution_clock::now();  // phsp_factor/d_P_vec（free-θ 融合扫描）完成
         tF4 = tF3;  // （原 B̄ CGEMM 段已删；D2H 计入 tF3 段）
@@ -1208,7 +1233,9 @@ public:
                 for (int g = 0; g < num_gpus; ++g) total_phsp += events_list[g][0];
                 double effective_data = totalDataWeight - bkg_integral_;
                 if (total_phsp > 0 && phsp_factor > 1e-30) {
-                    double phsp_sign = -effective_data / (phsp_factor * total_phsp);
+                    // S 下面会乘 w/W_total（scalePhspSByWeightKernel），
+                    // 因此 sign 不再除 total_phsp（W_total 已在 S 里）。
+                    double phsp_sign = -effective_data / phsp_factor;
 
                     std::vector<ctComplex*> d_S_bufs(num_gpus, nullptr);
                     std::vector<int> n_phsp_evts(num_gpus);
@@ -1244,6 +1271,11 @@ public:
                             CUBLAS_CGEMV(s_phsp_handle[g], CUBLAS_OP_T, n_amplitudes_, nTot,
                                 &a, d_amp, n_amplitudes_, d_vg, 1, &b, d_S_bufs[g], 1);
                         }
+                        const double* d_w = (g < (int)d_phsp_weights_list.size())
+                            ? d_phsp_weights_list[g] : nullptr;
+                        int gS = (nP + 255) / 256;
+                        CTPWA_LAUNCH(scalePhspSByWeightKernel, gS, 256, 0,
+                            d_S_bufs[g], d_w, nP, n_polar_, 1.0 / W_total);
                     }
 
                     cudaSetDevice(primary_dev);  // d_grad_res is on primary_dev

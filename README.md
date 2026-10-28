@@ -176,6 +176,18 @@ rep.active_idx        # 被边界钉住的参数
 （ΔNLL=4.3）处 H 已正定、θ 回到真值。这是归一化 MC 的统计分辨率不足，
 不是 getHessian 写错。
 
+**data_weights / bkg_weights**：已用 FD 对照（data 0.5/1.0、bkg 0.8，
+含/不含 phsp_weights），梯度相对差 ~1e-7、Hessian PASS；它们同时进入
+`computeFactorNLL`、data Hessian 和 `N_eff`，没有发现 phsp 权重那种
+NLL/导数不同源的问题。
+
+**phsp_weights 归一化**：旧版 forward 的 `phsp_factor` 用无权重 `Σf/N`，
+但 `d_phsp_matrix_` / 梯度 / Hessian 用 `Σw/Σw`，NLL 与导数不是同一条函数
+（`J/ψ→γK_SK_Sπ⁰π⁰` 上 H vs FD 差 15%、梯度差 30%）。现已改为
+`Σw f / Σw`，回归见 `tests/test_cpu_numerics.py::test_phsp_weights_nll_grad_hessian`。
+注意：流式 phsp（`free_phsp_amplitudes`）仍用旧的 `/N`，且自由 θ 的 θθ
+Hessian phsp 项尚未接权重（NLL/梯度已接）。
+
 **多 LS + 大 bkg 的专门回归**：`J/ψ→ωηη′`（9 链、69 振幅、21 耦合，
 3074 bkg / 2024 data）在旧版上 H 有 9 个负本征值（λmin=-533），FD 却是
 PSD。根因是 `getHessian` 耦合变换二阶项里 bkg 的 `g_v` 被翻了两次符号

@@ -168,3 +168,97 @@ def test_bkg_sign_in_coupling_hessian(tmp_path):
         H, fd_utils.analysis_grad_fn(ana), p, idxs,
         h_judge=1e-3, rtol=0.05)
     assert rep.verdict != "FAIL", rep.summary()
+
+
+def test_phsp_weights_nll_grad_hessian(tmp_path):
+    """回归：phsp_weights 必须同时进入 NLL 归一化、梯度和 Hessian。
+
+    旧 forward 的固定 θ 分支用 `computePhspMeanSum`（无权重）算 phsp_factor，
+    但 `d_phsp_matrix_` / d_P_vec 用 w 加权 → NLL 与梯度/Hessian 非同一条
+    函数；表现是 gradient vs FD 差 ~30%，Hessian vs FD 差 ~15%。
+    这里用 hess_mult（nt=0，纯耦合）覆盖用户 J/psi→γ KsKs pi0pi0 的结构。
+    """
+    import ctpwa
+    import fd_utils
+    from conftest import CONFIGS_DIR
+
+    data_dir = CONFIGS_DIR.parent / "data"
+    src = (CONFIGS_DIR / "hess_mult.yml").read_text()
+    for name in ("test_4body_data.dat", "test_4body_phsp.dat",
+                 "test_4body_sideband.dat"):
+        src = src.replace(f'"./data/{name}"', f'"{data_dir / name}"')
+
+    wpath = tmp_path / "phspw.dat"
+    wpath.write_text("".join("0.5\n" if i % 2 == 0 else "1.0\n"
+                             for i in range(10000)))
+    phsp_line = f'  phsp: [dat, "{data_dir / "test_4body_phsp.dat"}"]'
+    assert phsp_line in src
+    src = src.replace(phsp_line, phsp_line + f'\n  phsp_weights: [dat, "{wpath}"]')
+
+    cfg = tmp_path / "hess_mult_phspw.yml"
+    cfg.write_text(src)
+    ana = ctpwa.analysis(str(cfg))
+    p = make_params(ana, CPU)
+    grad_fn = fd_utils.analysis_grad_fn(ana)
+    g = grad_fn(p)
+    for i in (1, 2, 5, 7, 8):
+        h = 1e-5 * max(abs(float(p[i])), 1.0)
+        pp, pm = p.clone(), p.clone()
+        pp[i] += h
+        pm[i] -= h
+        fd = (float(ana.getNLL(pp)) - float(ana.getNLL(pm))) / (2 * h)
+        rel = abs(float(g[i]) - fd) / max(abs(fd), 1e-8)
+        assert rel < 1e-5, f"phsp_weights 梯度 [{i}]: AD={float(g[i]):.8g} FD={fd:.8g} rel={rel:.2e}"
+
+    H, idxs = fd_utils.analysis_hessian_block(ana, p)
+    rep = fd_utils.compare_hessian(H, grad_fn, p, idxs,
+                                   h_judge=1e-3, rtol=0.05)
+    assert rep.verdict != "FAIL", rep.summary()
+
+
+def test_data_weights_nll_grad_hessian(tmp_path):
+    """data_weights + bkg_weights 的 NLL/梯度/Hessian 必须同源。
+
+    与 phsp_weights 的 bug 不同，data 权重从一开始就同时进入
+    computeFactorNLL、data Hessian 和 N_eff；这里做回归保护。
+    """
+    import ctpwa
+    import fd_utils
+    from conftest import CONFIGS_DIR
+
+    data_dir = CONFIGS_DIR.parent / "data"
+    src = (CONFIGS_DIR / "hess_mult.yml").read_text()
+    for name in ("test_4body_data.dat", "test_4body_phsp.dat",
+                 "test_4body_sideband.dat"):
+        src = src.replace(f'"./data/{name}"', f'"{data_dir / name}"')
+
+    wdata = tmp_path / "dataw.dat"
+    wdata.write_text("".join("0.5\n" if i % 2 == 0 else "1.0\n"
+                             for i in range(1000)))
+    wbkg = tmp_path / "bkgw.dat"
+    wbkg.write_text("0.8\n" * 300)
+    data_line = f'  data: [dat, "{data_dir / "test_4body_data.dat"}"]'
+    bkg_line = f'  bkg:  [dat, "{data_dir / "test_4body_sideband.dat"}"]'
+    assert data_line in src and bkg_line in src
+    src = src.replace(data_line, data_line + f'\n  data_weights: [dat, "{wdata}"]')
+    src = src.replace(bkg_line, bkg_line + f'\n  bkg_weights: [dat, "{wbkg}"]')
+
+    cfg = tmp_path / "hess_mult_dataw.yml"
+    cfg.write_text(src)
+    ana = ctpwa.analysis(str(cfg))
+    p = make_params(ana, CPU)
+    grad_fn = fd_utils.analysis_grad_fn(ana)
+    g = grad_fn(p)
+    for i in (1, 2, 5, 7, 8):
+        h = 1e-5 * max(abs(float(p[i])), 1.0)
+        pp, pm = p.clone(), p.clone()
+        pp[i] += h
+        pm[i] -= h
+        fd = (float(ana.getNLL(pp)) - float(ana.getNLL(pm))) / (2 * h)
+        rel = abs(float(g[i]) - fd) / max(abs(fd), 1e-8)
+        assert rel < 1e-5, f"data_weights 梯度 [{i}]: AD={float(g[i]):.8g} FD={fd:.8g} rel={rel:.2e}"
+
+    H, idxs = fd_utils.analysis_hessian_block(ana, p)
+    rep = fd_utils.compare_hessian(H, grad_fn, p, idxs,
+                                   h_judge=1e-3, rtol=0.05)
+    assert rep.verdict != "FAIL", rep.summary()

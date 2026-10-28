@@ -32,11 +32,13 @@ void conjugateComplexArray(ctComplex* data, int N);
 // 向量axpy: y[i] += alpha * x[i], n较小(<~200)，单block完成
 void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n);
 
-// 返回 Σ_ev f_ev = Σ |A·v|²（double 累加）——phsp 均值的高精度来源
+// 返回 Σ_ev w_ev·f_ev = Σ w |A·v|²（double 累加）——phsp 均值的高精度来源
+// d_w=nullptr 时为单位权重（旧行为）。调用方用 Σw 归一化。
 double computePhspMeanSum(const ctComplex* d_amp, const ctComplex* d_vector,
-    int nEvents, int n_polar, int n_amplitudes);
+    int nEvents, int n_polar, int n_amplitudes,
+    const double* d_w = nullptr);
 
-// free-θ 常驻模式: 一次 phsp 扫描同时给出 phsp_sum（语义同 computePhspMeanSum）
+// free-θ 常驻模式: 一次 phsp 扫描同时给出 phsp_sum（Σ w|S|²，语义同 computePhspMeanSum）
 // 与 v 梯度 phsp 项 d_P_vec = Σ_ev,p (w_ev/W)·A_ev,p·conj(S_ev,p)（每 GPU 局部和，
 // 调用方负责跨 GPU 求和）。数学身份 d_P_vec ≡ B̄·v̄（B̄=Σ(w/W)AA^H），
 // 免去 free-θ 下每 forward 的 7.2GB B̄ 加权副本重建。
@@ -67,9 +69,10 @@ double computeFactorNLLF(const float2* d_amp, const ctComplex* d_vector,
     ctComplex* d_grad_out, int nEvents, int n_polar, int n_amplitudes,
     const double* d_weights = nullptr, float2* d_w_out = nullptr);
 
-// 语义同 computePhspMeanSum（Σ|A·v|² double 累加）；d_amp 为 float2 布局。
+// 语义同 computePhspMeanSum（Σ w|A·v|² double 累加）；d_amp 为 float2 布局。
 double computePhspMeanSumF(const float2* d_amp, const ctComplex* d_vector,
-    int nEvents, int n_polar, int n_amplitudes);
+    int nEvents, int n_polar, int n_amplitudes,
+    const double* d_w = nullptr);
 
 // 语义同 computePhspMeanSumAndGradP；d_amp 为 float2 布局。
 // d_P_out 仍为 double（ctComplex）输出——float matvec 局部和 → double 累加。

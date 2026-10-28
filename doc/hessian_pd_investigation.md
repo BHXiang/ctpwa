@@ -201,6 +201,56 @@ CPU 与 GPU 的 H 本征值在 1e-6 量级一致；生产点 full λmin 在
 -0.13（CPU）~-0.79（GPU）之间摆动，是贴边方向的数值噪声，但 active
 子空间稳定为正。
 
+## 4.7 `J/ψ→γK_SK_Sπ⁰π⁰`：phsp_weights 未进入 NLL 归一化
+
+目录：`~/pwa/Jpsi2gamKsKspi0pi0/test`。5 体末态、28 个振幅、12 个自由耦合、
+`nt=0`、48248 个 phsp 事件带逐事件 `phsp_weights`（0.5/1.0）。
+
+旧版在 best 点（fit2.py，NLL=-3113.9）报不正定：
+
+| 量 | 旧版 | 去掉 phsp_weights |
+|---|---|---|
+| H 全自由块 λmin | -25.94 | -37.91 |
+| H vs FD max rel | **15.4%** | **1.3e-4** |
+| gradient vs FD | **~30%** | ~1e-6 |
+
+去掉 `identical` 仍差 14.8% → 根因是 **phsp_weights**。
+旧 forward 的 `phsp_factor` 用无权重 `Σf/N`，但 `d_phsp_matrix_`、`d_P_vec`
+和 Hessian 用 `Σw/Σw` 加权 → NLL、梯度、Hessian 不是同一条函数。
+
+**修复**：
+- `computePhspMeanKernel` / `computePhspMeanF2Kernel` 增加 `d_w`，求 `Σw·f`；
+- forward 的 `phsp_factor = Σw f / Σw`（流式 double 矩阵仍用旧的 `/N`，
+  该路径暂不支持 phsp_weights）；
+- 自由 θ 的 phsp 梯度先把 S 乘 `w/W_total`，sign 相应去掉 `/total_phsp`；
+- 新增回归 `test_phsp_weights_nll_grad_hessian`（hess_mult + phsp_weights）。
+
+修复后（同一旧点）：NLL=-3263.56，gradient vs FD ~1e-6，
+H vs FD max rel **6.1e-5**（6 个负本征值，但该点 gmax=59.7，本来就不是极小）。
+
+用加权 NLL 重新 BFGS 拟合：**NLL=-3440.406**，H **0 个负本征值**
+（λmin=+2e-6，λmax=2.09e5；条件数极大但 PSD），
+θ 无；旧 fit 的 -3113.9 是未加权 NLL，需重拟合。
+
+> 已知缺口：`nt>0` + `phsp_weights` 时，θθ Hessian 的 UH phsp 项仍是
+> 未加权（NLL/梯度已加权）。本过程的 `nt=0` 不受影响；自由 θ 的 config
+> 需暂时固定 θ 或去掉 phsp_weights 做二阶误差。
+
+## 4.8 data_weights / bkg_weights 检查（无 bug）
+
+同样用 FD 对照，专门测 data/bkg 权重：
+
+| config | 权重 | gradient rel | Hessian |
+|---|---|---|---|
+| hess_mult | data 0.5/1.0 + bkg 0.8 + phsp 0.5/1.0 | 1.4e-7 | PASS, max rel 9.1e-4 |
+| constraints | data 0.5/1.0（nt=4） | 7.8e-8 | PASS, max rel 1.8e-3 |
+| hess_mult | data 0.5/1.0（无其它权重） | 1.0e-7 | PASS, max rel 4.1e-3 |
+
+结论：`data_weights` 同时进入 `computeFactorNLL`、data Hessian 和
+`N_eff=Σw_data−bkg_integral`；`bkg_weights` 在 data/bkg Hessian 中也一致。
+没有发现 phsp 权重那种"NLL 与导数不同源"的问题。回归：
+`tests/test_cpu_numerics.py::test_data_weights_nll_grad_hessian`。
+
 ## 5. 本次修复
 
 - `src/Analysis.cu`：修正 `getHessian` 里 bkg `g_v` 的符号（`-1 → +1`）。
