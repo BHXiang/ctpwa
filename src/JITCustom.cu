@@ -107,6 +107,48 @@ __device__ __noinline__ double jitBreakup(double m, double m1, double m2) {
 // 势垒因子 Bf（ResModel.cuh Bf<double> 原文；pow 与模板版同样落到
 // pow(double,double)，主库与 NVRTC 均未开 fast_math → 逐位一致）
 // 显式 __noinline__：见 jitBreakup 注释（防内联膨胀）
+// lnBf 对数导数黑盒（与 src/CustomExpr.cu bfLogDerivs 逐项一致，L ≤ 6）：
+//   lq   = ∂lnBf/∂q   = -0.5·d·N'(z)/N(z),      z  = q·d
+//   lq0  = ∂lnBf/∂q0  = +0.5·d·N'(z0)/N0(z0),   z0 = q0·d
+//   lqq  = ∂²lnBf/∂q²  = -0.5·d²·(N''/N − (N'/N)²)
+//   lq0q0= ∂²lnBf/∂q0² = +0.5·d²·(N''/N − (N'/N)²)（z0 处）
+__device__ __noinline__ double jitBfLogDeriv(int which, int L, double q, double q0, double d) {
+    auto poly = [](int L_, double w, double& nw, double& dnw, double& ddnw) {
+        double w2 = w * w;
+        switch (L_) {
+        case 0: nw = 1.0; dnw = 0.0; ddnw = 0.0; break;
+        case 1: nw = 1.0 + w2; dnw = 2.0 * w; ddnw = 2.0; break;
+        case 2: nw = 9.0 + w2 * (3.0 + w2); dnw = w * (6.0 + 4.0 * w2);
+                ddnw = 6.0 + 12.0 * w2; break;
+        case 3: nw = 225.0 + w2 * (45.0 + w2 * (6.0 + w2));
+                dnw = w * (90.0 + w2 * (24.0 + 6.0 * w2));
+                ddnw = 90.0 + w2 * (72.0 + 30.0 * w2); break;
+        case 4: nw = 11025.0 + w2 * (1575.0 + w2 * (135.0 + w2 * (10.0 + w2)));
+                dnw = w * (3150.0 + w2 * (540.0 + w2 * (60.0 + 8.0 * w2)));
+                ddnw = 3150.0 + w2 * (1620.0 + w2 * (300.0 + 56.0 * w2)); break;
+        case 5: nw = 893025.0 + w2 * (99225.0 + w2 * (6300.0 + w2 * (315.0 + w2 * (15.0 + w2))));
+                dnw = w * (198450.0 + w2 * (25200.0 + w2 * (1890.0 + w2 * (120.0 + 10.0 * w2))));
+                ddnw = 198450.0 + w2 * (75600.0 + w2 * (9450.0 + w2 * (840.0 + 90.0 * w2))); break;
+        case 6: nw = 540326025.0 + w2 * (6185025.0 + w2 * (363825.0 + w2 * (17325.0 + w2 * (630.0 + w2 * (21.0 + w2)))));
+                dnw = w * (12370050.0 + w2 * (1455300.0 + w2 * (103950.0 + w2 * (5040.0 + w2 * (210.0 + 12.0 * w2)))));
+                ddnw = 12370050.0 + w2 * (4365900.0 + w2 * (519750.0 + w2 * (35280.0 + w2 * (1890.0 + 132.0 * w2)))); break;
+        default: nw = 1.0; dnw = 0.0; ddnw = 0.0; break;
+        }
+    };
+    double nz, dnz, ddnz, nz0, dnz0, ddnz0;
+    poly(L, q * d, nz, dnz, ddnz);
+    poly(L, q0 * d, nz0, dnz0, ddnz0);
+    double r1 = (nz > 0.0) ? dnz / nz : 0.0;
+    double r2 = (nz0 > 0.0) ? dnz0 / nz0 : 0.0;
+    double e1 = (nz > 0.0) ? ddnz / nz : 0.0;
+    double e2 = (nz0 > 0.0) ? ddnz0 / nz0 : 0.0;
+    double lq = -0.5 * d * r1;
+    double lq0 = 0.5 * d * r2;
+    double lqq = -0.5 * d * d * (e1 - r1 * r1);
+    double lq0q0 = 0.5 * d * d * (e2 - r2 * r2);
+    return which == 0 ? lq : (which == 1 ? lq0 : (which == 2 ? lqq : lq0q0));
+}
+
 __device__ __noinline__ double jitBf(int L, double q, double q0, double d) {
     double z = q * d;
     double z0 = q0 * d;
@@ -413,7 +455,11 @@ static bool genSegment(GenCtx& g, const double* instrs, int n_instr, int P)
                     case CFUNC_CONJ:
                         pushTemp(g, a.re, "(-" + a.im + ")");
                         break;
-                    default: return false;
+                    default:
+                        if (getenv("CTPWA_JIT_DEBUG"))
+                            fprintf(stderr, "[ctpwa] genSegment: 未知 CFUNC %d (instr %d)\n",
+                                    (int)a0, i);
+                        return false;
                 }
                 break; }
             case COP_MODEL: {
@@ -518,10 +564,26 @@ static bool genSegment(GenCtx& g, const double* instrs, int n_instr, int P)
                         else
                             pushTemp(g, ri, "0.0");
                         break; }
+                    case MODEL_BF_DLNQ:
+                    case MODEL_BF_DLNQ0:
+                    case MODEL_BF_D2LNQQ:
+                    case MODEL_BF_D2LNQ0Q0: {  // [L, q, q0, d] → lnBf 对数导数（实数）
+                        auto dv = popVal(g);
+                        auto q0v = popVal(g);
+                        auto qv = popVal(g);
+                        auto Lv = popVal(g);
+                        pushTemp(g, "jitBfLogDeriv(" + std::to_string((int)a0 - MODEL_BF_DLNQ) +
+                                    ", (int)(" + Lv.re + "), " + qv.re + ", " + q0v.re +
+                                    ", " + dv.re + ")", "0.0");
+                        break; }
                     case MODEL_ONE:
                         pushVal(g, "1.0", "0.0");
                         break;
-                    default: return false;
+                    default:
+                        if (getenv("CTPWA_JIT_DEBUG"))
+                            fprintf(stderr, "[ctpwa] genSegment: 未知 MODEL %d (instr %d)\n",
+                                    (int)a0, i);
+                        return false;
                 }
                 break; }
             default:
@@ -565,26 +627,39 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
     std::ostringstream segs;
     int seg_off = 2;
     if (getenv("CTPWA_JIT_DEBUG")) {
+        // 注意：调试打印必须用独立的游标，否则会推进生成循环用的 seg_off，
+        // 导致 CTPWA_JIT_DEBUG=1 时 JIT 解析越界、静默回退解释器（实测踩过）
+        int seg_dbg = seg_off;
         fprintf(stderr, "[ctpwa] genNodeFunction node=%d full=%d P=%d n_seg=%d:",
                 node_id, (int)full, P, n_seg);
         for (int s = 0; s < n_seg; ++s) {
-            int ni = (int)aux[seg_off];
+            int ni = (int)aux[seg_dbg];
             fprintf(stderr, " seg%d=%d", s, ni);
-            seg_off += 1 + 3 * ni;
+            seg_dbg += 1 + 3 * ni;
         }
         fprintf(stderr, "\n");
         seg_off = 2;   // 复位，正式循环重新走
     }
     for (int s = 0; s < n_need; ++s) {
         int n_instr = (int)aux[seg_off];
-        if (n_instr < 0) return false;
+        if (n_instr < 0) {
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] genNodeFunction node=%d seg=%d: n_instr=%d <0\n",
+                        node_id, s, n_instr);
+            return false;
+        }
         seg_off += 1 + 3 * n_instr;   // 先前进（后续段独立）
         GenCtx g;
         g.lines.clear();
         g.depth = 0;   // 临时变量计数 g.t 跨段单调递增（段间避免重名声明）
         g.fail = false;
         // 段数据从 n_instr 之后开始（与解释器 aux + seg_off + 1 一致；seg_off 已前进）
-        if (!genSegment(g, &aux[seg_off - 3 * n_instr], n_instr, P)) return false;
+        if (!genSegment(g, &aux[seg_off - 3 * n_instr], n_instr, P)) {
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] genNodeFunction node=%d seg=%d: genSegment failed (%d instr)\n",
+                        node_id, s, n_instr);
+            return false;
+        }
         std::string re, im;
         if (!g.stk.empty()) { re = g.stk.back().re; im = g.stk.back().im; }
         else { re = "0.0"; im = "0.0"; }
@@ -884,9 +959,15 @@ static bool loadModuleForGpu(const std::string& key, CUfunction& f_grad,
 
 bool jitEnabled()
 {
+    // 默认**关闭**：JIT 对内置模型（BWR/GS/…）已能编译且数值与解释器逐位一致，
+    // 但只有 nSL 很小的配置更快（实测 3 SL：0.43→0.35 s/次；16 SL：3.07→29 s/次，
+    // 因为 pass-1 物化 + pass-2 跨步读 d_jit 的访存模式在大 nSL 下崩掉）。
+    // 在访存布局重做之前用 CTPWA_JIT=1 显式开启；CTPWA_NO_JIT=1 仍可强制关闭。
     static const bool v = ([] {
-        const char* e = getenv("CTPWA_NO_JIT");
-        return !(e && e[0] == '1');
+        const char* off = getenv("CTPWA_NO_JIT");
+        if (off && off[0] == '1') return false;
+        const char* on = getenv("CTPWA_JIT");
+        return on && on[0] == '1';
     })();
     return v;
 }
@@ -965,7 +1046,14 @@ bool jitCompileBlock(JitBlockState& st,
             if (src.empty()) return false;
             bin = std::make_shared<JitBinary>();
             std::string err;
-            if (!compileToBinaryTimeout(src, *bin, err)) {
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] jit: compiling %zu B (arch %s)\n",
+                        src.size(), arch.c_str());
+            bool jit_ok = compileToBinaryTimeout(src, *bin, err);
+            if (getenv("CTPWA_JIT_DEBUG"))
+                fprintf(stderr, "[ctpwa] jit: compile rc=%d bytes=%zu err='%s'\n",
+                        (int)jit_ok, bin->data.size(), err.c_str());
+            if (!jit_ok) {
                 fprintf(stderr, "[ctpwa] JIT 编译失败，该块回退解释器: %s\n", err.c_str());
                 return false;
             }

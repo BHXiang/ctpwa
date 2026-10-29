@@ -2974,7 +2974,12 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (dr.type == ResModelType::Interp || dr.aux_size <= 0 ||
                     dr.param_count < 1 || dr.param_count > 16)
                     continue;
-                if (hessian_target < 0 && mr == 0) hessian_target = (int)specs.size();
+                // JIT 只物化 F/dF（grad 变体）；二阶（full）变体只在显式要求 Hessian
+                // JIT 时生成 —— 默认不生成：full 版段是 grad 的 5~10 倍长，pass-1 每次
+                // NLL 都要算，320k 事例下反而比解释器慢（实测 3.07s → 4.15s）。
+                // Hessian 走解释器（正确，只是慢），拟合主循环吃 JIT 收益。
+                if (getenv("CTPWA_JIT_HESSIAN") && hessian_target < 0 && mr == 0)
+                    hessian_target = (int)specs.size();
                 JitNodeSpec sp;
                 sp.node_idx = ni;
                 sp.mother_idx = n.mother_idx;
