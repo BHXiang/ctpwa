@@ -35,7 +35,7 @@ from conftest import CONFIGS_DIR, make_params
 
 DEVICE = torch.device("cpu") if ctpwa.backend() == "cpu" else torch.device("cuda:0")
 FD_H = 1e-5
-GRAD_RTOL = 1e-5
+GRAD_RTOL = 1e-4          # 按 max|g| 归一；GPU FD 噪声 ~3e-6，修复前 ~0.25
 
 
 @pytest.fixture(scope="module")
@@ -77,11 +77,19 @@ def test_theta_gradient_matches_fd(nested_ana):
     assert nt >= 4, "nested_free 至少要有两个自由共振态"
 
     g = _grad(ana, p0)
+    # 按 max|g| 归一（同 test_identical）：小分量在 GPU 上被 FD 噪声主导，
+    # 逐分量相对误差会假报警；归一后对"整块梯度算错"依然灵敏（修复前 ~0.25）
+    scale = float(g.abs().max().clamp_min(1e-6))
+    worst, worst_i = 0.0, -1
     for i in range(2 * nv, 2 * nv + nt):
         fd = _fd_scalar_grad(ana, p0, i)
-        rel = abs(float(g[i]) - fd) / max(abs(fd), 1e-8)
-        assert rel < GRAD_RTOL, (
-            f"θ[{i - 2 * nv}] AD={float(g[i]):.8g} FD={fd:.8g} rel={rel:.2e}")
+        d = abs(float(g[i]) - fd)
+        if d > worst:
+            worst, worst_i = d, i
+    rel = worst / scale
+    assert rel < GRAD_RTOL, (
+        f"θ[{worst_i - 2 * nv}] AD={float(g[worst_i]):.8g} "
+        f"FD={_fd_scalar_grad(ana, p0, worst_i):.8g} 归一化误差={rel:.2e}")
 
 
 def test_hessian_theta_block_matches_fd(nested_ana):
@@ -97,7 +105,7 @@ def test_hessian_theta_block_matches_fd(nested_ana):
     p0 = make_params(ana, DEVICE)
     nv, nt = ana.getNVector(), ana.getNFreeTheta()
     th0 = 2 * nv
-    H = ana.getHessian(p0).detach().double().numpy()
+    H = ana.getHessian(p0).detach().double().cpu().numpy()
     idxs = list(range(th0, th0 + nt))
     rep = fd_utils.compare_hessian(H[np.ix_(idxs, idxs)],
                                    lambda q: _grad(ana, q), p0, idxs)

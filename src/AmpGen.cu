@@ -1848,12 +1848,21 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                     dFi[j] = jb[2 + 2 * j + 1];
                                 }
                             } else {
-                                double p1_P = pD1.P(), p1_E = pD1.E;
-                                double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                                double p1_phi = atan2(pD1.Py, pD1.Px);
-                                double p2_P = pD2.P(), p2_E = pD2.E;
-                                double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                                double p2_phi = atan2(pD2.Py, pD2.Px);
+                                // 极角量只有 Custom/Interp 的 DSL 引用；内置模型的
+                                // AST 不含这些变量，无条件算 atan2 会拖成延迟受限
+                                const bool need_polar =
+                                    (target_res.type == ResModelType::Custom
+                                     || target_res.type == ResModelType::Interp);
+                                double p1_P = 0.0, p1_E = 0.0, p1_ct = 0.0, p1_phi = 0.0;
+                                double p2_P = 0.0, p2_E = 0.0, p2_ct = 0.0, p2_phi = 0.0;
+                                if (need_polar) {
+                                    p1_P = pD1.P(); p1_E = pD1.E;
+                                    p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                                    p1_phi = atan2(pD1.Py, pD1.Px);
+                                    p2_P = pD2.P(); p2_E = pD2.E;
+                                    p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                                    p2_phi = atan2(pD2.Py, pD2.Px);
+                                }
                                 evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
                                     md1_q0, md2_q0,
                                     p1_P, p1_E, p1_ct, p1_phi,
@@ -1972,12 +1981,21 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                 dFi[j] = jb[2 + 2 * j + 1];
                             }
                         } else {
-                            double p1_P = pD1.P(), p1_E = pD1.E;
-                            double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                            double p1_phi = atan2(pD1.Py, pD1.Px);
-                            double p2_P = pD2.P(), p2_E = pD2.E;
-                            double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                            double p2_phi = atan2(pD2.Py, pD2.Px);
+                            // 极角量只有 Custom/Interp 的 DSL 引用；内置模型的 AST
+                            // 不含这些变量，无条件算 atan2 会拖成延迟受限
+                            const bool need_polar =
+                                (res.type == ResModelType::Custom
+                                 || res.type == ResModelType::Interp);
+                            double p1_P = 0.0, p1_E = 0.0, p1_ct = 0.0, p1_phi = 0.0;
+                            double p2_P = 0.0, p2_E = 0.0, p2_ct = 0.0, p2_phi = 0.0;
+                            if (need_polar) {
+                                p1_P = pD1.P(); p1_E = pD1.E;
+                                p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                                p1_phi = atan2(pD1.Py, pD1.Px);
+                                p2_P = pD2.P(); p2_E = pD2.E;
+                                p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                                p2_phi = atan2(pD2.Py, pD2.Px);
+                            }
                             evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
                                 md1_q0, md2_q0,
                                 p1_P, p1_E, p1_ct, p1_phi,
@@ -2753,6 +2771,18 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
     int n_free = nFreeResParams();
     if (n_free == 0 || blocks_.empty()) return;
 
+    // CTPWA_PROF: 分段时间（含 sync），定位 reComputeAmps 的瓶颈段
+    auto _prof_ad = getenv("CTPWA_PROF") != nullptr;
+    auto _prof_t = std::chrono::high_resolution_clock::now();
+    auto prof_tick = [&](const char* tag) {
+        if (!_prof_ad) return;
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "[PROF-AD] %-18s %8.2f ms\n", tag,
+                std::chrono::duration<double, std::milli>(t1 - _prof_t).count());
+        _prof_t = t1;
+    };
+
     // primary = d_params 所在设备（调用方显式传入）。
     // 不能在此 cudaGetDevice——torch 的 .to() 会把运行时当前设备切走，
     // 用当前设备做广播源会读到错误内存（双卡下 theta 变零 → BF 除零 → NaN）。
@@ -3127,6 +3157,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     break;
                 }
             };
+            prof_tick("jit+desc");
             float2* f2a = reinterpret_cast<float2*>(d_amplitudes[gpu]);
             if (dF_float_)
                 launchCustom(f2a, static_cast<float2*>(nullptr));
@@ -3134,12 +3165,14 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 launchCustom(f2a, static_cast<ctComplex*>(nullptr));
             else
                 launchCustom(d_amplitudes[gpu], static_cast<ctComplex*>(nullptr));
+            prof_tick("ad-kernel");
         }
 
         // 非 AD block（无自由参数）：振幅 A 只依赖四动量，与 θ 无关，
         // 初始化时 getAmps 已计算，fit 循环中跳过重算（纯浪费）
     }
 
+    prof_tick("tail");
     // 恢复 primary device
     cudaSetDevice(primary_dev);
 }
