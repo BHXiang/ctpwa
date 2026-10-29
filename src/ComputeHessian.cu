@@ -780,6 +780,151 @@ __device__ void addBfQ0HessianTerms(
 }
 
 // ============================================================
+// 模型线形内部 q0 对"自由共振态子质量"的一阶/二阶对数导数（跨共振）
+// BWR/GS/Flatte 的 F 里 γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²，q0 = breakup(m0,md1,md2)
+// 依赖子粒子质量；当子粒子是本块内的自由共振态时，aux 里 md1/md2 是
+// CVAR_MD1/2（VAR，对参数导数为 0）→ ∂F/∂m_child、∂²F/∂m_child∂θ、∂²F/∂m²
+// 全部缺失（addBfQ0HessianTerms 只覆盖顶点 Bf，不覆盖模型线形）。
+//
+// 这里对子质量做数值扰动（解释器与 JIT 数值一致）取:
+//   A_d = ∂F/∂m_d,  B_d = ∂²F/∂m_d²,  C_dp = ∂²F/(∂m_d∂θ_p)
+// 再转成对数导数（与 d2ln 的定义一致：∂²lnF = ∂²F/F − ∂lnF·∂lnF）累加。
+// 只在"本节点确有两个自由共振态子粒子"时触发，Hessian 路径不受影响时零开销。
+// ============================================================
+__device__ void addModelQ0HessianTerms(
+    const DeviceResonance& res, const double* aux,
+    const double* rp, int P_r,
+    double mm, double qq, double q0, int L, double bf_d,
+    double md1_q0, double md2_q0,
+    double p1_P, double p1_E, double p1_ct, double p1_phi,
+    double p2_P, double p2_E, double p2_ct, double p2_phi,
+    const DecayNode& node, int match_r,
+    double Fr, double Fi,
+    const double* dFr, const double* dFi,
+    const DeviceResonance* d_res, int R,
+    const int* res_off, const int* res_cnt, const int* pm,
+    double* dln_re, double* dln_im, double* d2ln_re, double* d2ln_im)
+{
+    if (res.type == ResModelType::BW || res.type == ResModelType::ONE)
+        return;
+    const double den = Fr * Fr + Fi * Fi;
+    if (den <= 0.0) return;
+
+    // 收集"自由共振态子粒子"：side（true=daug1）、质量值、位置下标
+    int n_d = 0, pos[2] = { -1, -1 };
+    double mdv[2] = { 0.0, 0.0 };
+    bool side1[2] = { false, false };
+    for (int s = 0; s < 2; ++s) {
+        if ((s == 0 ? node.mass[1] : node.mass[2]) > 0.0) continue;   // 固定质量
+        const int d_idx = (s == 0) ? node.daug1_idx : node.daug2_idx;
+        for (int r2 = 0; r2 < R; ++r2) {
+            if (r2 == match_r || d_res[r2].param_count <= 0) continue;
+            if (d_res[r2].particle_idx != d_idx) continue;
+            const int off2 = res_off[r2], cnt2 = res_cnt[r2];
+            int pos2 = -1;
+            for (int j = 0; j < cnt2; ++j)
+                if ((pm ? pm[off2 + j] : j) == 0) { pos2 = off2 + j; break; }
+            if (pos2 < 0) break;          // mass 不是自由参数，无槽位可写
+            side1[n_d] = (s == 0);
+            mdv[n_d] = (s == 0) ? md1_q0 : md2_q0;
+            pos[n_d] = pos2;
+            n_d++;
+            break;
+        }
+    }
+    if (n_d == 0) return;
+
+    const int off = res_off[match_r];
+    const int cnt = res_cnt[match_r];
+    double l_re[2], l_im[2];
+    for (int d = 0; d < n_d; ++d) {
+        const double m = mdv[d];
+        const double h = 1e-6 * (m > 0.05 ? m : 0.05);
+        const double md1p = md1_q0 + (side1[d] ? h : 0.0);
+        const double md2p = md2_q0 + (side1[d] ? 0.0 : h);
+        const double md1m = md1_q0 - (side1[d] ? h : 0.0);
+        const double md2m = md2_q0 - (side1[d] ? 0.0 : h);
+
+        double Fp_r, Fp_i, Fm_r, Fm_i;
+        double dFpr[16], dFpi[16], dFmr[16], dFmi[16];
+        double d2r[16 * 16], d2i[16 * 16];
+        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            md1p, md2p, p1_P, p1_E, p1_ct, p1_phi,
+            p2_P, p2_E, p2_ct, p2_phi,
+            rp, P_r, Fp_r, Fp_i, dFpr, dFpi, d2r, d2i, false);
+        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            md1m, md2m, p1_P, p1_E, p1_ct, p1_phi,
+            p2_P, p2_E, p2_ct, p2_phi,
+            rp, P_r, Fm_r, Fm_i, dFmr, dFmi, d2r, d2i, false);
+
+        const double A_re = (Fp_r - Fm_r) / (2.0 * h);
+        const double A_im = (Fp_i - Fm_i) / (2.0 * h);
+        const double B_re = (Fp_r - 2.0 * Fr + Fm_r) / (h * h);
+        const double B_im = (Fp_i - 2.0 * Fi + Fm_i) / (h * h);
+
+        l_re[d] = (A_re * Fr + A_im * Fi) / den;
+        l_im[d] = (A_im * Fr - A_re * Fi) / den;
+        dln_re[pos[d]] += l_re[d];
+        dln_im[pos[d]] += l_im[d];
+
+        // 对角项 ∂²lnF/∂m_d²
+        const double t = (B_re * Fr + B_im * Fi) / den;
+        const double u = (B_im * Fr - B_re * Fi) / den;
+        d2ln_re[pos[d] * 16 + pos[d]] += t - (l_re[d] * l_re[d] - l_im[d] * l_im[d]);
+        d2ln_im[pos[d] * 16 + pos[d]] += u - 2.0 * l_re[d] * l_im[d];
+
+        // 与自身参数 θ_p 的交叉项 ∂²lnF/(∂m_d∂θ_p)
+        for (int j = 0; j < cnt; ++j) {
+            const int p = pm ? pm[off + j] : j;
+            if (p < 0 || p >= P_r) continue;
+            const double c_re = (dFpr[p] - dFmr[p]) / (2.0 * h);
+            const double c_im = (dFpi[p] - dFmi[p]) / (2.0 * h);
+            const double own_l_re = (dFr[p] * Fr + dFi[p] * Fi) / den;
+            const double own_l_im = (dFi[p] * Fr - dFr[p] * Fi) / den;
+            const double tt = (c_re * Fr + c_im * Fi) / den;
+            const double uu = (c_im * Fr - c_re * Fi) / den;
+            const double v_re = tt - (l_re[d] * own_l_re - l_im[d] * own_l_im);
+            const double v_im = uu - (l_re[d] * own_l_im + l_im[d] * own_l_re);
+            const int jj = off + j, kk = pos[d];
+            d2ln_re[jj * 16 + kk] += v_re;
+            d2ln_im[jj * 16 + kk] += v_im;
+            d2ln_re[kk * 16 + jj] += v_re;
+            d2ln_im[kk * 16 + jj] += v_im;
+        }
+    }
+
+    // 两个自由子质量之间的交叉项 ∂²lnF/(∂m_1∂m_2)（四角差分）
+    if (n_d == 2) {
+        const double h1 = 1e-6 * (mdv[0] > 0.05 ? mdv[0] : 0.05);
+        const double h2 = 1e-6 * (mdv[1] > 0.05 ? mdv[1] : 0.05);
+        double Fv_r[4], Fv_i[4];
+        for (int c = 0; c < 4; ++c) {          // bit0 = m1 符号, bit1 = m2 符号
+            const double s1 = (c & 1) ? -1.0 : 1.0;
+            const double s2 = (c & 2) ? -1.0 : 1.0;
+            const double m1v = md1_q0 + (side1[0] ? s1 * h1 : 0.0)
+                                     + (side1[1] ? s2 * h2 : 0.0);
+            const double m2v = md2_q0 + (side1[0] ? 0.0 : s1 * h1)
+                                     + (side1[1] ? 0.0 : s2 * h2);
+            double dFa[16], dFb[16], d2a[16 * 16], d2b[16 * 16];
+            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+                m1v, m2v, p1_P, p1_E, p1_ct, p1_phi,
+                p2_P, p2_E, p2_ct, p2_phi,
+                rp, P_r, Fv_r[c], Fv_i[c], dFa, dFb, d2a, d2b, false);
+        }
+        const double D_re = (Fv_r[0] - Fv_r[1] - Fv_r[2] + Fv_r[3]) / (4.0 * h1 * h2);
+        const double D_im = (Fv_i[0] - Fv_i[1] - Fv_i[2] + Fv_i[3]) / (4.0 * h1 * h2);
+        const double t = (D_re * Fr + D_im * Fi) / den;
+        const double u = (D_im * Fr - D_re * Fi) / den;
+        const double v_re = t - (l_re[0] * l_re[1] - l_im[0] * l_im[1]);
+        const double v_im = u - (l_re[0] * l_im[1] + l_im[0] * l_re[1]);
+        d2ln_re[pos[0] * 16 + pos[1]] += v_re;
+        d2ln_im[pos[0] * 16 + pos[1]] += v_im;
+        d2ln_re[pos[1] * 16 + pos[0]] += v_re;
+        d2ln_im[pos[1] * 16 + pos[0]] += v_im;
+    }
+}
+
+// ============================================================
 // Custom 模型 Hessian（标量路径，参数数 P 运行时无上限；多共振态）
 // F_total = Π 共振态因子 × Π Bf；log-derivative 累积（与梯度 kernel R>1 一致）:
 //   dln[j]  = Σ_n ∂ln F_n/∂θ_j
@@ -1097,6 +1242,14 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                     if (P_r > 16) P_r = 16;
                     int off = d_res_off[match_r];
                     int cnt = d_res_cnt[match_r];
+                    // 极角量提前算：模型 q0 跨共振项（addModelQ0HessianTerms）
+                    // 在特化/JIT/解释器三条分支上都要用
+                    const double p1_P = pD1.P(), p1_E = pD1.E;
+                    const double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
+                    const double p1_phi = atan2(pD1.Py, pD1.Px);
+                    const double p2_P = pD2.P(), p2_E = pD2.E;
+                    const double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
+                    const double p2_phi = atan2(pD2.Py, pD2.Px);
 
                     double Fr, Fi, dFr[16], dFi[16], d2Fr[16 * 16], d2Fi[16 * 16];
                     if (d_jit_out_full && nodeIdx == jit_target_node) {
@@ -1127,12 +1280,6 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                                     res.bwr_has_bf != 0,
                                     Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                     } else {
-                        double p1_P = pD1.P(), p1_E = pD1.E;
-                        double p1_ct = (p1_P > 0) ? pD1.Pz / p1_P : 0.0;
-                        double p1_phi = atan2(pD1.Py, pD1.Px);
-                        double p2_P = pD2.P(), p2_E = pD2.E;
-                        double p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
-                        double p2_phi = atan2(pD2.Py, pD2.Px);
                         // P_r=0（固定/ONE 模型）: 只读值段（dF/d2F 段不存在）
                         evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
@@ -1176,6 +1323,16 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                         addBfQ0HessianTerms(node, L, q0, m0_q0, md1_q0, md2_q0,
                             dln_re, dln_im, d2ln_re, d2ln_im,
                             d_resonances, R, d_res_off, d_res_cnt, pm);
+                    // 模型线形内部 q0 的跨共振项（顶点 Bf 之外的那一半）：
+                    // q0 里"自由共振态子粒子"的质量 → 该子共振态 mass 槽位的一二阶
+                    // 对数导数。特化/解释器/JIT 三条分支都补（特化只保证 q0 与
+                    // 自身 θ 的关系正确，子粒子质量同样缺失）。
+                    addModelQ0HessianTerms(res, aux, rp, P_r,
+                        mm, qq, q0, L, node.bf_d, md1_q0, md2_q0,
+                        p1_P, p1_E, p1_ct, p1_phi, p2_P, p2_E, p2_ct, p2_phi,
+                        node, match_r, Fr, Fi, dFr, dFi,
+                        d_resonances, R, d_res_off, d_res_cnt, pm,
+                        dln_re, dln_im, d2ln_re, d2ln_im);
 
                     double nr = Ftr * Fr - Fti * Fi;
                     double ni = Ftr * Fi + Fti * Fr;
