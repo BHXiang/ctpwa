@@ -2060,8 +2060,24 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                     // 质量（CVAR_MD1/2 为 VAR，aux 无该导数）→ 补 ∂lnBf/∂q0·∂q0/∂m
                     // （仅 mass 参数受影响；BW 的 aux 不含 Bf，与 K0 固定路径一致）
                     if (node.has_bf && res.type != ResModelType::BW) {
+                        const bool model_q0_term = (res.type != ResModelType::ONE);
                         for (int r = 0; r < R; ++r) {
                             if (B.d_res[r].param_count <= 0) continue;
+                            // 该子粒子若是本块内的自由共振态，上面"跨共振 q0 项"已经用
+                            // 数值扰动把 ∂F/∂m **整项**（含 aux 里的 Bf 与 γ 的 q0 链）
+                            // 补齐了；这里再加 Bf 那一半就重复计数。
+                            if (model_q0_term) {
+                                bool covered = false;
+                                for (int side = 0; side < 2 && !covered; ++side) {
+                                    const double dmass = (side == 0) ? node.mass[1] : node.mass[2];
+                                    const int didx = (side == 0) ? node.daug1_idx : node.daug2_idx;
+                                    if (dmass > 0.0 || didx != B.d_res[r].particle_idx) continue;
+                                    const int o2 = B.res_dF_offset[r], c2 = B.res_dF_count[r];
+                                    for (int j2 = 0; j2 < c2; ++j2)
+                                        if (B.d_param_map[o2 + j2] == 0) { covered = true; break; }
+                                }
+                                if (covered) continue;
+                            }
                             double dq0_dm = 0.0;
                             if (node.mass[1] <= 0 && node.daug1_idx == B.d_res[r].particle_idx)
                                 dq0_dm += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);

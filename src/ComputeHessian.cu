@@ -720,7 +720,8 @@ __device__ void addBfQ0HessianTerms(
     double m0_q0, double md1_q0, double md2_q0,
     double* dln_re, double* dln_im, double* d2ln_re, double* d2ln_im,
     const DeviceResonance* d_resonances, int R,
-    const int* res_off, const int* res_cnt, const int* pm)
+    const int* res_off, const int* res_cnt, const int* pm,
+    bool skip_model_q0_daughters = false)
 {
     double lq0 = dlnBf_dq0(L, q0, node.bf_d);
     double l2q0 = d2lnBf_dq0q0(L, q0, node.bf_d);
@@ -729,6 +730,21 @@ __device__ void addBfQ0HessianTerms(
     for (int r = 0; r < R; ++r) {
         const DeviceResonance& res = d_resonances[r];
         if (res.param_count <= 0) continue;
+        // 本节点若以该共振态为子粒子且其 mass 是自由槽，则 ∂F/∂m 的**整项**
+        // （含 aux 里的 Bf 与 γ 的 q0 链）已由 addModelQ0HessianTerms 用数值扰动
+        // 补齐；这里再补 Bf 那一半会重复计数。
+        if (skip_model_q0_daughters) {
+            bool covered = false;
+            for (int side = 0; side < 2 && !covered; ++side) {
+                const double dmass = (side == 0) ? node.mass[1] : node.mass[2];
+                const int didx = (side == 0) ? node.daug1_idx : node.daug2_idx;
+                if (dmass > 0.0 || didx != res.particle_idx) continue;
+                const int o2 = res_off[r], c2 = res_cnt[r];
+                for (int j2 = 0; j2 < c2; ++j2)
+                    if ((pm ? pm[o2 + j2] : (o2 + j2)) == 0) { covered = true; break; }
+            }
+            if (covered) continue;
+        }
         double dq0 = 0.0, d2q0 = 0.0;
         if (node.mass[1] <= 0 && node.daug1_idx == res.particle_idx) {
             dq0 += breakup_dq_dm(1, m0_q0, md1_q0, md2_q0);
@@ -1322,7 +1338,8 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                     if (node.has_bf && res.type != ResModelType::BW)
                         addBfQ0HessianTerms(node, L, q0, m0_q0, md1_q0, md2_q0,
                             dln_re, dln_im, d2ln_re, d2ln_im,
-                            d_resonances, R, d_res_off, d_res_cnt, pm);
+                            d_resonances, R, d_res_off, d_res_cnt, pm,
+                            /*skip_model_q0_daughters=*/(res.type != ResModelType::ONE));
                     // 模型线形内部 q0 的跨共振项（顶点 Bf 之外的那一半）：
                     // q0 里"自由共振态子粒子"的质量 → 该子共振态 mass 槽位的一二阶
                     // 对数导数。特化/解释器/JIT 三条分支都补（特化只保证 q0 与

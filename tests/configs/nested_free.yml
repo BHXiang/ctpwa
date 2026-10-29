@@ -42,9 +42,13 @@ DecayChains:
   decay1:
     Jpsi:
       - [gamma, R1]
+      - [pi01, R4]
     R1: [pi01, R2]
     R2: [pi02, R3]
     R3: [pi03, pi04]
+    R4: [gamma, R5]
+    R5: [pi02, R6]
+    R6: [pi03, pi04]
     intermediates:
       R1:
         - [J: 1, P: 1]: [n1]
@@ -52,6 +56,12 @@ DecayChains:
         - [J: 1, P: 1]: [n2]
       R3:
         - [J: 0, P: 1]: [n3]
+      R4:
+        - [J: 1, P: 1]: [n4]
+      R5:
+        - [J: 2, P: 1]: [n5]
+      R6:
+        - [J: 2, P: 1]: [n6]
 
 Resonances:
   n1:
@@ -71,6 +81,24 @@ Resonances:
     P: 1
     model: BWR
     parameters: [0.6, 0.20]
+    free: [0, 1]
+  n4:
+    J: 1
+    P: 1
+    model: BWR
+    parameters: [2.4, 0.16]
+    free: [0, 1]
+  n5:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [1.9, 0.19]
+    free: [0, 1]
+  n6:
+    J: 2
+    P: 1
+    model: BWR
+    parameters: [1.5, 0.22]
     free: [0, 1]
 
 Constraints:
