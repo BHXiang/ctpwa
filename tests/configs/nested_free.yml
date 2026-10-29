@@ -1,0 +1,78 @@
+# 嵌套自由共振态回归：J/psi → gamma + R1 → pi01 + R2 → pi02 + R3 → pi03 pi04
+#
+# 用途：钉住"父共振态线形里的 q0 对自由子质量求导缺失"的 bug
+# （见 tests/test_nested_resonances.py）。
+# 结构要求：一条链里出现 ≥2 个带 free 参数的共振态，且父节点的子粒子是
+# 另一个自由共振态 —— 此时父节点 BWR 的 q0 = breakup(m0, md1, md2) 里
+# md2 是该自由共振态的质量参数，AST 中它是 VAR（EventMass），导数为 0。
+# 于是 ∂F_parent/∂m_child 整项丢失 → θ 质量梯度与 Hessian 都错。
+# 数据用 tests/data/5body.dat（4 个 π⁰ + γ 的伪事例，deep_4pi0 共用）。
+Particles:
+  Jpsi:
+    J: 1
+    P: -1
+    mass: 3.0969
+  gamma:
+    J: 1
+    P: -1
+    mass: 0.0
+  pi01:
+    J: 0
+    P: -1
+    mass: 0.135
+  pi02:
+    J: 0
+    P: -1
+    mass: 0.135
+  pi03:
+    J: 0
+    P: -1
+    mass: 0.135
+  pi04:
+    J: 0
+    P: -1
+    mass: 0.135
+
+Data:
+  order: [pi01, pi02, pi03, pi04, gamma]
+  data: [dat, "./data/5body.dat"]
+  phsp: [dat, "./data/5body.dat"]
+
+DecayChains:
+  decay1:
+    Jpsi:
+      - [gamma, R1]
+    R1: [pi01, R2]
+    R2: [pi02, R3]
+    R3: [pi03, pi04]
+    intermediates:
+      R1:
+        - [J: 1, P: 1]: [n1]
+      R2:
+        - [J: 1, P: 1]: [n2]
+      R3:
+        - [J: 0, P: 1]: [n3]
+
+Resonances:
+  n1:
+    J: 1
+    P: 1
+    model: BWR
+    parameters: [1.9, 0.15]
+    free: [0, 1]
+  n2:
+    J: 1
+    P: 1
+    model: BWR
+    parameters: [1.3, 0.18]
+    free: [0, 1]
+  n3:
+    J: 0
+    P: 1
+    model: BWR
+    parameters: [0.6, 0.20]
+    free: [0, 1]
+
+Constraints:
+  maxL: 3
+  bf_d: 3.0

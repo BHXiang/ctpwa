@@ -1997,6 +1997,65 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                         dln_im[j_glob] += (dFi[p] * Fr - dFr[p] * Fi) / den;
                     }
 
+                    // 跨共振 q0 项（**模型线形内部**）:
+                    // BWR/GS/Flatte 的线形里 γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²，
+                    // q0 = breakup(m0, md1, md2) 依赖"子粒子是另一个自由共振态"的
+                    // 质量参数；但 aux 里 md1/md2 是 CVAR_MD1/2（VAR，对参数导数为 0），
+                    // 于是 ∂F_this/∂m_child 整项缺失（该子共振态的质量梯度与 θθ
+                    // Hessian 因此错）。这里对子质量做两次数值扰动求导（解释器与 JIT
+                    // 数值一致），补进该子共振态的 mass 槽位。
+                    // 只在"本节点确有自由共振态子粒子"时触发，代价是多两次模型求值。
+                    if (res.type != ResModelType::BW && res.type != ResModelType::ONE) {
+                        const double e1_P = pD1.P(), e1_E = pD1.E;
+                        const double e1_ct = (e1_P > 0) ? pD1.Pz / e1_P : 0.0;
+                        const double e1_phi = atan2(pD1.Py, pD1.Px);
+                        const double e2_P = pD2.P(), e2_E = pD2.E;
+                        const double e2_ct = (e2_P > 0) ? pD2.Pz / e2_P : 0.0;
+                        const double e2_phi = atan2(pD2.Py, pD2.Px);
+                        for (int r2 = 0; r2 < R; ++r2) {
+                            if (r2 == match_r || B.d_res[r2].param_count <= 0) continue;
+                            const bool d1_free = (node.mass[1] <= 0
+                                && node.daug1_idx == B.d_res[r2].particle_idx);
+                            const bool d2_free = (node.mass[2] <= 0
+                                && node.daug2_idx == B.d_res[r2].particle_idx);
+                            if (!d1_free && !d2_free) continue;
+                            const int off2 = B.res_dF_offset[r2];
+                            const int cnt2 = B.res_dF_count[r2];
+                            bool slot_free = false;
+                            for (int j_loc = 0; j_loc < cnt2; ++j_loc)
+                                if (B.d_param_map[off2 + j_loc] == 0) { slot_free = true; break; }
+                            if (!slot_free) continue;
+
+                            const double m_child = d1_free ? md1_q0 : md2_q0;
+                            const double hh = 1e-6 * (m_child > 0.05 ? m_child : 0.05);
+                            const double md1p = md1_q0 + (d1_free ? hh : 0.0);
+                            const double md2p = md2_q0 + (d2_free ? hh : 0.0);
+                            const double md1m = md1_q0 - (d1_free ? hh : 0.0);
+                            const double md2m = md2_q0 - (d2_free ? hh : 0.0);
+                            double Fp_r, Fp_i, Fm_r, Fm_i;
+                            double dFr2[16], dFi2[16], d2Fr2[256], d2Fi2[256];
+                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1p, md2p, e1_P, e1_E, e1_ct, e1_phi,
+                                e2_P, e2_E, e2_ct, e2_phi,
+                                rp, P_r, Fp_r, Fp_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
+                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                md1m, md2m, e1_P, e1_E, e1_ct, e1_phi,
+                                e2_P, e2_E, e2_ct, e2_phi,
+                                rp, P_r, Fm_r, Fm_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
+                            const double dF_dm_re = (Fp_r - Fm_r) / (2.0 * hh);
+                            const double dF_dm_im = (Fp_i - Fm_i) / (2.0 * hh);
+                            const double lq_re = (dF_dm_re * Fr + dF_dm_im * Fi) / den;
+                            const double lq_im = (dF_dm_im * Fr - dF_dm_re * Fi) / den;
+                            for (int j_loc = 0; j_loc < cnt2; ++j_loc) {
+                                const int j_glob = off2 + j_loc;
+                                if (B.d_param_map[j_glob] == 0) {
+                                    dln_re[j_glob] += lq_re;
+                                    dln_im[j_glob] += lq_im;
+                                }
+                            }
+                        }
+                    }
+
                     // 跨共振 Bf 项: 匹配节点 aux 内含的 Bf 因子其 q0 链含共振态子粒子
                     // 质量（CVAR_MD1/2 为 VAR，aux 无该导数）→ 补 ∂lnBf/∂q0·∂q0/∂m
                     // （仅 mass 参数受影响；BW 的 aux 不含 Bf，与 K0 固定路径一致）
