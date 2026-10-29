@@ -1586,7 +1586,10 @@ class UnifiedPWAOptimizer:
         print("参数削减报告 (有效秩降维, 候选 fit mode 2)")
         print("=" * 78)
         print(f"  统一参数: {self.n_params} 实维 (复耦合 {nc} + θ {self.n_res_free})")
-        print(f"  自由(非活跃)坐标: {red['n_free']} 实维; 有效秩门槛 tau={red['tau']:g}·λmax")
+        _thr = red['tau'] * red.get('scale', red['lam_max'])
+        print(f"  自由(非活跃)坐标: {red['n_free']} 实维; "
+              f"有效秩门槛 tau={red['tau']:g}·{red.get('rank_scale','max')} "
+              f"(= {_thr:.4g})")
         print(f"  => 保留 {red['k']} 实维 (≈{red['k']/2:.1f} 复参数, "
               f"原自由维度的 {100.0*red['k']/max(red['n_free'],1):.0f}%)  "
               f"[尺度={red.get('rank_scale','max')}: {red.get('scale', red['lam_max']):.4g}]")
@@ -1661,9 +1664,18 @@ class UnifiedPWAOptimizer:
 
     # --------------------------------------------------------
     def extract_coupling_complex(self, params):
-        """从统一参数中提取复数耦合向量 (complex64, n_coupling_free)"""
-        real = params[:self.n_coupling_free].float()
-        imag = params[self.n_coupling_free:2 * self.n_coupling_free].float()
+        """从统一参数中提取复数耦合向量（dtype 必须匹配 .so 编译精度）。
+
+        `getFitFractions` / `getEfficiency` 的 C++ 入口用
+        `TORCH_CHECK(vector.dtype() == TORCH_COMPLEX)`；double 编译的 .so
+        （默认 wheel/本地构建）要求 complex128，而旧代码固定 `.float()` 得到
+        complex64 → 即使 config 没有 phsp_truth 也会先在 dtype 检查处报
+        "vector dtype must match .so complex precision"。
+        """
+        complex_bytes = int(ctpwa.build_info().get("complex_bytes", 16))
+        real_dtype = torch.float64 if complex_bytes == 16 else torch.float32
+        real = params[:self.n_coupling_free].to(dtype=real_dtype)
+        imag = params[self.n_coupling_free:2 * self.n_coupling_free].to(dtype=real_dtype)
         return torch.complex(real, imag)
 
     def extract_theta_phys(self, params):
