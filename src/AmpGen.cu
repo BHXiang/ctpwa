@@ -1835,6 +1835,15 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             for (int j = 0; j < 256; ++j) d2Fr[j] = d2Fi[j] = 0.0;
                             interpEval(aux + target_res.aux_offset, mm,
                                        Fr, Fi, dFr, dFi, P);
+                        } else if (target_res.bwr_flag && target_res.param_count == 2) {
+                            // BWR 解析快路径：原生函数代替字节码解释器（math 与
+                            // buildModelAST 逐项一致，见 bwrSpecEval 注释/回归）
+                            bwrSpecEval(target_rp[0], target_rp[1], mm, qq,
+                                        md1_q0, md2_q0, target_res.bwr_d,
+                                        target_res.bwr_lmin, L,
+                                        target_res.bwr_has_bf != 0,
+                                        Fr, Fi, dFr, dFi, d2Fr, d2Fi,
+                                        /*want_2nd=*/false);
                         } else {
                             // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P，同流顺序保证）
                             int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;
@@ -1968,6 +1977,13 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                     if (res.type == ResModelType::Interp) {
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
+                    } else if (res.bwr_flag && res.param_count == 2) {
+                        // BWR 解析快路径（同 R==1 分支）
+                        bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0,
+                                    res.bwr_d, res.bwr_lmin, L,
+                                    res.bwr_has_bf != 0,
+                                    Fr, Fi, dFr, dFi, d2Fr_tmp, d2Fi_tmp,
+                                    /*want_2nd=*/false);
                     } else {
                         // JIT 物化读取（pass-1 已算 F/dF；nvals = 2+2P_r）
                         int joff = B.d_jit_slice ? B.d_jit_slice[nodeIdx] : -1;

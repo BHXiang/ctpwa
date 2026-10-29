@@ -480,4 +480,151 @@ __host__ __device__ auto Flatte(T m, T m0,
     return ResResult<T>::make(den_re / den_sq, (T(0.0) - den_im) / den_sq);
 }
 
+// ============================================================================
+// BWR 解析 F / dF / d²F（ComputeHessian.cu 的 bwr_flag 特化与 AmpGen.cu 的
+// 振幅 fast path 共用；math 与 buildModelAST 的字节码逐项一致）
+// ============================================================================
+// N_L(z) = Σ_k c_k z^{2k} 及其对 z 的一/二阶（系数与 ResModel bfPolyCoeffs 一致）
+static __device__ void bwrN(int L, double z, double& n, double& np, double& npp) {
+    n = 1.0; np = 0.0; npp = 0.0;
+    if (L < 0 || L > 5) return;
+    static const double C[6][6] = {
+        {1,0,0,0,0,0}, {1,1,0,0,0,0}, {9,3,1,0,0,0},
+        {225,45,6,1,0,0}, {11025,1575,135,10,1,0},
+        {893025,99225,6300,210,15,1}};
+    double z2 = z * z;
+    n = 0.0;
+    double pw = 1.0;    // z^{2k}
+    double pw2 = 1.0;   // z^{2k-2}（k=1 时 = z^0）
+    for (int k = 0; k <= L; ++k) {
+        double c = C[L][k];
+        if (k == 0) {
+            n += c;
+        } else {
+            pw *= z2;
+            n += c * pw;
+            np += c * (2.0 * k) * pw2 * z;              // 2k·c·z^{2k-1}
+            npp += c * (2.0 * k) * (2.0 * k - 1.0) * pw2; // 2k(2k-1)·c·z^{2k-2}
+            pw2 *= z2;
+        }
+    }
+}
+
+// 解析 F/dF/d²F: dF[0]=∂m0, dF[1]=∂g0; d2F[j*2+k]（对称 2×2, 与 evalCustomAll 同布局）
+static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
+                            double q0m1, double q0m2, double dd,
+                            int Lmin, int Lvtx, bool has_bf,
+                            double& Fr, double& Fi,
+                            double* dFr, double* dFi,
+                            double* d2Fr, double* d2Fi,
+                            bool want_2nd = true) {
+    // ---- q0 = breakup(m0, q0m1, q0m2) 及其对 m0 的一/二阶 ----
+    double A = (q0m1 + q0m2) * (q0m1 + q0m2);
+    double B = (q0m1 - q0m2) * (q0m1 - q0m2);
+    double m02 = m0 * m0, m03 = m02 * m0, m04 = m02 * m02;
+    double Q2 = ((m02 - A) * (m02 - B)) / (4.0 * m02);   // q0²
+    // Q2' = (m0⁴−AB)/(2m0³);  Q2'' = (m0⁴+3AB)/(2m0⁴)
+    double q0 = Q2 > 0.0 ? sqrt(Q2) : 0.0;
+    double q0p = 0.0, q0pp = 0.0;
+    if (q0 > 1e-9) {
+        double Q2p = (m04 - A * B) / (2.0 * m03);
+        double Q2pp = (m04 + 3.0 * A * B) / (2.0 * m04);
+        q0p = Q2p / (2.0 * q0);
+        q0pp = (Q2pp - 2.0 * q0p * q0p) / (2.0 * q0);
+    }
+    double u = q0p / q0;                       // d(ln q0)/dm0
+
+    // ---- 内部 Bf² = N(q0·di)/N(q·di); di = has_bf? dd : 0（di=0 → Bf≡1）----
+    double di = has_bf ? dd : 0.0;
+    double Ni_v, Ni_p, Ni_pp, N0i_v, N0i_p, N0i_pp;
+    bwrN(Lmin, q * di, Ni_v, Ni_p, Ni_pp);
+    bwrN(Lmin, q0 * di, N0i_v, N0i_p, N0i_pp);
+    double I2 = N0i_v / Ni_v;
+    double N0i_m = N0i_p * di * q0p;                       // dN0i/dm0
+    double N0i_mm = N0i_pp * (di * q0p) * (di * q0p) + N0i_p * di * q0pp;
+    double lI = N0i_m / N0i_v;                             // (ln Bf²)'
+    double lIp = (N0i_mm * N0i_v - N0i_m * N0i_m) / (N0i_v * N0i_v);  // 二阶 ln 导
+
+    // ---- 顶点 Bv = √(N(q0·dd)/N(q·dd))（has_bf 时）----
+    double Bv = 1.0, lB = 0.0, lBp = 0.0;      // Bv 数值 + ln 导数(对 m0)
+    if (has_bf) {
+        double Nv_v, Nv_p, Nv_pp, Nv0_v, Nv0_p, Nv0_pp;
+        bwrN(Lvtx, q * dd, Nv_v, Nv_p, Nv_pp);
+        bwrN(Lvtx, q0 * dd, Nv0_v, Nv0_p, Nv0_pp);
+        Bv = sqrt(Nv0_v / Nv_v);
+        double Nv0_m = Nv0_p * dd * q0p;
+        double Nv0_mm = Nv0_pp * (dd * q0p) * (dd * q0p) + Nv0_p * dd * q0pp;
+        lB = 0.5 * Nv0_m / Nv0_v;
+        lBp = 0.5 * (Nv0_mm / Nv0_v - (Nv0_m / Nv0_v) * (Nv0_m / Nv0_v));
+    }
+
+    // ---- P = (q/q0)^n, n = 2Lmin+1（q 与 m0 无关）----
+    int nP = 2 * Lmin + 1;
+    double lP = -nP * u;                       // P'/P
+    double lPp = nP * (u * u - q0pp / q0);     // (P'/P)'
+    double pP = 1.0;
+    for (int k = 0; k < nP; ++k) pP *= (q / q0);
+
+    // ---- γ 组: γ = g0·P·(m0/m)·Bf² ----
+    double Lg = lP + 1.0 / m0 + lI;
+    double Lgp = lPp - 1.0 / (m0 * m0) + lIp;
+    double gamma = g0 * pP * (m0 / m) * I2;
+    double g_m = gamma * Lg;
+    double g_mm = gamma * (Lg * Lg + Lgp);
+    double g_g = gamma / g0;
+    double g_mg = g_m / g0;
+    double g_gg = 0.0;
+
+    // ---- x, y, s: 对 (m0, g0) 与混合的一二阶 ----
+    double x = m02 - m * m;
+    double x_m = 2.0 * m0, x_mm = 2.0;
+    double x_g = 0.0, x_mg = 0.0, x_gg = 0.0;   // x 与 g0 无关
+    double y = m0 * gamma;
+    double y_m = gamma + m0 * g_m;
+    double y_mm = 2.0 * g_m + m0 * g_mm;
+    double y_g = m0 * g_g;
+    double y_gg = m0 * g_gg;
+    double y_mg = g_g + m0 * g_mg;
+    double s = x * x + y * y;
+    double s_m = 2.0 * x * x_m + 2.0 * y * y_m;
+    double s_mm = 2.0 * x_m * x_m + 2.0 * x * x_mm + 2.0 * y_m * y_m + 2.0 * y * y_mm;
+    double s_g = 2.0 * y * y_g;
+    double s_gg = 2.0 * y_g * y_g;
+    double s_mg = 2.0 * y_m * y_g + 2.0 * y * y_mg;
+
+    // ---- 商 z/s 的一二阶（z = x 或 y; g0 与 x 无关但公式通用）----
+    double invs = 1.0 / s, invs2 = invs * invs, invs3 = invs2 * invs;
+    double Rm = (x_m * s - x * s_m) * invs2;
+    double Rg = (-x * s_g) * invs2;
+    double Rmm = (2.0 * s - x * s_mm) * invs2 - 2.0 * s_m * (x_m * s - x * s_m) * invs3;
+    double Rgg = (-x * s_gg) * invs2 - 2.0 * s_g * (-x * s_g) * invs3;
+    double Rmg = (x_mg * s + x_g * s_m - x_m * s_g - x * s_mg) * invs2
+               - 2.0 * s_m * (x_g * s - x * s_g) * invs3;
+    double Im = (y_m * s - y * s_m) * invs2;
+    double Ig = (y_g * s - y * s_g) * invs2;
+    double Imm = (y_mm * s - y * s_mm) * invs2 - 2.0 * s_m * (y_m * s - y * s_m) * invs3;
+    double Igg = (y_gg * s - y * s_gg) * invs2 - 2.0 * s_g * (y_g * s - y * s_g) * invs3;
+    double Img = (y_mg * s + y_g * s_m - y_m * s_g - y * s_mg) * invs2
+               - 2.0 * s_m * (y_g * s - y * s_g) * invs3;
+
+    // ---- 乘顶点 Bv: (z·Bv)' = Bv(z' + z·lB); 二阶 = Bv(z'' + 2z'·lB + z(lB²+lBp)) ----
+    double R = x * invs, I = y * invs;
+    Fr = R * Bv;
+    Fi = I * Bv;
+    dFr[0] = (Rm + R * lB) * Bv;
+    dFi[0] = (Im + I * lB) * Bv;
+    dFr[1] = Rg * Bv;                        // Bv 与 g0 无关
+    dFi[1] = Ig * Bv;
+    if (!want_2nd) return;      // fit 主循环只要 F/dF（二阶闭式约占总 flop 的 1/3）
+    double b2 = lB * lB + lBp;
+    d2Fr[0] = (Rmm + 2.0 * Rm * lB + R * b2) * Bv;
+    d2Fi[0] = (Imm + 2.0 * Im * lB + I * b2) * Bv;
+    d2Fr[1] = (Rmg + Rg * lB) * Bv;          // ∂m∂g
+    d2Fi[1] = (Img + Ig * lB) * Bv;
+    d2Fr[2] = d2Fr[1];                       // ∂g∂m（对称）
+    d2Fi[2] = d2Fi[1];
+    d2Fr[3] = Rgg * Bv;
+    d2Fi[3] = Igg * Bv;
+}
+
 #endif // RES_MODEL_CUH
