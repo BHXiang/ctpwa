@@ -4,7 +4,8 @@
 recursive-include ctpwa *.py
 recursive-include include *.cuh *.h
 recursive-include src *.cu *.cuh *.h
-recursive-include doc *
+# 内部设计稿/调研笔记不属于发布物（GitHub 上也不再跟踪 doc/）
+prune doc
 recursive-include example *.py *.yml *.md
 include README.md LICENSE
 prune tests
