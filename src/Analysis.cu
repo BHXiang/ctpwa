@@ -3363,7 +3363,8 @@ public:
     // 输入: 自由耦合 p（complex [n_free]）；内部先映射为振幅 v 再对 v 求 Hessian。
     torch::Tensor computeCouplingHessian(torch::Tensor vector)
     {
-        TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector must be on CUDA");
+        TORCH_CHECK(ctpwa_is_cuda_like(vector),
+            "vector 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
         TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
         TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
         TORCH_CHECK(ctpwa_on_primary(vector, primary_dev_),
@@ -4517,21 +4518,24 @@ public:
         torch::Tensor hessian_in)
     {
         cudaSetDevice(primary_dev_);   // 入口恢复主设备（调用方可能刚从多 GPU 段返回）
-        // computeTruthIntegrals 内已做 float2→double 上转: 两种精度共用双精度积分,
-        // 分支比/效率及 Jacobian 结果与 precision:double 数值一致。
-        TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
-        if (hessian_in.numel() > 0)
-            TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
-                "hessian_in must be float64 CUDA");
 
         // 未配置 phsp_truth(无效率相空间 MC)时天然返回空张量 [0,2]:
-        // 早期拟合不带 mctruth, fit.py 据此自然跳过, 不抛异常、不触碰任何相关 kernel
+        // 早期拟合不带 mctruth, fit.py 据此自然跳过, 不抛异常、不触碰任何相关 kernel。
+        // 早退放在 Tensor 检查**之前**：调用方探测"有没有份额"时不该被 dtype/device
+        // 挡住（以前 CPU 构建传 CPU Hessian 会被下面的 is_cuda 检查误伤）。
         const auto& data_files = config_parser_.getDataFiles();
         if (data_files.count("phsp_truth") == 0) {
             return torch::empty({0, 2},
                 torch::TensorOptions().dtype(torch::kFloat64));
         }
+
+        // computeTruthIntegrals 内已做 float2→double 上转: 两种精度共用双精度积分,
+        // 分支比/效率及 Jacobian 结果与 precision:double 数值一致。
+        TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
+        if (hessian_in.numel() > 0)
+            TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && ctpwa_is_cuda_like(hessian_in),
+                "hessian_in must be float64 on the backend device (CPU build: CPU tensor)");
 
         // 自由耦合 p → 扩展振幅 v（乘法链映射），Jacobian/Hessian 在 p 空间
         torch::Tensor ev_center = freeParamsToAmplitudes(vector);
@@ -4659,19 +4663,21 @@ public:
         torch::Tensor hessian_in)
     {
         cudaSetDevice(primary_dev_);   // 入口恢复主设备
-        TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector must be on CUDA");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
-        if (hessian_in.numel() > 0)
-            TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && hessian_in.is_cuda(),
-                "hessian_in must be float64 CUDA");
 
         // 需要 phsp（带效率 MC）与 phsp_truth（无效率 MC）两个数据键;
-        // 缺任一 → 天然返回空张量 [0,2]（同 getFitFractions 的缺数据行为）
+        // 缺任一 → 天然返回空张量 [0,2]（同 getFitFractions 的缺数据行为）。
+        // 早退放在 Tensor 检查之前：探测"有没有效率"时不该被 dtype/device 挡住。
         const auto& data_files = config_parser_.getDataFiles();
         if (data_files.count("phsp_truth") == 0 || data_files.count("phsp") == 0) {
             return torch::empty({0, 2},
                 torch::TensorOptions().dtype(torch::kFloat64));
         }
+
+        TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
+        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
+        if (hessian_in.numel() > 0)
+            TORCH_CHECK(hessian_in.dtype() == torch::kFloat64 && ctpwa_is_cuda_like(hessian_in),
+                "hessian_in must be float64 on the backend device (CPU build: CPU tensor)");
 
         torch::Tensor ev_center = freeParamsToAmplitudes(vector);
         const int n = vector.numel();
