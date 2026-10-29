@@ -2569,6 +2569,24 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
         off[r] = cur;
         cur += cnt[r];
     }
+
+    if (getenv("CTPWA_GRAD_DEBUG")) {
+        const auto& bb = blocks_.back();
+        fprintf(stderr, "[ctpwa][blk %d] site=%d R=%d nFree=%d res_off=[",
+                block_idx, bb.site, R, bb.nFree);
+        for (int r = 0; r < R; ++r) fprintf(stderr, "%d%s", off[r], r + 1 < R ? "," : "");
+        fprintf(stderr, "] cnt=[");
+        for (int r = 0; r < R; ++r) fprintf(stderr, "%d%s", cnt[r], r + 1 < R ? "," : "");
+        fprintf(stderr, "] global_idx=[");
+        for (size_t j = 0; j < bb.free_global_idx.size(); ++j)
+            fprintf(stderr, "%d%s", bb.free_global_idx[j],
+                    j + 1 < bb.free_global_idx.size() ? "," : "");
+        fprintf(stderr, "] param_idx=[");
+        for (size_t j = 0; j < bb.free_param_idx.size(); ++j)
+            fprintf(stderr, "%d%s", bb.free_param_idx[j],
+                    j + 1 < bb.free_param_idx.size() ? "," : "");
+        fprintf(stderr, "]\n");
+    }
 }
 
 void AmpCalc::applyVarEqual(const std::vector<std::vector<std::string>>& groups)
