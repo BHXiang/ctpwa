@@ -109,6 +109,12 @@ def make_params(ana, device, seed=SEED):
     """构造合法的初始参数向量 [real(v), imag(v), theta]。
 
     布局: v_0 = 1.0 + 0.0i 固定参考振幅，其余随机（固定 seed），theta 用标称值。
+
+    ⚠ **跨后端比较时注意**：随机数用的是 ``torch.Generator(device=device)``，
+    CPU 与 CUDA 的随机流不同 → 同一个 seed 在两端得到**不同的耦合初值**。
+    拿两个后端的 ``getNLL(make_params(ana, dev))`` 直接比会误判成"NLL 不一致"
+    （曾因此误报 CPU/CUDA 差 5–7%）。要比就统一在 CPU 生成再 ``.to(device)``，
+    见 ``tmp/backend_parity/parity_all.py``。
     """
     n_vec = ana.getNVector()
     n_theta = ana.getNFreeTheta()
