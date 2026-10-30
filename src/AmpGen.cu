@@ -1507,14 +1507,44 @@ void AmpCasDecay::releaseStaticData()
         }
     }
     // σ≥1 的全同粒子置换重建动量（仅 nSigma>1 的 cas 分配）
-    for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
-        for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g) {
-            cudaSetDevice((int)g);
-            if (d_mom_sigma_[si][g]) {
+    //
+    // ⚠ 这些缓冲同时也登记在 d_momenta_structs_/d_momenta_arrays_（供下次
+    // computeSLAmps 开头统一释放）里。只 cudaFree 不摘簿记 → 析构函数会对同一
+    // 指针再 free 一次（CPU 后端 malloc/free 直接 abort：
+    // "free(): double free detected in tcache 2"；CUDA 上是 cudaFree 二次释放）。
+    // 这里按指针匹配把对应条目从簿记里摘掉，并顺带释放同 σ 的四动量数组。
+    {
+        std::set<DeviceMomenta*> drop;
+        for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
+            for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g)
+                if (d_mom_sigma_[si][g]) drop.insert(d_mom_sigma_[si][g]);
+        for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
+            for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g) {
+                if (!d_mom_sigma_[si][g]) continue;
+                cudaSetDevice((int)g);
                 cudaFree(d_mom_sigma_[si][g]);
                 d_mom_sigma_[si][g] = nullptr;
             }
+        if (!drop.empty()) {
+            std::vector<std::pair<int, DeviceMomenta*>> keep_structs;
+            std::vector<std::pair<int, LorentzVector*>> keep_arrays;
+            keep_structs.reserve(d_momenta_structs_.size());
+            keep_arrays.reserve(d_momenta_arrays_.size());
+            for (size_t k = 0; k < d_momenta_structs_.size(); ++k) {
+                if (drop.count(d_momenta_structs_[k].second)) {
+                    if (k < d_momenta_arrays_.size()) {
+                        cudaSetDevice(d_momenta_arrays_[k].first);
+                        if (d_momenta_arrays_[k].second) cudaFree(d_momenta_arrays_[k].second);
+                    }
+                } else {
+                    keep_structs.push_back(d_momenta_structs_[k]);
+                    if (k < d_momenta_arrays_.size()) keep_arrays.push_back(d_momenta_arrays_[k]);
+                }
+            }
+            d_momenta_structs_.swap(keep_structs);
+            d_momenta_arrays_.swap(keep_arrays);
         }
+    }
     slamp_released_ = true;
     // 逐链释放日志注释掉（真实分析每 ctor 刷屏）; 诊断时取消注释
     // fprintf(stderr, "[ctpwa] releaseStaticData: 链 %s 无自由参数，静态 SL 表已释放\n",
