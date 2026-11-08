@@ -14,6 +14,8 @@ ctpwa/*.so
 !example/**
 !pyproject.toml
 !README.md
+!README.en.md
+!CHANGELOG.md
 !LICENSE
 !tests/
 !tests/**
