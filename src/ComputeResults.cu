@@ -151,10 +151,10 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
                 }
                 else {
                     // 非对角线元素：2 * Re(A_i * A_j^*)
-                    float a = partial_real[i];
-                    float b = partial_imag[i];
-                    float c = partial_real[j];
-                    float d = partial_imag[j];
+                    double a = partial_real[i];
+                    double b = partial_imag[i];
+                    double c = partial_real[j];
+                    double d = partial_imag[j];
                     interference_value = 2.0 * (a * c + b * d);
                 }
 

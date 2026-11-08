@@ -1697,7 +1697,10 @@ public:
 
         double h_phsp_integral = 0.0;
         double h_full_phsp_integral = 0.0;  // 全量 phsp 积分（干涉矩阵归一分母）
-        double* h_interference_matrix = new double[nSLvectors_.size() * nSLvectors_.size()];
+        // 多 GPU 结果在下面用 += 累加，宿主数组必须从零开始；否则会把
+        // 未初始化内存带入干涉矩阵（可表现为 NaN 或 1e170 量级的垃圾值）。
+        double* h_interference_matrix =
+            new double[nSLvectors_.size() * nSLvectors_.size()]();
         double* h_total_results = new double[N_phsp];
         double* h_partial_results = new double[N_phsp * npartials];
         int ev_cumulative = 0;  // 多GPU累加偏移
