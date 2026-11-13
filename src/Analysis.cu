@@ -2180,6 +2180,10 @@ public:
         int n_particles = particleToIndex.size();
 
         // 计算并保存data直方图
+        // data_weights_ 为空/该 GPU 无权重时返回 nullptr，填充 kernel 按权重 1 处理。
+        auto data_weights_for_gpu = [this](size_t gpu) -> double* {
+            return gpu < data_weights_.size() ? data_weights_[gpu] : nullptr;
+        };
         if (N_data > 0)
         {
             std::vector<TH1F*> masshist_data;
@@ -2202,7 +2206,7 @@ public:
                     temp.emplace_back(hist);
                 }
                 // 计算当前GPU的直方图
-                CalculateMassHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, masshist, nullptr, temp, events_[i][1], n_particles);
+                CalculateMassHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, masshist, data_weights_for_gpu(i), temp, events_[i][1], n_particles);
                 // 累加到总直方图
                 for (size_t j = 0; j < masshist.size(); ++j)
                 {
@@ -2238,7 +2242,7 @@ public:
                     temp.emplace_back(hist);
                 }
                 // 计算当前GPU的直方图
-                CalculateAngleHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, anglehist, nullptr, temp, events_[i][1], n_particles);
+                CalculateAngleHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, anglehist, data_weights_for_gpu(i), temp, events_[i][1], n_particles);
                 // 累加到总直方图
                 for (size_t j = 0; j < anglehist.size(); ++j)
                 {
@@ -2278,7 +2282,7 @@ public:
                     temp.emplace_back(hist);
                 }
                 // 计算当前GPU的直方图
-                CalculateDalitzHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, dalitzhist, nullptr, temp, events_[i][1], n_particles);
+                CalculateDalitzHist(device_momenta_list[i] + events_offsets_[i][1] * n_particles, particleToIndex, dalitzhist, data_weights_for_gpu(i), temp, events_[i][1], n_particles);
                 // 累加到总直方图
                 for (size_t j = 0; j < dalitzhist.size(); ++j)
                 {
@@ -2697,8 +2701,8 @@ public:
 
         // =====================================================================
         // 统一观测直方图 (Plot 序列 form, type=="obs"): 1d/2d 自动区分
-        //   数据 hdata: 原始计数;  模型 hfit: phsp 权重 d_final_result_vec
-        //   (全模型或 waves 子集) × normFactor
+        //   数据 hdata: data_weights_（无权重时按 1）;  模型 hfit: phsp 权重
+        //   d_final_result_vec (全模型或 waves 子集) × normFactor
         // =====================================================================
         {
             std::vector<PlotConfig> obshists;
@@ -2767,7 +2771,7 @@ public:
                     }
                     CalculateObsHist(
                         device_momenta_list[gpu] + events_offsets_[gpu][1] * n_particles,
-                        particleToIndex, obshists, nullptr, t1, t2,
+                        particleToIndex, obshists, data_weights_for_gpu(gpu), t1, t2,
                         events_[gpu][1], n_particles, motherIdx);
                     for (size_t j = 0; j < obshists.size(); ++j) {
                         if (obs1d_data[j]) obs1d_data[j]->Add(t1[j]);
