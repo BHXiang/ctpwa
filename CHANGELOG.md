@@ -1,5 +1,15 @@
 # Changelog
 
+## [v0.3.20] - 2026-11-13
+
+### Fixed
+
+- Apply `data_weights` when filling data histograms in `writeResult`. Previously the
+  fitted model and background histograms used the weighted event yield, but `hdata`
+  used raw event counts, so weighted datasets produced inconsistent plots.
+- Keep unweighted data behavior unchanged: a missing per-GPU data-weight pointer is
+  treated as weight 1.
+
 ## [v0.3.19] - 2026-11-08
 
 ### Fixed
