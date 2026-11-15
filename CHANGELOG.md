@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v0.3.21] - 2026-11-16
 
 ### Fixed
 
@@ -18,6 +18,13 @@
 - Warn when a result-writing kernel's local-memory pool would exceed a quarter of
   the free device memory, so the failure points at the partial-wave count instead
   of the phase-space sample size.
+
+### Improved
+
+- Report the partial-wave count in the initialization banner and print the SL
+  amplitude count next to it. The line previously printed only the SL amplitude
+  count under the label "Number of partial waves", which hid which
+  `computeModWithInterference` bucket a configuration lands in.
 
 ## [v0.3.20] - 2026-11-13
 
