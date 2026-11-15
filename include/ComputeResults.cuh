@@ -29,7 +29,9 @@ void computeResults(const ctComplex *d_matrix, const ctComplex *d_vector,
                     double *d_selected_integral,   // 可空; 子集积分
                     double *d_total_out,           // 可空; = d_total_result, 子集时覆盖
                     const int *d_pair_list,        // 可空; [npairs] 只导出这些对
-                    int npairs_exported,
+                                                   // （上三角线性索引; ≤2048）
+                    int npairs_exported,           // 0 = 不导出逐事件干涉项,
+                                                   // 此时每线程局部内存最小
                     int *d_nSLvectors, int npartials, int nEvents, int ngls,
                     int npolar);
 

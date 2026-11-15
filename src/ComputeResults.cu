@@ -2,6 +2,7 @@
 #include "Backend.h"     // CTPWA_KERNEL / CTPWA_TID / CTPWA_LAUNCH / 双后端
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <string>
 #include <vector>
 #include <stdexcept>
 // #include <iostream>
@@ -49,17 +50,29 @@ computeModTotalWeight(const ctComplex* __restrict__ complex_result,
 // 修改后的部分权重核函数，同时计算干涉矩阵 + 逐事件干涉项
 // d_wave_mask: 可空; [npartials] 0/1 选择子集 —— 非空时把每事件总强度
 // 覆盖为 Σ_pol |Σ_{p∈S} A_p|² 并原子累加 d_selected_integral（其余输出不变）
-template <int N_PARTIALS>
+//
+// 两个模板参数都直接决定**每线程局部内存**（ptxas 的 STACK 帧）。CUDA 的局部
+// 内存按"最大常驻线程数 × 每线程字节"整块预留，与 grid 大小无关：
+//   V100: 2048 线程/SM × 80 SM = 163 840 线程
+//   ⇒ <50,*>: ~11 KB/线程 → ~1.7 GiB；<200,*>: ~164 KB/线程 → ~25 GiB；
+//     <1000,*>: ~4 MB/线程 → 直接超出单线程 512 KB 上限。
+// 所以桶跨度不能太大（51 波落进 <200> 桶就足以把 32 GB 卡吃光，见 v0.3.21）。
+//
+// N_PAIRS == 0 表示调用方不需要逐事件干涉项（writeResult 的路径）：累加器整块
+// 被 `if constexpr` 挡掉、不进栈帧，局部内存退化为 2·N_PARTIALS 个 double。
+// N_PAIRS > 0 时累加器只保留"被导出的对"的槽位（d_pair_lookup 给出紧凑槽位），
+// 而不是原来的 ninterference 个槽。
+template <int N_PARTIALS, int N_PAIRS>
 CTPWA_KERNEL void
 computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     double* __restrict__ final_result,
     double* __restrict__ interference_matrix,
-    double* __restrict__ event_interference,   // [nEvents × ninterference] 原始(未归一) Σ_λ2Re(A_i A_j*)
+    double* __restrict__ event_interference,   // [nEvents × npairs_exported] 原始(未归一) Σ_λ2Re(A_i A_j*)
     int* d_nSLvectors, double* total_result,
     const int* __restrict__ d_wave_mask,
     double* __restrict__ d_selected_integral,
     double* __restrict__ d_event_total,
-    const int* __restrict__ d_pair_list,       // 可空; [npairs] 上三角线性索引, 只导出这些对
+    const int* __restrict__ d_pair_lookup,     // 可空; [ninterference] 导出对→紧凑槽位, 未导出 = -1
     int npairs_exported,
     int npartials, int nEvents, int ngls, int npolar)
 {
@@ -68,7 +81,6 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     if (event_idx >= nEvents)
         return;
 
-    int ninterference = npartials * (npartials + 1) / 2;
     double total_result_value = *total_result;
 
     // 如果总权重为零，跳过计算
@@ -76,9 +88,8 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
         return;
     }
 
-    // 局部数组：假设npartials <= 200，否则需要调整MAX_PARTIALS
+    // 局部数组：假设npartials <= N_PARTIALS，否则需要调整模板桶
     const int MAX_PARTIALS = N_PARTIALS;
-    const int MAX_INTERFERENCE = MAX_PARTIALS * (MAX_PARTIALS + 1) / 2; // 5050
 
     if (npartials > MAX_PARTIALS) {
         printf("Error: npartials=%d exceeds maximum supported value (%d).\n",
@@ -89,11 +100,15 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
     // 使用局部数组，避免设备端malloc
     double partial_real[MAX_PARTIALS];
     double partial_imag[MAX_PARTIALS];
-    double interference_accumulator[MAX_INTERFERENCE];
+    // 逐事件干涉累加器: 只为被导出的对保留槽位。N_PAIRS==0 时只有 1 个占位
+    // 元素且所有访问都被 `if constexpr` 删掉 → 不进栈帧。
+    double interference_accumulator[N_PAIRS > 0 ? N_PAIRS : 1];
 
     // 初始化干涉累加器为0
-    for (int k = 0; k < ninterference; k++) {
-        interference_accumulator[k] = 0.0;
+    if constexpr (N_PAIRS > 0) {
+        for (int q = 0; q < N_PAIRS; q++) {
+            interference_accumulator[q] = 0.0;
+        }
     }
 
     double selected_acc = 0.0;   // 子集总强度 Σ_pol |Σ_{p∈S} A_p|²
@@ -164,26 +179,26 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
                 // 原子累加到全局干涉矩阵（对所有事件和极化求和）
                 atomicAdd(&interference_matrix[idx], interference_value);
 
-                // 累加到线程本地干涉矩阵累加器（仅对当前事件的极化求和）
-                interference_accumulator[idx] += interference_value;
+                // 逐事件干涉项: 只累加被导出的对（槽位由 d_pair_lookup 给出,
+                // 每线程只保留 npairs_exported 个槽位而非 ninterference 个）
+                if constexpr (N_PAIRS > 0) {
+                    const int q = d_pair_lookup[idx];
+                    if (q >= 0) {
+                        interference_accumulator[q] += interference_value;
+                    }
+                }
             }
         }
     }
 
     // 将干涉矩阵累加器写入 event_interference（原始值, 未除以总积分:
     // 与 weight_<i> 同单位, 满足 weight 守恒: Σ_i|A_i|² + Σ_{i<j}2Re(A_iA_j*) = total）
-    // d_pair_list 给出要导出的对(上三角线性索引); 写为紧凑布局 [npairs × nEvents]
-    if (event_interference != nullptr) {
-        if (d_pair_list != nullptr) {
+    // 布局为紧凑的 [npairs_exported × nEvents]
+    if constexpr (N_PAIRS > 0) {
+        if (event_interference != nullptr) {
             for (int q = 0; q < npairs_exported; ++q) {
-                int k = d_pair_list[q];
-                event_interference[event_idx + nEvents * q] =
-                    interference_accumulator[k];
-            }
-        } else {
-            for (int k = 0; k < ninterference; k++) {
-                event_interference[event_idx + nEvents * k] =
-                    interference_accumulator[k];
+                event_interference[(size_t)event_idx + (size_t)nEvents * q] =
+                    interference_accumulator[q];
             }
         }
     }
@@ -193,6 +208,27 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
         d_event_total[event_idx] = selected_acc;
         atomicAdd(d_selected_integral, selected_acc);
     }
+}
+
+// 局部内存池诊断: CUDA 按"每线程局部字节 × 最大常驻线程数(与 grid 无关)"整块预留,
+// 所以大模板桶会让"NLL 拟合一切正常、一写结果就 OOM"。超过空闲显存 25% 时提示一次
+// （指向分波数/导出对数，而不是让用户去怀疑数据量）。
+static void warnIfLocalMemoryHeavy(size_t local_per_thread, const char* tag)
+{
+    static std::string warned;
+    if (warned.find(tag) != std::string::npos) return;
+    const size_t resident = ctpwa::max_resident_threads();
+    if (resident <= 1) return;   // CPU 后端: 没有局部内存池概念
+    const size_t pool = local_per_thread * resident;
+    const size_t free_mem = ctpwa::available_memory();
+    if (free_mem == 0 || pool * 4 < free_mem) return;
+    warned += tag;
+    fprintf(stderr,
+        "[ctpwa] warn: %s 每线程局部内存 %.1f KB × 常驻 %zu 线程 ≈ %.2f GiB"
+        "（当前空闲 %.2f GiB）——局部内存按常驻线程数整块预留、与 grid 无关；"
+        "若此处 OOM，先减分波数/导出对数，而不是减 phsp\n",
+        tag, local_per_thread / 1024.0, resident,
+        pool / 1073741824.0, free_mem / 1073741824.0);
 }
 
 // 主计算函数
@@ -284,36 +320,93 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
                     "cublasCdgmm");
 
     // 计算部分权重和干涉矩阵
-    // 共享内存用于存储部分振幅的实部和虚部（每个部分2个double）以及干涉矩阵累加器
-    // 每个线程需要 (2*npartials + ninterference) 个double，其中ninterference =
-    // npartials*(npartials+1)/2 整个block需要乘以blockSize int ninterference =
-    // npartials * (npartials + 1) / 2; size_t shared_mem_size = blockSize * (2
-    // * npartials + ninterference) * sizeof(double);
+    // 局部内存(不是共享内存)是这里的成本大头: 每线程 2·N_PARTIALS 个 double +
+    // (导出时) N_PAIRS 个 double。CUDA 按"最大常驻线程数 × 每线程字节"整块预留，
+    // 与 grid 无关，所以桶必须贴着实际需要选，且不需要逐事件干涉项时 N_PAIRS=0
+    // 让累加器整块消失（164 KB/线程 → 3 KB/线程，V100 上 25 GiB → 0.5 GiB）。
+    int pair_bucket = 0;
+    int* d_pair_lookup = nullptr;
+    if (d_event_interference != nullptr) {
+        if (d_pair_list == nullptr || npairs_exported <= 0) {
+            throw std::runtime_error(
+                "computeResults: 导出逐事件干涉项需要非空 pair_list 且 pairs>0"
+                "（不再支持一次性导出全部 ninterference 对——每线程局部内存会爆）");
+        }
+        if (npairs_exported <= 32) pair_bucket = 32;
+        else if (npairs_exported <= 128) pair_bucket = 128;
+        else if (npairs_exported <= 512) pair_bucket = 512;
+        else if (npairs_exported <= 2048) pair_bucket = 2048;
+        else {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "computeResults: 一次最多导出 2048 对逐事件干涉项(收到 %d)，"
+                     "请拆成多次 writeInterfResult 调用",
+                     npairs_exported);
+            throw std::runtime_error(buf);
+        }
+        // [ninterference] 查找表: 导出对 → 紧凑槽位, 其余 -1
+        const int ninterference = npartials * (npartials + 1) / 2;
+        std::vector<int> h_pairs(npairs_exported);
+        std::vector<int> h_lookup(ninterference, -1);
+        cudaMemcpy(h_pairs.data(), d_pair_list,
+                   (size_t)npairs_exported * sizeof(int),
+                   cudaMemcpyDeviceToHost);
+        for (int q = 0; q < npairs_exported; ++q) {
+            int k = h_pairs[q];
+            if (k < 0 || k >= ninterference) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "computeResults: pair_list[%d]=%d 越界 (0..%d)", q, k,
+                         ninterference - 1);
+                throw std::runtime_error(buf);
+            }
+            h_lookup[k] = q;
+        }
+        alloc_or_throw(reinterpret_cast<void**>(&d_pair_lookup),
+                       (size_t)ninterference * sizeof(int), "pair_lookup");
+        cudaMemcpy(d_pair_lookup, h_lookup.data(),
+                   (size_t)ninterference * sizeof(int), cudaMemcpyHostToDevice);
+    }
+
+#define CTPWA_MOD_LAUNCH(NP_, NPAIR_)                                         \
+    CTPWA_LAUNCH_P((&computeModWithInterference<NP_, NPAIR_>), gridSize,       \
+        blockSize, 0, d_result_matrix, d_partial_result,                       \
+        d_interference_matrix, d_event_interference, d_nSLvectors,             \
+        d_total_integral, d_wave_mask, d_selected_integral, d_total_out,       \
+        d_pair_lookup, npairs_exported, npartials, nEvents, ngls, npolar)
+
+#define CTPWA_MOD_LAUNCH_BY_PAIRS(NP_)                                        \
+    do {                                                                      \
+        switch (pair_bucket) {                                                \
+        case 0:   CTPWA_MOD_LAUNCH(NP_, 0);    break;                         \
+        case 32:  CTPWA_MOD_LAUNCH(NP_, 32);   break;                         \
+        case 128: CTPWA_MOD_LAUNCH(NP_, 128);  break;                         \
+        case 512: CTPWA_MOD_LAUNCH(NP_, 512);  break;                         \
+        default:  CTPWA_MOD_LAUNCH(NP_, 2048); break;                         \
+        }                                                                     \
+    } while (0)
 
     if (npartials <= 50) {
-        CTPWA_LAUNCH(computeModWithInterference<50>, gridSize, blockSize, 0,
-            d_result_matrix, d_partial_result, d_interference_matrix,
-            d_event_interference, d_nSLvectors, d_total_integral,
-            d_wave_mask, d_selected_integral, d_total_out,
-            d_pair_list, npairs_exported,
-            npartials, nEvents, ngls, npolar);
+        CTPWA_MOD_LAUNCH_BY_PAIRS(50);
+        warnIfLocalMemoryHeavy((size_t)(2 * 50 + (pair_bucket ? pair_bucket : 1))
+                                   * sizeof(double),
+            "computeModWithInterference<50>");
     }
     else if (npartials <= 200) {
-        CTPWA_LAUNCH(computeModWithInterference<200>, gridSize, blockSize, 0,
-            d_result_matrix, d_partial_result, d_interference_matrix,
-            d_event_interference, d_nSLvectors, d_total_integral,
-            d_wave_mask, d_selected_integral, d_total_out,
-            d_pair_list, npairs_exported,
-            npartials, nEvents, ngls, npolar);
+        CTPWA_MOD_LAUNCH_BY_PAIRS(200);
+        warnIfLocalMemoryHeavy((size_t)(2 * 200 + (pair_bucket ? pair_bucket : 1))
+                                   * sizeof(double),
+            "computeModWithInterference<200>");
     }
     else {
-        CTPWA_LAUNCH(computeModWithInterference<1000>, gridSize, blockSize, 0,
-            d_result_matrix, d_partial_result, d_interference_matrix,
-            d_event_interference, d_nSLvectors, d_total_integral,
-            d_wave_mask, d_selected_integral, d_total_out,
-            d_pair_list, npairs_exported,
-            npartials, nEvents, ngls, npolar);
+        CTPWA_MOD_LAUNCH_BY_PAIRS(1000);
+        warnIfLocalMemoryHeavy((size_t)(2 * 1000 + (pair_bucket ? pair_bucket : 1))
+                                   * sizeof(double),
+            "computeModWithInterference<1000>");
     }
+
+#undef CTPWA_MOD_LAUNCH_BY_PAIRS
+#undef CTPWA_MOD_LAUNCH
     kernel_or_throw("computeModWithInterference");
 
     // 同步确保所有操作完成
@@ -330,6 +423,7 @@ void computeResults(const ctComplex* d_matrix, const ctComplex* d_vector,
 
     // 清理资源
     cudaFree(d_result_matrix);
+    if (d_pair_lookup != nullptr) cudaFree(d_pair_lookup);
     cublasDestroy(handle);
 }
 

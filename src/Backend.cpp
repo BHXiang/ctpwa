@@ -136,6 +136,16 @@ std::size_t total_memory()
     return total_b;
 }
 
+std::size_t max_resident_threads()
+{
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 0;
+    return (std::size_t)prop.multiProcessorCount
+        * (std::size_t)prop.maxThreadsPerMultiProcessor;
+}
+
 #else  // ---------------- CPU 实现 ----------------
 
 void* alloc(std::size_t bytes)
@@ -195,6 +205,8 @@ std::size_t available_memory()
 #endif
     return 0;
 }
+
+std::size_t max_resident_threads() { return 1; }
 
 std::size_t total_memory()
 {

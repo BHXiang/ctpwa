@@ -6119,7 +6119,11 @@ private:
         if (!amp_calc_.empty()) amp_calc_.releaseStaticCasData();
 
         std::cout << "Number of GPUs available: " << n_gpus_ << std::endl;
-        std::cout << "Number of partial waves: " << n_gls_ << std::endl;
+        // n_gls_ 是 SL 振幅条数（= 进入 cublas 的列数），不是分波数：多 SL 的链上
+        // 两者差别很大（如 51 个分波 → 105 条 SL 振幅），而 writeResult 的模板桶/
+        // 局部内存是按**分波数** nSLvectors_.size() 选的，所以两个都打出来。
+        std::cout << "Number of partial waves: " << nSLvectors_.size()
+                  << " (SL amplitudes: " << n_gls_ << ")" << std::endl;
         std::cout << "Number of res parameters: " << params_.nFreeTheta() << std::endl;
         std::cout << "Initialization complete." << std::endl;
 
