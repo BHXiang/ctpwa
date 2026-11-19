@@ -660,7 +660,8 @@ std::vector<double> buildModelAST(
     const std::vector<double>& channel_masses,  // Flatte: [m_a0,m_b0, m_a1,m_b1, ...]
     Q0MassDep md1_dep, double md1_fixed,
     Q0MassDep md2_dep, double md2_fixed,
-    bool has_bf)                        // 目标节点是否有势垒因子（false 时 AST 不含 Bf）
+    bool has_bf,                        // 目标节点是否有势垒因子（false 时 AST 不含 Bf）
+    bool use_lift)                      // true = 生成缩并版（提升量表），Hessian 路径用
 {
     // q0 链辅助：把质量依赖描述转成 AST 节点
     auto massNode = [&](Q0MassDep dep, double val, int cv) -> Node {
@@ -696,7 +697,7 @@ std::vector<double> buildModelAST(
             // → d kid 传 0.0 使 Bf≡1，与 bf_d=0.0 完全等价
             // 宽度约定与 computeNodeFactor 一致: BWR Γ(Lmin) 与波无关恒用节点
             // SL 列表最小 L（烘焙）; 顶点 Bf 用 CVAR_L（内核运行时逐波 sl.L）
-            if (liftEnabled()) {                       // 缩并路径（CTPWA_LIFT=1）
+            if (use_lift) {                            // 缩并路径
                 std::vector<double> l_aux;
                 if (buildLiftedBWR(P, Lmin, d, has_bf, q0_ast, l_aux))
                     return l_aux;
@@ -768,7 +769,7 @@ std::vector<double> buildModelAST(
             break;
         }
         case ResModelType::GS: {
-            if (liftEnabled()) {
+            if (use_lift) {
                 std::vector<double> l_aux;
                 double mpi_l = (n_channels > 0) ? channel_masses[0] : 0.1396;
                 if (buildLiftedGS(P, Lmin, d, has_bf, q0_ast, mpi_l, l_aux))

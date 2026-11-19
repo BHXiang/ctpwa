@@ -2451,6 +2451,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
         // Hist/Custom: 构造时已构建（getAuxData）；内置模型（BWR/BW/ONE/Flatte）:
         // 符号微分 aux 需要 decay 结构（q0 链的子粒子质量依赖）→ 此处构建。
         std::vector<double> aux = res.getAuxData();
+        std::vector<double> aux2;   // 缩并版（可选）
         if (aux.empty() &&
             (dr.type == ResModelType::BWR || dr.type == ResModelType::BW ||
              dr.type == ResModelType::ONE || dr.type == ResModelType::Flatte ||
@@ -2484,10 +2485,23 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             if (Lmin < 0) Lmin = L;   // 无匹配 decay 节点时退化为块级 L
             aux = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
                                 m1d, m1f, m2d, m2f, has_bf);
+            // 缩并版（提升量表）：只给二阶/Hessian 路径用；普通路径仍走 aux
+            static const bool s_lift = [] {
+                const char* e = getenv("CTPWA_LIFT");
+                return e && e[0] == '1';
+            }();
+            if (s_lift)
+                aux2 = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
+                                     m1d, m1f, m2d, m2f, has_bf, true);
         }
         dr.aux_offset = static_cast<int>(h_all_channels.size());
         dr.aux_size = static_cast<int>(aux.size());
         h_all_channels.insert(h_all_channels.end(), aux.begin(), aux.end());
+        if (!aux2.empty()) {
+            dr.aux2_offset = static_cast<int>(h_all_channels.size());
+            dr.aux2_size = static_cast<int>(aux2.size());
+            h_all_channels.insert(h_all_channels.end(), aux2.begin(), aux2.end());
+        }
 
         // BWR 解析特化资格: BWR + 2 参数 + q0 链子质量不是 M0Param（m1d/m2d 在
         // 上方 aux 构建分支作用域; 非内置模型分支此段仍执行, 变量不可见 →

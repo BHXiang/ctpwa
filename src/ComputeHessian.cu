@@ -864,11 +864,11 @@ __device__ void addModelQ0HessianTerms(
         double Fp_r, Fp_i, Fm_r, Fm_i;
         double dFpr[16], dFpi[16], dFmr[16], dFmi[16];
         double d2r[16 * 16], d2i[16 * 16];
-        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+        evalCustomAll(aux, (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, bf_d,
             md1p, md2p, p1_P, p1_E, p1_ct, p1_phi,
             p2_P, p2_E, p2_ct, p2_phi,
             rp, P_r, Fp_r, Fp_i, dFpr, dFpi, d2r, d2i, false);
-        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+        evalCustomAll(aux, (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, bf_d,
             md1m, md2m, p1_P, p1_E, p1_ct, p1_phi,
             p2_P, p2_E, p2_ct, p2_phi,
             rp, P_r, Fm_r, Fm_i, dFmr, dFmi, d2r, d2i, false);
@@ -922,7 +922,7 @@ __device__ void addModelQ0HessianTerms(
             const double m2v = md2_q0 + (side1[0] ? 0.0 : s1 * h1)
                                      + (side1[1] ? 0.0 : s2 * h2);
             double dFa[16], dFb[16], d2a[16 * 16], d2b[16 * 16];
-            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            evalCustomAll(aux, (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, bf_d,
                 m1v, m2v, p1_P, p1_E, p1_ct, p1_phi,
                 p2_P, p2_E, p2_ct, p2_phi,
                 rp, P_r, Fv_r[c], Fv_i[c], dFa, dFb, d2a, d2b, false);
@@ -1157,7 +1157,7 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                                     Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                     } else {
                         // P_r=0（固定/ONE 模型）: 只读值段（dF/d2F 段不存在）
-                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                        evalCustomAll(aux, (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
                             p1_P, p1_E, p1_ct, p1_phi,
                             p2_P, p2_E, p2_ct, p2_phi,

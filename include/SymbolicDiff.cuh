@@ -167,6 +167,7 @@ std::vector<double> buildModelAST(
     const std::vector<double>& channel_masses,
     Q0MassDep md1_dep, double md1_fixed,
     Q0MassDep md2_dep, double md2_fixed,
-    bool has_bf = true);
+    bool has_bf = true,
+    bool use_lift = false);   // true = 生成缩并版（提升量表），Hessian 路径用
 
 #endif // SYMBOLIC_DIFF_CUH
