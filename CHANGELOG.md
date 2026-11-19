@@ -4,6 +4,12 @@
 
 ### Improved
 
+- The contraction is now generic: `buildLiftedAux()` takes the model's "shell"
+  expression (lifted quantities referenced as placeholder parameters) plus the
+  list of lifted sub-expressions, and assembles every derivative segment from
+  the multivariate chain rule. Each model only declares *what* to lift
+  (BWR/GS are ~30 lines each now) and lift-to-lift dependencies are resolved
+  automatically (BWR's `gamma` is built from the `Bf` table).
 - Symbolic differentiation can now be *contracted*: expensive model factors
   (`Bf`, the `(q/q0)^{2L+1}` factor, the BWR width `gamma`, and the GS
   coefficients `d/m0`, `f/g0`, `(q/q0)^3 m0/m`) are lifted into a per-node
@@ -18,6 +24,9 @@
 
 ### Fixed
 
+- The BWR contraction used a single `Bf` table for both the width (`Lmin`) and the
+  vertex (runtime `L`); they only coincide when `L == Lmin`. The vertex barrier
+  factor is now its own lifted quantity.
 - `evalCustomAll` passed `lifts = nullptr` while evaluating the lift tables, so
   a lifted quantity that referenced an earlier one (BWR `gamma` using `B`) read
   zero. This silently zeroed the imaginary part of the amplitude and made the

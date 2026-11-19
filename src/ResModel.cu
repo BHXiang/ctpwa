@@ -403,135 +403,212 @@ static Node substLiftParam(const Node& n, int from, int slot)
     return r;
 }
 
-// 返回 true = 已按缩并路径生成 aux（P 必须为 2）
-// 提升两个量，**Bf 先提**（它同时被 γ 和顶点用）：
-//   槽 0..2 : B, B_m0, B_m0m0                    （顶点/宽度共用的 Bf）
-//   槽 3..8 : γ, γ_m0, γ_g0, γ_m0m0, γ_m0g0, γ_g0g0
-//   B  = Bf(Lmin, q, q0, d_eff)（has_bf=false 时 ≡1，只提 γ）
-//   γ  = g0·(q/q0)^(2L+1)·(m0/m)·B²
-//   F  = ((x/s) + i(y/s))·B_vertex,  x = m0²-m², y = m0·γ, s = x²+y²
-static bool buildLiftedBWR(int P, int Lmin, double d, bool has_bf,
-                           const Node& q0_ast, std::vector<double>& aux)
+
+// ============================================================================
+// 通用缩并：给定"壳" F（提升量用伪参数 P..P+n-1 表示）与各提升量的导数表，
+// 按多元链式法则生成节点各段，并拼出带提升量区的 aux。
+//
+//   F_p  = ∂F/∂u_p + Σ_i (∂F/∂L_i)·L_i,p
+//   F_pq = ∂²F/∂u_p∂u_q
+//        + Σ_i [ (∂²F/∂u_p∂L_i)·L_i,q + (∂²F/∂u_q∂L_i)·L_i,p ]
+//        + Σ_ij (∂²F/∂L_i∂L_j)·L_i,p·L_j,q
+//        + Σ_i (∂F/∂L_i)·L_i,pq
+//
+// 槽位约定（每个提升量按"依赖几个真参数"nd 分配）：
+//   [V, V_0..V_{nd-1}, V_00, V_01, ...]  共 1 + nd + nd(nd+1)/2 个
+// ============================================================================
+struct LiftSpec {
+    int fake_param = 0;
+    std::vector<int> deps;
+    std::vector<Node> segs;
+    int n_grad = 0;
+};
+
+static bool nodeHasParam(const Node& n, int p)
 {
-    if (P != 2) return false;
-    const int GB = P + 1;                    // 伪参数：B
-    const int GG = P + 2;                    // 伪参数：γ
-    Node m  = Node::makeVar(CVAR_M);
-    Node q  = Node::makeVar(CVAR_Q);
-    Node m0 = Node::makeParam(0);
-    Node g0 = Node::makeParam(1);
+    if (n.type == NodeType::Param && n.param_id == p) return true;
+    for (const auto& k : n.kids) if (nodeHasParam(k, p)) return true;
+    return false;
+}
 
-    double d_eff = has_bf ? d : 0.0;
-    Node BfW = Node::makeComposite(MODEL_BF,
-                  { Node::makeNum((double)Lmin), q, q0_ast, Node::makeNum(d_eff) });
+static std::vector<double> buildLiftedAux(int P, Node F, const std::vector<LiftSpec>& lifts)
+{
+    const int n = (int)lifts.size();
+    if (n == 0) return {};
 
-    // ---- 提升量 1：B（= 宽度里的 Bf；has_bf 时顶点也是它）
-    Node bv = Node::makeParam(GB);
-    std::vector<Node> B_segs = { BfW, deriv(BfW, 0), deriv2(BfW, 0, 0) };
+    // 槽位分配 + 依赖关系（提升量可以引用先算好的提升量，如 BWR 的 γ 用 B）
+    std::vector<int> base(n, 0), nd(n, 0);
+    int acc = 0;
+    for (int i = 0; i < n; ++i) {
+        nd[i] = (int)lifts[i].deps.size();
+        base[i] = acc;
+        acc += 1 + nd[i] + nd[i] * (nd[i] + 1) / 2;
+    }
+    if (acc > CVAR_LIFT_MAX) return {};
 
-    // ---- 提升量 2：γ = g0·pw·(m0/m)·B²，B 视为伪参数
-    Node pw = Node::makeOp(NodeType::Pow, astDiv(q, q0_ast), astNum(2.0 * Lmin + 1.0));
-    Node gam = astMul(astMul(astMul(g0, pw), astDiv(m0, m)), astSq(bv));
-    Node G0 = deriv(gam, 0), G1 = deriv(gam, 1), GBd = deriv(gam, GB);
-    Node G00 = deriv2(gam, 0, 0), G01 = deriv2(gam, 0, 1), G11 = deriv2(gam, 1, 1);
-    Node G0B = deriv2(gam, 0, GB), G1B = deriv2(gam, 1, GB), GBB = deriv2(gam, GB, GB);
+    std::vector<std::vector<int>> refs(n);          // 每个提升量引用了哪些更早的提升量
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < i; ++j)
+            if (nodeHasParam(lifts[i].segs[0], lifts[j].fake_param)) refs[i].push_back(j);
 
-    // ---- 壳
-    Node gv = Node::makeParam(GG);
-    Node x  = astSub(astSq(m0), astSq(m));
-    Node y  = astMul(m0, gv);
-    Node s  = astAdd(astSq(x), astSq(y));
-    Node F  = astMul(astAdd(astDiv(x, s), astMul(astI(), astDiv(y, s))), bv);
-    Node D0 = deriv(F, 0), D1 = deriv(F, 1), DG = deriv(F, GG), DB = deriv(F, GB);
-    Node D00 = deriv2(F, 0, 0), D01 = deriv2(F, 0, 1), D11 = deriv2(F, 1, 1);
-    Node D0G = deriv2(F, 0, GG), D1G = deriv2(F, 1, GG), DGG = deriv2(F, GG, GG);
-    Node D0B = deriv2(F, 0, GB), D1B = deriv2(F, 1, GB), DGB = deriv2(F, GB, GG);
-    Node DBB = deriv2(F, GB, GB);
-
-    // 槽位
-    Node B0 = Node::makeVar(CVAR_LIFT_BASE + 0);   // B
-    Node B1 = Node::makeVar(CVAR_LIFT_BASE + 1);   // B'
-    Node B2 = Node::makeVar(CVAR_LIFT_BASE + 2);   // B''
-    Node g0v = Node::makeVar(CVAR_LIFT_BASE + 3);  // γ
-    Node g1v = Node::makeVar(CVAR_LIFT_BASE + 4);  // γ_m0
-    Node g2v = Node::makeVar(CVAR_LIFT_BASE + 5);  // γ_g0
-    Node g00 = Node::makeVar(CVAR_LIFT_BASE + 6);  // γ_m0m0
-    Node g01 = Node::makeVar(CVAR_LIFT_BASE + 7);  // γ_m0g0
-    Node g11 = Node::makeVar(CVAR_LIFT_BASE + 8);  // γ_g0g0
-
+    auto pairIdx = [&](int i, int a, int bb) {
+        if (a > bb) { int t = a; a = bb; bb = t; }
+        int k = 0;
+        for (int x = 0; x < nd[i]; ++x)
+            for (int y = x; y < nd[i]; ++y) { if (x == a && y == bb) return k; ++k; }
+        return -1;
+    };
+    auto depIdx = [&](int i, int p) {
+        for (int k = 0; k < nd[i]; ++k) if (lifts[i].deps[k] == p) return k;
+        return -1;
+    };
+    auto V = [&](int i, int slot) { return Node::makeVar(CVAR_LIFT_BASE + base[i] + slot); };
+    auto S = [&](Node t) {
+        for (int i = 0; i < n; ++i) t = substLiftParam(t, lifts[i].fake_param, base[i]);
+        return t;
+    };
     auto mul = [](Node a, Node b) { return astMul(a, b); };
     auto sum = [](std::vector<Node> xs) {
         Node r = Node::makeNum(0.0);
         for (auto& x : xs) r = astAdd(r, x);
         return r;
     };
-    auto S_g = [&](const Node& n) { return substLiftParam(n, GG, 3); };  // γ → 槽 3
-    auto S_b = [&](const Node& n) { return substLiftParam(n, GB, 0); };  // B → 槽 0
 
-    // γ 的 6 段（B 随 m0 变：γ_0 = ∂γ/∂m0 + ∂γ/∂B·B' …）
-    Node gam_seg0 = S_b(gam);
-    Node gam_seg1 = sum({ S_b(G0), mul(S_b(GBd), B1) });
-    Node gam_seg2 = S_b(G1);
-    Node gam_seg3 = sum({ S_b(G00), mul(astNum(2.0), mul(S_b(G0B), B1)),
-                          mul(S_b(GBB), astSq(B1)), mul(S_b(GBd), B2) });
-    Node gam_seg4 = sum({ S_b(G01), mul(S_b(G1B), B1) });
-    Node gam_seg5 = S_b(G11);
+    // 对表达式 A 求"总导数"：显式 ∂/∂u + 经由 rl 里各提升量的链式项
+    auto totalDeriv = [&](const Node& A, const std::vector<int>& rl,
+                          std::vector<Node>& d1, std::vector<Node>& d2) {
+        d1.assign(P, Node::makeNum(0.0));
+        d2.assign(P * P, Node::makeNum(0.0));
+        for (int p = 0; p < P; ++p) {
+            std::vector<Node> t{ deriv(A, p) };
+            for (int j : rl) {
+                const int k = depIdx(j, p);
+                if (k < 0) continue;
+                t.push_back(mul(deriv(A, lifts[j].fake_param), V(j, 1 + k)));
+            }
+            d1[p] = sum(t);
+        }
+        for (int p = 0; p < P; ++p)
+            for (int q = p; q < P; ++q) {
+                std::vector<Node> t{ deriv2(A, p, q) };
+                for (int j : rl) {
+                    const int kq = depIdx(j, q), kp = depIdx(j, p);
+                    if (p == q) {
+                        if (kp >= 0)
+                            t.push_back(mul(astNum(2.0),
+                                            mul(deriv2(A, p, lifts[j].fake_param), V(j, 1 + kp))));
+                    } else {
+                        if (kq >= 0) t.push_back(mul(deriv2(A, p, lifts[j].fake_param), V(j, 1 + kq)));
+                        if (kp >= 0) t.push_back(mul(deriv2(A, q, lifts[j].fake_param), V(j, 1 + kp)));
+                    }
+                }
+                for (int j : rl)
+                    for (int k2 : rl) {
+                        const int kp = depIdx(j, p), kq = depIdx(k2, q);
+                        if (kp < 0 || kq < 0) continue;
+                        t.push_back(mul(deriv2(A, lifts[j].fake_param, lifts[k2].fake_param),
+                                        mul(V(j, 1 + kp), V(k2, 1 + kq))));
+                    }
+                for (int j : rl) {
+                    const int kp = depIdx(j, p), kq = depIdx(j, q);
+                    if (kp < 0 || kq < 0) continue;
+                    const int sl = pairIdx(j, kp, kq);
+                    if (sl < 0) continue;
+                    t.push_back(mul(deriv(A, lifts[j].fake_param), V(j, 1 + nd[j] + sl)));
+                }
+                d2[p * P + q] = d2[q * P + p] = sum(t);
+            }
+    };
 
-    // 节点 6 段（γ 与 B 都随 m0 变）
-    Node seg0 = mul(S_g(S_b(F)), Node::makeNum(1.0));
-    Node seg1 = sum({ S_g(S_b(D0)), mul(S_g(S_b(DG)), g1v), mul(S_g(S_b(DB)), B1) });
-    Node seg2 = sum({ S_g(S_b(D1)), mul(S_g(S_b(DG)), g2v) });
-    Node seg3 = sum({ S_g(S_b(D00)),
-                      mul(astNum(2.0), mul(S_g(S_b(D0G)), g1v)),
-                      mul(S_g(S_b(DGG)), astSq(g1v)),
-                      mul(S_g(S_b(DG)), g00),
-                      mul(astNum(2.0), mul(S_g(S_b(D0B)), B1)),
-                      mul(astNum(2.0), mul(S_g(S_b(DGB)), mul(g1v, B1))),
-                      mul(S_g(S_b(DBB)), astSq(B1)),
-                      mul(S_g(S_b(DB)), B2) });
-    Node seg4 = sum({ S_g(S_b(D01)),
-                      mul(S_g(S_b(D0G)), g2v),
-                      mul(S_g(S_b(D1G)), g1v),
-                      mul(S_g(S_b(DGG)), mul(g1v, g2v)),
-                      mul(S_g(S_b(DG)), g01),
-                      mul(S_g(S_b(DGB)), mul(g2v, B1)),
-                      mul(S_g(S_b(D1B)), B1) });
-    Node seg5 = sum({ S_g(S_b(D11)),
-                      mul(astNum(2.0), mul(S_g(S_b(D1G)), g2v)),
-                      mul(S_g(S_b(DGG)), astSq(g2v)),
-                      mul(S_g(S_b(DG)), g11) });
+    // 1) 各提升量的表：对 lift 自己的 AST 求总导数（含它引用的更早提升量）
+    std::vector<std::vector<Node>> tables(n);
+    for (int i = 0; i < n; ++i) {
+        std::vector<Node> d1, d2;
+        totalDeriv(lifts[i].segs[0], refs[i], d1, d2);
+        tables[i].push_back(S(lifts[i].segs[0]));                 // V
+        for (int k = 0; k < nd[i]; ++k) tables[i].push_back(S(d1[lifts[i].deps[k]]));
+        for (int a = 0; a < nd[i]; ++a)
+            for (int bb = a; bb < nd[i]; ++bb)
+                tables[i].push_back(S(d2[lifts[i].deps[a] * P + lifts[i].deps[bb]]));
+    }
 
-    std::vector<Node> node_segs = { seg0, seg1, seg2, seg3, seg4, seg5 };
+    // 2) 节点各段
+    std::vector<int> all(n);
+    for (int i = 0; i < n; ++i) all[i] = i;
+    std::vector<Node> d1, d2;
+    totalDeriv(F, all, d1, d2);
+    std::vector<Node> node_segs;
+    node_segs.push_back(S(F));
+    for (int p = 0; p < P; ++p) node_segs.push_back(S(d1[p]));
+    for (int p = 0; p < P; ++p)
+        for (int q = p; q < P; ++q) node_segs.push_back(S(d2[p * P + q]));
 
-    aux.clear();
+    std::vector<double> aux;
     aux.push_back((double)P);
     aux.push_back((double)node_segs.size());
     aux.push_back(AUX_MAGIC_LIFT);
-    aux.push_back(2.0);                                  // n_lift
+    aux.push_back((double)n);
     auto emit = [&](const Node& tree) {
         std::vector<double> seg;
         compileNode(simplify(tree), seg);
         aux.push_back((double)(seg.size() / 3));
         aux.insert(aux.end(), seg.begin(), seg.end());
     };
-    aux.push_back(3.0);                                  // B 表 3 段（梯度用前 2）
-    aux.push_back(2.0);
-    for (const auto& t : B_segs) emit(t);
-    aux.push_back(6.0);                                  // γ 表 6 段（梯度用前 3）
-    aux.push_back(3.0);
-    for (const auto& t : { gam_seg0, gam_seg1, gam_seg2, gam_seg3, gam_seg4, gam_seg5 })
-        emit(t);
+    for (int i = 0; i < n; ++i) {
+        aux.push_back((double)tables[i].size());
+        aux.push_back((double)(lifts[i].n_grad > 0 ? lifts[i].n_grad : (int)tables[i].size()));
+        for (const auto& t : tables[i]) emit(t);
+    }
     for (const auto& t : node_segs) emit(t);
-    return true;
+    return aux;
+}
+
+// BWR 缩并：宽度里的 Bf(Lmin)、γ、顶点 Bf(CVAR_L) 各成一张表
+//   槽：Bw 0..2, γ 3..8, Bv 9..11（has_bf=false 时只有 γ 一张）
+static bool buildLiftedBWR(int P, int Lmin, double d, bool has_bf,
+                           const Node& q0_ast, std::vector<double>& aux)
+{
+    if (P != 2) return false;
+    const int GB = P, GG = P + 1, GV = P + 2;
+    Node m = Node::makeVar(CVAR_M), q = Node::makeVar(CVAR_Q);
+    Node m0 = Node::makeParam(0), g0 = Node::makeParam(1);
+    const double d_eff = has_bf ? d : 0.0;
+
+    std::vector<LiftSpec> lifts;
+    if (has_bf) {
+        // 宽度里的 Bf：L 用烘焙的 Lmin（与 MODEL_BWR 内部一致）
+        Node Bw = Node::makeComposite(MODEL_BF,
+                      { Node::makeNum((double)Lmin), q, q0_ast, Node::makeNum(d_eff) });
+        lifts.push_back({ GB, {0}, { Bw }, 2 });
+    }
+    {
+        Node bvB = has_bf ? Node::makeParam(GB) : Node::makeNum(1.0);
+        Node pw = Node::makeOp(NodeType::Pow, astDiv(q, q0_ast), astNum(2.0 * Lmin + 1.0));
+        Node gam = astMul(astMul(astMul(g0, pw), astDiv(m0, m)), astSq(bvB));
+        lifts.push_back({ GG, {0, 1}, { gam }, 3 });
+    }
+    Node bv = Node::makeNum(1.0);
+    if (has_bf) {
+        // 顶点 Bf：L 用运行时的 CVAR_L → 必须是**独立**的一张表
+        Node Bv = Node::makeComposite(MODEL_BF,
+                      { Node::makeVar(CVAR_L), q, q0_ast, Node::makeNum(d) });
+        bv = Node::makeParam(GV);
+        lifts.push_back({ GV, {0}, { Bv }, 2 });
+    }
+    Node gv = Node::makeParam(GG);
+    Node x = astSub(astSq(m0), astSq(m));
+    Node y = astMul(m0, gv);
+    Node s = astAdd(astSq(x), astSq(y));
+    Node F = astMul(astAdd(astDiv(x, s), astMul(astI(), astDiv(y, s))), bv);
+
+    aux = buildLiftedAux(P, F, lifts);
+    return !aux.empty();
 }
 
 // ============================================================================
-// 缩并（CTPWA_LIFT=1）：Gounaris-Sakurai
-//   壳:  Num = 1 + g0·B,  DenRe = m0²-m² + g0·F1,  DenIm = -g0·m0·E1
-//        F = Num/(DenRe + i·DenIm)·B_vertex
-//   提升量（都只随 m0 变，故每个 3 段 V/V′/V″）: B = d/m0, F1 = f/g0,
-//        E1 = (q/q0)³·(m0/m), B_vertex
-//   槽: B 0..2, F1 3..5, E1 6..8, Bv 9..11
+// GS 缩并：四个只随 m0 变的系数各成一张表
+//   Num = 1 + g0·B,  DenRe = m0²-m² + g0·F1,  DenIm = -g0·m0·E1
+//   F = Num/(DenRe + i·DenIm)·B_vertex
 // ============================================================================
 static bool buildLiftedGS(int P, int Lmin, double d, bool has_bf,
                           const Node& q0_ast, double mpi, std::vector<double>& aux)
@@ -543,7 +620,6 @@ static bool buildLiftedGS(int P, int Lmin, double d, bool has_bf,
     auto L_ = [](Node a) { return Node::makeFunc(CFUNC_LOG, a); };
     auto sq = [](Node a) { return astSq(a); };
 
-    // —— GS 原始子式（与下方 switch 里逐项一致）——
     Node hm = astMul(astNum(2.0 / pi), astMul(astDiv(q, m),
         L_(astDiv(astAdd(m, astMul(astNum(2.0), q)), astNum(2.0 * mpi)))));
     Node q0_2 = sq(q0_ast), q0_3 = astMul(q0_2, q0_ast), mpi2 = astNum(mpi * mpi);
@@ -557,29 +633,25 @@ static bool buildLiftedGS(int P, int Lmin, double d, bool has_bf,
                                         astDiv(astNum(1.0), astMul(astNum(2.0), sq(m0))))),
                       astDiv(astNum(1.0), astMul(astNum(2.0 * pi), sq(m0))));
     Node qratio = astDiv(q, q0_ast);
-    Node gam1 = astMul(astMul(sq(qratio), qratio), astDiv(m0, m));   // γ/g0
-    Node f1 = astMul(astDiv(sq(m0), q0_3),
+    Node E1val = astMul(astMul(sq(qratio), qratio), astDiv(m0, m));
+    Node F1val = astMul(astDiv(sq(m0), q0_3),
                      astAdd(astMul(sq(q), astSub(hm, h0)),
-                            astMul(astMul(astSub(sq(m0), sq(m)), q0_2), dh0)));  // f/g0
-    Node Bv0 = has_bf ? Node::makeComposite(MODEL_BF,
-                    { Node::makeVar(CVAR_L), q, q0_ast, Node::makeNum(d) }) : Node::makeNum(1.0);
+                            astMul(astMul(astSub(sq(m0), sq(m)), q0_2), dh0)));
+    Node Bval = astDiv(dval, m0);
 
-    Node Bval = astDiv(dval, m0);        // B
-    Node F1val = f1;                     // F1
-    Node E1val = gam1;                   // E1
-
-    // —— 四张表（各 3 段）——
-    auto tbl = [](const Node& n, std::vector<Node>& out) {
-        out.push_back(n); out.push_back(deriv(n, 0)); out.push_back(deriv2(n, 0, 0));
+    std::vector<LiftSpec> lifts = {
+        { 2, {0}, { Bval,  deriv(Bval, 0),  deriv2(Bval, 0, 0)  }, 2 },
+        { 3, {0}, { F1val, deriv(F1val, 0), deriv2(F1val, 0, 0) }, 2 },
+        { 4, {0}, { E1val, deriv(E1val, 0), deriv2(E1val, 0, 0) }, 2 },
     };
-    std::vector<Node> Bs, Fs, Es, Vs;
-    tbl(Bval, Bs); tbl(F1val, Fs); tbl(E1val, Es);
-    if (has_bf) tbl(Bv0, Vs); else { Vs = { Node::makeNum(1.0), Node::makeNum(0.0), Node::makeNum(0.0) }; }
+    if (has_bf) {
+        Node BfV = Node::makeComposite(MODEL_BF,
+                       { Node::makeVar(CVAR_L), q, q0_ast, Node::makeNum(d) });
+        lifts.push_back({ 5, {0}, { BfV, deriv(BfV, 0), deriv2(BfV, 0, 0) }, 2 });
+    }
 
-    // —— 壳（伪参数 2..5 代表四个提升量）——
-    const int fB = 2, fF = 3, fE = 4, fV = 5;
-    Node b = Node::makeParam(fB), ff = Node::makeParam(fF),
-         e = Node::makeParam(fE), bv = Node::makeParam(fV);
+    Node b = Node::makeParam(2), ff = Node::makeParam(3), e = Node::makeParam(4);
+    Node bv = has_bf ? Node::makeParam(5) : Node::makeNum(1.0);
     Node Num   = astAdd(astNum(1.0), astMul(g0, b));
     Node DenRe = astAdd(astSub(sq(m0), sq(m)), astMul(g0, ff));
     Node DenIm = astNeg(astMul(astMul(g0, m0), e));
@@ -587,69 +659,8 @@ static bool buildLiftedGS(int P, int Lmin, double d, bool has_bf,
     Node F = astMul(astAdd(astDiv(astMul(Num, DenRe), DenSq),
                            astMul(astI(), astNeg(astDiv(astMul(Num, DenIm), DenSq)))), bv);
 
-    // —— 偏导 ——
-    Node D0 = deriv(F, 0), D1 = deriv(F, 1);
-    Node DL[4] = { deriv(F, fB), deriv(F, fF), deriv(F, fE), deriv(F, fV) };
-    Node D00 = deriv2(F, 0, 0), D01 = deriv2(F, 0, 1), D11 = deriv2(F, 1, 1);
-    Node D0L[4] = { deriv2(F, 0, fB), deriv2(F, 0, fF), deriv2(F, 0, fE), deriv2(F, 0, fV) };
-    Node D1L[4] = { deriv2(F, 1, fB), deriv2(F, 1, fF), deriv2(F, 1, fE), deriv2(F, 1, fV) };
-    Node DLL[4][4];
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j)
-            DLL[i][j] = deriv2(F, (i == 0 ? fB : i == 1 ? fF : i == 2 ? fE : fV),
-                                  (j == 0 ? fB : j == 1 ? fF : j == 2 ? fE : fV));
-
-    const int base[4] = { 0, 3, 6, 9 };
-    auto V = [](int k) { return Node::makeVar(CVAR_LIFT_BASE + k); };
-    auto dl = [&](int i) { return V(base[i] + 1); };     // V′
-    auto ddl = [&](int i) { return V(base[i] + 2); };    // V″
-    auto S = [&](const Node& n) {
-        Node r = substLiftParam(n, fB, base[0]);
-        r = substLiftParam(r, fF, base[1]);
-        r = substLiftParam(r, fE, base[2]);
-        r = substLiftParam(r, fV, base[3]);
-        return r;
-    };
-    auto mul = [](Node a, Node c) { return astMul(a, c); };
-    auto sum = [](std::vector<Node> xs) {
-        Node r = Node::makeNum(0.0);
-        for (auto& x : xs) r = astAdd(r, x);
-        return r;
-    };
-
-    Node seg0 = S(F);
-    std::vector<Node> s1, s3, s4;
-    s1.push_back(S(D0)); s3.push_back(S(D00)); s4.push_back(S(D01));
-    for (int i = 0; i < 4; ++i) {
-        s1.push_back(mul(S(DL[i]), dl(i)));
-        s3.push_back(mul(astNum(2.0), mul(S(D0L[i]), dl(i))));
-        s3.push_back(mul(S(DL[i]), ddl(i)));
-        s4.push_back(mul(S(D1L[i]), dl(i)));
-        for (int j = 0; j < 4; ++j)
-            s3.push_back(mul(S(DLL[i][j]), mul(dl(i), dl(j))));
-    }
-    Node seg1 = sum(s1), seg2 = S(D1), seg3 = sum(s3), seg4 = sum(s4), seg5 = S(D11);
-    std::vector<Node> node_segs = { seg0, seg1, seg2, seg3, seg4, seg5 };
-
-    aux.clear();
-    aux.push_back((double)P);
-    aux.push_back((double)node_segs.size());
-    aux.push_back(AUX_MAGIC_LIFT);
-    aux.push_back(4.0);                                  // n_lift
-    auto emit = [&](const Node& tree) {
-        std::vector<double> seg;
-        compileNode(simplify(tree), seg);
-        aux.push_back((double)(seg.size() / 3));
-        aux.insert(aux.end(), seg.begin(), seg.end());
-    };
-    const std::vector<Node>* tabs[4] = { &Bs, &Fs, &Es, &Vs };
-    for (int i = 0; i < 4; ++i) {
-        aux.push_back(3.0);                              // 3 段
-        aux.push_back(2.0);                              // 梯度只用前 2 段
-        for (const auto& t : *tabs[i]) emit(t);
-    }
-    for (const auto& t : node_segs) emit(t);
-    return true;
+    aux = buildLiftedAux(P, F, lifts);
+    return !aux.empty();
 }
 
 std::vector<double> buildModelAST(
