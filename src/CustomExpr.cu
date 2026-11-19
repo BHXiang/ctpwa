@@ -1248,6 +1248,9 @@ __device__ void evalCustomAll(
             int off = 4;
             for (int i = 0; i < n_lift; ++i) {
                 int nl = (int)base[off++];
+                // 梯度路径只要 (V, ∂V/∂p…)：二阶提升量段没人读，别算（否则
+                // 一阶段反而比不缩并慢 ~10 倍）
+                int need = compute_2nd ? nl : (1 + P < nl ? 1 + P : nl);
                 for (int sg = 0; sg < nl; ++sg) {
                     int ni = (int)base[off];
                     double lo[2] = {0.0, 0.0};
@@ -1256,6 +1259,13 @@ __device__ void evalCustomAll(
                                   params, lo, nullptr);
                     if (n_liftv < CVAR_LIFT_MAX) liftv[n_liftv++] = lo[0];
                     off += 1 + 3 * ni;
+                    if (sg + 1 >= need) {                 // 跳过剩余段（只推进游标）
+                        for (int sg2 = sg + 1; sg2 < nl; ++sg2) {
+                            int ni2 = (int)base[off];
+                            off += 1 + 3 * ni2;
+                        }
+                        break;
+                    }
                 }
             }
         }

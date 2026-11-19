@@ -374,6 +374,108 @@ Node modelDeriv2(int composite_id, const Node& n, int p, int q)
 // buildModelAST: 程序化构建内置模型的符号微分 AST → aux[]（替代 computeNodeFactor<Var>）
 // ============================================================================
 
+
+// ============================================================================
+// 缩并层（CTPWA_LIFT=1）：把 BWR 的宽度项 γ 提成"提升量表"
+//
+//   γ = g0·(q/q0)^(2Lmin+1)·(m0/m)·Bf²
+//   F = (x/s + i·y/s)·Bf_vertex,  x = m0²-m²,  y = m0·γ,  s = x²+y²
+//
+// 每个事例每 SL 只算一次 (γ, ∂γ/∂m0, ∂γ/∂g0, ∂²γ/…) 共 6 个数，节点 6 个段
+// 改用链式法则组合，不再把 γ 及其导数各自展开（实测指令数 21383 → ~5000）。
+// ============================================================================
+static bool liftEnabled()
+{
+    static const bool v = [] {
+        const char* e = getenv("CTPWA_LIFT");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+// 把 Param(from) 递归替换成 Var(CVAR_LIFT_BASE + slot)
+static Node substLiftParam(const Node& n, int from, int slot)
+{
+    if (n.type == NodeType::Param && n.param_id == from)
+        return Node::makeVar(CVAR_LIFT_BASE + slot);
+    Node r = n;
+    for (auto& k : r.kids) k = substLiftParam(k, from, slot);
+    return r;
+}
+
+// 返回 true = 已按缩并路径生成 aux（P 必须为 2）
+static bool buildLiftedBWR(int P, int Lmin, double d, bool has_bf,
+                           const Node& q0_ast, std::vector<double>& aux)
+{
+    if (P != 2) return false;
+    const int GP = P;                       // 伪参数下标（代表 γ）
+    Node m  = Node::makeVar(CVAR_M);
+    Node q  = Node::makeVar(CVAR_Q);
+    Node m0 = Node::makeParam(0);
+    Node g0 = Node::makeParam(1);
+
+    // γ（与 MODEL_BWR 内部约定逐项一致：has_bf=false 时 d_eff=0 → Bf≡1）
+    double d_eff = has_bf ? d : 0.0;
+    Node BfW = Node::makeComposite(MODEL_BF,
+                  { Node::makeNum((double)Lmin), q, q0_ast, Node::makeNum(d_eff) });
+    Node pw  = Node::makeOp(NodeType::Pow, astDiv(q, q0_ast), astNum(2.0 * Lmin + 1.0));
+    Node gam = astMul(astMul(astMul(g0, pw), astDiv(m0, m)), astSq(BfW));
+
+    std::vector<Node> lift_segs = {
+        gam, deriv(gam, 0), deriv(gam, 1),
+        deriv2(gam, 0, 0), deriv2(gam, 0, 1), deriv2(gam, 1, 1)
+    };
+
+    // 壳：F = (x/s + i·y/s)·Bf_vertex，γ 写成 Param(GP)
+    Node gv = Node::makeParam(GP);
+    Node x  = astSub(astSq(m0), astSq(m));
+    Node y  = astMul(m0, gv);
+    Node s  = astAdd(astSq(x), astSq(y));
+    Node F  = astAdd(astDiv(x, s), astMul(astI(), astDiv(y, s)));
+    if (has_bf) {
+        Node bfv = Node::makeComposite(MODEL_BF,
+                       { Node::makeVar(CVAR_L), q, q0_ast, Node::makeNum(d) });
+        F = astMul(F, bfv);
+    }
+
+    Node D0 = deriv(F, 0),  D1 = deriv(F, 1),  DG = deriv(F, GP);
+    Node D00 = deriv2(F, 0, 0), D01 = deriv2(F, 0, 1), D11 = deriv2(F, 1, 1);
+    Node D0G = deriv2(F, 0, GP), D1G = deriv2(F, 1, GP), DGG = deriv2(F, GP, GP);
+
+    auto V = [](int k) { return Node::makeVar(CVAR_LIFT_BASE + k); };
+    auto S = [&](const Node& n) { return substLiftParam(n, GP, 0); };   // γ → 槽 0
+
+    Node seg0 = S(F);
+    Node seg1 = astAdd(S(D0), astMul(S(DG), V(1)));
+    Node seg2 = astAdd(S(D1), astMul(S(DG), V(2)));
+    Node seg3 = astAdd(astAdd(S(D00), astMul(astNum(2.0), astMul(S(D0G), V(1)))),
+                       astAdd(astMul(S(DGG), astSq(V(1))), astMul(S(DG), V(3))));
+    Node seg4 = astAdd(astAdd(S(D01), astMul(S(D0G), V(2))),
+                       astAdd(astMul(S(D1G), V(1)),
+                              astAdd(astMul(S(DGG), astMul(V(1), V(2))),
+                                     astMul(S(DG), V(4)))));
+    Node seg5 = astAdd(astAdd(S(D11), astMul(astNum(2.0), astMul(S(D1G), V(2)))),
+                       astAdd(astMul(S(DGG), astSq(V(2))), astMul(S(DG), V(5))));
+
+    std::vector<Node> node_segs = { seg0, seg1, seg2, seg3, seg4, seg5 };
+
+    aux.clear();
+    aux.push_back((double)P);
+    aux.push_back((double)node_segs.size());
+    aux.push_back(AUX_MAGIC_LIFT);
+    aux.push_back(1.0);                                  // n_lift
+    aux.push_back((double)lift_segs.size());             // 该 lift 的段数
+    auto emit = [&](const Node& tree) {
+        std::vector<double> seg;
+        compileNode(simplify(tree), seg);
+        aux.push_back((double)(seg.size() / 3));
+        aux.insert(aux.end(), seg.begin(), seg.end());
+    };
+    for (const auto& t : lift_segs) emit(t);
+    for (const auto& t : node_segs) emit(t);
+    return true;
+}
+
 std::vector<double> buildModelAST(
     ResModelType model_type,
     int L, int Lmin, double d,
@@ -418,6 +520,11 @@ std::vector<double> buildModelAST(
             // → d kid 传 0.0 使 Bf≡1，与 bf_d=0.0 完全等价
             // 宽度约定与 computeNodeFactor 一致: BWR Γ(Lmin) 与波无关恒用节点
             // SL 列表最小 L（烘焙）; 顶点 Bf 用 CVAR_L（内核运行时逐波 sl.L）
+            if (liftEnabled()) {                       // 缩并路径（CTPWA_LIFT=1）
+                std::vector<double> l_aux;
+                if (buildLiftedBWR(P, Lmin, d, has_bf, q0_ast, l_aux))
+                    return l_aux;
+            }
             Node bwr = Node::makeComposite(MODEL_BWR, {
                 Node::makeVar(CVAR_M),
                 Node::makeParam(0),       // m0
