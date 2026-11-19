@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Improved
+
+- Symbolic differentiation can now be *contracted*: expensive model factors
+  (`Bf`, the `(q/q0)^{2L+1}` factor, the BWR width `gamma`, and the GS
+  coefficients `d/m0`, `f/g0`, `(q/q0)^3 m0/m`) are lifted into a per-node
+  derivative table that is evaluated once per event/SL, and the node's
+  derivative segments are assembled from it by the chain rule instead of
+  expanding every factor again. BWR `d2F` drops from 21k to 4.3k bytecode
+  instructions, GS from 264k to 35k.
+  The contracted variant is only used by the second-order (`Hessian`) path;
+  amplitude/gradient paths keep the original `aux`. GS Hessian is ~4.8x faster
+  (RTX 5060, `tests/configs/gs.yml`: 588 -> 123 ms); BWR keeps its analytic
+  specialisation and is unchanged. Disable with `CTPWA_NO_LIFT=1`.
+
+### Fixed
+
+- `evalCustomAll` passed `lifts = nullptr` while evaluating the lift tables, so
+  a lifted quantity that referenced an earlier one (BWR `gamma` using `B`) read
+  zero. This silently zeroed the imaginary part of the amplitude and made the
+  Hessian's q0 finite-difference terms explode to ~1e11.
+- `addModelQ0HessianTerms` now evaluates its base value from the same `aux` as
+  the perturbed ones; previously the base came from the caller (possibly a
+  different path) and the mismatch was amplified by `1/h^2`.
+
 ## [v0.3.21] - 2026-11-16
 
 ### Fixed
