@@ -2042,7 +2042,7 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                 p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                                 p2_phi = atan2(pD2.Py, pD2.Px);
                             }
-                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1_q0, md2_q0,
                                 p1_P, p1_E, p1_ct, p1_phi,
                                 p2_P, p2_E, p2_ct, p2_phi,
@@ -2098,11 +2098,11 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             const double md2m = md2_q0 - (d2_free ? hh : 0.0);
                             double Fp_r, Fp_i, Fm_r, Fm_i;
                             double dFr2[16], dFi2[16], d2Fr2[256], d2Fi2[256];
-                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1p, md2p, e1_P, e1_E, e1_ct, e1_phi,
                                 e2_P, e2_E, e2_ct, e2_phi,
                                 rp, P_r, Fp_r, Fp_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
-                            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1m, md2m, e1_P, e1_E, e1_ct, e1_phi,
                                 e2_P, e2_E, e2_ct, e2_phi,
                                 rp, P_r, Fm_r, Fm_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
@@ -2495,6 +2495,11 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                 aux2 = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
                                      m1d, m1f, m2d, m2f, has_bf, true);
         }
+        static const int s_lift_grad = [] {
+            const char* e = getenv("CTPWA_LIFT_GRAD");
+            return (e && e[0] == '1') ? 1 : 0;
+        }();
+        dr.use_aux2_grad = s_lift_grad;
         dr.aux_offset = static_cast<int>(h_all_channels.size());
         dr.aux_size = static_cast<int>(aux.size());
         h_all_channels.insert(h_all_channels.end(), aux.begin(), aux.end());

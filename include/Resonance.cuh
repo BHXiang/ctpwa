@@ -38,6 +38,7 @@ struct DeviceResonance
     int aux_size = 0;        // 辅助数据长度（未用为 0）
     // 缩并版 aux（提升量表 + 链式法则组合），只给二阶/Hessian 路径用；
     // 为 0 表示没有（回退到 aux_offset）
+    int use_aux2_grad = 0;   // 梯度路径是否也走缩并版（CTPWA_LIFT_GRAD=1）
     int aux2_offset = 0;
     int aux2_size = 0;
     // ---- BWR 解析特化资格（host 一次性判定; 0=不可特化, 走字节码）----
