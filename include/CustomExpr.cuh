@@ -40,8 +40,13 @@ enum CustomVarId : int {
     CVAR_P1P = 7,        CVAR_P1E = 8,        // |p1|, E1
     CVAR_P1COSTHETA = 9, CVAR_P1PHI = 10,     // cosθ1, φ1
     CVAR_P2P = 11,       CVAR_P2E = 12,       // |p2|, E2
-    CVAR_P2COSTHETA = 13,CVAR_P2PHI = 14      // cosθ2, φ2
+    CVAR_P2COSTHETA = 13,CVAR_P2PHI = 14,     // cosθ2, φ2
+    // 缩并"提升量"槽位：100 + k（k < 64）。值由调用方在解释某节点之前算好
+    // （每个提升量贡献 V、∂V/∂p … 若干个数），经 evalCustomSeg 的 lifts 形参
+    // 传入；未提供时按 0 处理（旧 aux 不会引用这些 id，行为不变）。
+    CVAR_LIFT_BASE = 100
 };
+constexpr int CVAR_LIFT_MAX = 64;             // lifts[] 的最大长度
 
 // 函数 id
 enum CustomFuncId : int {
@@ -86,7 +91,8 @@ __device__ void evalCustomSeg(
     double md1, double md2,
     double p1p, double p1e, double p1costheta, double p1phi,
     double p2p, double p2e, double p2costheta, double p2phi,
-    const double* params, double* out);
+    const double* params, double* out,
+    const double* lifts = nullptr);
 
 // 获取第 s 段在 aux 中的偏移（host 和 device 共用逻辑）
 __host__ __device__ inline int customSegOffset(const double* aux, int s)
@@ -115,7 +121,8 @@ __device__ void evalCustomAll(
     double& Fr, double& Fi,
     double* dFr, double* dFi,
     double* d2Fr, double* d2Fi,
-    bool compute_2nd = true);
+    bool compute_2nd = true,
+    const double* lifts = nullptr);
 
 // host 端编译入口（src/CustomExpr.cu）
 // expr: 表达式字符串; params: 参数名列表

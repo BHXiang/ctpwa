@@ -1002,7 +1002,7 @@ __device__ void evalCustomSeg(
     double md1, double md2,
     double p1p, double p1e, double p1costheta, double p1phi,
     double p2p, double p2e, double p2costheta, double p2phi,
-    const double* params, double* out)
+    const double* params, double* out, const double* lifts)
 {
     // 栈式复数求值
     constexpr int kStack = 32;
@@ -1046,6 +1046,12 @@ __device__ void evalCustomSeg(
                     case CVAR_P2E: v = p2e; break;
                     case CVAR_P2COSTHETA: v = p2costheta; break;
                     case CVAR_P2PHI: v = p2phi; break;
+                    default:
+                        // 缩并提升量：100+k → lifts[k]（未提供时 0，旧 aux 不受影响）
+                        if ((int)a0 >= CVAR_LIFT_BASE &&
+                            (int)a0 < CVAR_LIFT_BASE + CVAR_LIFT_MAX && lifts)
+                            v = lifts[(int)a0 - CVAR_LIFT_BASE];
+                        break;
                 }
                 push(v, 0.0); break;
             }
@@ -1230,21 +1236,21 @@ __device__ void evalCustomAll(
     double& Fr, double& Fi,
     double* dFr, double* dFi,
     double* d2Fr, double* d2Fi,
-    bool compute_2nd)
+    bool compute_2nd, const double* lifts)
 {
     int seg_off = aux_offset + 2;
     double out[2];
     // 值段
     int n_instr = (int)aux[seg_off];
     evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out, lifts);
     Fr = out[0]; Fi = out[1];
     seg_off += 1 + 3 * n_instr;
     // 一阶段
     for (int j = 0; j < P; ++j) {
         n_instr = (int)aux[seg_off];
         evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out, lifts);
         dFr[j] = out[0]; dFi[j] = out[1];
         seg_off += 1 + 3 * n_instr;
     }
@@ -1254,7 +1260,7 @@ __device__ void evalCustomAll(
         for (int k = j; k < P; ++k) {
             n_instr = (int)aux[seg_off];
             evalCustomSeg(aux + seg_off + 1, n_instr, m, q, q0, L, d, md1, md2,
-                          p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out);
+                          p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi, params, out, lifts);
             d2Fr[j * P + k] = out[0]; d2Fi[j * P + k] = out[1];
             d2Fr[k * P + j] = out[0]; d2Fi[k * P + j] = out[1];
             seg_off += 1 + 3 * n_instr;
