@@ -2485,9 +2485,10 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             if (Lmin < 0) Lmin = L;   // 无匹配 decay 节点时退化为块级 L
             aux = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
                                 m1d, m1f, m2d, m2f, has_bf);
-            // 缩并版（提升量表）：只给二阶/Hessian 路径用；普通路径仍走 aux
+            // 缩并版（提升量表）aux2：眼下没有安全的消费者（见 ComputeHessian 的
+            // addModelQ0HessianTerms —— 与数值扰动项叠加会炸到 1e11），只作实验保留。
             static const bool s_lift = [] {
-                const char* e = getenv("CTPWA_LIFT");
+                const char* e = getenv("CTPWA_LIFT_AUX2");
                 return e && e[0] == '1';
             }();
             if (s_lift)
