@@ -823,7 +823,17 @@ __device__ void addModelQ0HessianTerms(
 {
     if (res.type == ResModelType::BW || res.type == ResModelType::ONE)
         return;
-    const double den = Fr * Fr + Fi * Fi;
+    // 三次求值必须同源：基准值也从同一份 aux 取，否则两条路径的残差会被
+    // 1/(h1·h2)（h≈1e-6）放大 1e12 倍 —— 曾经因此把 θ 对角项算成 1e11。
+    // 注意: 缩并版 aux2 目前仍不能在这里用（接线未验证，见 CHANGELOG/提交说明）
+    const int sel_off = res.aux_offset;
+    double F0_r = Fr, F0_i = Fi;               // 兜底（下面会覆盖）
+    double d0r[16], d0i[16], dz1[16 * 16], dz2[16 * 16];
+    evalCustomAll(aux, sel_off, mm, qq, q0, L, bf_d,
+        md1_q0, md2_q0, p1_P, p1_E, p1_ct, p1_phi,
+        p2_P, p2_E, p2_ct, p2_phi,
+        rp, P_r, F0_r, F0_i, d0r, d0i, dz1, dz2, false);
+    const double den = F0_r * F0_r + F0_i * F0_i;
     if (den <= 0.0) return;
 
     // 收集"自由共振态子粒子"：side（true=daug1）、质量值、位置下标
@@ -864,28 +874,28 @@ __device__ void addModelQ0HessianTerms(
         double Fp_r, Fp_i, Fm_r, Fm_i;
         double dFpr[16], dFpi[16], dFmr[16], dFmi[16];
         double d2r[16 * 16], d2i[16 * 16];
-        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+        evalCustomAll(aux, sel_off, mm, qq, q0, L, bf_d,
             md1p, md2p, p1_P, p1_E, p1_ct, p1_phi,
             p2_P, p2_E, p2_ct, p2_phi,
             rp, P_r, Fp_r, Fp_i, dFpr, dFpi, d2r, d2i, false);
-        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+        evalCustomAll(aux, sel_off, mm, qq, q0, L, bf_d,
             md1m, md2m, p1_P, p1_E, p1_ct, p1_phi,
             p2_P, p2_E, p2_ct, p2_phi,
             rp, P_r, Fm_r, Fm_i, dFmr, dFmi, d2r, d2i, false);
 
         const double A_re = (Fp_r - Fm_r) / (2.0 * h);
         const double A_im = (Fp_i - Fm_i) / (2.0 * h);
-        const double B_re = (Fp_r - 2.0 * Fr + Fm_r) / (h * h);
-        const double B_im = (Fp_i - 2.0 * Fi + Fm_i) / (h * h);
+        const double B_re = (Fp_r - 2.0 * F0_r + Fm_r) / (h * h);
+        const double B_im = (Fp_i - 2.0 * F0_i + Fm_i) / (h * h);
 
-        l_re[d] = (A_re * Fr + A_im * Fi) / den;
-        l_im[d] = (A_im * Fr - A_re * Fi) / den;
+        l_re[d] = (A_re * F0_r + A_im * F0_i) / den;
+        l_im[d] = (A_im * F0_r - A_re * F0_i) / den;
         dln_re[pos[d]] += l_re[d];
         dln_im[pos[d]] += l_im[d];
 
         // 对角项 ∂²lnF/∂m_d²
-        const double t = (B_re * Fr + B_im * Fi) / den;
-        const double u = (B_im * Fr - B_re * Fi) / den;
+        const double t = (B_re * F0_r + B_im * F0_i) / den;
+        const double u = (B_im * F0_r - B_re * F0_i) / den;
         d2ln_re[pos[d] * 16 + pos[d]] += t - (l_re[d] * l_re[d] - l_im[d] * l_im[d]);
         d2ln_im[pos[d] * 16 + pos[d]] += u - 2.0 * l_re[d] * l_im[d];
 
@@ -895,10 +905,10 @@ __device__ void addModelQ0HessianTerms(
             if (p < 0 || p >= P_r) continue;
             const double c_re = (dFpr[p] - dFmr[p]) / (2.0 * h);
             const double c_im = (dFpi[p] - dFmi[p]) / (2.0 * h);
-            const double own_l_re = (dFr[p] * Fr + dFi[p] * Fi) / den;
-            const double own_l_im = (dFi[p] * Fr - dFr[p] * Fi) / den;
-            const double tt = (c_re * Fr + c_im * Fi) / den;
-            const double uu = (c_im * Fr - c_re * Fi) / den;
+            const double own_l_re = (d0r[p] * F0_r + d0i[p] * F0_i) / den;
+            const double own_l_im = (d0i[p] * F0_r - d0r[p] * F0_i) / den;
+            const double tt = (c_re * F0_r + c_im * F0_i) / den;
+            const double uu = (c_im * F0_r - c_re * F0_i) / den;
             const double v_re = tt - (l_re[d] * own_l_re - l_im[d] * own_l_im);
             const double v_im = uu - (l_re[d] * own_l_im + l_im[d] * own_l_re);
             const int jj = off + j, kk = pos[d];
@@ -922,15 +932,15 @@ __device__ void addModelQ0HessianTerms(
             const double m2v = md2_q0 + (side1[0] ? 0.0 : s1 * h1)
                                      + (side1[1] ? 0.0 : s2 * h2);
             double dFa[16], dFb[16], d2a[16 * 16], d2b[16 * 16];
-            evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, bf_d,
+            evalCustomAll(aux, sel_off, mm, qq, q0, L, bf_d,
                 m1v, m2v, p1_P, p1_E, p1_ct, p1_phi,
                 p2_P, p2_E, p2_ct, p2_phi,
                 rp, P_r, Fv_r[c], Fv_i[c], dFa, dFb, d2a, d2b, false);
         }
         const double D_re = (Fv_r[0] - Fv_r[1] - Fv_r[2] + Fv_r[3]) / (4.0 * h1 * h2);
         const double D_im = (Fv_i[0] - Fv_i[1] - Fv_i[2] + Fv_i[3]) / (4.0 * h1 * h2);
-        const double t = (D_re * Fr + D_im * Fi) / den;
-        const double u = (D_im * Fr - D_re * Fi) / den;
+        const double t = (D_re * F0_r + D_im * F0_i) / den;
+        const double u = (D_im * F0_r - D_re * F0_i) / den;
         const double v_re = t - (l_re[0] * l_re[1] - l_im[0] * l_im[1]);
         const double v_im = u - (l_re[0] * l_im[1] + l_im[0] * l_re[1]);
         d2ln_re[pos[0] * 16 + pos[1]] += v_re;
