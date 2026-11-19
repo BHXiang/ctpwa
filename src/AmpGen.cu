@@ -2486,11 +2486,9 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             aux = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
                                 m1d, m1f, m2d, m2f, has_bf);
             // 缩并版（提升量表）：只给二阶/Hessian 路径用；普通路径仍走 aux
-            // 默认开；CTPWA_NO_LIFT=1 关（排查/对拍用），CTPWA_LIFT=1 强制开
             static const bool s_lift = [] {
-                const char* off = getenv("CTPWA_NO_LIFT");
-                if (off && off[0] == '1') return false;
-                return true;
+                const char* e = getenv("CTPWA_LIFT");
+                return e && e[0] == '1';
             }();
             if (s_lift)
                 aux2 = buildModelAST(dr.type, L, Lmin, dd, dr.param_count, dr.n_channels, cf,
