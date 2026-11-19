@@ -1247,10 +1247,11 @@ __device__ void evalCustomAll(
             int n_lift = (int)base[3];
             int off = 4;
             for (int i = 0; i < n_lift; ++i) {
-                int nl = (int)base[off++];
-                // 梯度路径只要 (V, ∂V/∂p…)：二阶提升量段没人读，别算（否则
-                // 一阶段反而比不缩并慢 ~10 倍）
-                int need = compute_2nd ? nl : (1 + P < nl ? 1 + P : nl);
+                int nl = (int)base[off];
+                int ng = (int)base[off + 1];
+                off += 2;
+                // 梯度路径只算该提升量的前 n_grad 段（二阶表没人读，算了反而更慢）
+                int need = compute_2nd ? nl : (ng < nl ? ng : nl);
                 for (int sg = 0; sg < nl; ++sg) {
                     int ni = (int)base[off];
                     double lo[2] = {0.0, 0.0};

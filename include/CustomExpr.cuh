@@ -97,7 +97,8 @@ __device__ void evalCustomSeg(
 // ---------------------------------------------------------------------------
 // aux 头格式
 //   旧: [P, n_seg, 段...]
-//   新: [P, n_seg, AUX_MAGIC_LIFT, n_lift, {n_seg_l, 段...} × n_lift, 段...]
+//   新: [P, n_seg, AUX_MAGIC_LIFT, n_lift, {n_seg_l, n_grad_l, 段...} × n_lift, 段...]
+//   n_grad_l = 梯度路径（compute_2nd=false）只用前多少段，避免白算二阶表
 // 提升量（缩并）段是若干"子 aux"，在解释某节点之前算一次，结果依次写进
 // lifts[0..]，节点的各段通过 CVAR_LIFT_BASE + 槽位读取。
 // 用 aux[2] 的负哨兵区分新旧格式 → 旧 aux 仍逐字段可读。
@@ -111,7 +112,8 @@ __host__ __device__ inline int auxSegBase(const double* aux)
     int n_lift = (int)aux[3];
     int off = 4;
     for (int i = 0; i < n_lift; ++i) {
-        int nl = (int)aux[off++];
+        int nl = (int)aux[off];
+        off += 2;                          // [n_seg, n_grad]
         for (int s = 0; s < nl; ++s) {
             int ni = (int)aux[off];
             off += 1 + 3 * ni;
