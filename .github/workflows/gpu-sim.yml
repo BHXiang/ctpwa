@@ -1,0 +1,102 @@
+name: GPU tests (simulated H100)
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the CUDA backend and runs the pytest suite on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator has no timing model
+# and cannot reproduce hardware-specific behavior, so it complements runs on
+# real GPUs and does not replace them.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "setup.py"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-sim:
+    name: pytest (CUDA 13.0, simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated H100 and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@a1b9d4237411f9b2b0e0bb895b4d83377f336a7b # v0.1.9
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # ROOT, yaml-cpp and ninja come from conda-forge. torch is pinned to 2.12.0
+      # (the version the project builds against; newer releases need C++20), in
+      # its CUDA 13.0 wheel to match the toolkit.
+      - name: Install ROOT, yaml-cpp and PyTorch
+        run: |
+          curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o "$RUNNER_TEMP/miniconda.sh"
+          bash "$RUNNER_TEMP/miniconda.sh" -b -p "$HOME/miniconda"
+          "$HOME/miniconda/bin/conda" create -y -q -p "$HOME/ctpwa-env" \
+            --override-channels -c conda-forge python=3.12 root yaml-cpp ninja
+          "$HOME/ctpwa-env/bin/pip" install -q "torch==2.12.0+cu130" --index-url https://download.pytorch.org/whl/cu130
+          "$HOME/ctpwa-env/bin/pip" install -q numpy pyyaml pytest uproot setuptools wheel
+          echo "$HOME/ctpwa-env/bin" >> "$GITHUB_PATH"
+          echo "CONDA_PREFIX=$HOME/ctpwa-env" >> "$GITHUB_ENV"
+          echo "ROOTSYS=$HOME/ctpwa-env" >> "$GITHUB_ENV"
+
+      # setup.py builds SASS for sm_70..sm_120, which the simulator cannot run.
+      # Build only compute_90 and embed its PTX, and use the shared CUDA runtime
+      # the simulator needs. These edits are made on the runner only.
+      - name: Build the CUDA backend as PTX
+        env:
+          CUDA_HOME: /usr/local/cuda-13.0
+          CTPWA_BACKEND: cuda
+          MAX_JOBS: "3"
+        run: |
+          sed -i 's/^    desired_sm = \[70.*/    desired_sm = [90]/' setup.py
+          sed -i 's/code=sm_{sm}/code=compute_{sm}/' setup.py
+          sed -i 's/"-rdc=true",/"-rdc=true", "-cudart=shared",/' setup.py
+          sed -i 's/"nvcc_dlink": \["-dlink"\]/"nvcc_dlink": ["-dlink", "-cudart=shared"]/' setup.py
+          git diff --stat
+          vgpu run --preload python setup.py build_ext --inplace
+
+      - name: Check that the simulated GPU is in use
+        run: |
+          vgpu run --preload python -c "
+          import torch, ctpwa
+          assert torch.cuda.is_available(), 'no CUDA device'
+          print(torch.cuda.get_device_name(0), ctpwa.backend())
+          assert ctpwa.backend() == 'cuda'"
+
+      # The CPU-backend tests skip themselves on a CUDA build. The step fails
+      # unless pytest exits 0 and reports at least 100 passed tests, so an empty
+      # or all-skipped run cannot go green.
+      - name: Run the tests
+        shell: bash
+        run: |
+          set -o pipefail
+          export PYTHONPATH="$PWD"
+          cd tests
+          vgpu run --preload python -m pytest . -v --tb=short -rfEs -p no:cacheprovider 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          summary=$(grep -E '^=+ .* in [0-9.]+s' "$RUNNER_TEMP/pytest.log" | tail -1)
+          echo "$summary"
+          if echo "$summary" | grep -qE '[0-9]+ (failed|error)'; then
+            echo "::error::pytest reported failures"
+            exit 1
+          fi
+          passed=$(echo "$summary" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo 0)
+          if [ "$passed" -lt 100 ]; then
+            echo "::error::only $passed tests passed"
+            exit 1
+          fi
