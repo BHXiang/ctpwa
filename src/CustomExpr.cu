@@ -1240,35 +1240,36 @@ __device__ void evalCustomAll(
 {
     // 提升量（缩并）区：先算一次，结果给所有段共享
     double liftv[CVAR_LIFT_MAX];
+    for (int i = 0; i < CVAR_LIFT_MAX; ++i) liftv[i] = 0.0;
     int n_liftv = 0;
     {
         const double* base = aux + aux_offset;
         if (base[2] == AUX_MAGIC_LIFT) {
             int n_lift = (int)base[3];
             int off = 4;
+            int slot = 0;                       // 槽位按"声明的段数"累加，与是否求值无关
             for (int i = 0; i < n_lift; ++i) {
                 int nl = (int)base[off];
                 int ng = (int)base[off + 1];
                 off += 2;
-                // 梯度路径只算该提升量的前 n_grad 段（二阶表没人读，算了反而更慢）
+                // 梯度路径只求前 ng 段；其余段跳过（槽保持 0），但游标照走
                 int need = compute_2nd ? nl : (ng < nl ? ng : nl);
                 for (int sg = 0; sg < nl; ++sg) {
                     int ni = (int)base[off];
-                    double lo[2] = {0.0, 0.0};
-                    evalCustomSeg(base + off + 1, ni, m, q, q0, L, d, md1, md2,
-                                  p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi,
-                                  params, lo, nullptr);
-                    if (n_liftv < CVAR_LIFT_MAX) liftv[n_liftv++] = lo[0];
-                    off += 1 + 3 * ni;
-                    if (sg + 1 >= need) {                 // 跳过剩余段（只推进游标）
-                        for (int sg2 = sg + 1; sg2 < nl; ++sg2) {
-                            int ni2 = (int)base[off];
-                            off += 1 + 3 * ni2;
-                        }
-                        break;
+                    if (sg < need && slot + sg < CVAR_LIFT_MAX) {
+                        double lo[2] = {0.0, 0.0};
+                        // 提升量之间有依赖（γ 的公式里引用了 B 的槽），必须把
+                        // 已经算好的 liftv 传进去，否则后算的会读到 0
+                        evalCustomSeg(base + off + 1, ni, m, q, q0, L, d, md1, md2,
+                                      p1p, p1e, p1costheta, p1phi, p2p, p2e, p2costheta, p2phi,
+                                      params, lo, liftv);
+                        liftv[slot + sg] = lo[0];
                     }
+                    off += 1 + 3 * ni;
                 }
+                slot += nl;
             }
+            n_liftv = slot < CVAR_LIFT_MAX ? slot : CVAR_LIFT_MAX;
         }
     }
     int seg_off = aux_offset + auxSegBase(aux + aux_offset);

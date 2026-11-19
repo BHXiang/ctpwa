@@ -825,8 +825,7 @@ __device__ void addModelQ0HessianTerms(
         return;
     // 三次求值必须同源：基准值也从同一份 aux 取，否则两条路径的残差会被
     // 1/(h1·h2)（h≈1e-6）放大 1e12 倍 —— 曾经因此把 θ 对角项算成 1e11。
-    // 注意: 缩并版 aux2 目前仍不能在这里用（接线未验证，见 CHANGELOG/提交说明）
-    const int sel_off = res.aux_offset;
+    const int sel_off = (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset);
     double F0_r = Fr, F0_i = Fi;               // 兜底（下面会覆盖）
     double d0r[16], d0i[16], dz1[16 * 16], dz2[16 * 16];
     evalCustomAll(aux, sel_off, mm, qq, q0, L, bf_d,
@@ -1167,7 +1166,7 @@ CTPWA_KERNEL void computeCustomHessianKernel(
                                     Fr, Fi, dFr, dFi, d2Fr, d2Fi);
                     } else {
                         // P_r=0（固定/ONE 模型）: 只读值段（dF/d2F 段不存在）
-                        evalCustomAll(aux, res.aux_offset, mm, qq, q0, L, node.bf_d,
+                        evalCustomAll(aux, (res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                             md1_q0, md2_q0,
                             p1_P, p1_E, p1_ct, p1_phi,
                             p2_P, p2_E, p2_ct, p2_phi,
