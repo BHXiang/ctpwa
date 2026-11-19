@@ -94,11 +94,37 @@ __device__ void evalCustomSeg(
     const double* params, double* out,
     const double* lifts = nullptr);
 
+// ---------------------------------------------------------------------------
+// aux 头格式
+//   旧: [P, n_seg, 段...]
+//   新: [P, n_seg, AUX_MAGIC_LIFT, n_lift, {n_seg_l, 段...} × n_lift, 段...]
+// 提升量（缩并）段是若干"子 aux"，在解释某节点之前算一次，结果依次写进
+// lifts[0..]，节点的各段通过 CVAR_LIFT_BASE + 槽位读取。
+// 用 aux[2] 的负哨兵区分新旧格式 → 旧 aux 仍逐字段可读。
+// ---------------------------------------------------------------------------
+constexpr double AUX_MAGIC_LIFT = -2.0;
+
+// 节点段区的起始下标（跳过提升量区）
+__host__ __device__ inline int auxSegBase(const double* aux)
+{
+    if (aux[2] != AUX_MAGIC_LIFT) return 2;      // 旧格式
+    int n_lift = (int)aux[3];
+    int off = 4;
+    for (int i = 0; i < n_lift; ++i) {
+        int nl = (int)aux[off++];
+        for (int s = 0; s < nl; ++s) {
+            int ni = (int)aux[off];
+            off += 1 + 3 * ni;
+        }
+    }
+    return off;
+}
+
 // 获取第 s 段在 aux 中的偏移（host 和 device 共用逻辑）
 __host__ __device__ inline int customSegOffset(const double* aux, int s)
 {
     int P = (int)aux[0];
-    int off = 2;
+    int off = auxSegBase(aux);
     int seg = 0;
     while (seg < s) {
         int n_instr = (int)aux[off];

@@ -581,6 +581,8 @@ std::vector<double> buildModelAST(
     std::vector<double> aux;
     aux.push_back((double)P);
     aux.push_back((double)segs.size());
+    aux.push_back(AUX_MAGIC_LIFT);   // 新格式哨兵
+    aux.push_back(0.0);              // n_lift（缩并层暂未生成）
     for (const auto& seg_tree : segs) {
         std::vector<double> seg;
         compileNode(seg_tree, seg);

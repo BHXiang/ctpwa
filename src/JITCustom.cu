@@ -605,6 +605,12 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
     int P = (int)aux[0];
     if (P < 0 || P > 16) return false;
     int n_seg = (int)aux[1];
+    // 缩并提升量区：JIT 目前不支持（直接放弃 → 整块回退解释器）
+    if (aux.size() > 3 && aux[2] == AUX_MAGIC_LIFT && (int)aux[3] != 0) {
+        if (getenv("CTPWA_JIT_DEBUG"))
+            fprintf(stderr, "[ctpwa] JIT: aux 含 %d 个提升量，回退解释器\n", (int)aux[3]);
+        return false;
+    }
     std::vector<std::pair<int, int>> pairs;   // 二阶段 (j,k) 序（j≤k 行主序）
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) pairs.push_back({j, k});
@@ -625,7 +631,7 @@ static bool genNodeFunction(std::string& src, const std::vector<double>& aux,
     // 8 万行无分支代码，ptxas 对超长单函数编译卡死（实测 sm_80 上
     // nvrtc 12.9/13.2 均 OOM/超时；拆段后 sm_80 数秒编过）。
     std::ostringstream segs;
-    int seg_off = 2;
+    int seg_off = auxSegBase(aux.data());
     if (getenv("CTPWA_JIT_DEBUG")) {
         // 注意：调试打印必须用独立的游标，否则会推进生成循环用的 seg_off，
         // 导致 CTPWA_JIT_DEBUG=1 时 JIT 解析越界、静默回退解释器（实测踩过）
