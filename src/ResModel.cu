@@ -525,6 +525,133 @@ static bool buildLiftedBWR(int P, int Lmin, double d, bool has_bf,
     return true;
 }
 
+// ============================================================================
+// 缩并（CTPWA_LIFT=1）：Gounaris-Sakurai
+//   壳:  Num = 1 + g0·B,  DenRe = m0²-m² + g0·F1,  DenIm = -g0·m0·E1
+//        F = Num/(DenRe + i·DenIm)·B_vertex
+//   提升量（都只随 m0 变，故每个 3 段 V/V′/V″）: B = d/m0, F1 = f/g0,
+//        E1 = (q/q0)³·(m0/m), B_vertex
+//   槽: B 0..2, F1 3..5, E1 6..8, Bv 9..11
+// ============================================================================
+static bool buildLiftedGS(int P, int Lmin, double d, bool has_bf,
+                          const Node& q0_ast, double mpi, std::vector<double>& aux)
+{
+    if (P != 2) return false;
+    const double pi = 3.14159265358979323846;
+    Node m0 = Node::makeParam(0), g0 = Node::makeParam(1);
+    Node m = Node::makeVar(CVAR_M), q = Node::makeVar(CVAR_Q);
+    auto L_ = [](Node a) { return Node::makeFunc(CFUNC_LOG, a); };
+    auto sq = [](Node a) { return astSq(a); };
+
+    // —— GS 原始子式（与下方 switch 里逐项一致）——
+    Node hm = astMul(astNum(2.0 / pi), astMul(astDiv(q, m),
+        L_(astDiv(astAdd(m, astMul(astNum(2.0), q)), astNum(2.0 * mpi)))));
+    Node q0_2 = sq(q0_ast), q0_3 = astMul(q0_2, q0_ast), mpi2 = astNum(mpi * mpi);
+    Node logArg = astDiv(astAdd(m0, astMul(astNum(2.0), q0_ast)), astNum(2.0 * mpi));
+    Node dval = astSub(
+        astAdd(astMul(astMul(astNum(3.0 / pi), astDiv(mpi2, q0_2)), L_(logArg)),
+               astDiv(m0, astMul(astNum(2.0 * pi), q0_ast))),
+        astDiv(astMul(mpi2, m0), astMul(astNum(pi), q0_3)));
+    Node h0 = astMul(astNum(2.0 / pi), astMul(astDiv(q0_ast, m0), L_(logArg)));
+    Node dh0 = astAdd(astMul(h0, astSub(astDiv(astNum(1.0), astMul(astNum(8.0), q0_2)),
+                                        astDiv(astNum(1.0), astMul(astNum(2.0), sq(m0))))),
+                      astDiv(astNum(1.0), astMul(astNum(2.0 * pi), sq(m0))));
+    Node qratio = astDiv(q, q0_ast);
+    Node gam1 = astMul(astMul(sq(qratio), qratio), astDiv(m0, m));   // γ/g0
+    Node f1 = astMul(astDiv(sq(m0), q0_3),
+                     astAdd(astMul(sq(q), astSub(hm, h0)),
+                            astMul(astMul(astSub(sq(m0), sq(m)), q0_2), dh0)));  // f/g0
+    Node Bv0 = has_bf ? Node::makeComposite(MODEL_BF,
+                    { Node::makeVar(CVAR_L), q, q0_ast, Node::makeNum(d) }) : Node::makeNum(1.0);
+
+    Node Bval = astDiv(dval, m0);        // B
+    Node F1val = f1;                     // F1
+    Node E1val = gam1;                   // E1
+
+    // —— 四张表（各 3 段）——
+    auto tbl = [](const Node& n, std::vector<Node>& out) {
+        out.push_back(n); out.push_back(deriv(n, 0)); out.push_back(deriv2(n, 0, 0));
+    };
+    std::vector<Node> Bs, Fs, Es, Vs;
+    tbl(Bval, Bs); tbl(F1val, Fs); tbl(E1val, Es);
+    if (has_bf) tbl(Bv0, Vs); else { Vs = { Node::makeNum(1.0), Node::makeNum(0.0), Node::makeNum(0.0) }; }
+
+    // —— 壳（伪参数 2..5 代表四个提升量）——
+    const int fB = 2, fF = 3, fE = 4, fV = 5;
+    Node b = Node::makeParam(fB), ff = Node::makeParam(fF),
+         e = Node::makeParam(fE), bv = Node::makeParam(fV);
+    Node Num   = astAdd(astNum(1.0), astMul(g0, b));
+    Node DenRe = astAdd(astSub(sq(m0), sq(m)), astMul(g0, ff));
+    Node DenIm = astNeg(astMul(astMul(g0, m0), e));
+    Node DenSq = astAdd(sq(DenRe), sq(DenIm));
+    Node F = astMul(astAdd(astDiv(astMul(Num, DenRe), DenSq),
+                           astMul(astI(), astNeg(astDiv(astMul(Num, DenIm), DenSq)))), bv);
+
+    // —— 偏导 ——
+    Node D0 = deriv(F, 0), D1 = deriv(F, 1);
+    Node DL[4] = { deriv(F, fB), deriv(F, fF), deriv(F, fE), deriv(F, fV) };
+    Node D00 = deriv2(F, 0, 0), D01 = deriv2(F, 0, 1), D11 = deriv2(F, 1, 1);
+    Node D0L[4] = { deriv2(F, 0, fB), deriv2(F, 0, fF), deriv2(F, 0, fE), deriv2(F, 0, fV) };
+    Node D1L[4] = { deriv2(F, 1, fB), deriv2(F, 1, fF), deriv2(F, 1, fE), deriv2(F, 1, fV) };
+    Node DLL[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            DLL[i][j] = deriv2(F, (i == 0 ? fB : i == 1 ? fF : i == 2 ? fE : fV),
+                                  (j == 0 ? fB : j == 1 ? fF : j == 2 ? fE : fV));
+
+    const int base[4] = { 0, 3, 6, 9 };
+    auto V = [](int k) { return Node::makeVar(CVAR_LIFT_BASE + k); };
+    auto dl = [&](int i) { return V(base[i] + 1); };     // V′
+    auto ddl = [&](int i) { return V(base[i] + 2); };    // V″
+    auto S = [&](const Node& n) {
+        Node r = substLiftParam(n, fB, base[0]);
+        r = substLiftParam(r, fF, base[1]);
+        r = substLiftParam(r, fE, base[2]);
+        r = substLiftParam(r, fV, base[3]);
+        return r;
+    };
+    auto mul = [](Node a, Node c) { return astMul(a, c); };
+    auto sum = [](std::vector<Node> xs) {
+        Node r = Node::makeNum(0.0);
+        for (auto& x : xs) r = astAdd(r, x);
+        return r;
+    };
+
+    Node seg0 = S(F);
+    std::vector<Node> s1, s3, s4;
+    s1.push_back(S(D0)); s3.push_back(S(D00)); s4.push_back(S(D01));
+    for (int i = 0; i < 4; ++i) {
+        s1.push_back(mul(S(DL[i]), dl(i)));
+        s3.push_back(mul(astNum(2.0), mul(S(D0L[i]), dl(i))));
+        s3.push_back(mul(S(DL[i]), ddl(i)));
+        s4.push_back(mul(S(D1L[i]), dl(i)));
+        for (int j = 0; j < 4; ++j)
+            s3.push_back(mul(S(DLL[i][j]), mul(dl(i), dl(j))));
+    }
+    Node seg1 = sum(s1), seg2 = S(D1), seg3 = sum(s3), seg4 = sum(s4), seg5 = S(D11);
+    std::vector<Node> node_segs = { seg0, seg1, seg2, seg3, seg4, seg5 };
+
+    aux.clear();
+    aux.push_back((double)P);
+    aux.push_back((double)node_segs.size());
+    aux.push_back(AUX_MAGIC_LIFT);
+    aux.push_back(4.0);                                  // n_lift
+    auto emit = [&](const Node& tree) {
+        std::vector<double> seg;
+        compileNode(simplify(tree), seg);
+        aux.push_back((double)(seg.size() / 3));
+        aux.insert(aux.end(), seg.begin(), seg.end());
+    };
+    const std::vector<Node>* tabs[4] = { &Bs, &Fs, &Es, &Vs };
+    for (int i = 0; i < 4; ++i) {
+        aux.push_back(3.0);                              // 3 段
+        aux.push_back(2.0);                              // 梯度只用前 2 段
+        for (const auto& t : *tabs[i]) emit(t);
+    }
+    for (const auto& t : node_segs) emit(t);
+    return true;
+}
+
 std::vector<double> buildModelAST(
     ResModelType model_type,
     int L, int Lmin, double d,
@@ -641,6 +768,12 @@ std::vector<double> buildModelAST(
             break;
         }
         case ResModelType::GS: {
+            if (liftEnabled()) {
+                std::vector<double> l_aux;
+                double mpi_l = (n_channels > 0) ? channel_masses[0] : 0.1396;
+                if (buildLiftedGS(P, Lmin, d, has_bf, q0_ast, mpi_l, l_aux))
+                    return l_aux;
+            }
             // Gounaris-Sakurai for ρ→ππ: F = (1 + d·g₀/m₀) / (m₀² - m² + f - i·m₀·Γ) × Bf
             // Decomposed into MODEL_BREAKUP_Q0 (q₀) + arithmetic (h, d, h₀, h'₀, Γ, f)
             double mpi = (n_channels > 0) ? channel_masses[0] : 0.1396;
