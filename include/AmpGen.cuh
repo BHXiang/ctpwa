@@ -280,6 +280,9 @@ public:
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
         std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
         std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（符号微分 aux 输出）
+        // SL 复用表（每 GPU）：[res][nSigma][nEv][8] = [R,I,Rm,Im,Rg,Ig,∂q0ln re,im]
+        // BWR 节点"与 L 无关"的传播子整块；主 kernel 每 SL 只补顶点 Bv。
+        std::vector<double*> d_prop6;
         int resonance_count;
         std::vector<int> res_dF_offset_;               // per-resonance: d_dF_tab local free index offset
         std::vector<int> res_dF_count_;                // per-resonance: number of free params

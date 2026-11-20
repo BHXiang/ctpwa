@@ -510,6 +510,25 @@ static __device__ void bwrN(int L, double z, double& n, double& np, double& npp)
     }
 }
 
+// q0 = breakup(m0, m1, m2) 及其对 m0 的一/二阶（bwrSpecEval 与 SL 复用表共用）
+// 阈值下（Q2<=0）钳到 0；q0≈0 时导数给 0，避免 1/q0 → NaN（与旧实现逐字一致）
+static __device__ inline void bwrQ0Derivs(double m0, double m1, double m2,
+                                          double& q0, double& q0p, double& q0pp)
+{
+    double A = (m1 + m2) * (m1 + m2);
+    double B = (m1 - m2) * (m1 - m2);
+    double m02 = m0 * m0, m03 = m02 * m0, m04 = m02 * m02;
+    double Q2 = ((m02 - A) * (m02 - B)) / (4.0 * m02);   // q0²
+    q0 = Q2 > 0.0 ? sqrt(Q2) : 0.0;
+    q0p = 0.0; q0pp = 0.0;
+    if (q0 > 1e-9) {
+        double Q2p = (m04 - A * B) / (2.0 * m03);
+        double Q2pp = (m04 + 3.0 * A * B) / (2.0 * m04);
+        q0p = Q2p / (2.0 * q0);
+        q0pp = (Q2pp - 2.0 * q0p * q0p) / (2.0 * q0);
+    }
+}
+
 // 解析 F/dF/d²F: dF[0]=∂m0, dF[1]=∂g0; d2F[j*2+k]（对称 2×2, 与 evalCustomAll 同布局）
 // 顶点势垒因子及对 m0 的一阶对数导数（bwrSpecEval 与 SL 复用路径共用）
 //   Bv = sqrt( N(L, q0·d) / N(L, q·d) ),  lB = ∂lnBv/∂m0
@@ -542,19 +561,9 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
                             // SL 复用：与 L 无关的整块 [R, I, Rm, Im, Rg, Ig]
                             double* prop6 = nullptr) {
     // ---- q0 = breakup(m0, q0m1, q0m2) 及其对 m0 的一/二阶 ----
-    double A = (q0m1 + q0m2) * (q0m1 + q0m2);
-    double B = (q0m1 - q0m2) * (q0m1 - q0m2);
-    double m02 = m0 * m0, m03 = m02 * m0, m04 = m02 * m02;
-    double Q2 = ((m02 - A) * (m02 - B)) / (4.0 * m02);   // q0²
-    // Q2' = (m0⁴−AB)/(2m0³);  Q2'' = (m0⁴+3AB)/(2m0⁴)
-    double q0 = Q2 > 0.0 ? sqrt(Q2) : 0.0;
-    double q0p = 0.0, q0pp = 0.0;
-    if (q0 > 1e-9) {
-        double Q2p = (m04 - A * B) / (2.0 * m03);
-        double Q2pp = (m04 + 3.0 * A * B) / (2.0 * m04);
-        q0p = Q2p / (2.0 * q0);
-        q0pp = (Q2pp - 2.0 * q0p * q0p) / (2.0 * q0);
-    }
+    double q0, q0p, q0pp;
+    bwrQ0Derivs(m0, q0m1, q0m2, q0, q0p, q0pp);
+    double m02 = m0 * m0;
     double u = q0p / q0;                       // d(ln q0)/dm0
 
     // ---- 内部 Bf² = N(q0·di)/N(q·di); di = has_bf? dd : 0（di=0 → Bf≡1）----

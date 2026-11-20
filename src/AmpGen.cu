@@ -1861,7 +1861,25 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
 
                 if (is_target) {
                     if (!custom_eval) {
-                        if (target_res.type == ResModelType::Interp) {
+                        // SL 复用：读传播子表（每事例每共振态只算一次），
+                        // 本 SL 只补顶点 Bv/lB —— 与下面的闭式逐项同源。
+                        if (target_res.bwr_flag && target_res.param_count == 2
+                            && B.d_prop6 && B.nPropRes > 0) {
+                            const double* p8 = B.d_prop6
+                                + ((((size_t)0 * B.nSigma + s) * B.nEvents
+                                    + event_idx) * 8);
+                            double q0v, q0pv, q0ppv;
+                            bwrQ0Derivs(m0_q0, md1_q0, md2_q0, q0v, q0pv, q0ppv);
+                            double Bv, lB, lBp;
+                            bwrVertexBv(L, qq, q0v, q0pv, q0ppv, target_res.bwr_d,
+                                        target_res.bwr_has_bf != 0, Bv, lB, lBp);
+                            Fr = p8[0] * Bv;
+                            Fi = p8[1] * Bv;
+                            dFr[0] = (p8[2] + p8[0] * lB) * Bv;
+                            dFi[0] = (p8[3] + p8[1] * lB) * Bv;
+                            dFr[1] = p8[4] * Bv;
+                            dFi[1] = p8[5] * Bv;
+                        } else if (target_res.type == ResModelType::Interp) {
                             for (int j = 0; j < 256; ++j) d2Fr[j] = d2Fi[j] = 0.0;
                             interpEval(aux + target_res.aux_offset, mm,
                                        Fr, Fi, dFr, dFi, P);
@@ -2004,7 +2022,30 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                     if (P_r > 16) P_r = 16;
 
                     double Fr, Fi, dFr[16], dFi[16], d2Fr_tmp[1], d2Fi_tmp[1];
-                    if (res.type == ResModelType::Interp) {
+                    // SL 复用表：传播子（与 L 无关）每事例每共振态算一次，
+                    // 本 SL 只算顶点 Bv/lB 后组装。
+                    bool used_prop6 = false;
+                    double prop_q0v = 0.0, prop_q0r = 0.0, prop_q0i = 0.0;
+                    if (res.bwr_flag && res.param_count == 2
+                        && B.d_prop6 && B.nPropRes > 0) {
+                        const double* p8 = B.d_prop6
+                            + ((((size_t)match_r * B.nSigma + s) * B.nEvents
+                                + event_idx) * 8);
+                        double q0pv, q0ppv;
+                        bwrQ0Derivs(m0_q0, md1_q0, md2_q0, prop_q0v, q0pv, q0ppv);
+                        double Bv, lB, lBp;
+                        bwrVertexBv(L, qq, prop_q0v, q0pv, q0ppv, res.bwr_d,
+                                    res.bwr_has_bf != 0, Bv, lB, lBp);
+                        Fr = p8[0] * Bv;
+                        Fi = p8[1] * Bv;
+                        dFr[0] = (p8[2] + p8[0] * lB) * Bv;
+                        dFi[0] = (p8[3] + p8[1] * lB) * Bv;
+                        dFr[1] = p8[4] * Bv;
+                        dFi[1] = p8[5] * Bv;
+                        prop_q0r = p8[6];
+                        prop_q0i = p8[7];
+                        used_prop6 = true;
+                    } else if (res.type == ResModelType::Interp) {
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
                     } else if (res.bwr_flag && res.param_count == 2) {
@@ -2094,14 +2135,24 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             // BWR 闭式：∂lnF/∂q0 已含"传播子经 γ"和"顶点 Bf"两条链，
                             // 一次求值即可，不必 ±h 扰动两次（数值与扰动一致到 h²）
                             if (res.bwr_flag && res.param_count == 2) {
-                                double Fv_r, Fv_i, dFr_v[16], dFi_v[16], d2r_v[1], d2i_v[1];
-                                double dlq_r = 0.0, dlq_i = 0.0, dlq0_r = 0.0, dlq0_i = 0.0;
-                                bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0,
-                                            res.bwr_d, res.bwr_lmin, L,
-                                            res.bwr_has_bf != 0,
-                                            Fv_r, Fv_i, dFr_v, dFi_v, d2r_v, d2i_v,
-                                            /*want_2nd=*/false,
-                                            &dlq_r, &dlq_i, &dlq0_r, &dlq0_i);
+                                double dlq0_r = 0.0, dlq0_i = 0.0;
+                                if (used_prop6) {
+                                    // 表里只有传播子部分；顶点项依赖本 SL 的 Lvtx=L
+                                    dlq0_r = prop_q0r;
+                                    dlq0_i = prop_q0i;
+                                    if (res.bwr_has_bf != 0)
+                                        dlq0_r += dlnBf_dq0(L, prop_q0v, res.bwr_d);
+                                } else {
+                                    double Fv_r, Fv_i, dFr_v[16], dFi_v[16], d2r_v[1], d2i_v[1];
+                                    double dlq_r = 0.0, dlq_i = 0.0;
+                                    bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0,
+                                                res.bwr_d, res.bwr_lmin, L,
+                                                res.bwr_has_bf != 0,
+                                                Fv_r, Fv_i, dFr_v, dFi_v, d2r_v, d2i_v,
+                                                /*want_2nd=*/false,
+                                                &dlq_r, &dlq_i, &dlq0_r, &dlq0_i);
+                                    (void)dlq_r; (void)dlq_i;
+                                }
                                 const double dq0_dm = breakup_dq_dm(d1_free ? 1 : 2,
                                                                     m0_q0, md1_q0, md2_q0);
                                 for (int j_loc = 0; j_loc < cnt2; ++j_loc) {
@@ -2239,6 +2290,79 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
 }
 
 
+// ---------------------------------------------------------------------------
+// SL 复用：把每个 (共振态, σ, 事例) 的"与 L 无关"整块物化成表
+//   表项 = [R, I, Rm, Im, Rg, Ig, ∂lnF/∂q0(re), ∂lnF/∂q0(im)]
+//   = bwrSpecEval 乘顶点 Bv 之前的传播子部分。
+// 主 kernel 里每个 SL 只需算顶点 Bv/lB（依赖 L）再组装 —— 传播子每事例每
+// 共振态只算一次（19 SL → 1 次）。
+// Lvtx 传 0：prop6 本身与顶点无关；而 Lvtx=0 时顶点项 dlnBf_dq0(0,q0,dd)≡0，
+// 于是 dln 输出正好是不含顶点的传播子部分，逐 SL 再补顶点项。
+// ---------------------------------------------------------------------------
+CTPWA_KERNEL void bwrPropTableKernel(
+    double* d_prop6,
+    const DeviceMomenta* d_momenta,
+    const DeviceMomenta* d_mom_tab,
+    const DeviceResonance* d_res, int nRes,
+    const double* d_all_params,
+    const DecayNode* d_nodes, int nNodes,
+    int nEvents, int nSigma)
+{
+    const int tid = CTPWA_TID();
+    if (tid >= nRes * nSigma * nEvents) return;
+    const int evt = tid % nEvents;
+    const int t = tid / nEvents;
+    const int s = t % nSigma;
+    const int r = t / nSigma;
+    double* out = d_prop6 + (size_t)tid * 8;
+    for (int j = 0; j < 8; ++j) out[j] = 0.0;
+
+    const DeviceResonance& res = d_res[r];
+    if (!res.bwr_flag || res.param_count != 2) return;
+    const DeviceMomenta* dm = (s == 0 || !d_mom_tab) ? d_momenta : &d_mom_tab[s];
+
+    int node_idx = -1;
+    for (int j = 0; j < nNodes; ++j) {
+        if (d_nodes[j].mother_idx == res.particle_idx && d_nodes[j].mass[0] <= 0) {
+            node_idx = j;
+            break;
+        }
+    }
+    if (node_idx < 0) return;
+
+    const DecayNode& node = d_nodes[node_idx];
+    LorentzVector pM = dm->getMomentum(evt, node.mother_idx);
+    LorentzVector pD1 = dm->getMomentum(evt, node.daug1_idx);
+    LorentzVector pD2 = dm->getMomentum(evt, node.daug2_idx);
+    const double mm = pM.M();
+    const double qq = breakup_momentum(mm, pD1.M(), pD2.M());
+    const double md1 = pD1.M(), md2 = pD2.M();
+
+    // q0 链：节点声明质量（>0）或"该子粒子是自由共振态"的参数质量
+    double md1_q0 = node.mass[1], md2_q0 = node.mass[2];
+    if (md1_q0 <= 0)
+        for (int r2 = 0; r2 < nRes; ++r2)
+            if (node.daug1_idx == d_res[r2].particle_idx && d_res[r2].param_count > 0) {
+                md1_q0 = d_all_params[d_res[r2].param_offset];
+                break;
+            }
+    if (md1_q0 <= 0) md1_q0 = md1;
+    if (md2_q0 <= 0)
+        for (int r2 = 0; r2 < nRes; ++r2)
+            if (node.daug2_idx == d_res[r2].particle_idx && d_res[r2].param_count > 0) {
+                md2_q0 = d_all_params[d_res[r2].param_offset];
+                break;
+            }
+    if (md2_q0 <= 0) md2_q0 = md2;
+
+    double Fr, Fi, dFr[16], dFi[16], d2Fr[1], d2Fi[1];
+    const double* rp = d_all_params + res.param_offset;
+    bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0, res.bwr_d,
+                res.bwr_lmin, /*Lvtx=*/0, res.bwr_has_bf != 0,
+                Fr, Fi, dFr, dFi, d2Fr, d2Fi, /*want_2nd=*/false,
+                nullptr, nullptr, &out[6], &out[7], out);
+}
+
 // 跨链全同粒子: 将交换拓扑的 SL 振幅就地累加到原始振幅
 // d_amp += sign * d_add,  sign = +1 (Bose) or -1 (Fermi)
 CTPWA_KERNEL void addSLAmpsKernel(
@@ -2308,6 +2432,7 @@ void AmpCalc::release()
         bump(ng, b.d_all_channels.size());
         bump(ng, b.d_T.size());
         bump(ng, b.d_dF.size());
+        bump(ng, b.d_prop6.size());
         bump(ng, b.d_res_idx_.size());
         bump(ng, b.d_param_idx_.size());
         bump(ng, b.d_global_offset_.size());
@@ -2331,6 +2456,7 @@ void AmpCalc::release()
             free_at(b.d_all_channels);
             free_at(b.d_T);
             free_at(b.d_dF);
+            free_at(b.d_prop6);
             free_at(b.d_res_idx_);
             free_at(b.d_param_idx_);
             free_at(b.d_global_offset_);
@@ -2849,6 +2975,13 @@ void AmpCalc::releaseStaticCasData()
     //         " SL 表（保留 %d 个）\n", freed, (int)(cas_list_.size() - freed));
 }
 
+// SL 复用表开关：CTPWA_NO_PROP6=1 强制逐 SL 现算（A/B 对拍、线上回退）
+static inline bool prop6Enabled()
+{
+    static const bool en = (getenv("CTPWA_NO_PROP6") == nullptr);
+    return en;
+}
+
 void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                             const double* d_params,
                             int n_amplitudes,
@@ -3106,6 +3239,17 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             size_t dF_bytes = dF_size * (dF_float_ ? sizeof(float2) : sizeof(ctComplex));
             if (!block.d_dF[gpu])
                 cudaMalloc(&block.d_dF[gpu], dF_bytes);
+            // SL 复用表（仅当块内有 BWR 共振态才分配）：
+            // [res][nSigma][nEv][8] doubles，传播子每事例每共振态一份。
+            if (!block.d_prop6.size()) block.d_prop6.assign(n_gpu, nullptr);
+            bool has_bwr = false;
+            for (const auto& dr : h_templates_[bi])
+                if (dr.bwr_flag && dr.param_count == 2) { has_bwr = true; break; }
+            if (has_bwr && prop6Enabled() && !block.d_prop6[gpu]) {
+                size_t prop_bytes = (size_t)std::max(1, block.resonance_count)
+                                  * (size_t)nSigma * (size_t)nEv * 8 * sizeof(double);
+                cudaMalloc(&block.d_prop6[gpu], prop_bytes);
+            }
             if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
             if (!block.d_param_map_[gpu]) {
                 cudaMalloc(&block.d_param_map_[gpu], block.nFree * sizeof(int));
@@ -3139,8 +3283,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 auto& block = blocks_[bi];
                 auto& cas = cas_list_[block.cas_idx];
                 ADBlockDesc d;
-                d.d_prop6 = nullptr;   // SL 复用表（未启用）
-                d.nPropRes = 0;
+                d.d_prop6 = (prop6Enabled() && !block.d_prop6.empty())
+                    ? block.d_prop6[gpu] : nullptr;
+                d.nPropRes = d.d_prop6 ? block.resonance_count : 0;
                 d.d_momenta = cas->getMomenta()[gpu];
                 d.d_slComb = cas->getDeviceSLCombs()[gpu];
                 d.d_slamp_tab = cas->getSLAmpsTab()[gpu];
@@ -3202,6 +3347,25 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 dd.d_jit_out = gready ? block.jit.grad_buf[gpu] : nullptr;
                 dd.d_jit_slice = gready ? block.jit.grad_slice[gpu] : nullptr;
             }
+            // ---- SL 复用表：传播子每 (共振态, σ, 事例) 算一次 ----
+            // 必须在 updateResonanceParamsKernel 之后（表用当前 θ 的质量/宽度）。
+            for (size_t ci = 0; ci < custom_blocks.size(); ++ci) {
+                auto& block = blocks_[custom_blocks[ci]];
+                if (!prop6Enabled() || block.d_prop6.empty() || !block.d_prop6[gpu]) continue;
+                auto& cas = cas_list_[block.cas_idx];
+                int nEv = static_cast<int>(cas->getNEventsVec()[gpu]);
+                int nSigma = cas->getNSigma();
+                int total = block.resonance_count * nSigma * nEv;
+                if (total <= 0) continue;
+                int grid_prop = (total + 255) / 256;
+                CTPWA_LAUNCH(bwrPropTableKernel, grid_prop, 256, 0,
+                    block.d_prop6[gpu], cas->getMomenta()[gpu],
+                    cas->getMomentaTab()[gpu], block.d_resonances[gpu],
+                    block.resonance_count, block.d_all_params[gpu],
+                    cas->getDecayNodes()[gpu], cas->getDecayChainSize(),
+                    nEv, nSigma);
+            }
+            prof_tick("prop-table");
             int nblocks = static_cast<int>(h_desc.size());
             cudaMemcpy(d_ad_desc_[gpu], h_desc.data(), nblocks * sizeof(ADBlockDesc),
                        cudaMemcpyHostToDevice);
