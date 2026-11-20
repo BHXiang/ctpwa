@@ -1832,7 +1832,7 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
             double Or = 1.0, Oi = 0.0;
             double dlnO_dm0 = 0.0;
             double Fr = 1.0, Fi = 0.0;
-            double dFr[16], dFi[16], d2Fr[256], d2Fi[256];
+            double dFr[16], dFi[16], d2Fr[1], d2Fi[1];
             bool custom_eval = false;
 
             for (int nodeIdx = 0; nodeIdx < B.decayChain_size; ++nodeIdx) {
@@ -1902,7 +1902,7 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                     p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                                     p2_phi = atan2(pD2.Py, pD2.Px);
                                 }
-                                evalCustomAll(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
+                                evalCustomAll<false>(aux, target_res.aux_offset, mm, qq, q0, L, node.bf_d,
                                     md1_q0, md2_q0,
                                     p1_P, p1_E, p1_ct, p1_phi,
                                     p2_P, p2_E, p2_ct, p2_phi,
@@ -2003,7 +2003,7 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                     if (P_r < 1) P_r = 1;
                     if (P_r > 16) P_r = 16;
 
-                    double Fr, Fi, dFr[16], dFi[16], d2Fr_tmp[256], d2Fi_tmp[256];
+                    double Fr, Fi, dFr[16], dFi[16], d2Fr_tmp[1], d2Fi_tmp[1];
                     if (res.type == ResModelType::Interp) {
                         for (int jj = 0; jj < 256; ++jj) d2Fr_tmp[jj] = d2Fi_tmp[jj] = 0.0;
                         interpEval(aux + res.aux_offset, mm, Fr, Fi, dFr, dFi, P_r);
@@ -2042,7 +2042,7 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                                 p2_ct = (p2_P > 0) ? pD2.Pz / p2_P : 0.0;
                                 p2_phi = atan2(pD2.Py, pD2.Px);
                             }
-                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
+                            evalCustomAll<false>(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1_q0, md2_q0,
                                 p1_P, p1_E, p1_ct, p1_phi,
                                 p2_P, p2_E, p2_ct, p2_phi,
@@ -2097,12 +2097,12 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             const double md1m = md1_q0 - (d1_free ? hh : 0.0);
                             const double md2m = md2_q0 - (d2_free ? hh : 0.0);
                             double Fp_r, Fp_i, Fm_r, Fm_i;
-                            double dFr2[16], dFi2[16], d2Fr2[256], d2Fi2[256];
-                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
+                            double dFr2[16], dFi2[16], d2Fr2[1], d2Fi2[1];
+                            evalCustomAll<false>(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1p, md2p, e1_P, e1_E, e1_ct, e1_phi,
                                 e2_P, e2_E, e2_ct, e2_phi,
                                 rp, P_r, Fp_r, Fp_i, dFr2, dFi2, d2Fr2, d2Fi2, false);
-                            evalCustomAll(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
+                            evalCustomAll<false>(aux, (res.use_aux2_grad && res.aux2_size > 0 ? res.aux2_offset : res.aux_offset), mm, qq, q0, L, node.bf_d,
                                 md1m, md2m, e1_P, e1_E, e1_ct, e1_phi,
                                 e2_P, e2_E, e2_ct, e2_phi,
                                 rp, P_r, Fm_r, Fm_i, dFr2, dFi2, d2Fr2, d2Fi2, false);

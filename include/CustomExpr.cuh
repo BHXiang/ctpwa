@@ -139,6 +139,9 @@ __host__ __device__ inline int customSegOffset(const double* aux, int s)
 // 全段解释器（src/CustomExpr.cu）：值段 + P 个一阶段 + P(P+1)/2 个二阶段
 // 布局与 evalCustomSeg 相同；d2 按 j≤k 段序读取，对称填充 d2[k][j]=d2[j][k]
 // compute_2nd=false（梯度路径）时跳过二阶段，d2Fr/d2Fi 不写（调用方不得读）
+// Want2nd=false → constexpr 关掉二阶段：调用方不必为 d2 缓冲预留 local memory
+// （拟合主循环只读 F/dF；实测该 kernel 因此从 20 KB 栈降到 ~6 KB）
+template <bool Want2nd = true>
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,

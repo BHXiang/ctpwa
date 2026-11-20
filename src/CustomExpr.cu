@@ -1226,6 +1226,7 @@ __device__ void evalCustomSeg(
     else { out[0] = 0; out[1] = 0; }
 }
 
+template <bool Want2nd>
 __device__ void evalCustomAll(
     const double* aux, int aux_offset,
     double m, double q, double q0, int L, double d,
@@ -1253,7 +1254,7 @@ __device__ void evalCustomAll(
                 int ng = (int)base[off + 1];
                 off += 2;
                 // 梯度路径只求前 ng 段；其余段跳过（槽保持 0），但游标照走
-                int need = compute_2nd ? nl : (ng < nl ? ng : nl);
+                int need = (Want2nd && compute_2nd) ? nl : (ng < nl ? ng : nl);
                 for (int sg = 0; sg < nl; ++sg) {
                     int ni = (int)base[off];
                     if (sg < need && slot + sg < CVAR_LIFT_MAX) {
@@ -1291,6 +1292,7 @@ __device__ void evalCustomAll(
         seg_off += 1 + 3 * n_instr;
     }
     // 二阶段（段序 j≤k，对称填充）
+    if constexpr (Want2nd)
     if (compute_2nd)
     for (int j = 0; j < P; ++j)
         for (int k = j; k < P; ++k) {
@@ -1304,6 +1306,18 @@ __device__ void evalCustomAll(
         }
 }
 
+
+// 显式实例化：AmpGen 的振幅 kernel 只用 <false>，Hessian/其它保持 <true>
+template __device__ void evalCustomAll<true>(
+    const double*, int, double, double, double, int, double, double, double,
+    double, double, double, double, double, double, double, double,
+    const double*, int, double&, double&, double*, double*,
+    double*, double*, bool, const double*);
+template __device__ void evalCustomAll<false>(
+    const double*, int, double, double, double, int, double, double, double,
+    double, double, double, double, double, double, double, double,
+    const double*, int, double&, double&, double*, double*,
+    double*, double*, bool, const double*);
 
 // ============================================================================
 // host 编译入口
