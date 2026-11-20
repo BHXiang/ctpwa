@@ -71,4 +71,18 @@ EOF
   done
 fi
 
+# 多卡一致性必须跨进程：pytest 在进程内跑，改不了 CUDA_VISIBLE_DEVICES。
+# 覆盖 per-GPU 分支：事件切分后的 d_static / d_prop6 / d_dF 行数、σ 置换表副本。
+# 注: 上面 `pytest .` 已在 2 卡上跑过，所以 per-GPU 代码路径本身有覆盖；
+#     这一步补的是"1 卡 与 N 卡给出同一 NLL/梯度"的**断言**。
+#     (只有 configs/static_nodes.yml 会真的建静态表，其余 config 的 static=0)
+echo; echo "===== 5) 多卡一致性（1 卡 vs N 卡，NLL + 全梯度）====="
+$PY "$HERE/multigpu_parity.py" 2>&1
+MGP_RC=$?
+if [ $MGP_RC -ne 0 ]; then
+  echo "!!! 多卡一致性未通过 (rc=$MGP_RC) —— 不要发布"
+else
+  echo "多卡一致性 ✓"
+fi
+
 echo "=== 结束: $(date) ==="
