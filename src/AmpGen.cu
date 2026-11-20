@@ -3436,16 +3436,25 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 block.node_free_mask_ = mask;
                 block.n_static_nodes_ = n_static;
                 const int nSLb = static_cast<int>(cas->getNSLCombs());
-                if (ok && n_static > 0) {
-                    size_t bytes = (size_t)nSigma * (size_t)nEv * (size_t)nSLb
-                                 * 2 * sizeof(double);
-                    cudaMalloc(&block.d_static[gpu], bytes);
+                // 内存预算：表只有 [σ][evt][SL]（无极化维），正好是**一份 SLamp 的
+                // 1/nPolar**（SLamp 送 [σ][SL][evt][pol]）。nPolar==1 时二者等大，
+                // 等于把 SLamps 存两遍 —— 那正是要避免的，此时不建表（退回热循环）。
+                const size_t table_bytes = (size_t)nSigma * (size_t)nEv * (size_t)nSLb
+                                         * 2 * sizeof(double);
+                const size_t slamp_bytes = (size_t)nSigma * (size_t)nEv * (size_t)nSLb
+                                         * n_polar * sizeof(ctComplex);
+                const bool fits_budget = (table_bytes * 2 <= slamp_bytes);
+                if (ok && n_static > 0 && fits_budget) {
+                    cudaMalloc(&block.d_static[gpu], table_bytes);
                 } else {
-                    block.static_ready[gpu] = 1;   // 无静态节点 → 永不建表
+                    block.static_ready[gpu] = 1;   // 无静态节点/超预算 → 永不建表
                 }
                 if (getenv("CTPWA_STATIC_DEBUG"))
-                    fprintf(stderr, "[ctpwa][blk %d] static: nodes=%d static=%d mask=0x%x\n",
-                            bi, nNodes, n_static, mask);
+                    fprintf(stderr, "[ctpwa][blk %d] static: nodes=%d static=%d mask=0x%x"
+                            " table=%.1fMB slamp=%.1fMB%s\n",
+                            bi, nNodes, n_static, mask,
+                            table_bytes / 1048576.0, slamp_bytes / 1048576.0,
+                            (ok && n_static > 0 && !fits_budget) ? " [skipped: nPolar<2]" : "");
             }
             if (!block.d_param_map_.size()) block.d_param_map_.assign(n_gpu, nullptr);
             if (!block.d_param_map_[gpu]) {
