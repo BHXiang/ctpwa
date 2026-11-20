@@ -517,7 +517,10 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
                             double& Fr, double& Fi,
                             double* dFr, double* dFi,
                             double* d2Fr, double* d2Fi,
-                            bool want_2nd = true) {
+                            bool want_2nd = true,
+                            // 级联用：子质量链的（复）对数导数 ∂lnF/∂q、∂lnF/∂q0
+                            double* dlnF_dq_re = nullptr, double* dlnF_dq_im = nullptr,
+                            double* dlnF_dq0_re = nullptr, double* dlnF_dq0_im = nullptr) {
     // ---- q0 = breakup(m0, q0m1, q0m2) 及其对 m0 的一/二阶 ----
     double A = (q0m1 + q0m2) * (q0m1 + q0m2);
     double B = (q0m1 - q0m2) * (q0m1 - q0m2);
@@ -615,6 +618,32 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
     dFi[0] = (Im + I * lB) * Bv;
     dFr[1] = Rg * Bv;                        // Bv 与 g0 无关
     dFi[1] = Ig * Bv;
+
+    // ---- 子质量链：∂lnF/∂q 与 ∂lnF/∂q0（复数）----
+    //   ∂ln prop/∂lnγ = m0·(i·x − y)/s          （K，与 γ 无关）
+    //   ∂γ/∂q  = γ·( +n/q  + 2·∂lnBf_internal/∂q  )
+    //   ∂γ/∂q0 = γ·( −n/q0 + 2·∂lnBf_internal/∂q0 )
+    //   顶点 Bf 另有 ∂lnBf_vertex/∂q、∂lnBf_vertex/∂q0（实数）
+    if (dlnF_dq_re || dlnF_dq_im || dlnF_dq0_re || dlnF_dq0_im) {
+        const double K_re = -m0 * y * invs;      // ∂ln prop/∂lnγ（实部）
+        const double K_im =  m0 * x * invs;      //                  （虚部）
+        const double nP_d = (double)nP;
+        const double dlBi_q  = dlnBf_dq0(Lmin, q,  di);   // 同一个函数（对自身动量求导）
+        const double dlBi_q0 = dlnBf_dq0(Lmin, q0, di);
+        const double dgam_q  = gamma * ( nP_d / q  - 2.0 * dlBi_q);   // Bf 在分母 → 负号
+        const double dgam_q0 = gamma * (-nP_d / q0 + 2.0 * dlBi_q0);
+        // ∂ln prop/∂q(0) = K · dγ/dq(0)
+        double dq_re  = K_re * dgam_q,  dq_im  = K_im * dgam_q;
+        double dq0_re = K_re * dgam_q0, dq0_im = K_im * dgam_q0;
+        if (has_bf) {                            // 顶点 Bf 的贡献（实数）
+            dq_re  -= dlnBf_dq0(Lvtx, q,  dd);   // 顶点 Bf 同样在分母
+            dq0_re += dlnBf_dq0(Lvtx, q0, dd);
+        }
+        if (dlnF_dq_re)  *dlnF_dq_re  = dq_re;
+        if (dlnF_dq_im)  *dlnF_dq_im  = dq_im;
+        if (dlnF_dq0_re) *dlnF_dq0_re = dq0_re;
+        if (dlnF_dq0_im) *dlnF_dq0_im = dq0_im;
+    }
     if (!want_2nd) return;      // fit 主循环只要 F/dF（二阶闭式约占总 flop 的 1/3）
     double b2 = lB * lB + lBp;
     d2Fr[0] = (Rmm + 2.0 * Rm * lB + R * b2) * Bv;
