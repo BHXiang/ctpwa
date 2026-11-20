@@ -4,6 +4,21 @@
 
 ### Improved
 
+- **Fixed-node budget (static chain factors).** A decay node whose parameters are
+  all fixed *and* whose daughters are not free resonances contributes a
+  θ-independent factor, so the product over all such nodes is materialised once
+  per (σ, event, SL) into a table (`d_static`) at initialisation. The amplitude
+  kernel then only loops over the remaining free nodes and multiplies the chain
+  amplitude by that table — `dF = F_total × dln` stays exact because the static
+  nodes contribute nothing to `dln`. Node classification is conservative: nodes
+  whose daughter is a free resonance stay in the hot loop (their `q0` moves with
+  θ), and only BWR(2-parameter)/`Bf`/unity factors are foldable — Custom, Interp,
+  GS and `ONE` nodes stay in the loop. `CTPWA_NO_STATIC=1` forces the old
+  all-nodes path (bitwise A/B, used in the review). On the 5-body benchmark with
+  one free resonance per chain: 193 → 113 ms (1.7×, RTX 5060); the all-free
+  benchmark is unchanged (no table is built).
+  A/B parity vs `CTPWA_NO_STATIC=1`: NLL identical to 1e-16 relative, gradients
+  2.6e-15 maximum relative deviation (CUDA and CPU backends).
 - The contraction is now generic: `buildLiftedAux()` takes the model's "shell"
   expression (lifted quantities referenced as placeholder parameters) plus the
   list of lifted sub-expressions, and assembles every derivative segment from
