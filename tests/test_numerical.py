@@ -32,7 +32,7 @@ HESSIAN_SYM_ATOL = 1e-6
 # NLL 基础性质
 # ============================================================
 
-@pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp"])
+@pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp", "static_nodes"])
 def test_nll_reproducible(make_analysis, device, config_key):
     """同一参数两次计算 NLL，结果必须完全一致（防 GPU 状态残留）。"""
     ana = make_analysis(config_key)
@@ -45,7 +45,7 @@ def test_nll_reproducible(make_analysis, device, config_key):
     )
 
 
-@pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp", "hess_mult"])
+@pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp", "hess_mult", "static_nodes"])
 def test_nll_finite(make_analysis, device, config_key):
     """NLL 必须为有限实数。"""
     ana = make_analysis(config_key)

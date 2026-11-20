@@ -42,6 +42,9 @@ def config_paths():
         "with_deep_trans": str(CONFIGS_DIR / "with_deep_trans.yml"),
         # 乘法链 (chain×step) Hessian 回归: 含 3 因子振幅, 见 test_numerical.py
         "hess_mult": str(CONFIGS_DIR / "hess_mult.yml"),
+        # 固定节点预算（静态链因子）: 链里有 1 个可折叠的静态节点,
+        # 见 test_static_budget.py 与 test_numerical.py::test_gradient_vs_fd
+        "static_nodes": str(CONFIGS_DIR / "static_nodes.yml"),
     }
 
 
