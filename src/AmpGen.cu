@@ -2091,6 +2091,28 @@ CTPWA_KERNEL void computeCustomAmpsKernelT(
                             if (!slot_free) continue;
 
                             const double m_child = d1_free ? md1_q0 : md2_q0;
+                            // BWR 闭式：∂lnF/∂q0 已含"传播子经 γ"和"顶点 Bf"两条链，
+                            // 一次求值即可，不必 ±h 扰动两次（数值与扰动一致到 h²）
+                            if (res.bwr_flag && res.param_count == 2) {
+                                double Fv_r, Fv_i, dFr_v[16], dFi_v[16], d2r_v[1], d2i_v[1];
+                                double dlq_r = 0.0, dlq_i = 0.0, dlq0_r = 0.0, dlq0_i = 0.0;
+                                bwrSpecEval(rp[0], rp[1], mm, qq, md1_q0, md2_q0,
+                                            res.bwr_d, res.bwr_lmin, L,
+                                            res.bwr_has_bf != 0,
+                                            Fv_r, Fv_i, dFr_v, dFi_v, d2r_v, d2i_v,
+                                            /*want_2nd=*/false,
+                                            &dlq_r, &dlq_i, &dlq0_r, &dlq0_i);
+                                const double dq0_dm = breakup_dq_dm(d1_free ? 1 : 2,
+                                                                    m0_q0, md1_q0, md2_q0);
+                                for (int j_loc = 0; j_loc < cnt2; ++j_loc) {
+                                    const int j_glob = off2 + j_loc;
+                                    if (B.d_param_map[j_glob] == 0) {
+                                        dln_re[j_glob] += dlq0_r * dq0_dm;
+                                        dln_im[j_glob] += dlq0_i * dq0_dm;
+                                    }
+                                }
+                                continue;      // 跳过数值扰动
+                            }
                             const double hh = 1e-6 * (m_child > 0.05 ? m_child : 0.05);
                             const double md1p = md1_q0 + (d1_free ? hh : 0.0);
                             const double md2p = md2_q0 + (d2_free ? hh : 0.0);
@@ -2521,7 +2543,9 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
             double ff1 = 0.0, ff2 = 0.0;
             bool okdep = cas->getDaughterMassDep(dr.particle_idx, dr.particle_idx,
                                                  mm1, ff1, mm2, ff2);
-            if (okdep && mm1 != Q0MassDep::M0Param && mm2 != Q0MassDep::M0Param) {
+            // M0Param（子粒子是质量浮动的共振态）也允许：闭式已经提供
+            // ∂lnF/∂q0（见 bwrSpecEval 的新输出），子质量链在 kernel 里补
+            if (okdep) {
                 const auto& ropts = res.getOptions();
                 double rdd = 3.0;
                 auto itd = ropts.find("d");
