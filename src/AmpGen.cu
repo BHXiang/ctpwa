@@ -3406,8 +3406,17 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 };
                 unsigned int mask = 0;   // bit i = 节点留在热循环
                 int n_static = 0;
+                // hasSLAmps()：本 cas 没被 releaseStaticCasData 裁掉。
+                // 填表 kernel 要读 slamp 的同生共死兄弟 d_mom_tab（σ>0 重建动量），
+                // 且主 kernel 也要 slamp 才能算 A —— 权威判据就是它。真出现
+                // "有 free 参数却被裁"的编程错误时，这里退化为不建表（走热循环），
+                // 而不是去读已释放的指针。
                 const bool ok = (nNodes > 0 && nNodes <= 32 && nEv > 0
-                                 && (int)cas->getNSLCombs() > 0);
+                                 && (int)cas->getNSLCombs() > 0 && cas->hasSLAmps());
+                if (ok == false && getenv("CTPWA_STATIC_DEBUG"))
+                    fprintf(stderr, "[ctpwa][blk %d] static: 跳过（nNodes=%d nEv=%d "
+                            "nSL=%d hasSLAmps=%d）\n", bi, nNodes, nEv,
+                            (int)cas->getNSLCombs(), (int)cas->hasSLAmps());
                 for (int i = 0; ok && i < nNodes; ++i) {
                     const DecayNode& nd = h_nodes[i];
                     int mr = -1;
