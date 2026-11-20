@@ -3139,6 +3139,8 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 auto& block = blocks_[bi];
                 auto& cas = cas_list_[block.cas_idx];
                 ADBlockDesc d;
+                d.d_prop6 = nullptr;   // SL 复用表（未启用）
+                d.nPropRes = 0;
                 d.d_momenta = cas->getMomenta()[gpu];
                 d.d_slComb = cas->getDeviceSLCombs()[gpu];
                 d.d_slamp_tab = cas->getSLAmpsTab()[gpu];

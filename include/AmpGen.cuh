@@ -261,6 +261,10 @@ struct ADBlockDesc {
     int nPolar;
     int sl_start;                // grid.x 累积偏移（组内）
     int site;                    // 振幅列偏移
+    // SL 复用：每个 (共振态, 事例) 的"与 L 无关"整块 [R,I,Rm,Im,Rg,Ig]
+    // 布局 [res][nEvents][6]；nullptr = 不启用（逐 SL 现算）
+    double* d_prop6;
+    int nPropRes;                // 表中共振态数（= resonance_count）
 };
 
 // ============================================================
