@@ -2337,6 +2337,7 @@ CTPWA_KERNEL void bwrPropTableKernel(
     const DeviceResonance* d_res, int nRes,
     const double* d_all_params,
     const DecayNode* d_nodes, int nNodes,
+    unsigned int free_mask,
     int nEvents, int nSigma)
 {
     const int tid = CTPWA_TID();
@@ -2352,14 +2353,18 @@ CTPWA_KERNEL void bwrPropTableKernel(
     if (!res.bwr_flag || res.param_count != 2) return;
     const DeviceMomenta* dm = (s == 0 || !d_mom_tab) ? d_momenta : &d_mom_tab[s];
 
+    // 节点都折进 d_static 的共振态：主 kernel 已跳过这些节点 → 本行无人读，
+    // 不必每轮重算（固定节点预算的"固定部分只算一次"）。多模式中间态可能对应
+    // 多个节点，只要有一个自由节点就要填。
     int node_idx = -1;
+    bool needed = false;
     for (int j = 0; j < nNodes; ++j) {
         if (d_nodes[j].mother_idx == res.particle_idx && d_nodes[j].mass[0] <= 0) {
-            node_idx = j;
-            break;
+            if (node_idx < 0) node_idx = j;
+            if ((free_mask >> j) & 1u) { needed = true; break; }
         }
     }
-    if (node_idx < 0) return;
+    if (node_idx < 0 || !needed) return;
 
     const DecayNode& node = d_nodes[node_idx];
     LorentzVector pM = dm->getMomentum(evt, node.mother_idx);
@@ -3553,12 +3558,16 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 int total = block.resonance_count * nSigma * nEv;
                 if (total <= 0) continue;
                 int grid_prop = (total + 255) / 256;
+                // 静态表启用时，已折进表的共振态不必重算传播子行（否则全 free）
+                const unsigned int eff_mask =
+                    (staticEnabled() && !block.d_static.empty() && block.d_static[gpu])
+                        ? block.node_free_mask_ : 0xFFFFFFFFu;
                 CTPWA_LAUNCH(bwrPropTableKernel, grid_prop, 256, 0,
                     block.d_prop6[gpu], cas->getMomenta()[gpu],
                     cas->getMomentaTab()[gpu], block.d_resonances[gpu],
                     block.resonance_count, block.d_all_params[gpu],
                     cas->getDecayNodes()[gpu], cas->getDecayChainSize(),
-                    nEv, nSigma);
+                    eff_mask, nEv, nSigma);
             }
             prof_tick("prop-table");
             // ---- 固定节点预算：静态链因子表（一次性；填完置 static_ready）----
