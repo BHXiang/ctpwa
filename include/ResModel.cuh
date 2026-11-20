@@ -511,6 +511,24 @@ static __device__ void bwrN(int L, double z, double& n, double& np, double& npp)
 }
 
 // 解析 F/dF/d²F: dF[0]=∂m0, dF[1]=∂g0; d2F[j*2+k]（对称 2×2, 与 evalCustomAll 同布局）
+// 顶点势垒因子及对 m0 的一阶对数导数（bwrSpecEval 与 SL 复用路径共用）
+//   Bv = sqrt( N(L, q0·d) / N(L, q·d) ),  lB = ∂lnBv/∂m0
+static __device__ inline void bwrVertexBv(int Lvtx, double q, double q0,
+                                          double q0p, double q0pp, double dd, bool has_bf,
+                                          double& Bv, double& lB, double& lBp)
+{
+    Bv = 1.0; lB = 0.0; lBp = 0.0;
+    if (!has_bf) return;
+    double Nv_v, Nv_p, Nv_pp, Nv0_v, Nv0_p, Nv0_pp;
+    bwrN(Lvtx, q * dd, Nv_v, Nv_p, Nv_pp);
+    bwrN(Lvtx, q0 * dd, Nv0_v, Nv0_p, Nv0_pp);
+    Bv = sqrt(Nv0_v / Nv_v);
+    double Nv0_m = Nv0_p * dd * q0p;
+    double Nv0_mm = Nv0_pp * (dd * q0p) * (dd * q0p) + Nv0_p * dd * q0pp;
+    lB = 0.5 * Nv0_m / Nv0_v;
+    lBp = 0.5 * (Nv0_mm / Nv0_v - (Nv0_m / Nv0_v) * (Nv0_m / Nv0_v));
+}
+
 static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
                             double q0m1, double q0m2, double dd,
                             int Lmin, int Lvtx, bool has_bf,
@@ -520,7 +538,9 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
                             bool want_2nd = true,
                             // 级联用：子质量链的（复）对数导数 ∂lnF/∂q、∂lnF/∂q0
                             double* dlnF_dq_re = nullptr, double* dlnF_dq_im = nullptr,
-                            double* dlnF_dq0_re = nullptr, double* dlnF_dq0_im = nullptr) {
+                            double* dlnF_dq0_re = nullptr, double* dlnF_dq0_im = nullptr,
+                            // SL 复用：与 L 无关的整块 [R, I, Rm, Im, Rg, Ig]
+                            double* prop6 = nullptr) {
     // ---- q0 = breakup(m0, q0m1, q0m2) 及其对 m0 的一/二阶 ----
     double A = (q0m1 + q0m2) * (q0m1 + q0m2);
     double B = (q0m1 - q0m2) * (q0m1 - q0m2);
@@ -550,16 +570,7 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
 
     // ---- 顶点 Bv = √(N(q0·dd)/N(q·dd))（has_bf 时）----
     double Bv = 1.0, lB = 0.0, lBp = 0.0;      // Bv 数值 + ln 导数(对 m0)
-    if (has_bf) {
-        double Nv_v, Nv_p, Nv_pp, Nv0_v, Nv0_p, Nv0_pp;
-        bwrN(Lvtx, q * dd, Nv_v, Nv_p, Nv_pp);
-        bwrN(Lvtx, q0 * dd, Nv0_v, Nv0_p, Nv0_pp);
-        Bv = sqrt(Nv0_v / Nv_v);
-        double Nv0_m = Nv0_p * dd * q0p;
-        double Nv0_mm = Nv0_pp * (dd * q0p) * (dd * q0p) + Nv0_p * dd * q0pp;
-        lB = 0.5 * Nv0_m / Nv0_v;
-        lBp = 0.5 * (Nv0_mm / Nv0_v - (Nv0_m / Nv0_v) * (Nv0_m / Nv0_v));
-    }
+    bwrVertexBv(Lvtx, q, q0, q0p, q0pp, dd, has_bf, Bv, lB, lBp);
 
     // ---- P = (q/q0)^n, n = 2Lmin+1（q 与 m0 无关）----
     int nP = 2 * Lmin + 1;
@@ -612,6 +623,7 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
 
     // ---- 乘顶点 Bv: (z·Bv)' = Bv(z' + z·lB); 二阶 = Bv(z'' + 2z'·lB + z(lB²+lBp)) ----
     double R = x * invs, I = y * invs;
+    if (prop6) { prop6[0]=R; prop6[1]=I; prop6[2]=Rm; prop6[3]=Im; prop6[4]=Rg; prop6[5]=Ig; }
     Fr = R * Bv;
     Fi = I * Bv;
     dFr[0] = (Rm + R * lB) * Bv;
