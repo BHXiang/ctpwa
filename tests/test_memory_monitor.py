@@ -29,8 +29,21 @@ OUT_DIR = TESTS_DIR / "outputs"
 GEN_DIR = TESTS_DIR / "outputs" / "gen"
 MEM_DIR = OUT_DIR / "memmon"
 
-# 放大倍数: test_phsp.dat = 1e4 事件; 400 倍 = 4e6 事件（本地 ~440MB dat）
-PHSP_MULT = int(os.environ.get("MEMMON_PHSP_MULT", "400"))
+# 放大倍数: test_phsp.dat = 1e4 事件。**按卡容量自适应**（默认让稳态驻留 ~20%），
+# MEMMON_PHSP_MULT 可显式覆盖。固定 400 倍（4e6 事件）是按 40GB 卡写的：
+# 实测驻留 ~1.9 KB/事件，4e6 事件要 ~7.6 GB，8GB 卡上光 ctor/getNLL 就会顶满。
+def _phsp_mult() -> int:
+    env = os.environ.get("MEMMON_PHSP_MULT")
+    if env:
+        return max(1, int(env))
+    try:
+        _, total = torch.cuda.mem_get_info(0)
+    except Exception:
+        return 400          # 无卡（本用例会被 CUDA fixture 跳过）
+    return int(max(40, min(1000, 0.20 * total / (10000 * 1900))))
+
+
+PHSP_MULT = _phsp_mult()
 PHSP_BASE = TESTS_DIR / "data" / "test_phsp.dat"
 N_PHSP = 10000 * PHSP_MULT
 

@@ -11,9 +11,27 @@
 #include <CustomExpr.cuh>
 #include "AmpGen.cuh"
 
+// 带诊断的 cudaMalloc（本文件局部版；OOM 时给出 缓冲/大小/卡号/剩余）
+static void hessCheckedMalloc(void** ptr, size_t bytes, const char* what)
+{
+    cudaError_t e = cudaMalloc(ptr, bytes);
+    if (e != cudaSuccess) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        size_t mf = 0, mt = 0;
+        cudaMemGetInfo(&mf, &mt);
+        char msg[512];
+        std::snprintf(msg, sizeof(msg),
+            "[ctpwa] cudaMalloc(%s) 失败: 需要 %zu MiB, gpu=%d 可用 %zu / %zu MiB (%s)",
+            what, bytes >> 20, dev, mf >> 20, mt >> 20, cudaGetErrorString(e));
+        std::fprintf(stderr, "%s\n", msg);
+        throw std::runtime_error(msg);
+    }
+}
+
 // 就地共轭kernel
-CTPWA_KERNEL void conjKernel(ctComplex* data, int N) {
-    const int i = CTPWA_TID();
+CTPWA_KERNEL void conjKernel(ctComplex* data, std::ptrdiff_t N) {
+    const std::ptrdiff_t i = CTPWA_TID();
     if (i < N) data[i].y = -data[i].y;
 }
 
@@ -46,7 +64,7 @@ CTPWA_KERNEL void perEventHessianKernel(
     double*   sS   = sBu + 2 * n;                                  // 1
 
     // 协作加载 B_k → shared memory
-    const ctComplex* Bk = d_B + evt * n * n;
+    const ctComplex* Bk = d_B + (std::ptrdiff_t)evt * n * n;
     int nn = n * n;
     for (int idx = threadIdx.x; idx < nn; idx += blockDim.x)
         sB[idx] = Bk[idx];
@@ -91,7 +109,7 @@ CTPWA_KERNEL void perEventHessianKernel(
 
     double invS = 1.0 / *sS;
     double invS2 = invS * invS;
-    double* hess_out = d_hessian_chunk + evt * hess_sz;
+    double* hess_out = d_hessian_chunk + (std::ptrdiff_t)evt * hess_sz;
 
     // --- per-event Hessian: H = 4*w*Bu*Bu^T/S² - 2*w*tildeB/S ---
     // 同样基于共轭存储 sB（sB.x=R, sB.y=-C）：
@@ -176,7 +194,7 @@ CTPWA_KERNEL void reduceHessianKernel(
     __shared__ double s_partial[256];
     double sum = 0.0;
     for (int evt = threadIdx.x; evt < nEvents; evt += blockDim.x)
-        sum += d_hessian_chunk[evt * hess_sz + elem];
+        sum += d_hessian_chunk[(std::ptrdiff_t)evt * hess_sz + elem];
 
     s_partial[threadIdx.x] = sum;
     __syncthreads();
@@ -228,10 +246,24 @@ void computeDataHessianContrib(
     if (max_chunk < 1) max_chunk = 1;
 
     // 一次性分配chunk缓冲区 (B + hessian_chunk)
+    // 大统计量下这里最容易炸：chunk×4n² 会越过 2³¹（int 溢出曾导致分配尺寸错、
+    // 逐事件偏移错 → 越界写）。打印出来方便对账；CTPWA_MEMPROBE=1 时始终打印。
+    const size_t bytes_B = (size_t)max_chunk * (size_t)stride_B * sizeof(ctComplex);
+    const size_t bytes_H = (size_t)max_chunk * (size_t)hess_sz * sizeof(double);
+    if (std::getenv("CTPWA_MEMPROBE") != nullptr) {
+        size_t mf = 0, mt = 0; cudaMemGetInfo(&mf, &mt);
+        std::printf("[UH] nEvents=%d n=%d hess_sz=%d max_chunk=%d chunk_x_hess=%.3g\n",
+                    nEvents, n, hess_sz, max_chunk,
+                    (double)max_chunk * (double)hess_sz);
+        std::printf("[UH] alloc d_B=%.1f MiB d_hessian_chunk=%.1f MiB (free=%.1f MiB)\n",
+                    (double)bytes_B / 1048576.0, (double)bytes_H / 1048576.0,
+                    (double)mf / 1048576.0);
+        std::fflush(stdout);
+    }
     ctComplex *d_B;
     double *d_hessian_chunk;
-    cudaMalloc(&d_B, max_chunk * stride_B * sizeof(ctComplex));
-    cudaMalloc(&d_hessian_chunk, max_chunk * hess_sz * sizeof(double));
+    hessCheckedMalloc((void**)&d_B, bytes_B, "computeUnifiedHessian:d_B");
+    hessCheckedMalloc((void**)&d_hessian_chunk, bytes_H, "computeUnifiedHessian:d_hessian_chunk");
 
     cublasHandle_t handle;
     cublasCreate(&handle);
@@ -248,8 +280,9 @@ void computeDataHessianContrib(
             CUBLAS_OP_N, CUBLAS_OP_C, n, n, n_polar,
             &alpha, A_chunk, n, stride_amp, A_chunk, n, stride_amp,
             &beta, d_B, n, stride_B, chunk);
-        int grid = (chunk * stride_B + kBlockSize - 1) / kBlockSize;
-        CTPWA_LAUNCH(conjKernel, grid, kBlockSize, 0, d_B, chunk * stride_B);
+        const size_t chunk_B = (size_t)chunk * (size_t)stride_B;
+        int grid = (int)((chunk_B + kBlockSize - 1) / kBlockSize);
+        CTPWA_LAUNCH(conjKernel, grid, kBlockSize, 0, d_B, chunk_B);
 
         // 2. Per-event Hessian (含S和Bu计算；B 已共轭 → 标准约定 [[R,-C],[C,R]])
         {
@@ -1739,11 +1772,11 @@ CTPWA_KERNEL void scalePhspAmpsKernel(
     ctComplex* d_amp, const double* d_weights,
     int nEvents, int nPolar, int nAmp, double inv_W_total, int evt_offset)
 {
-    const int idx = CTPWA_TID();
-    int total = nEvents * nPolar * nAmp;
+    const std::ptrdiff_t idx = (std::ptrdiff_t)CTPWA_TID();
+    const std::ptrdiff_t total = (std::ptrdiff_t)nEvents * nPolar * nAmp;
     if (idx >= total) return;
 
-    int evt = (idx / nAmp) / nPolar;
+    const int evt = (int)((idx / nAmp) / nPolar);
     double scale = (d_weights != nullptr)
         ? sqrt(d_weights[evt] * inv_W_total)
         : sqrt(inv_W_total);  // uniform weight: 1/N
@@ -1829,10 +1862,10 @@ CTPWA_KERNEL void scaleAmpsForGramKernel(
     int nEvents, int nPolar, int nAmp)
 {
     // NOTE: dA_src/dI/dW all point into the current chunk (event 0..nEvents-1)
-    const int idx = CTPWA_TID();
-    int total = nEvents * nPolar * nAmp;
+    const std::ptrdiff_t idx = (std::ptrdiff_t)CTPWA_TID();
+    const std::ptrdiff_t total = (std::ptrdiff_t)nEvents * nPolar * nAmp;
     if (idx >= total) return;
-    int evt = (idx / nAmp) / nPolar;
+    const int evt = (int)((idx / nAmp) / nPolar);
     ctFloat Ival = dI[evt];
     double w = (dW != nullptr) ? dW[evt] : 1.0;
     ctComplex z = ctMake(0.0f, 0.0f);

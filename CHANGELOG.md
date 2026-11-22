@@ -2,6 +2,111 @@
 
 ## [Unreleased]
 
+## [v0.3.22] - 2026-11-22
+
+### Deprecated / 待删（只是标记，行为不变）
+
+为后续"程序减负"先在源码里标出来（`src/Analysis.cu` 函数前 + `src/main.cu` 的
+pybind docstring 都有 `[可删·v0.3.22 标记]`）：
+
+- `getFitFractions(v[, H])` — 中心值 = `diag(interference_gen)/Σdiag`，已经由
+  `writeResult` 写进 `weight_best.root`（实测两条路径一致到 2e-15）；它的误差按
+  "非相干分母"传播，与 ROOT 里相干口径的 `interference_gen_err` 不是同一个量
+  （0.0476 vs 0.2797），而该口径本身不是文献定义。删除前先把 `example/fit.py`
+  的调用改成读 ROOT 或走矩阵 API。
+- `writeInterfResult` — 逐事例干涉树，且树名 `saved_weight` 与 `writeResult` 的
+  重名；建议合并成 `writeResult(..., pairs=[[i,j],...])`。当前无调用方。
+- `saveSLAmps` / `getSLAmpsTensor` / `getDataTensor` / `getBkgTensor` /
+  `getBkgWeightsTensor` — 零消费的调试接口（后三个只差一个 offset，可合并成
+  `getAmpTensor(sample=...)`；`getBkgWeightsTensor` 还返回 float32，与全库口径不一致）。
+- 暂留：`getEfficiency` 的中心值可由 ROOT 直接算，但 **MC 统计误差只在那里**；
+  把 MC 误差也写进 ROOT 之后即可与 `getFitFractions` 一起删。
+
+### Fixed
+
+- **Fitted resonance parameters (θ) now reach the truth / efficiency integrals.**
+  `getFitFractions`, `getEfficiency`, `getFitFractionMatrix` and the raw matrices
+  written by `writeResult` rebuild the amplitudes from the configured particle
+  objects, whose m0/Γ0 are the *config* values — `reCalcAmp(θ)` only updated the
+  resident amplitudes. With free resonance parameters every derived quantity was
+  therefore evaluated at the initial θ (a 10% shift of φ(1020)'s mass moved the
+  integrals by <1e-14), and the θ derivative was identically zero, so θ
+  parameter errors could not propagate either. `calculateAmplitudes` now takes
+  an explicit θ and applies it to the freshly built `Resonance` copies through
+  `AmpCalc::paramBindings(block)` (free slots + `var_equal` ghosts +
+  conjugate/same-name broadcast), and `analysis` tracks the current θ from
+  `reCalcAmp`, `getNLL`, `getHessian` and `writeResult`. Validated against an
+  independent reconstruction from the resident (device) amplitudes — agreement
+  1e-14 on single-chain, two-chain+`trans` and `var_equal` configs — see
+  `tests/test_theta_propagation.py`. Note: θ still does not enter the *parameter
+  error* propagation (Jacobian is coupling-only); that is the next step.
+
+- `computeResults` no longer accumulates an interference matrix for `writeResult` /
+  `writeInterfResult` (neither consumed it): the matrix argument now accepts `nullptr`
+  and the per-event `n(n+1)/2` atomics are skipped. The matrices come from
+  `computeFileBatchIntegrals` instead.
+
+### Added
+
+- **Two symmetric interference matrices in `weight_best.root`**, each normalised by
+  its own coherent total (entries are O(1) fractions, `trace + Σ_{i<j} = 1`):
+  `interference_rec` (reconstructed, efficiency-weighted MC) and `interference_gen`
+  (generated, `phsp_truth`). `diag = Σw|A_i|²/W`, `off = Σw·2Re(A_iA_j*)/W`, with the
+  same weights as the fit (`phsp_weights` / `phsp_truth_weights` now apply — the old
+  `interference` matrix ignored them). The companion tree `integrals` stores
+  `N_rec`/`N_gen` (Σw) and `W_rec`/`W_gen`, so the raw integrals are one multiplication
+  away; the diagonal of `interference_gen` is the literature fit fraction `F_i` and the
+  upper triangle its interference term `I_ij`. The old `interference` object and the
+  redundant `amplitude_names` tree were dropped. `CTPWA_WR_NO_INTEGRALS=1` skips both
+  passes (and then writes neither the matrices nor the tree).
+- **`interference_rec_err` / `interference_gen_err`** — parameter-error matrices for the
+  two tables, obtained by linearised propagation `σ(F_ij) = sqrt(J·Cov·Jᵀ)` with
+  `Cov = H[free,free]⁻¹` over the free couplings (reference directions masked) plus the
+  free θ directions (`∂/∂m₀`, `∂/∂Γ₀` now reach the integrals after the θ fix above).
+  Cost is `2·n_free` integral passes; `writeResult(..., hessian=H)` reuses the fit
+  Hessian (omitting it computes one internally), `CTPWA_WR_NO_ERR=1` skips them. A
+  non-positive-definite Hessian yields no matrices plus a warning instead of a bogus
+  number. New API `getFitFractionMatrixErrors(params, hessian)` returns the same two
+  matrices for scripting; see `tests/test_matrix_errors.py` (validated against an
+  independent finite-difference implementation).
+- **`getFitFractionMatrix(vector, sample="truth"|"phsp")`** returns the raw integral
+  matrix of either sample (truth = `phsp_truth`, phsp = the efficiency-weighted MC;
+  divided by its coherent total it reproduces the `interference_gen` / `interference_rec`
+  objects written by `writeResult`, verified element by element). See
+  `doc/branching_fraction_recipe.md` for the literature formulas
+  (Laura++ Eq. 22-23, LHCb Eq. 4-5, Eq. 21-22/25) and for which matrix is needed
+  to turn fit fractions into branching fractions.
+- **`getFitFractionMatrix(vector)`** returns the raw truth-sample integral matrix
+  behind `getFitFractions`: `M[i][i] = Σw|A_i|²` (the quantity the built-in fit
+  fractions divide) and `M[i][j] = Σw·2Re(A_iA_j*)` (the interference integral the
+  kernel already computed and then discarded). With `W = trace(M) + Σ_{i<j} M[i][j]`
+  both conventions come out of one matrix — ctpwa's `FF_i = M_ii/Σ_j M_jj`
+  (incoherent denominator, `Σ FF_i = 1`) and tf-pwa's
+  `FF_i = M_ii/W`, `FF_ij = M_ij/W` (coherent denominator, table closes to 1).
+  See `doc/fitfraction_vs_tfpwa.md` for the full comparison with
+  `/home/whitewash/pkgs/tf-pwa`.
+- **Per-event weights for the truth sample** (`phsp_truth_weights`). `phsp_truth`
+  is what fit fractions and per-wave efficiencies integrate over; it previously
+  always ran equal-weight, so a generator-level sample produced with a (small)
+  model could not stand in for flat phase space. The new key takes the same
+  forms as `data_weights` / `phsp_weights` (constant `[2.0]`, `[dat, file]` with
+  one weight per line, or `[ROOT, file, tree, branch]`) and changes the truth
+  integrals to `Σ w|A|²`, the normalization to `Σ w`, and the MC statistical
+  error of the efficiency to `Σ(w|A|²)²` — matching tf-pwa's
+  `_eval_integral` (`Σ w·f`, `Σ(w·f)²`). A model-generated MC with
+  `w ∝ 1/|M_gen|²` therefore behaves as flat phase-space MC.
+  `phsp_weights` now also enters the *numerator* of `getEfficiency` (it used to
+  apply to the fit NLL only, so the efficiency ratio mixed weighted and
+  unweighted samples); a constant weight leaves every result unchanged.
+  Weighting is batched per GPU and reuses one workspace, so a 15M-event truth
+  sample costs one extra `double` buffer per GPU.
+- `phsp_truth` / `phsp` may now be ROOT ntuples in the batched integrals: the
+  entry count comes from the `TTree` and `readMomentaFromDat` honours the
+  `offset` argument on the ROOT path (it used to ignore it, silently re-reading
+  the first batch for every batch beyond the first). DIYMC output
+  (`[ROOT, file, "mc"]` plus `[ROOT, file, "mc", "weight"]`) can therefore be
+  fed straight back as a weighted truth sample.
+
 ### Improved
 
 - **Fixed-node budget (static chain factors).** A decay node whose parameters are

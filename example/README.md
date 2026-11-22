@@ -269,3 +269,21 @@ FIT_POLISH  FIT_WARM  FIT_WAVES  FIT_EVENT_DATA  FIT_CHECKPOINT_INTERVAL
    `--tol-grad`（gtol）控制。
 5. 若在集群提交作业，注意 `fit.py` 会读 cwd 的 `config.yml` 并需要 GPU；建议
    一个方案一个目录（或配合 `--output-dir` 隔离结果）。
+
+---
+
+## 8. 读取 `weight_best.root` 里的干涉矩阵
+
+`read_interference.py` 把 `interference_rec` / `interference_gen`（以及可选的
+`*_err`、`integrals`）读出来打成表：
+
+```bash
+python3 read_interference.py weight_best.root                 # 两张表 + 派生量
+python3 read_interference.py weight_best.root --sample gen    # 只看产生侧
+python3 read_interference.py weight_best.root --bf-total 8.7e-4 --csv frac.csv
+```
+
+输出包含：逐波 `F_i ± σ`、完整 n×n 矩阵（对角 = fit fraction，上三角 = 干涉项）、
+闭合检验 `ΣF + ΣI = 1`、非相干份额 `F_i/ΣF`、平均效率 `ε̄ = W_rec/W_gen`、
+每波效率 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`；给 `--bf-total` 还会逐波算
+`BF_i = BF_total × F_i`（合计 ≠ BF_total 的差额正是干涉项）。

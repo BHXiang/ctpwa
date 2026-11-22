@@ -2664,6 +2664,30 @@ static std::vector<int> expandFreeIndices(
     return result;
 }
 
+// host 侧 θ → (res_idx, param_idx) 绑定表（与 reComputeAmps 上传的三张表同源）
+std::vector<std::array<int, 3>> AmpCalc::paramBindings(int block_idx) const
+{
+    std::vector<std::array<int, 3>> out;
+    for (int s = 0; s < static_cast<int>(slots_.size()); ++s) {
+        if (slots_[s].block_idx == block_idx)
+            out.push_back({slots_[s].res_idx, slots_[s].param_idx, s});
+    }
+    for (const auto& g : var_equal_ghosts_) {
+        if (g.member_block == block_idx)
+            out.push_back({g.member_res, g.member_param, g.owner_global});
+    }
+    for (const auto& [cj_key, owner_key] : conjugate_broadcast_) {
+        if (cj_key.first != block_idx) continue;
+        // kernel 侧是"整段参数拷贝"（owner 的全部参数 → 伙伴同一段）：
+        // 自由参数按 owner 的槽映射；固定参数两边本来就是同一个配置值。
+        for (int s = 0; s < static_cast<int>(slots_.size()); ++s) {
+            if (slots_[s].block_idx == owner_key.first)
+                out.push_back({cj_key.second, slots_[s].param_idx, s});
+        }
+    }
+    return out;
+}
+
 void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
                        const std::vector<Resonance>& resonances,
                        int site,

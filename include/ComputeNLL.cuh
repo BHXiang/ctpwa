@@ -30,7 +30,7 @@ double computeFactorNLL(const ctComplex* d_amp, const ctComplex* d_vector, ctCom
 void conjugateComplexArray(ctComplex* data, int N);
 
 // 向量axpy: y[i] += alpha * x[i], n较小(<~200)，单block完成
-void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n);
+void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int64_t n);
 
 // 返回 Σ_ev w_ev·f_ev = Σ w |A·v|²（double 累加）——phsp 均值的高精度来源
 // d_w=nullptr 时为单位权重（旧行为）。调用方用 Σw 归一化。

@@ -157,6 +157,22 @@ Here, `data` contains experimental or simulated events, while `phsp` contains th
 phase-space sample used for fit normalization. The final-state ordering in the data files
 must match `Data.order`. See [example](example/) for complete configurations and fit scripts.
 
+All three samples accept optional per-event weights (same syntax for each):
+
+```yaml
+Data:
+  data_weights:        [dat, "data_w.dat"]          # one weight per line
+  phsp_weights:        [ROOT, "phsp.root", "tree", "weight"]
+  phsp_truth_weights:  [2.0]                        # constant weight
+```
+
+With weights the normalization uses `Σw` instead of the event count and
+`NLL = -Σ w·log f`. For `phsp_truth` (the efficiency-free MC truth behind fit
+fractions and per-wave efficiencies) the integrals become `Σ w|A|²` and the MC
+statistical error uses `Σ(w|A|²)²`. A model-generated sample
+(e.g. `generateMC(mode="weighted")`) therefore becomes a usable flat phase-space
+sample simply by supplying `w ∝ 1/|M_gen|²`.
+
 ### 2. Evaluate the NLL and its gradient
 
 ```python
@@ -196,8 +212,35 @@ use PyTorch optimizers; see [example/fit.py](example/fit.py) for a complete work
 ana.writeResult(params.detach(), "weight_best.root", 0)
 ```
 
-The output file contains model/data projections, partial-wave weights, legends, and the
-interference matrix for subsequent plotting and validation.
+The output file contains model/data projections, partial-wave weights, legends, and **two
+raw (unnormalised) integral matrices**:
+
+| Object | Content |
+|---|---|
+| `interference_rec` | reconstructed (efficiency-weighted MC) interference matrix ÷ `W_rec` |
+| `interference_gen` | generated (`phsp_truth`, efficiency-free MC) interference matrix ÷ `W_gen` |
+| `interference_rec_err` / `interference_gen_err` | same-shape **parameter-error** matrices (`sqrt(J·H⁻¹·Jᵀ)`, MC statistics excluded) |
+| `integrals` | tree: `N_rec`/`N_gen` (Σw), `W_rec`/`W_gen` (coherent total = `trace+Σ_{i<j}`), `npartials` |
+
+Both tables are normalised (`trace + Σ_{i<j} = 1`, entries are O(1)) and use the same
+event weights as the fit. Therefore:
+
+```
+literature fit fractions F_i = interference_gen[i][i]   interference I_ij = interference_gen[i][j]
+incoherent fractions     FF_i = diag / Σ diag           (what getFitFractions returns)
+average efficiency       ε̄ = W_rec / W_gen             (same generated sample)
+per-wave efficiency      ε_i = (P_ii/N_rec)/(T_ii/N_gen)
+raw integrals            M_ij = interference_*[i][j] × W_*
+```
+
+See [doc/branching_fraction_recipe.md](doc/branching_fraction_recipe.md).
+Read the two tables with `python3 example/read_interference.py weight_best.root`
+(per-wave F_i±σ, full matrix, closure check, ε̄/ε_i, and `--bf-total` for BF_i).
+
+The error matrices are propagated from the `hessian=H` argument of
+`writeResult(params, file, flag, waves, hessian=H)` (computed internally when omitted); cost is
+`2·n_free` integral passes. `CTPWA_WR_NO_INTEGRALS=1` skips the matrices and `integrals`,
+`CTPWA_WR_NO_ERR=1` skips only the error matrices.
 
 ## Common Python API
 
@@ -206,7 +249,8 @@ interference matrix for subsequent plotting and validation.
 | `ctpwa.analysis(config)` | Load the configuration and initialize amplitudes, data, and device buffers |
 | `getNLL(params)` | Evaluate the negative log-likelihood with PyTorch autograd support |
 | `getHessian(params)` | Evaluate the Hessian for couplings and free resonance parameters |
-| `getFitFractions(...)` | Calculate partial-wave fit fractions |
+| `getFitFractions(...)` | Calculate partial-wave fit fractions (incoherent denominator, `Σ_i FF_i = 1`) |
+| `getFitFractionMatrix(vector, sample="truth"\|"phsp")` | Raw integrals `M[i][i]=Σw\|A_i\|²`, `M[i][j]=Σw·2Re(A_iA_j*)`; normalising by `W=trace+Σ_{i<j}M_ij` gives the literature fit fractions `FF_i`/`FF_ij`, and `W_phsp/W_truth` is the model-averaged efficiency |
 | `getEfficiency(...)` | Calculate efficiency corrections |
 | `writeResult(...)` | Write ROOT fit results, projections, and the interference matrix |
 | `writeInterfResult(...)` | Write event-by-event interference terms for selected wave pairs |
@@ -237,9 +281,17 @@ mcgen = ctpwa.PhaseSpaceGenerator("config.yml")
 events = mcgen.generate(100_000, seed=42)
 mcgen.write(events, "flat.root")
 
+# Flat events + GENBOD weights (weighted output goes to ROOT only: branch "weight" of tree "mc")
+flat, w = mcgen.generateWeighted(100_000, seed=42)
+mcgen.write(flat, "flat_weighted.root", weights=w)
+
 # Rejection sampling with the current amplitude, producing an equal-weight MC sample
 result = ana.generateMC(10_000, params.detach(), seed=42, mode="unweighted")
 ana.writeMC(result["events"], "mc.root")
+
+# Amplitude-weighted MC: feed the weights back through `phsp_truth_weights`
+weighted = ana.generateMC(10_000, params.detach(), seed=42, mode="weighted")
+ana.writeMC(weighted["events"], "mc_weighted.root", weighted["weights"])
 ```
 
 The phase-space sample must resolve the narrowest resonance in the model. Otherwise,

@@ -234,14 +234,25 @@ static void bind_ctpwa(pybind11::module_& m)
         .def("getSLVectors", &analysis::getSLVectors)
         .def("getLegends", &analysis::getLegends,
              "config legends 规则按展开链顺序解析出的图例名列表 (getLegends())")
-        .def("writeResult", &analysis::writeResult,
+        .def("writeResult",
+             [](analysis& a, torch::Tensor params, const std::string& filename,
+                int is_saved_weight, std::vector<int> waves, pybind11::object hessian) {
+                 torch::Tensor h;
+                 if (!hessian.is_none()) h = hessian.cast<torch::Tensor>();
+                 a.writeResult(params, filename, is_saved_weight, waves, h);
+             },
              pybind11::arg("params"), pybind11::arg("filename"),
              pybind11::arg("is_saved_weight") = 0,
              pybind11::arg("waves") = std::vector<int>(),
+             pybind11::arg("hessian") = pybind11::none(),
              "Save weights/histograms. waves: 可选分波下标子集, 只画 |Σ_{i∈S}A_i·v_i|² 的分布"
-             "（空=全部）; is_saved_weight=1 时额外导出逐事件 TTree")
+             "（空=全部）; is_saved_weight=1 时额外导出逐事件 TTree. "
+             "hessian: 可选统一 Hessian, 给了就顺便写 interference_rec_err/"
+             "interference_gen_err（参数误差, 省一次 Hessian 计算）")
         .def("getHessian", &analysis::getHessian, pybind11::arg("params"),
              "Full Hessian (2n+P)×(2n+P). params: [real(v), imag(v), theta] float64")
+        // [可删·v0.3.22 标记] 逐事例干涉树；与 writeResult 的 saved_weight 撞名，
+        // 建议合并进 writeResult(..., pairs=...)。目前 example/tests 无调用方。
         .def("writeInterfResult", &analysis::writeInterfResult,
              pybind11::arg("params"), pybind11::arg("filename"),
              pybind11::arg("pairs"),
@@ -269,11 +280,16 @@ static void bind_ctpwa(pybind11::module_& m)
              "(complex [n_amps])。用于校验 trans/var_equal 折叠与链×步参数化："
              "两模型的 v_ext 相同 ⇔ 拟合结果相同。")
         // .def("getTruthTensor", &analysis::getTruthTensor)
+        // [可删·v0.3.22 标记] 中心值 = diag(interference_gen)/Σdiag（ROOT 里就有），
+        // 误差是非相干口径、与 ROOT 的 interference_gen_err 不是同一个量。
+        // 删除前先把 example/fit.py 的调用改掉。
         .def("getFitFractions", pybind11::overload_cast<torch::Tensor>(
                  &analysis::getFitFractions),
              pybind11::arg("vector"),
              "Fit fractions: FF_i = ∫|A_i|² / Σ_j∫|A_j|² (纯形状份额, 无效率, "
              "只用 phsp_truth → 与效率 MC/归一化无关, 跨实验可比). "
+             "配了 phsp_truth_weights 时积分改为 Σw|A_i|² (带模型产生的 truth 样本 "
+             "用 w∝1/|M_gen|² 重加权即可当平坦 PHSP MC). "
              "Σ_i FF_i = 1; 绝对分支比 = BF_total × FF_i. "
              "返回 [npartials, 2] = [center, error].")
         .def("getFitFractions", pybind11::overload_cast<torch::Tensor, torch::Tensor>(
@@ -281,12 +297,35 @@ static void bind_ctpwa(pybind11::module_& m)
              pybind11::arg("vector"), pybind11::arg("hessian"),
              "getFitFractions(vector, hessian): hessian 为可选统一 Hessian "
              "(与拟合 getHessian 同源), 用于误差传播。")
+        .def("getFitFractionMatrix", &analysis::getFitFractionMatrix,
+             pybind11::arg("vector"), pybind11::arg("sample") = "truth",
+             "分波积分矩阵（原始值）: M[i][i]=Σw|A_i|², M[i][j]=Σw·2Re(A_iA_j*) "
+             "(i≠j, 对称)。行/列顺序与 getFitFractions 一致。"
+             "sample=\"truth\"(phsp_truth, 默认) 或 \"phsp\"(带效率 MC)。"
+             "相干总和 W = trace + Σ_{i<j}M_ij：文献/tf-pwa 口径 FF_i = M_ii/W, "
+             "FF_ij = M_ij/W；W_phsp/W_truth = 模型加权平均效率。缺对应数据键时返回空 [0,0]。")
+        .def("getFitFractionMatrixErrors",
+             [](analysis& a, torch::Tensor params, pybind11::object hessian) {
+                 torch::Tensor h;
+                 if (!hessian.is_none()) h = hessian.cast<torch::Tensor>();
+                 return a.getFitFractionMatrixErrors(params, h);
+             },
+             pybind11::arg("params"), pybind11::arg("hessian") = pybind11::none(),
+             "两张干涉矩阵的**参数误差**（不含 MC 统计）: 线性化传播 "
+             "σ(F_ij)=sqrt(J Cov J^T)，F=M/W 与 writeResult 写出的归一化表同口径，"
+             "Cov=H[free,free]^{-1}（自由方向 = 耦合去掉参考方向 + θ）。"
+             "params 为统一参数 [Re p, Im p, θ]；hessian 省略时内部调用 getHessian。"
+             "返回 [err_rec, err_gen] 两个 [npartials,npartials] float64；"
+             "Hessian 非正定时返回空张量。成本 = 2·n_free 趟积分。")
+        // [暂留] 中心值可由 ROOT 算；MC 统计误差只在这里 → 写进 ROOT 后再删。
         .def("getEfficiency", pybind11::overload_cast<torch::Tensor>(
                  &analysis::getEfficiency),
              pybind11::arg("vector"),
-             "分波效率: ε_i = (Σ_{phsp}|A_i|²/N_phsp) / (Σ_{phsp_truth}|A_i|²/N_truth), "
+             "分波效率: ε_i = (Σ_{phsp}w|A_i|²/Σw) / (Σ_{phsp_truth}w|A_i|²/Σw), "
              "phsp(如 cut 后 MC)=带效率样本, phsp_truth=无效率 MC truth, "
              "即分波加权的探测/选择效率 ∫|A_i|²ε(x)dΦ/∫|A_i|²dΦ. "
+             "权重来自 phsp_weights / phsp_truth_weights (缺省 w≡1), "
+             "统计误差取 S=Σ(w|A_i|²)² (tf-pwa _eval_integral 同款). "
              "依赖拟合结果(振幅形状含共振参数), 用拟合后 vector 计算. "
              "返回 [npartials, 2] = [center, error], "
              "误差 = 参数误差(Jacobian@H⁻¹@Jᵀ) ⊕ MC 统计误差(tf-pwa add_int_error 同款). "

@@ -782,6 +782,10 @@ void ConfigParser::parseData(const YAML::Node &node)
         data_files_["phsp_truth"] =
             node["phsp_truth"].as<std::vector<std::string>>();
 
+    if (node["phsp_truth_weights"])
+        data_files_["phsp_truth_weights"] =
+            node["phsp_truth_weights"].as<std::vector<std::string>>();
+
     if (node["bkg"])
         data_files_["bkg"] = node["bkg"].as<std::vector<std::string>>();
 

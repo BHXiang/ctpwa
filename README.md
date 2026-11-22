@@ -142,6 +142,20 @@ Resonances:
 其中 `data` 是实验或模拟数据，`phsp` 是用于拟合归一化的相空间样本；数据文件中的
 末态粒子顺序必须与 `Data.order` 一致。完整配置和拟合脚本见 [example](example/)。
 
+三个样本都支持逐事件权重（可选），写法一致：
+
+```yaml
+Data:
+  data_weights:        [dat, "data_w.dat"]          # 每行一个权重
+  phsp_weights:        [ROOT, "phsp.root", "tree", "weight"]
+  phsp_truth_weights:  [2.0]                        # 常数权重
+```
+
+有权重时归一化用 `Σw` 而不是事件数，`NLL = -Σ w·log f`；`phsp_truth`（无效率
+MC truth，用于拟合分数与分波效率）的积分变为 `Σ w|A|²`，MC 统计误差的二阶矩
+取 `Σ(w|A|²)²`。所以**带模型产生的 MC 样本**（例如 `generateMC(mode="weighted")`
+的输出）只要给出 `w ∝ 1/|M_gen|²`，就能当平坦 PHSP MC 提供给拟合分数/效率。
+
 ### 2. 计算 NLL 和梯度
 
 ```python
@@ -181,7 +195,34 @@ PyTorch 优化器，或参考 [example/fit.py](example/fit.py) 中的完整流�
 ana.writeResult(params.detach(), "weight_best.root", 0)
 ```
 
-输出文件包含模型与数据的投影、各分波权重、图例和干涉矩阵，可用于后续绘图与检查。
+输出文件包含模型与数据的投影、各分波权重、图例，以及**两张原始（未归一）积分矩阵**：
+
+| 对象 | 内容 |
+|---|---|
+| `interference_rec` | 重建侧（带效率 MC）干涉矩阵 ÷ `W_rec`：`diag = Σw\|A_i\|²/W_rec`，`off = Σw·2Re(A_iA_j*)/W_rec` |
+| `interference_gen` | 产生侧（`phsp_truth`，无效率 MC）干涉矩阵 ÷ `W_gen`，同一套定义 |
+| `interference_rec_err` / `interference_gen_err` | 同形状的**参数误差**矩阵（线性化传播 `sqrt(J·H⁻¹·Jᵀ)`，不含 MC 统计） |
+| `integrals` | 树：`N_rec`/`N_gen`（Σw）、`W_rec`/`W_gen`（相干总额 `trace+Σ_{i<j}`）、`npartials` |
+
+两张表都已归一（`trace + Σ_{i<j} = 1`，元素 O(1)）；权重口径与拟合 NLL 一致
+（`phsp_weights` / `phsp_truth_weights` 生效）。于是：
+
+```
+文献拟合分数 F_i = interference_gen[i][i]      干涉项 I_ij = interference_gen[i][j]
+非相干份额   FF_i = diag / Σ diag               （getFitFractions 的口径）
+平均效率     ε̄ = W_rec / W_gen                 （两样本同源产生时）
+每波效率     ε_i = (P_ii/N_rec)/(T_ii/N_gen)    （P = 矩阵 × W_rec）
+原始积分     M_ij = interference_*[i][j] × W_*
+```
+
+要原始积分就乘回 `W`。分支比换算见
+[doc/branching_fraction_recipe.md](doc/branching_fraction_recipe.md)。
+读取这两张表：`python3 example/read_interference.py weight_best.root`（逐波 F_i±σ、
+完整矩阵、闭合检验、ε̄/ε_i，`--bf-total` 还能直接算 BF_i）。
+
+误差矩阵由 `writeResult(params, file, flag, waves, hessian=H)` 的 `hessian` 传播（不传则内部
+算一次 `getHessian`）；成本 = `2·n_free` 趟积分（`n_free` = 自由耦合去掉参考方向 + θ）。
+`CTPWA_WR_NO_INTEGRALS=1` 跳过矩阵与 `integrals`，`CTPWA_WR_NO_ERR=1` 只跳过误差矩阵。
 
 ## 常用 Python 接口
 
@@ -190,7 +231,8 @@ ana.writeResult(params.detach(), "weight_best.root", 0)
 | `ctpwa.analysis(config)` | 读取配置并初始化振幅、数据和设备缓冲区 |
 | `getNLL(params)` | 计算负对数似然，支持 PyTorch autograd |
 | `getHessian(params)` | 计算耦合及自由共振态参数的 Hessian |
-| `getFitFractions(...)` | 计算分波份额 |
+| `getFitFractions(...)` | 计算分波份额（非相干分母，`Σ_i FF_i = 1`） |
+| `getFitFractionMatrix(vector, sample="truth"\|"phsp")` | 原始积分矩阵 `M[i][i]=Σw\|A_i\|²`、`M[i][j]=Σw·2Re(A_iA_j*)`；`W=trace+Σ_{i<j}M_ij` 归一后即文献口径（`FF_i`、`FF_ij`），两样本 `W` 之比 = 模型加权平均效率 |
 | `getEfficiency(...)` | 计算效率修正 |
 | `writeResult(...)` | 输出 ROOT 拟合结果、投影和干涉矩阵 |
 | `writeInterfResult(...)` | 输出指定波对的逐事件干涉项 |
@@ -218,9 +260,17 @@ mcgen = ctpwa.PhaseSpaceGenerator("config.yml")
 events = mcgen.generate(100_000, seed=42)
 mcgen.write(events, "flat.root")
 
+# 平坦事例 + GENBOD 权重（weighted 输出只能写 .root，权重进 "mc" 树的 weight 分支）
+flat, w = mcgen.generateWeighted(100_000, seed=42)
+mcgen.write(flat, "flat_weighted.root", weights=w)
+
 # 按当前振幅舍选，生成等权 MC
 result = ana.generateMC(10_000, params.detach(), seed=42, mode="unweighted")
 ana.writeMC(result["events"], "mc.root")
+
+# 按当前振幅加权（逐事件权重），配合 config 的 phsp_truth_weights 使用
+weighted = ana.generateMC(10_000, params.detach(), seed=42, mode="weighted")
+ana.writeMC(weighted["events"], "mc_weighted.root", weighted["weights"])
 ```
 
 相空间样本必须足以分辨模型中最窄的共振态，否则归一化统计涨落会影响拟合和 Hessian。

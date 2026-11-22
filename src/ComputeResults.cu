@@ -177,7 +177,10 @@ computeModWithInterference(const ctComplex* __restrict__ result_matrix,
                 int idx = getInterferenceIndex(i, j, npartials);
 
                 // 原子累加到全局干涉矩阵（对所有事件和极化求和）
-                atomicAdd(&interference_matrix[idx], interference_value);
+                // nullptr = 调用方不需要矩阵（writeResult/writeInterfResult 只用
+                // 逐事例量与 partial）；省掉每事例 n(n+1)/2 次原子操作。
+                if (interference_matrix != nullptr)
+                    atomicAdd(&interference_matrix[idx], interference_value);
 
                 // 逐事件干涉项: 只累加被导出的对（槽位由 d_pair_lookup 给出,
                 // 每线程只保留 npairs_exported 个槽位而非 ninterference 个）

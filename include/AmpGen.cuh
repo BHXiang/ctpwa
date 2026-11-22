@@ -403,6 +403,13 @@ public:
     int nFreeResParams() const { return static_cast<int>(slots_.size()); }
     bool empty() const { return blocks_.empty(); }
     const std::vector<ParamSlot>& slots() const { return slots_; }
+    // host 侧：block bi 的 (res_idx, param_idx, 全局θ下标) 绑定表。
+    // 与 reComputeAmps 上传给 updateResonanceParamsKernel 的三张表同源：
+    //   1) 本块自由参数槽；2) var_equal ghost（指向 owner 槽）；
+    //   3) conjugate broadcast（跨链/同名共享：把 owner 的自由参数写给伙伴共振态）。
+    // 用途：从配���粒子对象重建振幅时（calculateAmplitudes），必须按同一张表
+    // 覆盖 θ，否则伙伴共振态会留在配置初值（实测多链配置差 1e-2~1e-1）。
+    std::vector<std::array<int, 3>> paramBindings(int block_idx) const;
     const std::vector<std::shared_ptr<AmpCasDecay>>& casList() const { return cas_list_; }
     // 混合精度: 振幅缓冲按 float2 存储（double .so 上 precision:float 或默认 auto）。
     // 由 analysis initialize 设置；reComputeAmps 的写出与读取按此选实例。

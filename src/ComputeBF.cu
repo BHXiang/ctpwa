@@ -24,18 +24,24 @@ static inline void bfCheckCublas(cublasStatus_t s, const char* what)
 
 // 每事件/极化: 按nSLvectors分组SL分量到各粒子，累加模方和散射矩阵
 // 关键: 不除以total_result（与computeModWithInterference不同），产出原始散射矩阵
+// 权重: partial/scattering/total 累加 w·x，square 累加 (w·x)² —— 与 tf-pwa
+//   _eval_integral 的 Σ(w·f) / Σ(w·f)² 一致; d_event_weights=nullptr 时 w≡1。
 template <int N_PARTIALS>
 CTPWA_KERNEL void computeBFKernel(
     const ctComplex* __restrict__ result_matrix,  // [nEvents × npolar × ngls]
-    double* __restrict__ d_partial_integral,       // [npartials]
-    double* __restrict__ d_scattering_matrix,      // [npartials × npartials]
-    double* __restrict__ d_total_integral,         // [1]
-    double* __restrict__ d_square_integral,        // [npartials] Σ|A_i|⁴ (可空)
+    double* __restrict__ d_partial_integral,       // [npartials]     Σ w·|A_i|²
+    double* __restrict__ d_scattering_matrix,      // [npartials²]    Σ w·2Re(A_iA_j*)
+    double* __restrict__ d_total_integral,         // [1]             Σ w·Σ_i|A_i|²
+    double* __restrict__ d_square_integral,        // [npartials] Σ (w·|A_i|²)² (可空)
     const int* __restrict__ d_nSLvectors,          // [npartials]
+    const double* __restrict__ d_event_weights,    // [nEvents] 可空 = 全 1
     int npartials, int nEvents, int ngls, int npolar)
 {
     const int event_idx = CTPWA_TID();
     if (event_idx >= nEvents) return;
+
+    const double w = (d_event_weights != nullptr) ? d_event_weights[event_idx] : 1.0;
+    const double w2 = w * w;
 
     double partial_real[N_PARTIALS];
     double partial_imag[N_PARTIALS];
@@ -63,9 +69,9 @@ CTPWA_KERNEL void computeBFKernel(
             double intensity = partial_real[p] * partial_real[p] +
                                partial_imag[p] * partial_imag[p];
             if (d_partial_integral != nullptr)
-                atomicAdd(&d_partial_integral[p], intensity);
+                atomicAdd(&d_partial_integral[p], w * intensity);
             if (d_square_integral != nullptr)
-                atomicAdd(&d_square_integral[p], intensity * intensity);
+                atomicAdd(&d_square_integral[p], w2 * intensity * intensity);
             event_total += intensity;
         }
 
@@ -74,21 +80,21 @@ CTPWA_KERNEL void computeBFKernel(
                 // 对角线: 2 * |A_i|^2
                 double diag_val = 2.0 * (partial_real[i] * partial_real[i] +
                                          partial_imag[i] * partial_imag[i]);
-                atomicAdd(&d_scattering_matrix[i * npartials + i], diag_val);
+                atomicAdd(&d_scattering_matrix[i * npartials + i], w * diag_val);
 
                 for (int j = i + 1; j < npartials; j++) {
                     // 非对角线: 2 * Re(A_i * conj(A_j))
                     double cross_val = 2.0 * (partial_real[i] * partial_real[j] +
                                               partial_imag[i] * partial_imag[j]);
-                    atomicAdd(&d_scattering_matrix[i * npartials + j], cross_val);
+                    atomicAdd(&d_scattering_matrix[i * npartials + j], w * cross_val);
                     // 对称元素
-                    atomicAdd(&d_scattering_matrix[j * npartials + i], cross_val);
+                    atomicAdd(&d_scattering_matrix[j * npartials + i], w * cross_val);
                 }
             }
         }
 
         if (d_total_integral != nullptr)
-            atomicAdd(d_total_integral, event_total);
+            atomicAdd(d_total_integral, w * event_total);
     }
 }
 
@@ -102,7 +108,8 @@ void computeBranchingFractions(
     int* d_nSLvectors,
     int npartials, int nEvents, int ngls, int npolar,
     ctComplex* d_complex_result,
-    ctComplex* d_result_matrix)
+    ctComplex* d_result_matrix,
+    const double* d_event_weights)
 {
     if (nEvents <= 0 || ngls <= 0 || npolar <= 0) return;   // 空批：不碰 workspace
     if (d_complex_result == nullptr || d_result_matrix == nullptr)
@@ -138,17 +145,17 @@ void computeBranchingFractions(
     if (npartials <= 50)
         CTPWA_LAUNCH(computeBFKernel<50>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_square_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors, d_event_weights,
             npartials, nEvents, ngls, npolar);
     else if (npartials <= 200)
         CTPWA_LAUNCH(computeBFKernel<200>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_square_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors, d_event_weights,
             npartials, nEvents, ngls, npolar);
     else
         CTPWA_LAUNCH(computeBFKernel<1000>, gridSize, kBlockSize, 0,
             d_result_matrix, d_partial_integral, d_scattering_matrix,
-            d_total_integral, d_square_integral, d_nSLvectors,
+            d_total_integral, d_square_integral, d_nSLvectors, d_event_weights,
             npartials, nEvents, ngls, npolar);
 
     // 不再只 printf：启动/执行错误直接抛出，避免调用方拿着坏结果继续跑

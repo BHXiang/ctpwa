@@ -131,21 +131,21 @@ CTPWA_KERNEL void conjugateKernel(ctComplex* __restrict__ data, int N) {
 // ⚠️ 启动配置是 <<<1, 64>>>：线程数远小于 n，**必须**用 stride 循环覆盖全部元素。
 // 早期把它改成"一线程一元素"导致 n>64 时梯度被截断（NLL 正常、梯度和 Hessian 错），
 // 见 tests/test_cpu_numerics.py 的 hess_mult 回归。
-CTPWA_KERNEL void axpyComplexKernel(ctComplex* y, const ctComplex* __restrict__ x, ctComplex alpha, int n) {
+CTPWA_KERNEL void axpyComplexKernel(ctComplex* y, const ctComplex* __restrict__ x, ctComplex alpha, int64_t n) {
 #if defined(CTPWA_HAS_CUDA)
-    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x)
         y[i] = ctMake(
             y[i].x + alpha.x * x[i].x - alpha.y * x[i].y,
             y[i].y + alpha.x * x[i].y + alpha.y * x[i].x);
 #else
-    for (int i = 0; i < n; ++i)   // CPU：单次调用串行扫完
+    for (int64_t i = 0; i < n; ++i)   // CPU：单次调用串行扫完
         y[i] = ctMake(
             y[i].x + alpha.x * x[i].x - alpha.y * x[i].y,
             y[i].y + alpha.x * x[i].y + alpha.y * x[i].x);
 #endif
 }
 
-void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int n) {
+void axpyComplex(ctComplex* y, const ctComplex* x, ctComplex alpha, int64_t n) {
     CTPWA_LAUNCH_SERIAL(axpyComplexKernel, 1, 64, 0, y, x, alpha, n);
 }
 
