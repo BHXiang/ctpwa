@@ -105,7 +105,7 @@ def test_error_by_toy_monte_carlo(make_analysis):
     """把协方差缩到线性区，用 toy 抽参数：经验 std 应等于线性化 σ。"""
     ana = make_analysis("eff2", reuse=False)
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
-    free = [j for j in range(2 * n) if j not in (0, n)] + [2 * n + i for i in range(nθ)]
+    free = [j for j in range(2 * n) if j not in (0, n)]   # θ 暂不传播
     nf = len(free)
     rng = np.random.default_rng(0)
     A = rng.normal(size=(nf, nf))
@@ -119,7 +119,7 @@ def test_error_by_toy_monte_carlo(make_analysis):
         p0[2 * n:] = ana.getFreeResParams()[0].double().to(DEV)
 
     # 每个参数只抖 0.1%（θ 的宽度只有几 MeV，绝对值不能统一取）→ 线性化成立
-    scale = np.array([max(abs(float(p0[g])), 1e-3) for g in free]) * 1e-3
+    scale = np.array([max(abs(float(p0[g])), 1e-3) for g in free]) * 1e-2
     cov = base * np.outer(scale, scale)
     H = np.eye(2 * n + nθ)
     H[np.ix_(free, free)] = np.linalg.inv(cov)

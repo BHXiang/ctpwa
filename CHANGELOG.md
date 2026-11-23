@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+## [v0.3.23] - 2026-11-23
+
+### Changed（性能）
+
+- **重建侧干涉矩阵改用常驻 `B̄`**：`writeResult` 与
+  `getFitFractionMatrix("phsp")` 不再读 phsp 文件、不再重算振幅，而是
+  `M_ij = 2Re(v_i v_j* B̄_ij)`（`B̄ = Σ_e (w_e/W_total) A_e A_e^H`，NLL 的 phsp
+  分母，本来就在显存里）。1M 事例下 `writeResult` 47.4 s → 24.3 s，剩下的
+  24 s 全是 `phsp_truth` 那一趟（truth 没有常驻表，省不掉）。
+  文件路径已删除（`getFitFractionMatrix("phsp")` 现在走常驻 Gram）。
+
+- **误差矩阵改为解析传播（耦合方向）**：`getFitFractionMatrixErrors` 不再对
+  每个自由方向跑两趟全样本扫描（`4·n_free` 趟），改成
+  - 重建侧：`B̄` 收缩（0 趟）；
+  - 产生侧：一趟 `computeFileBatchIntegrals`，通过已有的
+    `ev_perturbed_p/m` 通道复用同一批振幅算出所有方向的导数；
+  - `Cov = H[coupling, coupling]⁻¹`，自由块只取耦合。
+  200k 事例（2 个自由耦合）实测 40.05 s → 1.89 s（**21×**）；趟数从
+  `4·n_free` 降到 `1`，与耦合数无关。
+  **θ 方向暂不传播**（等 `Hm = Σ w(∂_θA A^H + A ∂_θA^H)` 接进同一趟）。
+
+### Fixed
+
+- **θ 变了 `B̄` 不重建**：重建逻辑从 `getHessian` 抽成 `rebuildPhspGram()`，
+  `reCalcAmp(θ)`、`writeResult(θ)` 与 `getHessian` 都调用它。此前只有
+  `getHessian` 会刷新，`reCalcAmp` 之后份额/矩阵会拿到旧 θ 的 `B̄`。
+
+### Changed（日志）
+
+- 去掉 `[writeResult] ...`、`[phsp] events: ...` 这类带方括号的进度打印；
+  计时行只在 `CTPWA_VERBOSE=1` 时输出，事件数只在真正读文件时打印。
+
 ## [v0.3.22] - 2026-11-22
 
 ### Deprecated / 待删（只是标记，行为不变）

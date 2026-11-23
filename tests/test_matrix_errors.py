@@ -25,7 +25,7 @@ def _spd_hessian(nf, seed=0):
 def _full_hessian(ana, seed=0):
     """把 SPD 块塞进自由方向（耦合去掉参考 + θ），固定方向留单位阵。"""
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
-    free = [j for j in range(2 * n) if j not in (0, n)] + [2 * n + i for i in range(nθ)]
+    free = [j for j in range(2 * n) if j not in (0, n)]   # θ 暂不传播
     H = np.eye(2 * n + nθ)
     H[np.ix_(free, free)] = _spd_hessian(len(free), seed)
     return torch.tensor(H, dtype=torch.float64).to(DEV), free

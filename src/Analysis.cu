@@ -1673,6 +1673,8 @@ public:
                     reinterpret_cast<const double*>(theta.data_ptr()),
                     n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
                     dev.index());
+                // θ 变了：常驻 B̄ 同步刷新（否则再算矩阵还是旧 θ 的）
+                if (!phsp_freed_) rebuildPhspGram();
             }
         } else {
             TORCH_CHECK(params.dtype() == TORCH_COMPLEX, "params must be complex128 in legacy mode");
@@ -3021,12 +3023,25 @@ public:
                 diag.data(), off.data(), nullptr,
                 nullptr, nullptr, nullptr, nullptr, npartials);
             auto t1 = std::chrono::high_resolution_clock::now();
-            std::printf("[writeResult] %s 原始积分矩阵完成: %.1f ms\n", key.c_str(),
-                std::chrono::duration<double, std::milli>(t1 - t0).count());
+            if (std::getenv("CTPWA_VERBOSE"))
+                std::printf("%s 积分矩阵: %.1f ms\n", key.c_str(),
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
             return wsum;
         };
         if (want_raw && wr_data_files.count("phsp")) {
-            N_rec_w = runIntegrals("phsp", P_diag, P_off);
+            {
+                // 重建侧：常驻 B̄ 收缩（不读文件）；Mg 只有 n×n，取完 diag/off 立即析构
+                double Wg = 0.0;
+                torch::Tensor Mg = phspMatrixFromGram(extended_vector, &Wg, &N_rec_w);
+                P_diag.assign(npartials, 0.0);
+                P_off.assign((size_t)npartials * npartials, 0.0);
+                for (int i = 0; i < npartials; ++i) {
+                    P_diag[i] = Mg[i][i].item<double>();
+                    for (int j = i + 1; j < npartials; ++j)
+                        P_off[(size_t)i * npartials + j] = Mg[i][j].item<double>();
+                }
+            }
+
             W_rec_raw = gramTotal(P_diag, P_off);
         }
         bool have_truth = false;
@@ -3081,11 +3096,11 @@ public:
                 if (errs[1].numel() > 0)
                     writeTensor("interference_gen_err", errs[1]);
                 auto t1 = std::chrono::high_resolution_clock::now();
-                std::printf("[writeResult] interference_*_err 完成: %.1f ms\n",
-                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+                if (std::getenv("CTPWA_VERBOSE"))
+                    std::printf("参数误差矩阵: %.1f ms\n",
+                        std::chrono::duration<double, std::milli>(t1 - t0).count());
             } else {
-                std::cerr << "[writeResult] 参数误差矩阵未写出（Hessian 非正定或缺失）"
-                          << std::endl;
+                std::cerr << "参数误差矩阵未写出（Hessian 非正定或缺失）" << std::endl;
             }
         }
 
@@ -3714,89 +3729,8 @@ public:
         // Update d_phsp_matrix_ to reflect current amplitudes
         // phsp 流式模式下不重建：质量/宽度固定 → 矩阵在构造期已就绪且不变
         //（常驻表不含 phsp，重建会读错数据）
-        if (!phsp_freed_) {
-        {
-            int primary_dev = dev.index();
-            // Pre-compute total phsp weight for correct global normalization
-            double W_total = 0.0;
-            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                int nP = events_[gpu][0];
-                if (nP == 0) continue;
-                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
-                    cudaSetDevice(gpu);
-                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
-                    W_total += thrust::reduce(dp, dp + nP);
-                } else {
-                    W_total += (double)nP;
-                }
-            }
-            if (W_total <= 0.0) W_total = 1.0;
-
-            cudaSetDevice(primary_dev);
-            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-            // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
-            // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
-            const int kPhspBatch = 150000;  // 150k 事件/块 ≈ 3×29×16×150k ≈ 209MB
-            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                int nPhsp = events_[gpu][0];
-                if (nPhsp == 0) continue;
-                cudaSetDevice(gpu);
-                const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
-                cublasHandle_t h;
-                cublasCreate(&h);
-                ctComplex alpha = ctMake(1.0f, 0.0f);
-                for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
-                    int nch = std::min(kPhspBatch, nPhsp - c0);
-                    int nTot = nch * n_polar_ * n_amplitudes_;
-                    ctComplex* d_phsp_scaled;
-                    cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
-                    // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
-                    if (float_amps_) {
-                        const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
-                            + (size_t)c0 * n_polar_ * n_amplitudes_;
-                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nTot + 255) / 256, 256, 0, 
-                            srcF, reinterpret_cast<cuDoubleComplex*>(d_phsp_scaled), nTot);
-                    } else {
-                        cudaMemcpy(d_phsp_scaled,
-                            d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
-                            nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
-                    }
-                    int grid = (nTot + 255) / 256;
-                    CTPWA_LAUNCH(scalePhspAmpsKernel, grid, 256, 0, d_phsp_scaled,
-                        d_w ? d_w + c0 : nullptr, nch, n_polar_, n_amplitudes_,
-                        1.0 / W_total, 0);
-
-                    ctComplex* d_phsp_gpu;
-                    cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                    ctComplex beta = ctMake(0.0f, 0.0f);
-                    CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nch * n_polar_,
-                        &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
-                        &beta, d_phsp_gpu, n_amplitudes_);
-                    cudaFree(d_phsp_scaled);
-
-                    if (gpu == (size_t)primary_dev) {
-                        ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
-                        cudaFree(d_phsp_gpu);
-                    } else {
-                        cudaSetDevice(primary_dev);
-                        ctComplex* d_temp;
-                        cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                        cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                            n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                        cudaSetDevice(gpu);
-                        cudaFree(d_phsp_gpu);
-                        cudaSetDevice(primary_dev);
-                        ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
-                        cudaFree(d_temp);
-                        cudaSetDevice(gpu);
-                    }
-                }
-                cublasDestroy(h);
-            }
-        }
-        }  // if (!phsp_freed_) (getHessian phsp 矩阵重建)
+        if (!phsp_freed_) rebuildPhspGram();
+        // （原内联重建代码已抽成 rebuildPhspGram()）
 
         // std::cout << "Hessian elements in line." << __LINE__ << ": \n" << hessian << std::endl;
 
@@ -4566,7 +4500,8 @@ public:
                 " 的整数倍（config 的 Data.order / Particles 与文件不匹配）");
             total_events = lines / ev_lines;
         }
-        std::cout << "[" << file_key << "] events: " << total_events << std::endl;
+        if (std::getenv("CTPWA_VERBOSE"))
+            std::cout << file_key << ": " << total_events << " events" << std::endl;
 
         // 逐事件权重（可选）: <file_key>_weights
         std::vector<double> h_weights;
@@ -4917,10 +4852,81 @@ public:
     //   doc/branching_fraction_recipe.md）。
     // 缺对应数据键 → 返回空 [0,0]。不传 Hessian：这里只要积分，不要误差。
     // =====================================================================
+    // 重建侧矩阵：常驻 B̄ = Σ_e (w_e/W_total) A_e A_e^H 与 v 的二次型。
+    // B̄ 在构造期、reCalcAmp(θ)、getHessian 里都会刷新，所以这里不读文件、不跑逐事例 kernel，
+    // 只做 n×n 收缩；返回 Σ w A A^H 口径（乘回 W_total）。
+    torch::Tensor phspMatrixFromGram(const torch::Tensor& vector, double* W_out = nullptr,
+                                     double* Wtotal_out = nullptr)
+    {
+        cudaSetDevice(primary_dev_);
+        const int np = n_amplitudes_;      // B̄ 是 n_amplitudes_ × n_amplitudes_
+        auto opts2d = torch::TensorOptions().dtype(torch::kFloat64);
+        TORCH_CHECK((int)vector.numel() == np,
+            "phspMatrixFromGram 需要扩展后的振幅向量（n_amplitudes_=", np,
+            "），收到 ", vector.numel());
+        TORCH_CHECK(d_phsp_matrix_ != nullptr || d_phsp_matrix_double_ != nullptr,
+            "phsp Gram 未就绪（无 phsp 样本或尚未构建）");
+
+        double W_total = 0.0;
+        for (size_t g = 0; g < events_.size(); ++g) {
+            int nP = events_[g][0];
+            if (nP == 0) continue;
+            if (g < phsp_weights_.size() && phsp_weights_[g] != nullptr) {
+                cudaSetDevice((int)g);
+                std::vector<double> hw(nP);
+                cudaMemcpy(hw.data(), phsp_weights_[g], nP * sizeof(double),
+                           cudaMemcpyDeviceToHost);
+                for (double x : hw) W_total += x;
+            } else {
+                W_total += (double)nP;
+            }
+        }
+        if (W_total <= 0.0) W_total = 1.0;
+
+        std::vector<double> Br((size_t)np * np), Bi((size_t)np * np);
+        if (d_phsp_matrix_double_ != nullptr) {
+            std::vector<cuDoubleComplex> tmp((size_t)np * np);
+            cudaMemcpy(tmp.data(), d_phsp_matrix_double_,
+                       tmp.size() * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+            for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = tmp[k].x; Bi[k] = tmp[k].y; }
+        } else {
+            std::vector<ctComplex> tmp((size_t)np * np);
+            cudaMemcpy(tmp.data(), d_phsp_matrix_, tmp.size() * sizeof(ctComplex),
+                       cudaMemcpyDeviceToHost);
+            for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = (double)tmp[k].x; Bi[k] = (double)tmp[k].y; }
+        }
+
+        auto vcpu = vector.detach().to(torch::kCPU).contiguous();
+        const std::complex<double>* v =
+            reinterpret_cast<const std::complex<double>*>(vcpu.data_ptr());
+        torch::Tensor M = torch::zeros({ np, np }, opts2d);
+        double W = 0.0;
+        for (int i = 0; i < np; ++i)
+            for (int j = 0; j < np; ++j) {
+                std::complex<double> b(Br[(size_t)i * np + j], Bi[(size_t)i * np + j]);
+                // B̄ = A^H A（首下标带共轭）→ 取 conj(b) 才是 Σ A_i A_j*
+                double val = (i == j) ? std::norm(v[i]) * b.real()
+                                      : 2.0 * std::real(v[i] * std::conj(v[j]) * std::conj(b));
+                val *= W_total;
+                M[i][j] = val;
+                if (i == j || j > i) W += val;
+            }
+        if (W_out) *W_out = W;
+        if (Wtotal_out) *Wtotal_out = W_total;
+        return M;
+    }
+
     torch::Tensor getFitFractionMatrix(torch::Tensor vector, std::string sample)
     {
         cudaSetDevice(primary_dev_);
         if (sample == "truth") sample = "phsp_truth";
+        if (sample == "phsp") {
+            // 重建侧不再读文件：常驻 B̄ 收缩（B̄ 在构造 / reCalcAmp / writeResult 时刷新）
+            TORCH_CHECK(ctpwa_is_cuda_like(vector), "vector 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
+            TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision");
+            return phspMatrixFromGram(freeParamsToAmplitudes(vector));
+        }
+
         TORCH_CHECK(sample == "phsp_truth" || sample == "phsp",
             "sample 只能是 'truth' (phsp_truth) 或 'phsp'，收到 '", sample, "'");
         const auto& data_files = config_parser_.getDataFiles();
@@ -5000,7 +5006,9 @@ public:
         std::vector<int64_t> free_idx;
         for (int j = 0; j < 2 * n; ++j)
             if (j != 0 && j != n) free_idx.push_back(j);      // 参考方向固定
-        for (int j = 0; j < ntheta; ++j) free_idx.push_back(2 * n + j);
+        // θ 方向本轮不传播（解析导数待接）：自由块只取耦合，避免 Cov 里混入
+        // 与 J 无关的 θ 行列（PD 判据也会被它们干扰）。
+        (void)ntheta;
         const int nf = static_cast<int>(free_idx.size());
         if (nf == 0) {
             // 全固定配置（常见：只画图不拟合、或参数全被 fix_var 锁死）——
@@ -5079,45 +5087,140 @@ public:
             W_gen = has_gen ? tot(out_gen) : 0.0;
         };
 
-        torch::Tensor R0, G0;
-        double Wr = 0.0, Wg = 0.0;
-        runMatrices(params, R0, G0, Wr, Wg);
-        TORCH_CHECK(Wr > 0.0, "重建侧矩阵的相干总额非正，无法归一");
-        TORCH_CHECK(!has_gen || Wg > 0.0, "产生侧矩阵的相干总额非正，无法归一");
-
-        // 归一化矩阵（writeResult 写出的就是这张）
-        auto norm = [&](const torch::Tensor& M, double W) { return M / W; };
-        torch::Tensor F0_rec = norm(R0, Wr), F0_gen = norm(G0, Wg);
-        (void)F0_rec; (void)F0_gen;
-
-        // ---- Jacobian：[nf][npartials][npartials] ----
-        std::vector<double> Jrec((size_t)nf * npartials * npartials, 0.0);
-        std::vector<double> Jgen((size_t)nf * npartials * npartials, 0.0);
+        // ---- 耦合方向：解析（rec 由常驻 B̄、gen 一趟扫描）；θ 方向本轮不传播 ----
+        // 成本：rec = 0 趟（n×n 收缩），gen = 1 趟（复用同一批振幅算所有方向的 ±）。
+        // 对比旧实现：4·n_free 趟全样本扫描（每趟都读文件、重算振幅）。
         auto p_cpu = params.detach().to(torch::kCPU).contiguous();
         const double* h_p = p_cpu.data_ptr<double>();
-        for (int f = 0; f < nf; ++f) {
-            const int64_t g = free_idx[f];
-            const bool is_theta = (g >= 2 * n);
-            if (std::getenv("CTPWA_MEMPROBE"))
-                std::printf("[matrix-err] direction %d/%d (%s idx=%d)\n",
-                            f + 1, nf, is_theta ? "theta" : "coupling", (int)g);
-            const double eps = is_theta
-                ? 1e-4 * std::max(std::abs(h_p[g]), 1e-3)
-                : 5e-6 * std::max(std::abs(h_p[g]), 1.0);
+        const int np = npartials;
+
+        // 自由耦合方向（与 free_idx 的前段一致；参考方向 Re v0 / Im v0 固定）
+        std::vector<int64_t> dir_idx;
+        for (int j = 0; j < 2 * n; ++j)
+            if (j != 0 && j != n) dir_idx.push_back(j);
+        const int nd = (int)dir_idx.size();
+
+        auto cpl_from = [&](const torch::Tensor& pu) {
+            return torch::complex(pu.slice(0, 0, n).to(TORCH_FLOAT),
+                                  pu.slice(0, n, 2 * n).to(TORCH_FLOAT)).contiguous();
+        };
+        const torch::Tensor ev_center = freeParamsToAmplitudes(cpl_from(params));
+        std::vector<double> eps_d(nd, 1e-6);
+        std::vector<torch::Tensor> ev_p(nd), ev_m(nd);
+        for (int d = 0; d < nd; ++d) {
+            const int64_t g = dir_idx[d];
+            eps_d[d] = 5e-6 * std::max(std::abs(h_p[g]), 1.0);
             torch::Tensor pp = params.clone(), pm = params.clone();
-            pp[g] += eps; pm[g] -= eps;
-            torch::Tensor Rp, Gp, Rm, Gm;
-            double wrp = 0.0, wgp = 0.0, wrm = 0.0, wgm = 0.0;
-            runMatrices(pp, Rp, Gp, wrp, wgp);
-            runMatrices(pm, Rm, Gm, wrm, wgm);
-            for (int i = 0; i < npartials; ++i)
-                for (int j = 0; j < npartials; ++j) {
-                    const size_t o = ((size_t)f * npartials + i) * npartials + j;
-                    Jrec[o] = (Rp[i][j].item<double>() / wrp - Rm[i][j].item<double>() / wrm)
-                              / (2.0 * eps);
-                    if (has_gen)
-                        Jgen[o] = (Gp[i][j].item<double>() / wgp - Gm[i][j].item<double>() / wgm)
-                                  / (2.0 * eps);
+            pp[g] += eps_d[d];
+            pm[g] -= eps_d[d];
+            ev_p[d] = freeParamsToAmplitudes(cpl_from(pp));
+            ev_m[d] = freeParamsToAmplitudes(cpl_from(pm));
+        }
+
+        // 产生侧：一趟扫描，同时给出中心与所有方向的 ±
+        std::vector<double> C_diag(np, 0.0), C_off((size_t)np * np, 0.0);
+        std::vector<double> P_diag((size_t)nd * np, 0.0), P_off((size_t)nd * np * np, 0.0);
+        std::vector<double> M_diag((size_t)nd * np, 0.0), M_off((size_t)nd * np * np, 0.0);
+        std::vector<double> Wg(1, 0.0);
+        if (has_gen) {
+            computeFileBatchIntegrals("phsp_truth", ev_center, ev_p, ev_m,
+                C_diag.data(), C_off.data(), nullptr,
+                P_diag.data(), P_off.data(), M_diag.data(), M_off.data(), np);
+            Wg[0] = 0.0;
+            for (int i = 0; i < np; ++i) {
+                Wg[0] += C_diag[i];
+                for (int j = i + 1; j < np; ++j) Wg[0] += C_off[(size_t)i * np + j];
+            }
+            TORCH_CHECK(Wg[0] > 0.0, "产生侧矩阵的相干总额非正，无法归一");
+        }
+
+        // 重建侧：常驻 B̄ 拷一次 host，之后每个方向只是 n×n 收缩（0 趟）
+        std::vector<double> Br, Bi;
+        double W_total_rec = 1.0;
+        {
+            cudaSetDevice(primary_dev_);
+            Br.resize((size_t)np * np);
+            Bi.resize((size_t)np * np);
+            if (d_phsp_matrix_double_ != nullptr) {
+                std::vector<cuDoubleComplex> tmp((size_t)np * np);
+                cudaMemcpy(tmp.data(), d_phsp_matrix_double_,
+                           tmp.size() * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+                for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = tmp[k].x; Bi[k] = tmp[k].y; }
+            } else {
+                std::vector<ctComplex> tmp((size_t)np * np);
+                cudaMemcpy(tmp.data(), d_phsp_matrix_, tmp.size() * sizeof(ctComplex),
+                           cudaMemcpyDeviceToHost);
+                for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = (double)tmp[k].x; Bi[k] = (double)tmp[k].y; }
+            }
+            for (size_t g = 0; g < events_.size(); ++g) {
+                int nP = events_[g][0];
+                if (nP == 0) continue;
+                if (g < phsp_weights_.size() && phsp_weights_[g] != nullptr) {
+                    cudaSetDevice((int)g);
+                    std::vector<double> hw(nP);
+                    cudaMemcpy(hw.data(), phsp_weights_[g], nP * sizeof(double),
+                               cudaMemcpyDeviceToHost);
+                    for (double x : hw) W_total_rec += x;
+                } else {
+                    W_total_rec += (double)nP;
+                }
+            }
+        }
+        auto contractRec = [&](const torch::Tensor& vec, std::vector<double>& Mout,
+                               double& Wsum) {
+            auto vc = vec.detach().to(torch::kCPU).contiguous();
+            const std::complex<double>* v =
+                reinterpret_cast<const std::complex<double>*>(vc.data_ptr());
+            Mout.assign((size_t)np * np, 0.0);
+            Wsum = 0.0;
+            for (int i = 0; i < np; ++i)
+                for (int j = 0; j < np; ++j) {
+                    std::complex<double> b(Br[(size_t)i * np + j], Bi[(size_t)i * np + j]);
+                    double val = (i == j) ? std::norm(v[i]) * b.real()
+                                          : 2.0 * std::real(v[i] * std::conj(v[j]) * std::conj(b));
+                    val *= W_total_rec;
+                    Mout[(size_t)i * np + j] = val;
+                    if (i == j || j > i) Wsum += val;
+                }
+        };
+
+        // ---- Jacobian：[nf][np][np]（θ 列保持 0）----
+        std::vector<double> Jrec((size_t)nf * np * np, 0.0);
+        std::vector<double> Jgen((size_t)nf * np * np, 0.0);
+        std::vector<double> Mp, Mm;
+        double Wp = 0.0, Wm = 0.0;
+        for (int d = 0; d < nd; ++d) {
+            const size_t f = (size_t)(&dir_idx[d] - &dir_idx[0]);
+            // rec：B̄ 收缩
+            contractRec(ev_p[d], Mp, Wp);
+            contractRec(ev_m[d], Mm, Wm);
+            for (int i = 0; i < np; ++i)
+                for (int j = 0; j < np; ++j) {
+                    const size_t o = (f * np + i) * np + j;
+                    Jrec[o] = (Mp[(size_t)i * np + j] / Wp - Mm[(size_t)i * np + j] / Wm)
+                              / (2.0 * eps_d[d]);
+                    if (has_gen) {
+                        const double cp = C_off[(size_t)i * np + j];
+                        const double cm = C_off[(size_t)i * np + j];
+                        (void)cp; (void)cm;
+                        auto at = [&](const std::vector<double>& a, int which) {
+                            return a[(size_t)which * np * np + (size_t)i * np + j];
+                        };
+                        const double Pij = (i == j) ? P_diag[(size_t)d * np + j] : at(P_off, d);
+                        const double Mij = (i == j) ? M_diag[(size_t)d * np + j] : at(M_off, d);
+                        double Wp_g = 0.0, Wm_g = 0.0;
+                        for (int a = 0; a < np; ++a) {
+                            Wp_g += P_diag[(size_t)d * np + a];
+                            Wm_g += M_diag[(size_t)d * np + a];
+                            for (int b = a + 1; b < np; ++b) {
+                                Wp_g += P_off[(size_t)d * np * np + (size_t)a * np + b];
+                                Wm_g += M_off[(size_t)d * np * np + (size_t)a * np + b];
+                            }
+                        }
+                        if (Wp_g <= 0.0) Wp_g = 1e-30;
+                        if (Wm_g <= 0.0) Wm_g = 1e-30;
+                        Jgen[o] = (Pij / Wp_g - Mij / Wm_g) / (2.0 * eps_d[d]);
+                    }
                 }
         }
 
@@ -5492,6 +5595,92 @@ public:
         return h;
     }
 
+    // 从常驻振幅重算 phsp 的 Gram B̄ = Σ_e (w_e/W_total) A_e A_e^H。
+    // 与 getHessian 里原来那段一致（分块 scalePhspAmpsKernel + CGEMM + 跨卡 axpy）；
+    // 抽出来是为了让 reCalcAmp(θ) 之后 B̄ 也新鲜（此前只在 getHessian 里更新）。
+    void rebuildPhspGram()
+    {
+            int primary_dev = primary_dev_;
+            // Pre-compute total phsp weight for correct global normalization
+            double W_total = 0.0;
+            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+                int nP = events_[gpu][0];
+                if (nP == 0) continue;
+                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
+                    W_total += thrust::reduce(dp, dp + nP);
+                } else {
+                    W_total += (double)nP;
+                }
+            }
+            if (W_total <= 0.0) W_total = 1.0;
+
+            cudaSetDevice(primary_dev);
+            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+            // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
+            // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
+            const int kPhspBatch = 150000;  // 150k 事件/块 ≈ 3×29×16×150k ≈ 209MB
+            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
+                int nPhsp = events_[gpu][0];
+                if (nPhsp == 0) continue;
+                cudaSetDevice(gpu);
+                const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
+                cublasHandle_t h;
+                cublasCreate(&h);
+                ctComplex alpha = ctMake(1.0f, 0.0f);
+                for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
+                    int nch = std::min(kPhspBatch, nPhsp - c0);
+                    int nTot = nch * n_polar_ * n_amplitudes_;
+                    ctComplex* d_phsp_scaled;
+                    cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
+                    // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
+                    if (float_amps_) {
+                        const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
+                            + (size_t)c0 * n_polar_ * n_amplitudes_;
+                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nTot + 255) / 256, 256, 0, 
+                            srcF, reinterpret_cast<cuDoubleComplex*>(d_phsp_scaled), nTot);
+                    } else {
+                        cudaMemcpy(d_phsp_scaled,
+                            d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
+                            nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                    }
+                    int grid = (nTot + 255) / 256;
+                    CTPWA_LAUNCH(scalePhspAmpsKernel, grid, 256, 0, d_phsp_scaled,
+                        d_w ? d_w + c0 : nullptr, nch, n_polar_, n_amplitudes_,
+                        1.0 / W_total, 0);
+
+                    ctComplex* d_phsp_gpu;
+                    cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                    ctComplex beta = ctMake(0.0f, 0.0f);
+                    CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nch * n_polar_,
+                        &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
+                        &beta, d_phsp_gpu, n_amplitudes_);
+                    cudaFree(d_phsp_scaled);
+
+                    if (gpu == (size_t)primary_dev) {
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                        cudaFree(d_phsp_gpu);
+                    } else {
+                        cudaSetDevice(primary_dev);
+                        ctComplex* d_temp;
+                        cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                        cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
+                            n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                        cudaSetDevice(gpu);
+                        cudaFree(d_phsp_gpu);
+                        cudaSetDevice(primary_dev);
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                        cudaFree(d_temp);
+                        cudaSetDevice(gpu);
+                    }
+                }
+                cublasDestroy(h);
+            }
+    }
+
     void reCalcAmp(torch::Tensor params)
     {
         TORCH_CHECK(ctpwa_is_cuda_like(params), "params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
@@ -5506,6 +5695,9 @@ public:
             reinterpret_cast<const double*>(params.data_ptr()),
             n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
             params.device().index());
+        // θ 变了就要把 phsp 的 Gram 一起更新，否则常驻 B̄ 还是旧 θ 的
+        //（此前只有 getHessian 会更新，reCalcAmp 之后矩阵/份额会拿到过期值）。
+        if (!phsp_freed_) rebuildPhspGram();
     }
 
     // ---- DIYMC: 任意四动量的逐事件强度 Σ_pol |Σ_i A_i v_i|² ----
