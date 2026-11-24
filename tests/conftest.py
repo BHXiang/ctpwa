@@ -157,3 +157,89 @@ def load_golden(name: str) -> float:
 def save_golden(name: str, value) -> None:
     GOLDEN_DIR.mkdir(exist_ok=True)
     (GOLDEN_DIR / name).write_text(value if isinstance(value, str) else f"{value:.16g}\n")
+
+# ---------------------------------------------------------------------------
+# 读 weight_best.root 的小工具（原 getFitFractionMatrix / ...Errors 已删除）
+# ---------------------------------------------------------------------------
+def _unified_params(ana, cpl_or_params):
+    """耦合向量 -> 统一参数 [Re p, Im p, θ]；已是 (2n+nθ) float64 则原样返回。"""
+    import torch
+    n = ana.getNVector()
+    nθ = ana.getNFreeTheta()
+    t = cpl_or_params
+    if t.dtype == torch.complex128 or t.dtype == torch.complex64:
+        p = torch.zeros(2 * n + nθ, dtype=torch.float64)
+        p[:n] = t.real
+        p[n:2 * n] = t.imag
+        if nθ:
+            p[2 * n:] = ana.getFreeResParams()[0].double()
+        return p
+    return t
+
+
+def _read_root_matrices(path):
+    import numpy as np
+    import uproot
+    out = {}
+    with uproot.open(str(path)) as f:
+        keys = {k.split(";")[0] for k in f.keys()}
+        W = {}
+        if "integrals" in keys:
+            m = f["integrals"].arrays(library="np")
+            W = {"rec": float(m["W_rec"][0]), "gen": float(m["W_gen"][0])}
+        for tag, name in (("rec", "interference_rec"), ("gen", "interference_gen"),
+                          ("rec_err", "interference_rec_err"),
+                          ("gen_err", "interference_gen_err")):
+            if name in keys:
+                o = f[name]
+                M = np.asarray(o.member("fElements"), dtype=float).reshape(
+                    int(o.member("fNrows")), int(o.member("fNcols")))
+                out[tag] = M
+        for s in ("rec", "gen"):
+            if s in out and W.get(s, 0.0) > 0.0:
+                out[s + "_raw"] = out[s] * W[s]     # 乘回 W：与旧的原始积分口径一致
+    return out
+
+
+def fit_fraction_matrix(ana, cpl, sample="truth", hessian=None):
+    """旧 getFitFractionMatrix 的替代：写一次 ROOT 再读回来。
+
+    sample: "truth"/"gen" -> interference_gen；"phsp"/"rec" -> interference_rec。
+    返回值口径与旧 API 相同（原始积分，已乘回 W；即未归一化）。
+    """
+    import tempfile
+
+    import torch
+    params = _unified_params(ana, cpl)
+    dev = "cuda:0" if __import__("ctpwa").backend() == "cuda" else "cpu"
+    params = params.to(dev)
+    with tempfile.TemporaryDirectory() as d:
+        path = __import__("os").path.join(d, "m.root")
+        if hessian is None:
+            ana.writeResult(params, path, 0)
+        else:
+            ana.writeResult(params, path, 0, [], hessian.to(dev))
+        mats = _read_root_matrices(path)
+    key = "gen" if str(sample).lower() in ("truth", "gen", "phsp_truth") else "rec"
+    if key + "_raw" not in mats:
+        return torch.zeros(0, 0, dtype=torch.float64)   # 该样本未配置（如无 phsp_truth）
+    return torch.tensor(mats[key + "_raw"], dtype=torch.float64)
+
+
+def matrix_errors(ana, params, hessian):
+    """旧 getFitFractionMatrixErrors 的替代：写 ROOT 后读 interference_*_err。"""
+    import os
+    import tempfile
+
+    import torch
+    dev = "cuda:0" if __import__("ctpwa").backend() == "cuda" else "cpu"
+    p = _unified_params(ana, params).to(dev)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "e.root")
+        ana.writeResult(p, path, 0, [], hessian.to(dev))
+        mats = _read_root_matrices(path)
+    import numpy as np
+    er = torch.tensor(mats.get("rec_err", np.zeros((0, 0))), dtype=torch.float64)
+    eg = torch.tensor(mats.get("gen_err", np.zeros((0, 0))), dtype=torch.float64)
+    return [er, eg]
+

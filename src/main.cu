@@ -297,27 +297,6 @@ static void bind_ctpwa(pybind11::module_& m)
              pybind11::arg("vector"), pybind11::arg("hessian"),
              "getFitFractions(vector, hessian): hessian 为可选统一 Hessian "
              "(与拟合 getHessian 同源), 用于误差传播。")
-        .def("getFitFractionMatrix", &analysis::getFitFractionMatrix,
-             pybind11::arg("vector"), pybind11::arg("sample") = "truth",
-             "分波积分矩阵（原始值）: M[i][i]=Σw|A_i|², M[i][j]=Σw·2Re(A_iA_j*) "
-             "(i≠j, 对称)。行/列顺序与 getFitFractions 一致。"
-             "sample=\"truth\"(phsp_truth, 默认) 或 \"phsp\"(带效率 MC)。"
-             "相干总和 W = trace + Σ_{i<j}M_ij：文献/tf-pwa 口径 FF_i = M_ii/W, "
-             "FF_ij = M_ij/W；W_phsp/W_truth = 模型加权平均效率。缺对应数据键时返回空 [0,0]。")
-        .def("getFitFractionMatrixErrors",
-             [](analysis& a, torch::Tensor params, pybind11::object hessian) {
-                 torch::Tensor h;
-                 if (!hessian.is_none()) h = hessian.cast<torch::Tensor>();
-                 return a.getFitFractionMatrixErrors(params, h);
-             },
-             pybind11::arg("params"), pybind11::arg("hessian") = pybind11::none(),
-             "两张干涉矩阵的**参数误差**（不含 MC 统计）: 线性化传播 "
-             "σ(F_ij)=sqrt(J Cov J^T)，F=M/W 与 writeResult 写出的归一化表同口径，"
-             "Cov=H[free,free]^{-1}（自由方向 = 耦合去掉参考方向 + θ）。"
-             "params 为统一参数 [Re p, Im p, θ]；hessian 省略时内部调用 getHessian。"
-             "返回 [err_rec, err_gen] 两个 [npartials,npartials] float64；"
-             "Hessian 非正定时返回空张量。成本 = 2·n_free 趟积分。")
-        // [暂留] 中心值可由 ROOT 算；MC 统计误差只在这里 → 写进 ROOT 后再删。
         .def("getEfficiency", pybind11::overload_cast<torch::Tensor>(
                  &analysis::getEfficiency),
              pybind11::arg("vector"),

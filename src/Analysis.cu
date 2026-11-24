@@ -3082,7 +3082,7 @@ public:
             && std::getenv("CTPWA_WR_NO_ERR") == nullptr)
         {
             auto t0 = std::chrono::high_resolution_clock::now();
-            auto errs = getFitFractionMatrixErrors(params, hessian_in);
+            auto errs = computeMatrixErrors(params, hessian_in);
             if (errs.size() == 2 && errs[0].numel() > 0) {
                 auto writeTensor = [&](const char* name, const torch::Tensor& E) {
                     rootFile->cd();
@@ -4899,24 +4899,38 @@ public:
         auto vcpu = vector.detach().to(torch::kCPU).contiguous();
         const std::complex<double>* v =
             reinterpret_cast<const std::complex<double>*>(vcpu.data_ptr());
-        torch::Tensor M = torch::zeros({ np, np }, opts2d);
+
+        // 行/列 = 分波 = (链 × 共振态组合)，同一条分波内的多个 LS 组合**相干求和**：
+        //   S_p = Σ_{k∈p} v_k A_k
+        //   M_pq = W_total · [p==q ? 1 : 2] · Re Σ_{k∈p,l∈q} v_k conj(v_l) conj(B̄_kl)
+        // nSLvectors_ 给出的正是每条分波包含几个 SL 振幅（ls_filter: [4] → 1 行）。
+        const int npart = (int)nSLvectors_.size();
+        std::vector<int> pstart(npart + 1, 0);
+        for (int p = 0; p < npart; ++p) pstart[p + 1] = pstart[p] + nSLvectors_[p];
+        TORCH_CHECK(pstart[npart] == np,
+            "nSLvectors_ 之和 (", pstart[npart], ") 与 n_amplitudes_ (", np, ") 不一致");
+
+        torch::Tensor M = torch::zeros({ npart, npart }, opts2d);
         double W = 0.0;
-        for (int i = 0; i < np; ++i)
-            for (int j = 0; j < np; ++j) {
-                std::complex<double> b(Br[(size_t)i * np + j], Bi[(size_t)i * np + j]);
-                // B̄ = A^H A（首下标带共轭）→ 取 conj(b) 才是 Σ A_i A_j*
-                double val = (i == j) ? std::norm(v[i]) * b.real()
-                                      : 2.0 * std::real(v[i] * std::conj(v[j]) * std::conj(b));
-                val *= W_total;
-                M[i][j] = val;
-                if (i == j || j > i) W += val;
+        for (int p = 0; p < npart; ++p)
+            for (int q = 0; q < npart; ++q) {
+                std::complex<double> acc(0.0, 0.0);
+                for (int k = pstart[p]; k < pstart[p + 1]; ++k)
+                    for (int l = pstart[q]; l < pstart[q + 1]; ++l) {
+                        std::complex<double> b(Br[(size_t)k * np + l], Bi[(size_t)k * np + l]);
+                        acc += v[k] * std::conj(v[l]) * std::conj(b);
+                    }
+                double val = (p == q ? 1.0 : 2.0) * acc.real() * W_total;
+                M[p][q] = val;
+                if (p == q || q > p) W += val;
             }
         if (W_out) *W_out = W;
         if (Wtotal_out) *Wtotal_out = W_total;
         return M;
     }
 
-    torch::Tensor getFitFractionMatrix(torch::Tensor vector, std::string sample)
+    // 内部用：给定耦合向量算某样本的原始积分矩阵（rec 走常驻 B̄，truth 走一趟扫描）。
+    torch::Tensor matrixForSample(torch::Tensor vector, std::string sample)
     {
         cudaSetDevice(primary_dev_);
         if (sample == "truth") sample = "phsp_truth";
@@ -4975,7 +4989,8 @@ public:
     // 返回 {err_rec, err_gen}: 两个 [npartials, npartials] float64（未归一化误差为 0 的
     // 情况返回空张量）。缺 phsp_truth 时 err_gen 返回空。
     // =====================================================================
-    std::vector<torch::Tensor> getFitFractionMatrixErrors(
+    // 内部用：两张矩阵的参数误差（耦合方向解析；θ 见下方 TODO）。
+    std::vector<torch::Tensor> computeMatrixErrors(
         torch::Tensor params, torch::Tensor hessian_in)
     {
         cudaSetDevice(primary_dev_);
@@ -5006,8 +5021,7 @@ public:
         std::vector<int64_t> free_idx;
         for (int j = 0; j < 2 * n; ++j)
             if (j != 0 && j != n) free_idx.push_back(j);      // 参考方向固定
-        // θ 方向本轮不传播（解析导数待接）：自由块只取耦合，避免 Cov 里混入
-        // 与 J 无关的 θ 行列（PD 判据也会被它们干扰）。
+        // θ 方向暂不传播（θ FD 的步长在 M~1e4 时被舍入噪声主导；等解析 dF 路线）
         (void)ntheta;
         const int nf = static_cast<int>(free_idx.size());
         if (nf == 0) {
@@ -5171,16 +5185,24 @@ public:
             auto vc = vec.detach().to(torch::kCPU).contiguous();
             const std::complex<double>* v =
                 reinterpret_cast<const std::complex<double>*>(vc.data_ptr());
-            Mout.assign((size_t)np * np, 0.0);
+            // 与 phspMatrixFromGram 同一口径：行/列 = 分波（链 × 共振态组合），
+            // 分波内多个 LS 相干求和（nSLvectors_ 给出每段长度）。
+            const int npart = (int)nSLvectors_.size();
+            std::vector<int> pst(npart + 1, 0);
+            for (int p = 0; p < npart; ++p) pst[p + 1] = pst[p] + nSLvectors_[p];
+            Mout.assign((size_t)npart * npart, 0.0);
             Wsum = 0.0;
-            for (int i = 0; i < np; ++i)
-                for (int j = 0; j < np; ++j) {
-                    std::complex<double> b(Br[(size_t)i * np + j], Bi[(size_t)i * np + j]);
-                    double val = (i == j) ? std::norm(v[i]) * b.real()
-                                          : 2.0 * std::real(v[i] * std::conj(v[j]) * std::conj(b));
-                    val *= W_total_rec;
-                    Mout[(size_t)i * np + j] = val;
-                    if (i == j || j > i) Wsum += val;
+            for (int p = 0; p < npart; ++p)
+                for (int q = 0; q < npart; ++q) {
+                    std::complex<double> acc(0.0, 0.0);
+                    for (int k = pst[p]; k < pst[p + 1]; ++k)
+                        for (int l = pst[q]; l < pst[q + 1]; ++l) {
+                            std::complex<double> b(Br[(size_t)k * np + l], Bi[(size_t)k * np + l]);
+                            acc += v[k] * std::conj(v[l]) * std::conj(b);
+                        }
+                    double val = (p == q ? 1.0 : 2.0) * acc.real() * W_total_rec;
+                    Mout[(size_t)p * npart + q] = val;
+                    if (p == q || q > p) Wsum += val;
                 }
         };
 

@@ -20,6 +20,7 @@ import torch
 import pytest
 
 import ctpwa
+from conftest import fit_fraction_matrix, matrix_errors
 
 DEVICE = torch.device("cpu") if ctpwa.backend() == "cpu" else torch.device("cuda:0")
 
@@ -289,7 +290,7 @@ def test_fit_fraction_matrix_matches_api_and_total(make_analysis):
     params = _params(ana, seed=17)
     cpl = _coupling(ana, params)
 
-    M = ana.getFitFractionMatrix(cpl)
+    M = fit_fraction_matrix(ana, cpl)
     n = M.shape[0]
     assert M.dtype == torch.float64 and n == ana.getNVector()
 
@@ -324,7 +325,7 @@ def test_fit_fraction_matrix_empty_without_truth(make_analysis):
     """缺 phsp_truth → 返回空 [0,0]（与 getFitFractions 的早退一致）。"""
     ana = make_analysis("simple")
     cpl = _coupling(ana, _params(ana))
-    M = ana.getFitFractionMatrix(cpl)
+    M = fit_fraction_matrix(ana, cpl)
     assert tuple(M.shape) == (0, 0)
 
 
@@ -336,8 +337,8 @@ def test_fit_fraction_matrix_phsp_sample_matches_truth(make_analysis):
     """
     ana = make_analysis("eff2")
     cpl = _coupling(ana, _params(ana, seed=23))
-    M_t = ana.getFitFractionMatrix(cpl)                     # 默认 truth
-    M_p = ana.getFitFractionMatrix(cpl, sample="phsp")
+    M_t = fit_fraction_matrix(ana, cpl)                     # 默认 truth
+    M_p = fit_fraction_matrix(ana, cpl, sample="phsp")
     assert tuple(M_p.shape) == tuple(M_t.shape)
     assert torch.allclose(M_t, M_p, rtol=1e-10, atol=1e-9)
 
@@ -354,7 +355,7 @@ def test_write_result_interference_equals_matrix(tmp_path, make_analysis):
     params = _params(ana, seed=29)
     cpl = _coupling(ana, params)
 
-    M = ana.getFitFractionMatrix(cpl, sample="phsp")
+    M = fit_fraction_matrix(ana, cpl, sample="phsp")
     n = M.shape[0]
     W = float(M.diagonal().sum())
     for i in range(n):
@@ -387,8 +388,8 @@ def test_efficiency_equals_matrix_ratio(make_analysis):
     ana = make_analysis("eff2")
     cpl = _coupling(ana, _params(ana, seed=31))
     eff = ana.getEfficiency(cpl)[:, 0]
-    T = ana.getFitFractionMatrix(cpl)
-    P = ana.getFitFractionMatrix(cpl, sample="phsp")
+    T = fit_fraction_matrix(ana, cpl)
+    P = fit_fraction_matrix(ana, cpl, sample="phsp")
     # eff2：phsp 与 phsp_truth 同文件 → N_p == N_t
     ratio = P.diagonal() / T.diagonal()
     assert torch.allclose(eff, ratio, rtol=1e-10, atol=1e-12), (eff, ratio)

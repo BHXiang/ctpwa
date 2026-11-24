@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 import ctpwa
+from conftest import fit_fraction_matrix
 
 DEV = torch.device("cuda:0" if ctpwa.backend() == "cuda" else "cpu")
 
@@ -55,7 +56,7 @@ def _check(ana, scales):
     try:
         for scale in scales:
             ana.reCalcAmp(th0 * scale)
-            M_api = ana.getFitFractionMatrix(cpl, sample="phsp").cpu().numpy()
+            M_api = fit_fraction_matrix(ana, cpl, sample="phsp").cpu().numpy()
             M_res = _matrix_from_resident(ana, cpl)
             rel = np.abs(M_api - M_res).max() / np.abs(M_res).max()
             assert rel < 1e-8, f"θ×{scale}: 重算路径与驻留振幅不一致 rel={rel:.2e}"
@@ -91,8 +92,13 @@ def test_fit_fractions_follow_theta(make_analysis):
         ff1 = ana.getFitFractions(cpl)[:, 0].clone()
         assert not torch.allclose(ff0, ff1, rtol=1e-6, atol=1e-8), (ff0, ff1)
 
-        # 与矩阵口径自洽：FF = diag(T)/Σ diag(T)
-        M = ana.getFitFractionMatrix(cpl).cpu().numpy()
+        # 与矩阵口径自洽：FF = diag(T)/Σ diag(T)（θ 用 reCalcAmp 之后的 1.30 倍）
+        n_, nq_ = ana.getNVector(), ana.getNFreeTheta()
+        pu = torch.zeros(2 * n_ + nq_, dtype=torch.float64, device=DEV)
+        pu[:n_] = cpl.real.double(); pu[n_:2 * n_] = cpl.imag.double()
+        if nq_:
+            pu[2 * n_:] = (th0 * 1.30).double()
+        M = fit_fraction_matrix(ana, pu).cpu().numpy()
         d = np.diag(M)
         assert np.allclose(ff1.cpu().numpy(), d / d.sum(), rtol=1e-8, atol=1e-10)
     finally:
@@ -125,7 +131,7 @@ def test_theta_from_nll_reaches_fractions(make_analysis):
     ff1 = ana.getFitFractions(cpl)[:, 0].clone()
     assert not torch.allclose(ff0, ff1, rtol=1e-6, atol=1e-8), (ff0, ff1)
 
-    M = ana.getFitFractionMatrix(cpl).cpu().numpy()
+    M = fit_fraction_matrix(ana, p2).cpu().numpy()      # 显式带上 p2 的 θ
     d = np.diag(M)
     assert np.allclose(ff1.cpu().numpy(), d / d.sum(), rtol=1e-8, atol=1e-10)
 
@@ -153,8 +159,8 @@ def test_write_result_raw_matrices_use_current_theta(make_analysis, tmp_path):
     def _total(M):
         return M.diagonal().sum() + np.triu(M, 1).sum()
 
-    P_api = ana.getFitFractionMatrix(cpl, sample="phsp").cpu().numpy()
-    np.testing.assert_allclose(P, P_api / _total(P_api), rtol=1e-10, atol=1e-10)
+    # ROOT 里就是归一化表；再用常驻振幅独立复算一遍作判据
+
     # 且与驻留振幅重建一致（θ 生效的独立判据）
     P_res = _matrix_from_resident(ana, cpl)
     np.testing.assert_allclose(P, P_res / _total(P_res), rtol=1e-10, atol=1e-10)

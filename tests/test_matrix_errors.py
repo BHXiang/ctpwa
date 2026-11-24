@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 import ctpwa
+from conftest import fit_fraction_matrix, matrix_errors
 
 DEV = torch.device("cuda:0" if ctpwa.backend() == "cuda" else "cpu")
 
@@ -57,8 +58,8 @@ def _reference(ana, p, free):
         if nθ:
             ana.reCalcAmp(pu[2 * n:].contiguous())
         cpl = torch.complex(pu[:n], pu[n:2 * n]).contiguous().to(DEV)
-        return (_norm(ana.getFitFractionMatrix(cpl, sample="phsp").numpy()),
-                _norm(ana.getFitFractionMatrix(cpl, sample="truth").numpy()))
+        return (_norm(fit_fraction_matrix(ana, cpl, sample="phsp").numpy()),
+                _norm(fit_fraction_matrix(ana, cpl, sample="truth").numpy()))
 
     Jr, Jg = [], []
     for gidx in free:
@@ -79,7 +80,7 @@ def test_error_matrices_match_independent_fd(make_analysis):
     ana = make_analysis("eff2", reuse=False)
     p = _params(ana)
     H, free = _full_hessian(ana)
-    err_rec, err_gen = ana.getFitFractionMatrixErrors(p, H)
+    err_rec, err_gen = matrix_errors(ana, p, H)
     assert err_rec.shape == err_gen.shape == (ana.getNVector(), ana.getNVector())
 
     cov = np.linalg.inv(H.detach().cpu().numpy()[np.ix_(free, free)])
@@ -94,8 +95,8 @@ def test_error_scales_with_covariance(make_analysis):
     ana = make_analysis("eff2", reuse=False)
     p = _params(ana)
     H, _ = _full_hessian(ana)
-    e1, _ = ana.getFitFractionMatrixErrors(p, H)
-    e4, _ = ana.getFitFractionMatrixErrors(p, 4.0 * H)
+    e1, _ = matrix_errors(ana, p, H)
+    e4, _ = matrix_errors(ana, p, 4.0 * H)
     m = e1.numpy() > 1e-10
     assert m.sum() > 0
     np.testing.assert_allclose(e4.numpy()[m] / e1.numpy()[m], 0.5, rtol=1e-6)
@@ -120,7 +121,7 @@ def test_errors_written_to_root(tmp_path, make_analysis):
         Er, Eg = mat(f, "interference_rec_err"), mat(f, "interference_gen_err")
         Vr, Vg = mat(f, "interference_rec"), mat(f, "interference_gen")
 
-    api_r, api_g = ana.getFitFractionMatrixErrors(p, H)
+    api_r, api_g = matrix_errors(ana, p, H)
     # FD 依赖原子累加顺序（CPU 后端并行规约），两次调用差 ~1e-10 相对；给 1e-6
     np.testing.assert_allclose(Er, api_r.numpy(), rtol=1e-6, atol=1e-12)
     np.testing.assert_allclose(Eg, api_g.numpy(), rtol=1e-6, atol=1e-12)
@@ -135,7 +136,7 @@ def test_non_pd_hessian_returns_empty(make_analysis, capsys):
     p = _params(ana)
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
     H = -torch.eye(2 * n + nθ, dtype=torch.float64, device=DEV)   # 明显非正定
-    err_rec, err_gen = ana.getFitFractionMatrixErrors(p, H)
+    err_rec, err_gen = matrix_errors(ana, p, H)
     assert err_rec.numel() == 0 and err_gen.numel() == 0
 
 
@@ -150,11 +151,11 @@ def test_errors_do_not_leave_theta_perturbed(make_analysis):
     H, _ = _full_hessian(ana, seed=5)
     n = ana.getNVector()
 
-    before = ana.getFitFractionMatrix(
-        torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), sample="truth").clone()
-    ana.getFitFractionMatrixErrors(p, H)
-    after = ana.getFitFractionMatrix(
-        torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), sample="truth")
+    before = fit_fraction_matrix(
+        ana, torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), "truth").clone()
+    matrix_errors(ana, p, H)
+    after = fit_fraction_matrix(
+        ana, torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), "truth")
 
     assert torch.allclose(before, after, rtol=1e-12, atol=1e-9), (
         (before - after).abs().max().item())

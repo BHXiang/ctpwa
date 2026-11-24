@@ -12,7 +12,7 @@ import uproot
 
 import ctpwa
 
-from conftest import make_params
+from conftest import make_params, fit_fraction_matrix, matrix_errors
 
 
 def _read_matrix(root_file, name="interference_rec"):
@@ -96,8 +96,8 @@ def test_write_result_interference_rec_gen(make_analysis, tmp_path):
     assert total(G) == pytest.approx(1.0, rel=1e-12, abs=1e-12)
 
     # 与矩阵 API 一致：M / W
-    P_api = ana.getFitFractionMatrix(cpl, sample="phsp").cpu().numpy()
-    T_api = ana.getFitFractionMatrix(cpl, sample="truth").cpu().numpy()
+    P_api = fit_fraction_matrix(ana, cpl, sample="phsp").cpu().numpy()
+    T_api = fit_fraction_matrix(ana, cpl, sample="truth").cpu().numpy()
     np.testing.assert_allclose(R, P_api / total(P_api), rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(G, T_api / total(T_api), rtol=1e-10, atol=1e-12)
 
