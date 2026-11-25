@@ -6482,12 +6482,10 @@ private:
         std::cout << "Constraints: " << config_parser_.getConstraints().size()
             << std::endl;
 
-        // 捕获主 GPU（torch 当前设备）。d_phsp_matrix_ 等跨 GPU 缓冲分配在此设备，
-        // 后续所有 params 张量必须位于该设备（getNLL/getHessian 入口有 TORCH_CHECK）
-        cudaGetDevice(&primary_dev_);
-        // 立即把 raw device 拉回主设备：前一个 analysis 的任意多 GPU 循环可能把
-        // raw 停在其它卡（第二次构造时尤其危险——耦合表/各类 buffer 会传错卡，
-        // 引发"一个 GPU 访问另一个 GPU"的非法访问，FF/hessian 多卡实测均踩过）
+        // 主设备统一固定为 cuda:0。d_phsp_matrix_、耦合表和统一参数向量都
+        // 先放在主卡，再显式复制到其他卡；不能继承前一个多卡调用残留的
+        // current device=1，否则后续 make_params(cuda:0) 与主卡定义冲突。
+        primary_dev_ = 0;
         cudaSetDevice(primary_dev_);
         params_.setPrimaryDevice(primary_dev_);
 

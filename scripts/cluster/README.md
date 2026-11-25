@@ -5,7 +5,7 @@ probe 脚本均按"自身所在目录"定位（job 脚本内 `HERE=` 解析）�
 
 | 文件 | 用途 |
 |---|---|
-| `job_validate_all.sh` | 统一验证作业：全量 pytest + 三档（auto/float/double）数值一致性 + mem_probe 显存 + perf_probe 性能 + 多卡 NLL/梯度及派生量一致性 + 可选真实分析 CONFIG 单步 NLL。SLURM 双卡（v100:2） |
+| `job_validate_all.sh` | 统一验证作业：先重编 `_cuda.so`（避免 git pull 后跑旧库），再跑全量 pytest + 三档数值一致性 + mem_probe 显存 + perf_probe 性能 + 多卡 NLL/梯度及派生量一致性 + 可选真实分析 CONFIG 单步 NLL。SLURM 双卡（v100:2） |
 | `multigpu_parity.py` | 多卡一致性断言：子进程 `CUDA_VISIBLE_DEVICES=0` 取单卡参考，与 N 卡结果的 NLL/全梯度逐项比（超差 exit 1）。单卡机器自动跳过，`MGP_FORCE=1` 可强制自检脚本本身 |
 | `multigpu_results.py` | 1 卡 vs N 卡的加权 rec/gen 矩阵、误差、N/W、streaming Gram、单事件 truth 及内部 Hessian 对照；同时检查 `reCalcAmp` 设备恢复和故障后的 NLL。超差 exit 1，`MGR_FORCE=1` 可做 1卡/1卡自检 |
 | `mem_probe.py` | 分阶段显存探针（config 解析/积分/A/hessian），物理卡 nvidia-smi 交叉核对 |
