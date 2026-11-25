@@ -4,7 +4,8 @@
 multigpu_parity.py 只覆盖 NLL/梯度；本脚本覆盖 writeResult 的派生量：
   * eff2_weighted      非均匀 phsp/phsp_truth 权重，rec/gen + err + N/W；
   * free_phsp_weighted 流式 double Gram 的加权 rec + err + N/W；
-  * small_truth        单事件 truth + CTPWA_TRUTH_BATCH=1，强制 n_batch<n_gpus。
+  * small_truth        单事件 truth + CTPWA_TRUTH_BATCH=1，强制 n_batch<n_gpus；
+  * auto_hessian       不传 H，覆盖 writeResult 内部 getHessian 的多卡路径。
 
 用法（集群 GPU 节点，仓库根目录）：
   python3 scripts/cluster/multigpu_results.py
@@ -24,7 +25,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = ROOT / "tests"
 sys.path.insert(0, str(TESTS))
-DEFAULT_SCENARIOS = ["eff2_weighted", "free_phsp_weighted", "small_truth"]
+DEFAULT_SCENARIOS = ["eff2_weighted", "free_phsp_weighted", "small_truth", "auto_hessian"]
 
 
 def _make_config(scenario, directory):
@@ -103,7 +104,10 @@ def _evaluate(scenario):
             result["ff"] = ff.detach().cpu().tolist()
         else:
             root = Path(td) / "result.root"
-            ana.writeResult(p, str(root), 0, [], H)
+            if scenario == "auto_hessian":
+                ana.writeResult(p, str(root), 0)
+            else:
+                ana.writeResult(p, str(root), 0, [], H)
             result.update(_root_result(root))
         if ntheta:
             theta = ana.getFreeResParams()[0].double().to(dev)

@@ -222,6 +222,9 @@ static void bind_ctpwa(pybind11::module_& m)
              "需要 VSPACE 必须在此处传 1。")
         .def("getNLL", &analysis::getNLL, pybind11::arg("params"),
              "Compute NLL. params: [real(v), imag(v), theta] float64")
+        .def("release", &analysis::release,
+             "释放本对象持有的全部设备资源并标记为不可用；析构时自动调用。"
+             "长进程反复构造 analysis 时无需依赖进程退出回收显存。")
         .def("setFitMode", &analysis::setFitMode, pybind11::arg("mode"),
              "Set fit mode: 0=FREEPARAMS (chain×step, default), 1=VSPACE (direct amplitudes). "
              "注意：构造后调用改不了参数化（仅改 getNVector/getParamNames 语义），"

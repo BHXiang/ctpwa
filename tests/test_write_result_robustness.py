@@ -75,6 +75,13 @@ def test_empty_truth_writes_rec_and_skips_gen(tmp_path):
     assert float(meta["N_gen"][0]) == 0.0 and float(meta["W_gen"][0]) == 0.0
     assert torch.isfinite(ana.getNLL(p))
 
+    # 空 truth 对份额/效率也必须与"缺 phsp_truth"一致返回空，而不是 FF=0。
+    n = ana.getNVector()
+    cdt = torch.float32 if int(ctpwa.build_info()["complex_bytes"]) == 8 else torch.float64
+    cpl = torch.complex(p[:n].to(cdt), p[n:2 * n].to(cdt)).contiguous().to(DEV)
+    assert tuple(ana.getFitFractions(cpl).shape) == (0, 2)
+    assert tuple(ana.getEfficiency(cpl).shape) == (0, 2)
+
 
 @pytest.mark.skipif(ctpwa.backend() != "cuda" or torch.cuda.device_count() < 2,
                     reason="需要至少两张 CUDA GPU")
@@ -111,3 +118,48 @@ def test_recalc_amp_restores_primary_device(make_analysis):
         assert torch.cuda.current_device() == 0
     finally:
         ana.reCalcAmp(theta)
+
+
+def test_empty_phsp_skips_rec_errors(tmp_path):
+    """空 phsp：没有 rec 矩阵，就不该写 rec_err；gen 侧仍可正常写。"""
+    empty = tmp_path / "empty_phsp.dat"
+    empty.write_text("")
+    src = (CONFIGS_DIR / "eff2.yml").read_text().replace(
+        '  phsp: [dat, "./data/test_phsp.dat"]',
+        f'  phsp: [dat, "{empty}"]')
+    cfg = tmp_path / "empty_phsp.yml"
+    cfg.write_text(src)
+    ana = ctpwa.analysis(str(cfg))
+    p = make_params(ana, DEV)
+    H = torch.eye(p.numel(), dtype=torch.float64, device=DEV) * 100.0
+    out = tmp_path / "empty_phsp.root"
+    ana.writeResult(p, str(out), 0, [], H)
+
+    with uproot.open(out) as f:
+        keys = {k.split(";")[0] for k in f.keys()}
+    assert "interference_rec" not in keys
+    assert "interference_rec_err" not in keys
+    assert "interference_gen" in keys
+    assert "interference_gen_err" in keys
+
+
+def test_release_is_idempotent_and_marks_invalid(make_analysis):
+    ana = make_analysis("eff2", reuse=False)
+    ana.release()
+    assert not ana.isValid()
+    ana.release()  # 重复释放也必须安全，析构时还会再走一次
+
+
+@pytest.mark.skipif(ctpwa.backend() != "cuda" or torch.cuda.device_count() < 2,
+                    reason="需要至少两张 CUDA GPU")
+def test_sequential_analyses_restore_primary_device(make_analysis):
+    """析构不能把 current device 留在 1，害下一个对象选错主卡。"""
+    import gc
+    torch.cuda.set_device(0)
+    for _ in range(3):
+        ana = make_analysis("eff2", reuse=False)
+        p = make_params(ana, DEV)
+        assert torch.isfinite(ana.getNLL(p))
+        del ana
+        gc.collect()
+        assert torch.cuda.current_device() == 0

@@ -1584,14 +1584,60 @@ public:
         initialized_ = true;
     }
 
-    // 析构函数，用于释放 CUDA 内存
-    ~analysis()
+    // 正常运行中显式释放本对象持有的设备资源；析构时也会调用。
+    // 进程退出 GC 阶段 CUDA 上下文可能已销毁，此时只清空 host 簿记，
+    // 让驱动在上下文销毁时统一回收，避免旧实现析构段错误（rc=139）。
+    void release()
     {
-        // 同 AmpCalc::~AmpCalc：不在析构里释放 GPU 内存——pybind11 对象
-        // 在进程退出 GC 阶段析构时 torch 已销毁 CUDA 上下文，裸 cudaFree
-        // 会段错误（实测 rc=139）。CUDA 上下文销毁自动回收显存。
+        int saved_dev = 0;
+        if (cudaGetDevice(&saved_dev) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
+            (void)cudaGetLastError();
+            d_all_amplitudes_.clear();
+            initialized_ = false;
+            return;
+        }
+
+        for (size_t g = 0; g < d_all_amplitudes_.size(); ++g) {
+            cudaSetDevice(static_cast<int>(g));
+            if (d_all_amplitudes_[g]) {
+                cudaFree(d_all_amplitudes_[g]);
+                d_all_amplitudes_[g] = nullptr;
+            }
+        }
         d_all_amplitudes_.clear();
+
+        cudaSetDevice(primary_dev_);
+        if (d_phsp_matrix_) {
+            cudaFree(d_phsp_matrix_);
+            d_phsp_matrix_ = nullptr;
+        }
+        if (d_phsp_matrix_double_) {
+            cudaFree(d_phsp_matrix_double_);
+            d_phsp_matrix_double_ = nullptr;
+        }
+        auto free_weights = [](std::vector<double*>& weights) {
+            for (size_t g = 0; g < weights.size(); ++g) {
+                cudaSetDevice(static_cast<int>(g));
+                if (weights[g]) cudaFree(weights[g]);
+            }
+            weights.clear();
+        };
+        free_weights(data_weights_);
+        free_weights(phsp_weights_);
+        free_weights(bkg_weights_);
+
+        // 这些表也按 primary_dev_ 分配，先切到主卡再释放。
+        params_.freeCouplingData();
+        // 释放各 ResBlock、d_dF/static/JIT、slot 及 cas_list_ 的持久化资源。
+        // AmpCalc::release 内部会保存并恢复 current device。
+        amp_calc_.release();
+        initialized_ = false;
+        // 析构/释放不能成为新的 current-device 污染源：恢复进入前的设备。
+        cudaSetDevice(saved_dev);
     }
+
+    // 析构函数，用于释放 CUDA 内存
+    ~analysis() { release(); }
 
     bool isValid() const { return initialized_; }
 
@@ -1795,6 +1841,12 @@ public:
         double h_phsp_integral = 0.0;
         double* h_total_results = new double[N_phsp];
         double* h_partial_results = new double[N_phsp * npartials];
+        // 中途抛异常（Hessian 维度/ROOT 写入失败等）时也不能漏掉这两块 host
+        // 缓冲：大样本下 N_phsp×npartials×8B 可达 GB 级。
+        auto h_guard = makeScopeExit([&]() {
+            delete[] h_total_results;
+            delete[] h_partial_results;
+        });
         int ev_cumulative = 0;  // 多GPU累加偏移
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             cudaSetDevice(gpu);
@@ -2035,7 +2087,10 @@ public:
                 dataIntegral -= N_bkg;
             }
         }
-        double normFactor = static_cast<double>(dataIntegral) / h_phsp_integral;
+        // 空 phsp（N_phsp=0）时 h_phsp_integral=0；inf 会把所有 plot 直方图
+        // scale 成 inf。没有 phsp 就没有可画的拟合分布，保持 1.0 即可。
+        double normFactor = (h_phsp_integral > 0.0)
+            ? static_cast<double>(dataIntegral) / h_phsp_integral : 1.0;
 
         TFile* rootFile = new TFile(filename.c_str(), "RECREATE");
         // 中途抛异常（Hessian 形状/维度、积分扫描失败等）时也必须关闭 ROOT
@@ -3148,7 +3203,8 @@ public:
         {
             auto t0 = std::chrono::high_resolution_clock::now();
             auto errs = computeMatrixErrors(params, hessian_in);
-            if (errs.size() == 2 && errs[0].numel() > 0) {
+            bool wrote_err = false;
+            if (errs.size() == 2) {
                 auto writeTensor = [&](const char* name, const torch::Tensor& E) {
                     rootFile->cd();
                     TMatrixD m(npartials, npartials);
@@ -3157,15 +3213,24 @@ public:
                             m[i][j] = E[i][j].item<double>();
                     m.Write(name);
                 };
-                writeTensor("interference_rec_err", errs[0]);
-                if (errs[1].numel() > 0)
+                // rec/gen 独立写：空 phsp 时 rec_err 为空但 gen_err 仍有效。
+                if (errs[0].numel() > 0) {
+                    writeTensor("interference_rec_err", errs[0]);
+                    wrote_err = true;
+                }
+                if (errs[1].numel() > 0) {
                     writeTensor("interference_gen_err", errs[1]);
+                    wrote_err = true;
+                }
+            }
+            if (wrote_err) {
                 auto t1 = std::chrono::high_resolution_clock::now();
                 if (std::getenv("CTPWA_VERBOSE"))
                     std::printf("参数误差矩阵: %.1f ms\n",
                         std::chrono::duration<double, std::milli>(t1 - t0).count());
             } else {
-                std::cerr << "参数误差矩阵未写出（Hessian 非正定或缺失）" << std::endl;
+                std::cerr << "参数误差矩阵未写出（Hessian 非正定/缺失，或对应样本为空）"
+                          << std::endl;
             }
         }
 
@@ -3212,10 +3277,7 @@ public:
             }
         }
         cudaSetDevice(target_dev);
-        delete[] h_total_results;
-        // 旧代码把这行注释掉了：每次 writeResult 泄漏 N_phsp×npartials×8B
-        //（15M 事例 × 20 分波 ≈ 2.4 GB），大样本连续写文件会 OOM。
-        delete[] h_partial_results;
+        // h_total_results / h_partial_results 由 h_guard 统一释放（含异常路径）。
     }
 
     // =====================================================================
@@ -3297,19 +3359,24 @@ public:
         double* h_total = new double[N_phsp];
         double* h_partial = new double[(size_t)N_phsp * npartials];
         double* h_interf = new double[(size_t)N_phsp * npairs];
-        int* d_pair_list = nullptr;
-        cudaMalloc(&d_pair_list, npairs * sizeof(int));
-        cudaMemcpy(d_pair_list, pair_list.data(), npairs * sizeof(int),
-            cudaMemcpyHostToDevice);
+        auto h_guard = makeScopeExit([&]() {
+            delete[] h_total;
+            delete[] h_partial;
+            delete[] h_interf;
+        });
 
         int ev_cum = 0;
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             int ne = events_[gpu][0];
             if (ne == 0) continue;
             cudaSetDevice(gpu);
-            // 每 GPU 自己的归约缓冲：跨设备指针传给 computeResults 会非法访问。
+            // 每 GPU 自己的归约/索引缓冲：跨设备指针传给 computeResults 会非法访问。
             double* d_total_integral = nullptr;
             cudaMalloc(&d_total_integral, sizeof(double));
+            int* d_pair_list = nullptr;
+            cudaMalloc(&d_pair_list, npairs * sizeof(int));
+            cudaMemcpy(d_pair_list, pair_list.data(), npairs * sizeof(int),
+                cudaMemcpyHostToDevice);
             int* d_nsl = nullptr;
             cudaMalloc(&d_nsl, npartials * sizeof(int));
             cudaMemcpy(d_nsl, nSLvectors_.data(), npartials * sizeof(int),
@@ -3430,11 +3497,11 @@ public:
             ev_cum += ne;
             cudaFree(d_nsl);
             cudaFree(d_total_integral);
+            cudaFree(d_pair_list);
             if (d_total) cudaFree(d_total);
             if (d_partial) cudaFree(d_partial);
             if (d_intf) cudaFree(d_intf);
         }
-        cudaFree(d_pair_list);
         cudaSetDevice(dev.index());
 
         double h_phsp_integral = 0.0;
@@ -3504,9 +3571,7 @@ public:
         rootFile->Close();
         delete rootFile;
         rootFile = nullptr;
-        delete[] h_total;
-        delete[] h_partial;
-        delete[] h_interf;
+        // h_* 由 h_guard 统一释放（含异常路径）。
         std::cout << "writeInterfResult: " << filename
                   << " (pairs=" << npairs << ", events=" << N_phsp << ")" << std::endl;
         return;
@@ -3682,6 +3747,9 @@ public:
                 cublasDaxpy(h, hess_sz, &one, d_hess_buf, 1, d_hessian, 1);
                 cublasDestroy(h);
                 cudaFree(d_hess_buf);
+                // d_hess_gpu 在副卡分配；P2P 后当前设备是主卡，
+                // 必须先切回其所属设备再释放。
+                cudaSetDevice(gpu);
             }
             cudaFree(d_hess_gpu);
         }
@@ -4217,7 +4285,10 @@ public:
                     cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
                     int grid = (2 * na + 255) / 256;
                     CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, 1.0, 2 * na);
-                    cudaFree(d_tmp); cudaFree(d_g_gpu);
+                    cudaFree(d_tmp);
+                    // d_g_gpu 在副卡分配，切回所属设备后释放。
+                    cudaSetDevice(gpu);
+                    cudaFree(d_g_gpu);
                 }
 
                 // --- Bkg gradient: contribution to loss = data_nll - bkg_nll ---
@@ -4273,7 +4344,10 @@ public:
                     // Σ g_v·∂²v 的 bkg 贡献加反（J/psi→ωηη' 69 振幅案例）。
                     const double bkg_axpy = (d_neg_w != nullptr) ? 1.0 : -1.0;
                     CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, bkg_axpy, 2 * na);
-                    cudaFree(d_tmp); cudaFree(d_g_gpu);
+                    cudaFree(d_tmp);
+                    // d_g_gpu 在副卡分配，切回所属设备后释放。
+                    cudaSetDevice(gpu);
+                    cudaFree(d_g_gpu);
                 }
 
                 // --- Phsp gradient: g_phsp = N_eff / phsp_factor * (M × v) ---
@@ -4465,6 +4539,14 @@ public:
                             "computeTruthIntegrals: cudaMalloc(d_sq) 失败");
                 cudaMemset(d_sq, 0, npartials * sizeof(double));
             }
+            // computeBranchingFractions 可能抛异常；每卡的临时归约缓冲必须释放。
+            auto tmp_guard = makeScopeExit([&]() {
+                if (d_sq) cudaFree(d_sq);
+                cudaFree(d_p);
+                cudaFree(d_s);
+                cudaFree(d_t);
+                cudaFree(d_nsl);
+            });
 
             auto vg = extended_vector.to(ctpwa_dev(gpu));
             // float 模式: 该批振幅缓冲为 float2 → 上转 double 段后再进双精度
@@ -4501,9 +4583,8 @@ public:
                 std::vector<double> hsq(npartials);
                 cudaMemcpy(hsq.data(), d_sq, npartials * sizeof(double), cudaMemcpyDeviceToHost);
                 for (int i = 0; i < npartials; ++i) out_square[i] += hsq[i];
-                cudaFree(d_sq);
             }
-            cudaFree(d_p); cudaFree(d_s); cudaFree(d_t); cudaFree(d_nsl);
+            // 临时缓冲由 tmp_guard 在本次 GPU 迭代结束时释放（含异常路径）。
         }
         // 多 GPU 循环后恢复主设备（FF/EFF/writeResult 等随后会做 torch/耦合运算）
         cudaSetDevice(primary_dev_);
@@ -4654,6 +4735,27 @@ public:
         std::vector<ctComplex*> ws_matrix(n_gpus_, nullptr);
         std::vector<ctComplex*> ws_upcast(n_gpus_, nullptr);
         std::vector<double*> ws_weights(n_gpus_, nullptr);   // 仅加权时分配
+        // 分配到一半失败（OOM）时也要释放已分配的部分；正常路径在末尾置空。
+        auto ws_guard = makeScopeExit([&]() {
+            for (int g = 0; g < n_gpus_; ++g) {
+                cudaSetDevice(g);
+                if (ws_complex[g]) cudaFree(ws_complex[g]);
+                if (ws_matrix[g])  cudaFree(ws_matrix[g]);
+                if (ws_upcast[g])  cudaFree(ws_upcast[g]);
+                if (ws_weights[g]) cudaFree(ws_weights[g]);
+            }
+            cudaSetDevice(primary_dev_);
+        });
+        // 当前批的 A 表；异常（kernel 报错等）时也要释放。
+        std::vector<ctComplex*> d_batch_amps;
+        auto batch_guard = makeScopeExit([&]() {
+            for (size_t g = 0; g < d_batch_amps.size(); ++g)
+                if (d_batch_amps[g]) {
+                    cudaSetDevice((int)g);
+                    cudaFree(d_batch_amps[g]);
+                }
+            cudaSetDevice(primary_dev_);
+        });
         for (int g = 0; g < n_gpus_; ++g) {
             cudaSetDevice(g);
             TORCH_CHECK(cudaMalloc(&ws_complex[g], ws_cplx * sizeof(ctComplex)) == cudaSuccess,
@@ -4720,7 +4822,7 @@ public:
             }
 
             events_offsets_ = t_ev_off; amp_offsets_ = t_amp_off;
-            std::vector<ctComplex*> d_batch_amps = calculateAmplitudes(
+            d_batch_amps = calculateAmplitudes(
                 Vp4_tpg, nullptr, active_gpus, d_theta);
             memprobe("after-amps", start);
 
@@ -4747,15 +4849,16 @@ public:
             // Free batch amplitudes
             for (size_t g = 0; g < d_batch_amps.size(); ++g)
                 if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
+            d_batch_amps.clear();
             memprobe("after-amp-free", start);
         }
         // 统一释放 workspace（单次分配 → 单次释放，不再有上千次 alloc/free）
         for (int g = 0; g < n_gpus_; ++g) {
             cudaSetDevice(g);
-            if (ws_complex[g]) cudaFree(ws_complex[g]);
-            if (ws_matrix[g])  cudaFree(ws_matrix[g]);
-            if (ws_upcast[g])  cudaFree(ws_upcast[g]);
-            if (ws_weights[g]) cudaFree(ws_weights[g]);
+            if (ws_complex[g]) { cudaFree(ws_complex[g]); ws_complex[g] = nullptr; }
+            if (ws_matrix[g])  { cudaFree(ws_matrix[g]);  ws_matrix[g] = nullptr; }
+            if (ws_upcast[g])  { cudaFree(ws_upcast[g]);  ws_upcast[g] = nullptr; }
+            if (ws_weights[g]) { cudaFree(ws_weights[g]); ws_weights[g] = nullptr; }
         }
         memprobe("exit(after ws free)", -1);
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
@@ -4926,7 +5029,12 @@ public:
         // FF_i = truth_partial[i] / Σ_j truth_partial[j]
         double truth_total = 0.0;
         for (int i = 0; i < npartials; ++i) truth_total += truth_c_partial[i];
-        if (truth_total <= 0.0) truth_total = 1e-30;
+        if (!(truth_total > 0.0) || !std::isfinite(truth_total)) {
+            // phsp_truth 文件为空（或振幅退化）时，truth 积分全 0。
+            // 与"缺 phsp_truth"一致返回空，不能把 0/0 伪装成 FF=0。
+            return torch::empty({0, 2},
+                torch::TensorOptions().dtype(torch::kFloat64));
+        }
 
         std::vector<double> ff_center(npartials);
         for (int i = 0; i < npartials; ++i)
@@ -5177,6 +5285,8 @@ public:
         auto restoreTheta = [&]() { theta_cur_ = theta_saved; };
         // 异常路径也必须还原 θ：runMatrices/逐方向扫描会改 theta_cur_。
         auto theta_guard = makeScopeExit([&]() { theta_cur_ = theta_saved; });
+        // 读 B̄ 权重时按 GPU 循环会把 current device 留在最后一张卡。
+        auto dev_guard = makeScopeExit([&]() { cudaSetDevice(primary_dev_); });
 
         // ---- 统一 Hessian → Cov（耦合自由方向的边际协方差）----
         torch::Tensor H = hessian_in;
@@ -5341,6 +5451,8 @@ public:
                 }
             }
         }
+        // 空 phsp / 权重和为 0：没有重建侧矩阵，也就不该写 rec_err。
+        const bool has_rec = W_total_rec > 0.0;
         auto contractRec = [&](const torch::Tensor& vec, std::vector<double>& Mout,
                                double& Wsum) {
             auto vc = vec.detach().to(torch::kCPU).contiguous();
@@ -5378,14 +5490,21 @@ public:
         double Wp = 0.0, Wm = 0.0;
         for (int d = 0; d < nd; ++d) {
             const size_t f = (size_t)(&dir_idx[d] - &dir_idx[0]);
-            // rec：B̄ 收缩
-            contractRec(ev_p[d], Mp, Wp);
-            contractRec(ev_m[d], Mm, Wm);
+            // rec：B̄ 收缩（空 phsp 没有重建侧矩阵，跳过）
+            if (has_rec) {
+                contractRec(ev_p[d], Mp, Wp);
+                contractRec(ev_m[d], Mm, Wm);
+            }
             for (int i = 0; i < np; ++i)
                 for (int j = 0; j < np; ++j) {
                     const size_t o = (f * np + i) * np + j;
-                    Jrec[o] = (Mp[(size_t)i * np + j] / Wp - Mm[(size_t)i * np + j] / Wm)
-                              / (2.0 * eps_d[d]);
+                    if (has_rec) {
+                        const double wp = (Wp > 0.0) ? Wp : 1e-30;
+                        const double wm = (Wm > 0.0) ? Wm : 1e-30;
+                        Jrec[o] = (Mp[(size_t)i * np + j] / wp
+                                   - Mm[(size_t)i * np + j] / wm)
+                                  / (2.0 * eps_d[d]);
+                    }
                     if (has_gen) {
                         const double cp = C_off[(size_t)i * np + j];
                         const double cm = C_off[(size_t)i * np + j];
@@ -5431,7 +5550,8 @@ public:
                 }
         };
         torch::Tensor err_rec, err_gen;
-        sigma(Jrec, err_rec);
+        if (has_rec) sigma(Jrec, err_rec);
+        else err_rec = torch::empty({0, 0}, opts2d);
         if (has_gen) sigma(Jgen, err_gen);
         else err_gen = torch::empty({0, 0}, opts2d);
         restoreTheta();
@@ -5870,6 +5990,9 @@ public:
                 }
                 cublasDestroy(h);
             }
+            // 多卡循环会把 current device 留在最后一张卡；调用方（reCalcAmp/
+            // writeResult/getHessian）随后用 torch 默认 device 建张量，必须回来。
+            cudaSetDevice(primary_dev_);
     }
 
     void reCalcAmp(torch::Tensor params)

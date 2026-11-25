@@ -76,7 +76,9 @@ def main():
     ap.add_argument("--configs", nargs="+", default=DEFAULT_CONFIGS)
     ap.add_argument("--child", metavar="CFG", help=argparse.SUPPRESS)
     ap.add_argument("--nll-rtol", type=float, default=1e-9)
-    ap.add_argument("--grad-rtol", type=float, default=1e-8)
+    # 多卡梯度用 atomic/跨卡规约，顺序不同会带来 ~1e-8 相对噪声；
+    # V100 实测可达 5.4e-8，1e-8 会把正常结果误判为失败。
+    ap.add_argument("--grad-rtol", type=float, default=1e-7)
     args = ap.parse_args()
 
     if args.child:

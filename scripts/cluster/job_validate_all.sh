@@ -29,7 +29,8 @@ HERE="$CTPWA_ROOT/scripts/cluster"
 
 cd "$CTPWA_ROOT/tests"
 echo "=== 开始: $(date) ==="
-echo "--- .so: $(ls -l --time-style=+%F\ %T $CTPWA_ROOT/ctpwa.so | awk '{print $6, $7}')"
+echo "--- package _cuda.so: $(ls -l --time-style=+%F\ %T $CTPWA_ROOT/ctpwa/_cuda.so | awk '{print $6, $7}')"
+$PY -c 'import ctpwa; print("--- loaded backend:", ctpwa.__file__, ctpwa.build_info())'
 nvidia-smi --query-gpu=index,name --format=csv
 
 echo; echo "===== 1) 全量 pytest ====="
@@ -87,7 +88,7 @@ fi
 
 # NLL/梯度一致并不能发现派生量错误：加权 Gram、truth 分批、空 GPU 分片、
 # writeResult 的 N/W/矩阵/误差都要单独做 1卡 vs N卡断言。
-echo; echo "===== 5.5) 多卡派生量（加权 rec/gen + err、streaming、n_batch<n_gpus）====="
+echo; echo "===== 5.5) 多卡派生量（加权 rec/gen + err、streaming、n_batch<n_gpus、内部 Hessian）====="
 $PY "$HERE/multigpu_results.py" 2>&1
 MGR_RC=$?
 if [ $MGR_RC -ne 0 ]; then
@@ -95,5 +96,10 @@ if [ $MGR_RC -ne 0 ]; then
   exit $MGR_RC
 fi
 echo "多卡派生量一致性 ✓"
+
+# 两段都跑完后仍要保留 MGP 的失败状态，不能被派生量通过所掩盖。
+if [ $MGP_RC -ne 0 ]; then
+  exit $MGP_RC
+fi
 
 echo "=== 结束: $(date) ==="
