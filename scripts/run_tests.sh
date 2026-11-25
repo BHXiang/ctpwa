@@ -22,7 +22,7 @@ echo "=========================================="
 
 if $BUILD; then
     echo "[1/3] 编译..."
-    MAX_JOBS=4 python3 setup.py build_ext --inplace 2>&1 | tail -3
+    CTPWA_GLIBCXX_ASSERTIONS=1 MAX_JOBS=4 python3 setup.py build_ext --inplace 2>&1 | tail -3
 else
     echo "[1/3] 跳过编译 (--no-build)"
 fi

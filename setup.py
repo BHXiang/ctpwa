@@ -18,6 +18,13 @@ class ForceBuildExtension(BuildExtension):
 
 
 # 获取当前 CUDA 环境支持的 SM 架构，生成 gencode 编译选项
+# 测试构建打开 libstdc++ 的边界断言：std::vector::operator[] 越界会直接 abort，
+# 而不是静默读相邻内存（v0.3.25 那个 B̄ 越界就是这么漏过去的）。
+# 发布构建默认关闭，避免额外开销。
+_GLIBCXX_ASSERT = os.environ.get("CTPWA_GLIBCXX_ASSERTIONS", "0") == "1"
+_GLIBCXX_ASSERT_FLAGS = ["-D_GLIBCXX_ASSERTIONS"] if _GLIBCXX_ASSERT else []
+
+
 def get_cuda_gencode_flags():
     """检测当前 nvcc 支持的 SM 架构，只对存在的架构生成 -gencode 选项"""
     # 期望支持的目标架构（主版本号对应 compute capability）
@@ -242,6 +249,7 @@ def make_cuda_extension():
         extra_compile_args={
             "cxx": [
                 "-fPIC", "-std=c++17",
+                *_GLIBCXX_ASSERT_FLAGS,
                 "-D_GLIBCXX_USE_CXX11_ABI=1",
                 "-DCTPWA_BACKEND_CUDA",
                 "-DCTPWA_MODULE_CUDA",
@@ -298,6 +306,7 @@ def make_cpu_extension():
         ],
         extra_compile_args=[
             "-fPIC", "-std=c++17", "-O3", "-fopenmp",
+            *_GLIBCXX_ASSERT_FLAGS,
             f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}",
             "-DCTPWA_BACKEND_CPU",
             "-DCTPWA_MODULE_CPU",
@@ -327,7 +336,7 @@ except Exception:
 
 setup(
     name="ctpwa",
-    version="0.3.25",
+    version="0.3.26",
     author="Benhou Xiang",
     description="CUDA-Torch Partial Wave Analysis",
     long_description=_long_desc,

@@ -5046,8 +5046,19 @@ public:
             if (scale <= 0.0) scale = 1.0;
             torch::Tensor Ht = torch::from_blob(hcopy.data(), {nf, nf}, opts2d).clone();
             Ht = 0.5 * (Ht + Ht.transpose(0, 1));
-            auto eigs = torch::linalg_eigvalsh(Ht);
-            const double emin = eigs[0].item<double>();
+            // eigvalsh 在病态输入上会直接抛 LinAlgError（实测 ls_filter 类配置
+            // 在随机参数点取 Hessian 时就会）。这里按"判不了 = 非正定"处理，
+            // 让 writeResult 跳过误差矩阵，而不是把整个写文件弄崩。
+            double emin = 0.0;
+            try {
+                auto eigs = torch::linalg_eigvalsh(Ht);
+                emin = eigs[0].item<double>();
+            } catch (const std::exception& e) {
+                std::cerr << "[ctpwa] Hessian 特征分解失败（" << e.what()
+                          << "），按非正定处理：跳过参数误差矩阵" << std::endl;
+                restoreTheta();
+                return { torch::empty({0, 0}, opts2d), torch::empty({0, 0}, opts2d) };
+            }
             if (!(emin > 1e-8 * scale)) {
                 std::cerr << "[ctpwa] getFitFractionMatrixErrors: Hessian 自由块非正定 "
                              "(min eig = " << emin << ")，参数误差不可靠 → 返回空" << std::endl;

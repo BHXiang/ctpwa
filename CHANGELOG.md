@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [v0.3.26] - 2026-11-25
+
+### Fixed
+
+- **`writeResult` 在 Hessian 病态时被 `eigvalsh` 抛异常打断**：`computeMatrixErrors`
+  的正定判据直接调 `torch::linalg_eigvalsh`，病态输入会抛 `LinAlgError`
+  （实测 `ls_filter` 类配置在随机参数点取 Hessian 就能触发）。现在捕获异常，
+  按"非正定"处理并跳过误差矩阵，不让整个写文件崩掉。
+
+### Added
+
+- **测试构建默认打开 `-D_GLIBCXX_ASSERTIONS`**（`scripts/run_tests.sh` 已设置
+  `CTPWA_GLIBCXX_ASSERTIONS=1`）：`std::vector::operator[]` 越界会直接 abort，
+  而不是静默读相邻内存。v0.3.25 那个 `B̄` 越界正是靠"没崩"漏过测试的。
+  发布构建默认关闭（`setup.py` 里由环境变量控制，无额外开销）。
+- 新增回归 `test_error_matrix_with_multi_ls_partials`：多 LS 分波（`ls_filter`，
+  4 LS → 1 行）带 Hessian 写 ROOT 不崩，且误差矩阵维度 = `npartials`。
+
 ## [v0.3.25] - 2026-11-25
 
 ### Fixed
