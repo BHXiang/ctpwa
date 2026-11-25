@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [v0.3.26] - 2026-11-25
+## [v0.3.26] - 2026-11-26
 
 ### Fixed
 
@@ -10,6 +10,20 @@
   的正定判据直接调 `torch::linalg_eigvalsh`，病态输入会抛 `LinAlgError`
   （实测 `ls_filter` 类配置在随机参数点取 Hessian 就能触发）。现在捕获异常，
   按"非正定"处理并跳过误差矩阵，不让整个写文件崩掉。
+- **干涉矩阵和误差矩阵口径**：流式 phsp 的 double Gram 使用与常驻 B̄ 相同的
+  `w/Σw` 归一化，`W_rec` 不再放大样本数倍，非均匀权重下 rec 矩阵不再退化为无权；
+  耦合误差改用完整自由 Hessian 逆的耦合块（θ 边际化），并检查完整自由块正定性；
+  reader 的逐波效率补回 `W_rec/W_gen`。
+- **原生 `CTPWA_COMPLEX=float`**：修正上转缓冲按 8B 分配却按 16B 写入、以及
+  complex64 被当 complex128 读取的越界/错读；矩阵收缩按实际精度转换。
+- **多 GPU 设备与生命周期**：主设备统一为 `cuda:0`；fixed-θ 二次型固定在主卡执行；
+  副卡 Hessian/梯度缓冲在所属设备释放；`analysis` 正常析构时释放振幅、Gram、
+  权重、ResBlock/JIT 和耦合表，并恢复进入前的 current device。修复长进程反复
+  构造 analysis 时显存持续增长和 `primary=1` 错卡。
+- **空样本与异常恢复**：空 `phsp`/`phsp_truth` 只跳过对应矩阵和误差，不再让整个
+  `writeResult` 失败；ROOT 文件、offsets 和 host 缓冲使用 RAII 清理。
+- `cudaMemGetInfo()` 失败时报告真实 CUDA 错误，不再把异步 illegal access
+  误报成"显存只剩 0 MiB"。
 
 ### Added
 
@@ -17,8 +31,10 @@
   `CTPWA_GLIBCXX_ASSERTIONS=1`）：`std::vector::operator[]` 越界会直接 abort，
   而不是静默读相邻内存。v0.3.25 那个 `B̄` 越界正是靠"没崩"漏过测试的。
   发布构建默认关闭（`setup.py` 里由环境变量控制，无额外开销）。
-- 新增回归 `test_error_matrix_with_multi_ls_partials`：多 LS 分波（`ls_filter`，
-  4 LS → 1 行）带 Hessian 写 ROOT 不崩，且误差矩阵维度 = `npartials`。
+- 新增多 LS、流式加权矩阵、空样本、资源释放、原生 float 和多 GPU 回归。
+- 新增 `scripts/cluster/multigpu_results.py`：跨进程比较 1 卡 vs N 卡的加权
+  rec/gen 矩阵、误差、N/W、streaming Gram、小批次 truth 和内部 Hessian。
+- `scripts/run_tests_float.sh` 纳入仓库，作为原生 float 构建门禁。
 
 ## [v0.3.25] - 2026-11-25
 
