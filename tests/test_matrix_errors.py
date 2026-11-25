@@ -9,6 +9,7 @@
 """
 
 import numpy as np
+import pytest
 import torch
 
 import ctpwa
@@ -159,3 +160,28 @@ def test_errors_do_not_leave_theta_perturbed(make_analysis):
 
     assert torch.allclose(before, after, rtol=1e-12, atol=1e-9), (
         (before - after).abs().max().item())
+
+
+def test_error_matrix_with_multi_ls_partials(make_analysis, tmp_path):
+    """回归：分波内的多个 LS 组合（n_amplitudes_ > npartials）时不能越界。
+
+    B̄ 是 n_amplitudes_ × n_amplitudes_，而矩阵是 npartials × npartials；
+    v0.3.24 里按 npartials 取 B̄ → 越界（真实 5 体分析上直接崩）。
+    ls_filter：1 条链、1 个共振态、4 组 LS ⇒ 矩阵 1×1。
+    """
+    uproot = pytest.importorskip("uproot")
+    ana = make_analysis("ls_filter", reuse=False)
+    n, nθ = ana.getNVector(), ana.getNFreeTheta()
+    nsl = [int(x) for x in ana.getSLVectors()]
+    assert sum(nsl) > len(nsl), "该配置应为多 LS 分波（n_amplitudes_ > npartials）"
+
+    p = torch.zeros(2 * n + nθ, dtype=torch.float64, device=DEV)
+    p[0] = 1.0
+    H = torch.eye(2 * n + nθ, dtype=torch.float64, device=DEV) * 1e2
+    out = tmp_path / "ml.root"
+    ana.writeResult(p, str(out), 0, [], H)          # 不能崩
+
+    with uproot.open(out) as f:
+        o = f["interference_rec_err"]
+        nr, nc = int(o.member("fNrows")), int(o.member("fNcols"))
+    assert (nr, nc) == (len(nsl), len(nsl)), (nr, nc, nsl)

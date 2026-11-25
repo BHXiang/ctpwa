@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [v0.3.25] - 2026-11-25
+
+### Fixed
+
+- **`writeResult` 在"分波内含多个 LS 组合"的配置上崩溃**（`std::vector` 越界）。
+  `computeMatrixErrors` 里把常驻 `B̄` 按 `npartials × npartials` 拷贝，但 `B̄` 实际是
+  `n_amplitudes_ × n_amplitudes_`；当 `n_amplitudes_ > npartials`（同一分波有多个
+  L/S，例如 5 体分析 `P2_etap3pi`：`npartials=13`、`n_amplitudes_=20`）时索引越界。
+  改用 `n_amplitudes_` 做 `B̄` 的维度，矩阵维度仍是 `npartials`。
+  回归：`tests/test_matrix_errors.py::test_error_matrix_with_multi_ls_partials`
+  （`ls_filter`：4 个 LS 合成 1 行，误差矩阵必须是 1×1）。
+
 ## [v0.3.24] - 2026-11-24
 
 ### Fixed

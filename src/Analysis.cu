@@ -5106,7 +5106,8 @@ public:
         // 对比旧实现：4·n_free 趟全样本扫描（每趟都读文件、重算振幅）。
         auto p_cpu = params.detach().to(torch::kCPU).contiguous();
         const double* h_p = p_cpu.data_ptr<double>();
-        const int np = npartials;
+        const int np = npartials;          // 分波数（矩阵维度）
+        const int namp = n_amplitudes_;    // 振幅数（B̄ 的维度；多 LS 时 > np）
 
         // 自由耦合方向（与 free_idx 的前段一致；参考方向 Re v0 / Im v0 固定）
         std::vector<int64_t> dir_idx;
@@ -5153,15 +5154,15 @@ public:
         double W_total_rec = 1.0;
         {
             cudaSetDevice(primary_dev_);
-            Br.resize((size_t)np * np);
-            Bi.resize((size_t)np * np);
+            Br.resize((size_t)namp * namp);
+            Bi.resize((size_t)namp * namp);
             if (d_phsp_matrix_double_ != nullptr) {
-                std::vector<cuDoubleComplex> tmp((size_t)np * np);
+                std::vector<cuDoubleComplex> tmp((size_t)namp * namp);
                 cudaMemcpy(tmp.data(), d_phsp_matrix_double_,
                            tmp.size() * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
                 for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = tmp[k].x; Bi[k] = tmp[k].y; }
             } else {
-                std::vector<ctComplex> tmp((size_t)np * np);
+                std::vector<ctComplex> tmp((size_t)namp * namp);
                 cudaMemcpy(tmp.data(), d_phsp_matrix_, tmp.size() * sizeof(ctComplex),
                            cudaMemcpyDeviceToHost);
                 for (size_t k = 0; k < tmp.size(); ++k) { Br[k] = (double)tmp[k].x; Bi[k] = (double)tmp[k].y; }
@@ -5197,7 +5198,7 @@ public:
                     std::complex<double> acc(0.0, 0.0);
                     for (int k = pst[p]; k < pst[p + 1]; ++k)
                         for (int l = pst[q]; l < pst[q + 1]; ++l) {
-                            std::complex<double> b(Br[(size_t)k * np + l], Bi[(size_t)k * np + l]);
+                            std::complex<double> b(Br[(size_t)k * namp + l], Bi[(size_t)k * namp + l]);
                             acc += v[k] * std::conj(v[l]) * std::conj(b);
                         }
                     double val = (p == q ? 1.0 : 2.0) * acc.real() * W_total_rec;
