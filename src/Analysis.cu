@@ -998,6 +998,10 @@ public:
             }
         } else {
             // fixed-θ 常驻: B̄ 构造期预建（forward 不重建）→ matvec（快速路径）
+            // W_total 的逐 GPU 权重归约把 current device 留在最后一张卡。
+            // d_phsp_matrix_ 与 d_P_vec 都在主卡，必须先切回主卡再做二次型；
+            // 否则副卡 kernel 会直接读主卡指针（compute-sanitizer 已定位）。
+            cudaSetDevice(primary_dev);
             ctPhspReal* d_phsp_r, * d_phsp_i;
             cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
             cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
