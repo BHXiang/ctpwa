@@ -16,11 +16,12 @@
 
 from pathlib import Path
 
+import numpy as np
 import torch
 import pytest
 
 import ctpwa
-from conftest import fit_fraction_matrix, matrix_errors
+from conftest import fit_fraction_matrix, matrix_errors, resident_phsp_numpy
 
 DEVICE = torch.device("cpu") if ctpwa.backend() == "cpu" else torch.device("cuda:0")
 
@@ -306,8 +307,8 @@ def test_fit_fraction_matrix_matches_api_and_total(make_analysis):
             W += float(M[i][j])
 
     nsl = ana.getSLVectors().tolist()
-    A = ana.getPhspTensor().reshape(-1, sum(nsl))
-    v = ana.getExtendedVector(cpl).reshape(-1)
+    A = resident_phsp_numpy(ana).reshape(-1, sum(nsl))
+    v = ana.getExtendedVector(cpl).cpu().numpy().astype(np.complex128).reshape(-1)
     S = A * v
     off = [0]
     for k in nsl:

@@ -5742,9 +5742,13 @@ public:
     // 时按 元素偏移 上转 double 再克隆——保持 double .so 的 complex128 契约,
     // 同时不改动双精度路径的任何字节。峰值瞬态 = 该段 float + double, 用完即释放。
     torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el,
-        int64_t nEl) const
+        int64_t nEl, int gpu = 0) const
     {
-        auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(0));
+        int saved_dev = 0;
+        cudaGetDevice(&saved_dev);
+        auto device_guard = makeScopeExit([saved_dev]() { cudaSetDevice(saved_dev); });
+        cudaSetDevice(gpu);
+        auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(gpu));
         if (nEl == 0) return torch::empty({0}, opts);
         if (!float_amps_ || ctIsFloatComplex) {
             return torch::from_blob(base + offset_el, {nEl}, opts).clone();
@@ -5767,13 +5771,21 @@ public:
             (int64_t)events_[0][1] * n_polar_ * n_amplitudes_);
     }
 
-    torch::Tensor getPhspTensor() const
+    int getNDevices() const { return static_cast<int>(d_all_amplitudes_.size()); }
+
+    torch::Tensor getPhspTensor() const { return getPhspTensor(0); }
+
+    // 调试用：读取指定 GPU 的 phsp 振幅。默认无参版本仍只返回 GPU0，
+    // 多卡独立重建必须由调用方遍历 [0,getNDevices()) 后拼接。
+    torch::Tensor getPhspTensor(int gpu) const
     {
         TORCH_CHECK(!phsp_freed_,
             "Constraints.free_phsp_amplitudes=true 模式下 phsp 振幅不驻留（流式），"
             "getPhspTensor 不可用；请关闭该开关，或用 analysis.getNLL（C++ 路径）拟合");
-        return ampSegmentToTensor(d_all_amplitudes_[0], 0,
-            (int64_t)events_[0][0] * n_polar_ * n_amplitudes_);
+        TORCH_CHECK(gpu >= 0 && gpu < static_cast<int>(d_all_amplitudes_.size()),
+            "getPhspTensor: gpu=", gpu, " 超出设备数 ", d_all_amplitudes_.size());
+        return ampSegmentToTensor(d_all_amplitudes_[gpu], 0,
+            (int64_t)events_[gpu][0] * n_polar_ * n_amplitudes_, gpu);
     }
 
     // ---------------------------------------------------------------------

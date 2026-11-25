@@ -35,7 +35,7 @@ from conftest import CONFIGS_DIR, make_params
 
 DEVICE = torch.device("cpu") if ctpwa.backend() == "cpu" else torch.device("cuda:0")
 FD_H = 1e-5
-GRAD_RTOL = 1e-4          # 按 max|g| 归一；GPU FD 噪声 ~3e-6，修复前 ~0.25
+GRAD_RTOL = 2e-4          # V100 双卡 FD+跨卡规约实测 ~1.1e-4；修复前缺项误差 ~0.25
 
 
 @pytest.fixture(scope="module")

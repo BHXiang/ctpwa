@@ -201,6 +201,18 @@ def _read_root_matrices(path):
     return out
 
 
+def resident_phsp_numpy(ana):
+    """返回**所有 GPU** 的 phsp 驻留振幅，供独立矩阵重建使用。
+
+    无参 getPhspTensor() 为兼容旧调试接口只给 GPU0；双卡直接拿它与
+    writeResult 的全卡 Gram 比较，会把正确的合并结果误判成约两倍。
+    """
+    import numpy as np
+    parts = [ana.getPhspTensor(g).cpu().numpy()
+             for g in range(ana.getNDevices())]
+    return np.concatenate(parts).astype(np.complex128)
+
+
 def fit_fraction_matrix(ana, cpl, sample="truth", hessian=None):
     """旧 getFitFractionMatrix 的替代：写一次 ROOT 再读回来。
 

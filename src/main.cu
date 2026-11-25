@@ -261,8 +261,13 @@ static void bind_ctpwa(pybind11::module_& m)
              pybind11::arg("pairs"),
              "保存指定波对的逐事件干涉形状到 TTree saved_weight "
              "(totalweight/weight_<i>/interf_<i>_<j>/末态四动量); pairs=[[i,j],...]")
+        .def("getNDevices", &analysis::getNDevices)
         .def("getDataTensor", &analysis::getDataTensor)
-        .def("getPhspTensor", &analysis::getPhspTensor)
+        .def("getPhspTensor", pybind11::overload_cast<>(&analysis::getPhspTensor,
+             pybind11::const_))
+        .def("getPhspTensor", pybind11::overload_cast<int>(&analysis::getPhspTensor,
+             pybind11::const_), pybind11::arg("gpu"),
+             "读取指定 GPU 的 phsp 振幅；多卡独立重建需遍历 getNDevices() 并拼接。")
         .def("getExtendedVector", [](analysis& a, const torch::Tensor& v) {
                  // 折叠表在构造期上传到主 GPU，coupling kernel 固定在其上 →
                  // 传别的卡的向量会跨卡读表（多卡下非法访问）。这里显式挡住。

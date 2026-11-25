@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 import ctpwa
-from conftest import fit_fraction_matrix
+from conftest import fit_fraction_matrix, resident_phsp_numpy
 
 DEV = torch.device("cuda:0" if ctpwa.backend() == "cuda" else "cpu")
 
@@ -37,7 +37,7 @@ def _matrix_from_resident(ana, cpl):
     """用驻留（device）振幅重建 Σw·(|A_i|², 2Re A_iA_j*)。"""
     nsl = ana.getSLVectors().tolist()
     off = np.concatenate([[0], np.cumsum(nsl)])
-    A = ana.getPhspTensor().cpu().numpy().astype(np.complex128).reshape(-1, sum(nsl))
+    A = resident_phsp_numpy(ana).reshape(-1, sum(nsl))
     v = ana.getExtendedVector(cpl).cpu().numpy().astype(np.complex128).reshape(-1)
     S = A * v
     parts = [S[:, off[i]:off[i + 1]].sum(1) for i in range(len(nsl))]

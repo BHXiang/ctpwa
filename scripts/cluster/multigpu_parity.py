@@ -75,7 +75,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs", nargs="+", default=DEFAULT_CONFIGS)
     ap.add_argument("--child", metavar="CFG", help=argparse.SUPPRESS)
-    ap.add_argument("--nll-rtol", type=float, default=1e-9)
+    # trans 的多卡规约顺序也可让 NLL 有 ~6e-9 相对差；1e-8 仍远小于
+    # 任何漏并/权重错误，同时避免把正常舍入差判成失败。
+    ap.add_argument("--nll-rtol", type=float, default=1e-8)
     # 多卡梯度用 atomic/跨卡规约，顺序不同会带来 ~1e-8 相对噪声；
     # V100 实测可达 5.4e-8，1e-8 会把正常结果误判为失败。
     ap.add_argument("--grad-rtol", type=float, default=1e-7)

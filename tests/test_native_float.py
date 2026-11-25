@@ -12,7 +12,7 @@ import torch
 import uproot
 
 import ctpwa
-from conftest import CONFIGS_DIR, make_params
+from conftest import CONFIGS_DIR, make_params, resident_phsp_numpy
 
 INFO = ctpwa.build_info()
 pytestmark = __import__("pytest").mark.skipif(
@@ -83,7 +83,7 @@ def _assert_rec_matches_resident(ana, p, rec, w_rec):
     cpl = torch.complex(p[:n].to(dt), p[n:2 * n].to(dt)).contiguous().to(DEV)
     nsl = ana.getSLVectors().cpu().numpy()
     edges = np.concatenate([[0], np.cumsum(nsl)])
-    A = ana.getPhspTensor().cpu().numpy().astype(np.complex128).reshape(-1, sum(nsl))
+    A = resident_phsp_numpy(ana).reshape(-1, sum(nsl))
     v = ana.getExtendedVector(cpl).cpu().numpy().astype(np.complex128).reshape(-1)
     S = A * v
     parts = [S[:, edges[i]:edges[i + 1]].sum(axis=1) for i in range(len(nsl))]
