@@ -268,14 +268,14 @@ namespace hw {
 void gemv(Op op, int m, int n, ctComplex alpha, const ctComplex* A, int lda,
           const ctComplex* x, ctComplex beta, ctComplex* y)
 {
-    cublasZgemv(handle(), op_of(op), m, n, &alpha, A, lda, x, 1, &beta, y, 1);
+    CUBLAS_CGEMV(handle(), op_of(op), m, n, &alpha, A, lda, x, 1, &beta, y, 1);
 }
 
 void gemm(Op op_a, Op op_b, int m, int n, int k,
           ctComplex alpha, const ctComplex* A, int lda,
           const ctComplex* B, int ldb, ctComplex beta, ctComplex* C, int ldc)
 {
-    cublasZgemm(handle(), op_of(op_a), op_of(op_b), m, n, k, &alpha, A, lda,
+    CUBLAS_CGEMM(handle(), op_of(op_a), op_of(op_b), m, n, k, &alpha, A, lda,
                 B, ldb, &beta, C, ldc);
 }
 
@@ -284,7 +284,7 @@ void gemm_batched(bool trans_a, bool trans_b, int m, int n, int k,
                   const ctComplex* B, int ldb, idx_t stride_b,
                   ctComplex beta, ctComplex* C, int ldc, idx_t stride_c, int batch)
 {
-    cublasZgemmStridedBatched(handle(), trans_a ? CUBLAS_OP_T : CUBLAS_OP_N,
+    CUBLAS_CGEMM_STRIDED_BATCHED(handle(), trans_a ? CUBLAS_OP_T : CUBLAS_OP_N,
                               trans_b ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k,
                               &alpha, A, lda, (long long)stride_a, B, ldb,
                               (long long)stride_b, &beta, C, ldc,
@@ -294,7 +294,7 @@ void gemm_batched(bool trans_a, bool trans_b, int m, int n, int k,
 void dgmm(bool left, int m, int n, const ctComplex* A, int lda, const ctComplex* x,
           ctComplex* C, int ldc)
 {
-    cublasZdgmm(handle(), left ? CUBLAS_SIDE_LEFT : CUBLAS_SIDE_RIGHT, m, n, A,
+    CUBLAS_CDGMM(handle(), left ? CUBLAS_SIDE_LEFT : CUBLAS_SIDE_RIGHT, m, n, A,
                 lda, x, 1, C, ldc);
 }
 
@@ -326,7 +326,7 @@ void daxpy(idx_t n, double alpha, const double* x, double* y)
 ctComplex dotc(idx_t n, const ctComplex* x, const ctComplex* y)
 {
     ctComplex out = ctMake(0.0, 0.0);
-    cublasZdotc(handle(), (int)n, x, 1, y, 1, &out);
+    CUBLAS_CDOTC(handle(), (int)n, x, 1, y, 1, &out);
     return out;
 }
 

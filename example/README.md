@@ -285,5 +285,6 @@ python3 read_interference.py weight_best.root --bf-total 8.7e-4 --csv frac.csv
 
 输出包含：逐波 `F_i ± σ`、完整 n×n 矩阵（对角 = fit fraction，上三角 = 干涉项）、
 闭合检验 `ΣF + ΣI = 1`、非相干份额 `F_i/ΣF`、平均效率 `ε̄ = W_rec/W_gen`、
-每波效率 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`；给 `--bf-total` 还会逐波算
+每波效率 `ε_i = (P_ii/N_rec)/(T_ii/N_gen)`（P_ii/T_ii 是由表里的
+P_ii/W_rec、T_ii/W_gen 乘回 W 得到的原始积分）；给 `--bf-total` 还会逐波算
 `BF_i = BF_total × F_i`（合计 ≠ BF_total 的差额正是干涉项）。

@@ -25,11 +25,16 @@ def _spd_hessian(nf, seed=0):
 
 
 def _full_hessian(ana, seed=0):
-    """把 SPD 块塞进自由方向（耦合去掉参考 + θ），固定方向留单位阵。"""
+    """SPD Hessian：耦合自由块 **与 θ 块联合**（含耦合-θ 相关）。
+
+    旧版把 θ 块留成单位阵且耦合-θ 块为 0，此时边际协方差 == 条件协方差，
+    条件协方差的 bug 测不出来。这里用联合 SPD 随机块做回归。
+    """
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
-    free = [j for j in range(2 * n) if j not in (0, n)]   # θ 暂不传播
+    free = [j for j in range(2 * n) if j not in (0, n)]
+    free_all = free + [2 * n + k for k in range(nθ)]
     H = np.eye(2 * n + nθ)
-    H[np.ix_(free, free)] = _spd_hessian(len(free), seed)
+    H[np.ix_(free_all, free_all)] = _spd_hessian(len(free_all), seed)
     return torch.tensor(H, dtype=torch.float64).to(DEV), free
 
 
@@ -46,19 +51,24 @@ def _params(ana, seed=61):
     return p
 
 
+def _coupling_from_unified(p, n):
+    dt = torch.float32 if int(ctpwa.build_info()["complex_bytes"]) == 8 else torch.float64
+    return torch.complex(p[:n].to(dt), p[n:2 * n].to(dt)).contiguous().to(DEV)
+
+
 def _norm(M):
     return M / (np.diag(M).sum() + np.triu(M, 1).sum())
 
 
 def _reference(ana, p, free):
-    """独立参考实现：同 ε、同归一化、同 cov。"""
+    """独立参考实现：同 ε、同归一化、同 cov（联合 Hessian 的边际耦合块）。"""
     n, nθ = ana.getNVector(), ana.getNFreeTheta()
     pc = p.detach().cpu().numpy()
 
     def mats(pu):
         if nθ:
             ana.reCalcAmp(pu[2 * n:].contiguous())
-        cpl = torch.complex(pu[:n], pu[n:2 * n]).contiguous().to(DEV)
+        cpl = _coupling_from_unified(pu, n)
         return (_norm(fit_fraction_matrix(ana, cpl, sample="phsp").numpy()),
                 _norm(fit_fraction_matrix(ana, cpl, sample="truth").numpy()))
 
@@ -74,7 +84,15 @@ def _reference(ana, p, free):
         Rm, Gm = mats(pm)
         Jr.append((Rp - Rm) / (2 * eps))
         Jg.append((Gp - Gm) / (2 * eps))
-    return np.array(Jr), np.array(Jg)
+    return np.array(Jr), np.array(Jg), free
+
+
+def _marginal_coupling_cov(ana, H, free):
+    """Cov_pp = [inv(H_joint)] 的耦合块（不是 inv(H_pp) 条件协方差）。"""
+    n, nθ = ana.getNVector(), ana.getNFreeTheta()
+    free_all = list(free) + [2 * n + k for k in range(nθ)]
+    Hf = H.detach().cpu().numpy()[np.ix_(free_all, free_all)]
+    return np.linalg.inv(Hf)[:len(free), :len(free)]
 
 
 def test_error_matrices_match_independent_fd(make_analysis):
@@ -84,8 +102,8 @@ def test_error_matrices_match_independent_fd(make_analysis):
     err_rec, err_gen = matrix_errors(ana, p, H)
     assert err_rec.shape == err_gen.shape == (ana.getNVector(), ana.getNVector())
 
-    cov = np.linalg.inv(H.detach().cpu().numpy()[np.ix_(free, free)])
-    Jr, Jg = _reference(ana, p, free)
+    cov = _marginal_coupling_cov(ana, H, free)
+    Jr, Jg, _ = _reference(ana, p, free)
     sig = lambda J: np.sqrt(np.einsum("k...,kl,l...->...", J, cov, J))
     np.testing.assert_allclose(err_rec.numpy(), sig(Jr), rtol=1e-6, atol=1e-12)
     np.testing.assert_allclose(err_gen.numpy(), sig(Jg), rtol=1e-6, atol=1e-12)
@@ -141,24 +159,36 @@ def test_non_pd_hessian_returns_empty(make_analysis, capsys):
     assert err_rec.numel() == 0 and err_gen.numel() == 0
 
 
-def test_errors_do_not_leave_theta_perturbed(make_analysis):
-    """getFitFractionMatrixErrors 内部会扰 θ；出函数必须还原。
+def test_theta_only_non_pd_hessian_returns_empty(make_analysis):
+    """完整联合块非正定时，即使 H_cc 为正也不能写误差。"""
+    ana = make_analysis("eff2", reuse=False)
+    p = _params(ana)
+    n, nθ = ana.getNVector(), ana.getNFreeTheta()
+    assert nθ > 0
+    H = torch.eye(2 * n + nθ, dtype=torch.float64, device=DEV) * 100.0
+    H[2 * n:, 2 * n:] = -torch.eye(nθ, dtype=torch.float64, device=DEV) * 100.0
+    err_rec, err_gen = matrix_errors(ana, p, H)
+    assert err_rec.numel() == 0 and err_gen.numel() == 0
 
-    回归：残留的 θ 会让随后 getFitFractionMatrix / getFitFractions 用扰动过的
-    振幅算（实测份额第 5 位就偏），而且极难察觉。
-    """
+
+def test_errors_do_not_leave_theta_perturbed(make_analysis):
+    """误差扫描后，内部当前 θ 必须仍是非初值的拟合 θ。"""
     ana = make_analysis("eff2", reuse=False)
     p = _params(ana, seed=23)
     H, _ = _full_hessian(ana, seed=5)
-    n = ana.getNVector()
+    n, nθ = ana.getNVector(), ana.getNFreeTheta()
+    assert nθ > 0
+    p[2 * n:] *= 1.10
+    cpl = _coupling_from_unified(p, n)
+    ana.reCalcAmp(p[2 * n:].contiguous())
 
-    before = fit_fraction_matrix(
-        ana, torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), "truth").clone()
+    # getFitFractions 使用 analysis 内部当前 θ，不会像 ROOT helper 那样
+    # 从配置初值重建 unified params，因此能真正观察状态是否被污染。
+    before = ana.getFitFractions(cpl, H)[:, 0].clone()
     matrix_errors(ana, p, H)
-    after = fit_fraction_matrix(
-        ana, torch.complex(p[:n], p[n:2 * n]).contiguous().to(DEV), "truth")
+    after = ana.getFitFractions(cpl, H)[:, 0]
 
-    assert torch.allclose(before, after, rtol=1e-12, atol=1e-9), (
+    assert torch.allclose(before, after, rtol=1e-8, atol=1e-9), (
         (before - after).abs().max().item())
 
 

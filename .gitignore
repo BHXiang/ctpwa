@@ -21,6 +21,7 @@ ctpwa/*.so
 !tests/**
 !scripts/
 !scripts/run_tests.sh
+!scripts/run_tests_float.sh
 !scripts/check_interp_shape.py
 !scripts/port_cuda_to_cpu.py
 !scripts/bench_free_params.py

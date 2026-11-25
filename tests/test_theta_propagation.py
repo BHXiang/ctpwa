@@ -52,11 +52,18 @@ def _matrix_from_resident(ana, cpl):
 def _check(ana, scales):
     cpl = _coupling(ana)
     th0 = ana.getFreeResParams()[0].double().clone().to(DEV)
-    assert ana.getNFreeTheta() > 0, "该配置没有自由 θ，测不出问题"
+    n, nθ = ana.getNVector(), ana.getNFreeTheta()
+    assert nθ > 0, "该配置没有自由 θ，测不出问题"
     try:
         for scale in scales:
-            ana.reCalcAmp(th0 * scale)
-            M_api = fit_fraction_matrix(ana, cpl, sample="phsp").cpu().numpy()
+            theta = th0 * scale
+            ana.reCalcAmp(theta)
+            # 必须传完整 unified params。只传 cpl 会让测试 helper 从配置
+            # 初值重建 θ，把这里的 scale 悄悄撤销，形成假绿。
+            p = torch.zeros(2 * n + nθ, dtype=torch.float64, device=DEV)
+            p[:n], p[n:2 * n] = cpl.real.double(), cpl.imag.double()
+            p[2 * n:] = theta
+            M_api = fit_fraction_matrix(ana, p, sample="phsp").cpu().numpy()
             M_res = _matrix_from_resident(ana, cpl)
             rel = np.abs(M_api - M_res).max() / np.abs(M_res).max()
             assert rel < 1e-8, f"θ×{scale}: 重算路径与驻留振幅不一致 rel={rel:.2e}"

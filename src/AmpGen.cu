@@ -4157,10 +4157,10 @@ void AmpCalc::computeUnifiedHessian(
             // kernel 零改动、数值与 double 逐位一致。double 模式直接用原 A。
             const ctComplex* d_amp_c;
             ctComplex* d_amp_dbl = nullptr;
-            if (float_out_) {
+            if (float_out_ && !ctIsFloatComplex) {
                 const float2* srcF = reinterpret_cast<const float2*>(d_amp)
                     + (size_t)evt_off_c * nPol * n_amp_total;
-                cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(ctComplex));
+                cudaMalloc(&d_amp_dbl, (size_t)nch * nPol * n_amp_total * sizeof(cuDoubleComplex));
                 int gUp = (int)(((size_t)nch * nPol * n_amp_total + 255) / 256);
                 CTPWA_LAUNCH(castF2ToDouble2Kernel, gUp, 256, 0, 
                     srcF, reinterpret_cast<cuDoubleComplex*>(d_amp_dbl),

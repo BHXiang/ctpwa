@@ -59,6 +59,17 @@ static inline bool ctpwa_on_primary(const torch::Tensor& t, int primary)
 #include <TObjString.h>
 #include <TTree.h>
 
+#include <utility>
+
+// RAII：函数中途抛异常时也要还原 analysis 的内部状态/关闭 ROOT 文件。
+template <class F>
+struct ScopeExit {
+    F f;
+    ~ScopeExit() { f(); }
+};
+template <class F>
+ScopeExit<F> makeScopeExit(F f) { return ScopeExit<F>{std::move(f)}; }
+
 //////////////////////////////////////////////
 // 错误检查宏
 #define CUDA_CHECK(call) \
@@ -681,6 +692,33 @@ CTPWA_KERNEL void castPhspBatchToDoubleKernel(
     dst[i] = make_cuDoubleComplex((double)src[i].x, (double)src[i].y);
 }
 
+// 双精度 phsp Gram 的逐事例权重缩放（与 scalePhspAmpsKernel 同语义）：
+//   amp[e,p,a] *= sqrt(w[e] / W_total)
+// 流式 double 矩阵必须和 float32 矩阵用同一归一化，否则 double 矩阵少除 W_total，
+// 所有读它的消费者（W_rec、writeResult 的 interference_rec、误差矩阵）会大 N 倍。
+CTPWA_KERNEL void scalePhspAmpsDoubleKernel(
+    cuDoubleComplex* __restrict__ d_amp, const double* __restrict__ d_weights,
+    int nEvents, int nPolar, int nAmp, double inv_W_total)
+{
+    const std::ptrdiff_t idx = (std::ptrdiff_t)CTPWA_TID();
+    const std::ptrdiff_t total = (std::ptrdiff_t)nEvents * nPolar * nAmp;
+    if (idx >= total) return;
+    const int evt = (int)((idx / nAmp) / nPolar);
+    const double scale = (d_weights != nullptr)
+        ? sqrt(d_weights[evt] * inv_W_total)
+        : sqrt(inv_W_total);
+    d_amp[idx].x *= scale;
+    d_amp[idx].y *= scale;
+}
+static void scalePhspAmpsDouble(cuDoubleComplex* d_amp, const double* d_w,
+    int nEvents, int nPolar, int nAmp, double inv_W_total)
+{
+    const std::ptrdiff_t total = (std::ptrdiff_t)nEvents * nPolar * nAmp;
+    if (total <= 0) return;
+    const int grid = (int)((total + 255) / 256);
+    CTPWA_LAUNCH(scalePhspAmpsDoubleKernel, grid, 256, 0, d_amp, d_w,
+        nEvents, nPolar, nAmp, inv_W_total);
+}
 
 // phsp θ 梯度: S_ev,p ← S_ev,p · (w_ev / W_total)
 // （computeResonanceGradient 把 S 当"逐事件权重"消费；先乘 w/W 即得
@@ -862,7 +900,6 @@ public:
         ctComplex* d_P_vec;
         cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
         double phsp_sum = 0.0;
-        int total_phsp_evts = 0;
         // phsp 归一化分母: Σ w（无权重 = 事件数）。与 d_phsp_matrix_ 的
         // 1/W_total 以及梯度 d_P_vec 的 w/W_total 必须用同一个 W_total。
         double W_total = 0.0;
@@ -878,7 +915,9 @@ public:
             }
         }
         if (W_total <= 0.0) W_total = 1.0;
-        bool phsp_stream_raw = false;   // 流式 double 矩阵是 Σ|S|²（未除 N）
+        // 流式 double 矩阵与 float32 矩阵同归一化：B̄ = Σ(w/W)|A|²，
+        // Re(v^H B̄ v) 已经是 Σ(w/W)|S|²，不能再除 Σw。
+        bool phsp_stream_normalized = false;
         if (d_phsp_matrix_double_ != nullptr) {
             // phsp 流式模式: 原始 phsp 振幅不驻留，phsp_sum = Re(v^H M_double v)（主 GPU）
             TORCH_CHECK(n_free_res == 0,
@@ -888,8 +927,7 @@ public:
                 extended_vector.data_ptr());
             phsp_sum = computeDoublePhspSum(d_phsp_matrix_double_, d_v_primary,
                                             n_amplitudes_);
-            phsp_stream_raw = true;
-            for (int gpu = 0; gpu < num_gpus; ++gpu) total_phsp_evts += events_list[gpu][0];
+            phsp_stream_normalized = true;
             // fixed-θ（n_free_res==0 必成立）: 构造期预建 B̄ → matvec
             ctPhspReal* d_phsp_r, * d_phsp_i;
             cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
@@ -939,7 +977,6 @@ public:
                     phsp_sum += computePhspMeanSumAndGradP(d_all_amplitudes_list[gpu], d_v_gpu,
                         d_w, nP, n_polar_, n_amplitudes_, 1.0 / W_total, s_d_P_part[gpu]);
                 }
-                total_phsp_evts += nP;
             }
             // 跨 GPU 规约局部 d_P_vec → 主 GPU d_P_vec
             cudaSetDevice(primary_dev);
@@ -991,12 +1028,11 @@ public:
                     phsp_sum += computePhspMeanSum(d_all_amplitudes_list[gpu], d_v_gpu,
                                                    nP, n_polar_, n_amplitudes_, d_w);
                 }
-                total_phsp_evts += nP;
             }
         }
-        // 加权 phsp 均值: Σ w f / Σ w。流式 double 矩阵是未加权的 Σ|S|²，
-        // 保持旧语义除以事件数（该路径目前不支持 phsp_weights）。
-        double phsp_denom = phsp_stream_raw ? (double)total_phsp_evts : W_total;
+        // 加权 phsp 均值: Σ w f / Σ w。流式 double 矩阵已在构造期乘过
+        // sqrt(w/W_total)，所以 phsp_sum 已经是归一化值（denom=1）。
+        double phsp_denom = phsp_stream_normalized ? 1.0 : W_total;
         double phsp_factor = (phsp_denom > 0.0) ? phsp_sum / phsp_denom : 0.0;
         cudaSetDevice(primary_dev);
         tF3 = std::chrono::high_resolution_clock::now();  // phsp_factor/d_P_vec（free-θ 融合扫描）完成
@@ -1100,8 +1136,15 @@ public:
                         d_grad, nData_gpu, n_polar_, n_amplitudes_, d_w_data, d_w_f);
                     if (d_w_f) {
                         int nW = nData_gpu * n_polar_;
-                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nW + 255) / 256, 256, 0, 
-                            d_w_f, reinterpret_cast<cuDoubleComplex*>(d_w_out), nW);
+                        if (ctIsFloatComplex) {
+                            // 原生 float .so：float2 与 ctComplex(cuComplex) 同布局，
+                            // 直接 D2D 拷贝；再"上转 double"会按 16B/元素越界写。
+                            cudaMemcpy(d_w_out, d_w_f,
+                                (size_t)nW * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                        } else {
+                            CTPWA_LAUNCH(castF2ToDouble2Kernel, (nW + 255) / 256, 256, 0,
+                                d_w_f, reinterpret_cast<cuDoubleComplex*>(d_w_out), nW);
+                        }
                         cudaFree(d_w_f);
                     }
                 } else {
@@ -1172,8 +1215,13 @@ public:
                         d_grad, nBkg_gpu, n_polar_, n_amplitudes_, d_w, d_w_f);
                     if (d_w_f) {
                         int nW = nBkg_gpu * n_polar_;
-                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nW + 255) / 256, 256, 0, 
-                            d_w_f, reinterpret_cast<cuDoubleComplex*>(d_w_bkg_out), nW);
+                        if (ctIsFloatComplex) {
+                            cudaMemcpy(d_w_bkg_out, d_w_f,
+                                (size_t)nW * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                        } else {
+                            CTPWA_LAUNCH(castF2ToDouble2Kernel, (nW + 255) / 256, 256, 0,
+                                d_w_f, reinterpret_cast<cuDoubleComplex*>(d_w_bkg_out), nW);
+                        }
                         cudaFree(d_w_f);
                     }
                 } else {
@@ -1494,14 +1542,20 @@ public:
 ////////////////////////////////////////
 // float2 A 段 → 新分配 double 临时（writeResult/hessian 输出等低频消费路径用；
 // 调用方负责 cudaFree 返回值。返回 nullptr 表示非 float 模式）
+// 只允许 double .so 的混合精度模式，原生 float .so 下 A 已经是 ctComplex，
+// 再"上转"会按 16B/元素写进 8B/元素缓冲区（越界）并让下游按 float 错读。
 static ctComplex* upcastAmpSegToDouble(const ctComplex* baseF /*实际为 float2 存储*/,
                                        size_t nElem,
                                        ctComplex* buf = nullptr /*可选: 复用缓冲*/)
 {
     if (nElem == 0) return nullptr;
+    TORCH_CHECK(!ctIsFloatComplex,
+        "upcastAmpSegToDouble 只适用于 double .so 的混合精度模式；"
+        "原生 float .so 的 ctComplex 已是 float2，不应再上转");
     ctComplex* dbl = buf;
     if (dbl == nullptr) {
-        cudaError_t e = cudaMalloc(&dbl, nElem * sizeof(ctComplex));
+        // 返回缓冲按 cuDoubleComplex 语义使用，必须按 16B/元素分配。
+        cudaError_t e = cudaMalloc(&dbl, nElem * sizeof(cuDoubleComplex));
         TORCH_CHECK(e == cudaSuccess, "upcastAmpSegToDouble: cudaMalloc 失败: ",
                     cudaGetErrorString(e));
     }
@@ -1633,6 +1687,14 @@ public:
         cudaSetDevice(primary_dev_);   // 入口恢复主设备
         TORCH_CHECK(ctpwa_is_cuda_like(params), "params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
 
+        // 流式 phsp 分支会临时改写 offsets；异常时也要还原。
+        auto wr_ev0 = events_offsets_, wr_amp0 = amp_offsets_;
+        auto wr_guard = makeScopeExit([this, wr_ev0, wr_amp0]() {
+            events_offsets_ = wr_ev0;
+            amp_offsets_ = wr_amp0;
+            cudaSetDevice(primary_dev_);
+        });
+
         int npartials_all = (int)nSLvectors_.size();
         std::vector<int> wave_mask_host(npartials_all, 0);
         bool has_waves = !waves.empty();
@@ -1712,9 +1774,6 @@ public:
         // int* d_nSLvectors;
         // cudaMalloc(&d_nSLvectors, nSLvectors_.size() * sizeof(int));
         // cudaMemcpy(d_nSLvectors, nSLvectors_.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);
-        double* d_total_integral;
-        cudaMalloc(&d_total_integral, sizeof(double));
-        cudaMemset(d_total_integral, 0, sizeof(double));
 
         // 分配干涉矩阵和事件干涉项的设备内存
         // 干涉矩阵不再由 computeResults 累加（改由 computeFileBatchIntegrals 出
@@ -1782,7 +1841,7 @@ public:
                         int nch = std::min(batch_cap, ne - c0);
                         const ctComplex* d_amp_seg = d_amp_base;
                         ctComplex* d_amp_dbl = nullptr;
-                        if (float_amps_) {
+                        if (float_amps_ && !ctIsFloatComplex) {
                             // 注意: A 表为 float2(8B) 存储而 d_amp_base 是
                             // ctComplex*(16B 语义) —— 段偏移必须按 float2 算术,
                             // 否则 c0>0 的批指针翻倍错位（分批后 hfit 全 nan）
@@ -1877,7 +1936,7 @@ public:
                         {
                         const ctComplex* d_chunk_res = d_chunk[gpu];
                         ctComplex* d_chunk_dbl = nullptr;
-                        if (float_amps_) {
+                        if (float_amps_ && !ctIsFloatComplex) {
                             size_t nElem = (size_t)nch * n_polar_ * n_amplitudes_;
                             d_chunk_dbl = upcastAmpSegToDouble(d_chunk_res, nElem);
                             d_chunk_res = d_chunk_dbl;
@@ -1930,6 +1989,7 @@ public:
                     events_[gpu][0] * sizeof(double), cudaMemcpyDeviceToHost);
             ev_cumulative += events_[gpu][0];
             cudaFree(d_total_integral_gpu);
+            cudaFree(d_nSLvectors);
             if (d_wave_mask_gpu) cudaFree(d_wave_mask_gpu);
             if (d_selected_integral_gpu) cudaFree(d_selected_integral_gpu);
             delete[] h_total_results_gpu;
@@ -1978,6 +2038,11 @@ public:
         double normFactor = static_cast<double>(dataIntegral) / h_phsp_integral;
 
         TFile* rootFile = new TFile(filename.c_str(), "RECREATE");
+        // 中途抛异常（Hessian 形状/维度、积分扫描失败等）时也必须关闭 ROOT
+        // 文件，否则 TFile 缓冲区不落盘，后续再写同名文件会拿到半成品。
+        auto root_guard = makeScopeExit([&]() {
+            if (rootFile) { rootFile->Close(); delete rootFile; rootFile = nullptr; }
+        });
 
         TTree* legend = new TTree("legends", "Amplitude Legends");
         legend->Branch("legend", &legends_);
@@ -3118,9 +3183,10 @@ public:
             t->Write();
             delete t;
         }
-        // 关闭 ROOT 文件
+        // 关闭 ROOT 文件（root_guard 兜底异常路径）
         rootFile->Close();
         delete rootFile;
+        rootFile = nullptr;
 
         // std::cout << "Data written to ROOT file: " << filename << std::endl;
 
@@ -3146,10 +3212,10 @@ public:
             }
         }
         cudaSetDevice(target_dev);
-        if (d_total_integral != nullptr) cudaFree(d_total_integral);
         delete[] h_total_results;
-        // h_partial_results 可能未分配，检查是否为空
-        // if (h_partial_results != nullptr) delete[] h_partial_results;
+        // 旧代码把这行注释掉了：每次 writeResult 泄漏 N_phsp×npartials×8B
+        //（15M 事例 × 20 分波 ≈ 2.4 GB），大样本连续写文件会 OOM。
+        delete[] h_partial_results;
     }
 
     // =====================================================================
@@ -3169,6 +3235,13 @@ public:
     {
         TORCH_CHECK(ctpwa_is_cuda_like(params), "params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
         TORCH_CHECK(!pairs.empty(), "pairs 不能为空");
+        cudaSetDevice(primary_dev_);
+        auto wi_ev0 = events_offsets_, wi_amp0 = amp_offsets_;
+        auto wi_guard = makeScopeExit([this, wi_ev0, wi_amp0]() {
+            events_offsets_ = wi_ev0;
+            amp_offsets_ = wi_amp0;
+            cudaSetDevice(primary_dev_);
+        });
         int npartials = (int)nSLvectors_.size();
         std::vector<int> pair_list;
         std::vector<std::pair<int, int>> pair_named;
@@ -3229,13 +3302,14 @@ public:
         cudaMemcpy(d_pair_list, pair_list.data(), npairs * sizeof(int),
             cudaMemcpyHostToDevice);
 
-        double* d_total_integral = nullptr;
-        cudaMalloc(&d_total_integral, sizeof(double));
         int ev_cum = 0;
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             int ne = events_[gpu][0];
             if (ne == 0) continue;
             cudaSetDevice(gpu);
+            // 每 GPU 自己的归约缓冲：跨设备指针传给 computeResults 会非法访问。
+            double* d_total_integral = nullptr;
+            cudaMalloc(&d_total_integral, sizeof(double));
             int* d_nsl = nullptr;
             cudaMalloc(&d_nsl, npartials * sizeof(int));
             cudaMemcpy(d_nsl, nSLvectors_.data(), npartials * sizeof(int),
@@ -3256,7 +3330,7 @@ public:
             if (!phsp_freed_) {
                 const ctComplex* d_amp_res = d_all_amplitudes_[gpu];
                 ctComplex* d_amp_dbl = nullptr;
-                if (float_amps_) {
+                if (float_amps_ && !ctIsFloatComplex) {
                     size_t nElem = (size_t)ne * n_polar_ * n_amplitudes_;
                     d_amp_dbl = upcastAmpSegToDouble(d_amp_res, nElem);
                     d_amp_res = d_amp_dbl;
@@ -3307,7 +3381,7 @@ public:
                     {
                     const ctComplex* d_chunk_res = d_chunk[gpu];
                     ctComplex* d_chunk_dbl = nullptr;
-                    if (float_amps_) {
+                    if (float_amps_ && !ctIsFloatComplex) {
                         size_t nElem = (size_t)nch * n_polar_ * n_amplitudes_;
                         d_chunk_dbl = upcastAmpSegToDouble(d_chunk_res, nElem);
                         d_chunk_res = d_chunk_dbl;
@@ -3355,12 +3429,12 @@ public:
             // 流式模式: host 结果已在分块循环内逐批拷出
             ev_cum += ne;
             cudaFree(d_nsl);
+            cudaFree(d_total_integral);
             if (d_total) cudaFree(d_total);
             if (d_partial) cudaFree(d_partial);
             if (d_intf) cudaFree(d_intf);
         }
         cudaFree(d_pair_list);
-        cudaFree(d_total_integral);
         cudaSetDevice(dev.index());
 
         double h_phsp_integral = 0.0;
@@ -3370,6 +3444,9 @@ public:
             ? dataIntegral / h_phsp_integral : 1.0;
 
         TFile* rootFile = new TFile(filename.c_str(), "RECREATE");
+        auto wi_root_guard = makeScopeExit([&]() {
+            if (rootFile) { rootFile->Close(); delete rootFile; rootFile = nullptr; }
+        });
         TTree* tree = new TTree("saved_weight", "interference shapes per event");
         double total_weight = 0.0;
         tree->Branch("totalweight", &total_weight);
@@ -3426,6 +3503,7 @@ public:
         tree->Write();
         rootFile->Close();
         delete rootFile;
+        rootFile = nullptr;
         delete[] h_total;
         delete[] h_partial;
         delete[] h_interf;
@@ -3472,7 +3550,9 @@ public:
             else computeDataHessianContrib(
                 d_amp_seg, d_v, d_w_c, d_hess, n_ev, n_polar_, n_amp);
         };
-        if (!float_amps_) {
+        if (!float_amps_ || ctIsFloatComplex) {
+            // 原生 float .so：A 本身就是 ctComplex（cuComplex），kernel 直接读；
+            // 全 double .so：A 是 ctComplex（cuDoubleComplex），也直接读。
             run(d_all_amplitudes_[gpu] + amp_offsets_[gpu][seg], nEv, d_w);
         } else {
             // 窗口化上转（默认 50k 事件/窗口，与 computeDataHessianContribFast 内部 chunk
@@ -4391,7 +4471,7 @@ public:
             // computeBranchingFractions（批 ≤ 100k 事件, 临时翻倍有界, 与驻留 A 无关）
             const ctComplex* d_mat = d_amps[gpu];
             ctComplex* d_amp_dbl = nullptr;
-            if (float_amps_) {
+            if (float_amps_ && !ctIsFloatComplex) {
                 // 复用调用方的 upcast workspace（旧实现每次都 cudaMalloc/cudaFree）
                 d_amp_dbl = upcastAmpSegToDouble(d_amps[gpu],
                     (size_t)nt * n_polar_ * n_amplitudes_,
@@ -4502,6 +4582,9 @@ public:
         }
         if (std::getenv("CTPWA_VERBOSE"))
             std::cout << file_key << ": " << total_events << " events" << std::endl;
+        // 调用方按接口约定预零所有输出。空样本直接返回，避免为 0 个事件
+        // 分配整套 batch workspace，也避免常数权重展开后被误判为 Σw=0。
+        if (total_events == 0) return 0.0;
 
         // 逐事件权重（可选）: <file_key>_weights
         std::vector<double> h_weights;
@@ -4546,8 +4629,14 @@ public:
                       << " (CTPWA_TRUTH_BATCH)" << std::endl;
         }
         auto saved_ev = events_offsets_, saved_amp = amp_offsets_;
-
-        // workspace: 一次分配、跨 batch（及每个自由方向的 ± 扰动）复用。
+        // 批扫描会临时改写 events_offsets_/amp_offsets_；任何异常（文件缺失、
+        // cudaMalloc 失败、kernel 报错）都必须还原，否则 analysis 对象后续的
+        // getNLL/writeResult 会拿批偏移去索引驻留表。
+        auto offset_guard = makeScopeExit([&]() {
+            events_offsets_ = saved_ev;
+            amp_offsets_ = saved_amp;
+            cudaSetDevice(primary_dev_);
+        });
         // 旧实现在 computeBranchingFractions 内每次调用都 cudaMalloc/cudaFree
         // 两个大缓冲（ngls×1e5×npolar×16B ≈ 139 MB）：15M 事件的 truth = 150 batch
         // × (1+2·n_free) 次调用 → 上千次大块 alloc/free → 碎片化 → 分配失败
@@ -4573,10 +4662,10 @@ public:
             TORCH_CHECK(cudaMalloc(&ws_matrix[g], ws_mat * sizeof(ctComplex)) == cudaSuccess,
                 "[", file_key, "] workspace cudaMalloc 失败 (",
                 ws_mat * sizeof(ctComplex), " B)");
-            if (float_amps_) {
-                TORCH_CHECK(cudaMalloc(&ws_upcast[g], ws_mat * sizeof(ctComplex)) == cudaSuccess,
+            if (float_amps_ && !ctIsFloatComplex) {
+                TORCH_CHECK(cudaMalloc(&ws_upcast[g], ws_mat * sizeof(cuDoubleComplex)) == cudaSuccess,
                     "[", file_key, "] upcast workspace cudaMalloc 失败 (",
-                    ws_mat * sizeof(ctComplex), " B)");
+                    ws_mat * sizeof(cuDoubleComplex), " B)");
             }
             if (!h_weights.empty()) {
                 TORCH_CHECK(cudaMalloc(&ws_weights[g], batch_size * sizeof(double)) == cudaSuccess,
@@ -4591,24 +4680,26 @@ public:
             auto Vp4_batch = readMomentaFromDat(data_files.at(file_key),
                 data_order, particles_names, n_batch, start);
 
-            // Split across GPUs
-            std::vector<int> batch_ev_per_gpu(n_gpus_, 0);
-            int base_b = n_batch / n_gpus_, rem_b = n_batch % n_gpus_;
-            for (int g = 0; g < n_gpus_; ++g)
+            // Split across GPUs. 尾批/小样本可能少于 GPU 数：只给有事件的
+            // GPU 建 map，AmpCasDecay::computeSLAmps 不允许空 map。正常大批次
+            // active_gpus==n_gpus_，数据划分、workspace 和热循环完全不变。
+            const int active_gpus = std::min(n_gpus_, n_batch);
+            std::vector<int> batch_ev_per_gpu(active_gpus, 0);
+            int base_b = n_batch / active_gpus, rem_b = n_batch % active_gpus;
+            for (int g = 0; g < active_gpus; ++g)
                 batch_ev_per_gpu[g] = base_b + (g < rem_b ? 1 : 0);
 
-            std::vector<std::map<std::string, std::vector<LorentzVector>>> Vp4_tpg(n_gpus_);
+            std::vector<std::map<std::string, std::vector<LorentzVector>>> Vp4_tpg(active_gpus);
             int ev_off = 0;
-            for (int g = 0; g < n_gpus_; ++g) {
+            for (int g = 0; g < active_gpus; ++g) {
                 int nev = batch_ev_per_gpu[g];
-                if (nev > 0)
-                    for (const auto& [k, v] : Vp4_batch)
-                        Vp4_tpg[g][k].assign(v.begin() + ev_off, v.begin() + ev_off + nev);
+                for (const auto& [k, v] : Vp4_batch)
+                    Vp4_tpg[g][k].assign(v.begin() + ev_off, v.begin() + ev_off + nev);
                 ev_off += nev;
             }
 
-            std::vector<std::vector<int>> t_ev_off(n_gpus_), t_amp_off(n_gpus_);
-            for (int g = 0; g < n_gpus_; ++g) {
+            std::vector<std::vector<int>> t_ev_off(active_gpus), t_amp_off(active_gpus);
+            for (int g = 0; g < active_gpus; ++g) {
                 int nev = batch_ev_per_gpu[g];
                 t_ev_off[g] = {0, nev};
                 t_amp_off[g] = {0, nev * n_polar_ * n_amplitudes_};
@@ -4616,23 +4707,21 @@ public:
             // 每 GPU 一段连续权重，切分口径与 batch_ev_per_gpu / Vp4_tpg 一致
             if (!h_weights.empty()) {
                 int ev_off_w = 0;
-                for (int g = 0; g < n_gpus_; ++g) {
+                for (int g = 0; g < active_gpus; ++g) {
                     int nev = batch_ev_per_gpu[g];
-                    if (nev > 0) {
-                        cudaSetDevice(g);
-                        TORCH_CHECK(cudaMemcpy(ws_weights[g],
-                                h_weights.data() + start + ev_off_w,
-                                nev * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess,
-                            "[", weights_key, "] cudaMemcpy 失败 (start=", start,
-                            ", gpu=", g, ", n=", nev, ")");
-                    }
+                    cudaSetDevice(g);
+                    TORCH_CHECK(cudaMemcpy(ws_weights[g],
+                            h_weights.data() + start + ev_off_w,
+                            nev * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess,
+                        "[", weights_key, "] cudaMemcpy 失败 (start=", start,
+                        ", gpu=", g, ", n=", nev, ")");
                     ev_off_w += nev;
                 }
             }
 
             events_offsets_ = t_ev_off; amp_offsets_ = t_amp_off;
             std::vector<ctComplex*> d_batch_amps = calculateAmplitudes(
-                Vp4_tpg, nullptr, -1, d_theta);
+                Vp4_tpg, nullptr, active_gpus, d_theta);
             memprobe("after-amps", start);
 
             // Center (+ square)
@@ -4672,6 +4761,73 @@ public:
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
         cudaSetDevice(primary_dev_);   // 恢复主设备（内部多 GPU 循环后 raw 停在最后卡）
         return weight_sum;
+    }
+
+    // =====================================================================
+    // 从统一 Hessian 取"耦合自由方向"的协方差（误差传播用）。
+    //
+    //   H 维度 = 2n（仅耦合）或 2n+ntheta（联合 Hessian, 与 getHessian 同源）。
+    //   联合时 **必须** 用边际协方差 inv(H_joint) 的耦合块，
+    //   而不是 inv(H_coupling)（那是"θ 固定"的条件协方差，会系统性偏小）。
+    //   参考方向 Re v0 / Im v0（下标 0, n）按约定固定，不进入自由块。
+    //
+    // 返回 [nf, nf] CPU 张量；nf = 耦合自由方向数。
+    //   nf == 0        → 空张量, ok = true（没有参数误差可言）
+    //   非正定/非有限 → 空张量, ok = false（调用方应跳过误差矩阵并说明原因）
+    // =====================================================================
+    torch::Tensor couplingCovariance(const torch::Tensor& H, int n,
+                                     int& nf_out, bool& ok) const
+    {
+        ok = false;
+        nf_out = 0;
+        const int n2 = 2 * n;
+        std::vector<int64_t> free_c;
+        for (int j = 0; j < n2; ++j)
+            if (j != 0 && j != n) free_c.push_back(j);
+        nf_out = (int)free_c.size();
+        auto empty = torch::empty({0, 0},
+            torch::TensorOptions().dtype(torch::kFloat64));
+        if (H.numel() == 0) return empty;
+        TORCH_CHECK(H.dim() == 2 && H.size(0) == H.size(1),
+            "hessian 必须是方阵，收到 dim=", H.dim(),
+            " size0=", H.dim() > 0 ? H.size(0) : -1);
+        TORCH_CHECK(H.size(0) >= n2,
+            "hessian 维度 ", H.size(0), " 小于耦合参数维度 ", n2);
+        if (nf_out == 0) { ok = true; return empty; }
+
+        std::vector<int64_t> free_all = free_c;
+        for (int t = n2; t < (int)H.size(0); ++t) free_all.push_back(t);
+        auto idx = torch::tensor(free_all, torch::kInt64).to(H.device());
+        torch::Tensor Hf = H.index_select(0, idx).index_select(1, idx)
+                               .to(torch::kCPU).contiguous();
+        Hf = 0.5 * (Hf + Hf.transpose(0, 1));
+
+        double scale = Hf.diagonal().abs().max().item<double>();
+        if (!(scale > 0.0) || !std::isfinite(scale)) return empty;
+        double emin = 0.0;
+        try {
+            auto eigs = torch::linalg_eigvalsh(Hf);
+            emin = eigs[0].item<double>();
+        } catch (const std::exception& e) {
+            std::cerr << "[ctpwa] Hessian 特征分解失败（" << e.what()
+                      << "），按非正定处理" << std::endl;
+            return empty;
+        }
+        // 联合自由块（耦合 + θ）必须正定；只用耦合块判正定会漏掉 θ 方向的
+        // 负曲率，也会把条件协方差误当成边际协方差。
+        // 阈值必须按**联合块**的量级缩放：耦合曲率可能比 θ 块大 1e8 倍，
+        // 用绝对值 1e-8 会把完全正常的 θ 单位阵误判成非正定。
+        if (!(emin > 1e-12 * scale)) return empty;
+        torch::Tensor cov_full;
+        try {
+            cov_full = torch::linalg_inv(Hf);
+        } catch (const std::exception& e) {
+            std::cerr << "[ctpwa] Hessian 求逆失败（" << e.what()
+                      << "），跳过参数误差" << std::endl;
+            return empty;
+        }
+        ok = true;
+        return cov_full.slice(0, 0, nf_out).slice(1, 0, nf_out).contiguous();
     }
 
     // =====================================================================
@@ -4781,47 +4937,47 @@ public:
         // 固定参考参数方向同上: mask 掉再检查正定性/求逆。
         // Hessian 优先用传入的统一 Hessian（与拟合正定判定同源）。
         std::vector<double> ff_errors(npartials, 0.0);
+        // hessian_in 是统一 Hessian（含 θ）时，couplingCovariance 会给边际协方差；
+        // 只有 [2n,2n] 的耦合 Hessian 时才退化为条件协方差（无 θ 信息可用）。
         torch::Tensor hessian;
         if (hessian_in.numel() > 0)
-            hessian = hessian_in.slice(0, 0, n2).slice(1, 0, n2);  // 取耦合块
+            hessian = hessian_in;
         else
             hessian = computeCouplingHessian(vector);
-        if (hessian.numel() > 0 && hessian.size(0) == n2) {
+        int n_free = 0;
+        bool cov_ok = false;
+        torch::Tensor cov = couplingCovariance(hessian, n, n_free, cov_ok);
+        if (n_free > 0 && cov_ok) {
             std::vector<int64_t> free_idx;
             for (int j = 0; j < n2; ++j)
                 if (j != 0 && j != n) free_idx.push_back(j);
-            const int n_free = (int)free_idx.size();
-            if (n_free == 0) {
-                // 全部方向固定(如单链仅参考耦合): 无自由参数可传播, 参数误差为 0
-            } else {
-            auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
-            torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
-            auto eig = torch::linalg_eigvalsh(H_free);
-            if (eig[0].item<double>() > 1e-8) {
-                torch::Tensor cov = torch::linalg_inv(H_free).cpu();
-                std::vector<double> h_cov(n_free * n_free);
-                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n_free * n_free * sizeof(double));
+            TORCH_CHECK((int)free_idx.size() == n_free,
+                "getFitFractions: 自由方向计数不一致");
+            std::vector<double> h_cov((size_t)n_free * n_free);
+            std::memcpy(h_cov.data(), cov.data_ptr<double>(),
+                        h_cov.size() * sizeof(double));
 
-                std::vector<double> J(npartials * n_free, 0.0);
-                for (int fj = 0; fj < n_free; ++fj) {
-                    const int j = free_idx[fj];
-                    double tot_p = 0.0, tot_m = 0.0;
-                    for (int i = 0; i < npartials; ++i) {
-                        tot_p += truth_p_partial[j * npartials + i];
-                        tot_m += truth_m_partial[j * npartials + i];
-                    }
-                    if (tot_p <= 0.0) tot_p = 1e-30;
-                    if (tot_m <= 0.0) tot_m = 1e-30;
-                    for (int i = 0; i < npartials; ++i) {
-                        double ff_p = truth_p_partial[j * npartials + i] / tot_p;
-                        double ff_m = truth_m_partial[j * npartials + i] / tot_m;
-                        J[i * n_free + fj] = (ff_p - ff_m) / (2.0 * eps_j[j]);
-                    }
+            std::vector<double> J(npartials * n_free, 0.0);
+            for (int fj = 0; fj < n_free; ++fj) {
+                const int j = free_idx[fj];
+                double tot_p = 0.0, tot_m = 0.0;
+                for (int i = 0; i < npartials; ++i) {
+                    tot_p += truth_p_partial[j * npartials + i];
+                    tot_m += truth_m_partial[j * npartials + i];
                 }
-
-                computeBFErrors(J.data(), h_cov.data(), ff_errors.data(), npartials, n_free);
+                if (tot_p <= 0.0) tot_p = 1e-30;
+                if (tot_m <= 0.0) tot_m = 1e-30;
+                for (int i = 0; i < npartials; ++i) {
+                    double ff_p = truth_p_partial[j * npartials + i] / tot_p;
+                    double ff_m = truth_m_partial[j * npartials + i] / tot_m;
+                    J[i * n_free + fj] = (ff_p - ff_m) / (2.0 * eps_j[j]);
+                }
             }
-            }
+            computeBFErrors(J.data(), h_cov.data(), ff_errors.data(),
+                            npartials, n_free);
+        } else if (n_free > 0) {
+            std::cerr << "[ctpwa] getFitFractions: Hessian 自由块非正定/求逆失败，"
+                         "跳过参数误差" << std::endl;
         }
         // 返回 n×2: [center, error]
         auto opts = torch::TensorOptions().dtype(torch::kFloat64);
@@ -4897,8 +5053,13 @@ public:
         }
 
         auto vcpu = vector.detach().to(torch::kCPU).contiguous();
-        const std::complex<double>* v =
-            reinterpret_cast<const std::complex<double>*>(vcpu.data_ptr());
+        // vector 的复数精度随 .so：double 构建是 complex128，原生 float 构建是
+        // complex64。这里不能用 std::complex<double>* 硬读（会按 16B 跨步读 8B
+        // 数据，得到错误的 v，W_rec=0 → interference_rec 不写）。
+        TORCH_CHECK(vcpu.scalar_type() == TORCH_COMPLEX,
+            "phspMatrixFromGram: vector dtype 与 .so 复数精度不一致");
+        const ctC10Complex* v =
+            reinterpret_cast<const ctC10Complex*>(vcpu.data_ptr());
 
         // 行/列 = 分波 = (链 × 共振态组合)，同一条分波内的多个 LS 组合**相干求和**：
         //   S_p = Σ_{k∈p} v_k A_k
@@ -4918,7 +5079,9 @@ public:
                 for (int k = pstart[p]; k < pstart[p + 1]; ++k)
                     for (int l = pstart[q]; l < pstart[q + 1]; ++l) {
                         std::complex<double> b(Br[(size_t)k * np + l], Bi[(size_t)k * np + l]);
-                        acc += v[k] * std::conj(v[l]) * std::conj(b);
+                        const std::complex<double> vk(v[k].real(), v[k].imag());
+                        const std::complex<double> vl(v[l].real(), v[l].imag());
+                        acc += vk * std::conj(vl) * std::conj(b);
                     }
                 double val = (p == q ? 1.0 : 2.0) * acc.real() * W_total;
                 M[p][q] = val;
@@ -5005,67 +5168,46 @@ public:
         const int npartials = nSLvectors_.size();
         auto opts2d = torch::TensorOptions().dtype(torch::kFloat64);
         // 缺 phsp_truth（只有重建侧样本）时仍给 rec 侧误差，gen 侧返回空。
-        const bool has_gen = data_files.count("phsp_truth") > 0;
+        // 空样本/零相干总额在中心扫描后也会把 has_gen 降为 false。
+        bool has_gen = data_files.count("phsp_truth") > 0;
         // 误差扫描会在内部反复改 theta_cur_（每个 θ 方向的 ±ε）。出函数必须还原，
         // 否则后续 getFitFractionMatrix / getFitFractions / writeResult 会拿扰动过的
         // θ 算振幅（实测残留会让份额第 5 位就偏）。
         const torch::Tensor theta_saved = theta_cur_;
         auto restoreTheta = [&]() { theta_cur_ = theta_saved; };
+        // 异常路径也必须还原 θ：runMatrices/逐方向扫描会改 theta_cur_。
+        auto theta_guard = makeScopeExit([&]() { theta_cur_ = theta_saved; });
 
-        // ---- 统一 Hessian → Cov（自由块）----
+        // ---- 统一 Hessian → Cov（耦合自由方向的边际协方差）----
         torch::Tensor H = hessian_in;
         if (H.numel() == 0) H = getHessian(params);
         TORCH_CHECK(H.dtype() == torch::kFloat64, "hessian 必须是 float64");
         TORCH_CHECK(H.size(0) == 2 * n + ntheta, "hessian 维度与 params 不一致: ",
             H.size(0), " vs ", 2 * n + ntheta);
+
+        // J 的列只放耦合方向（θ 的 FD 在 M~1e4 时被舍入噪声主导），
+        // 但协方差必须来自**联合** Hessian 的耦合块：Cov_pp = [inv(H_joint)]_pp。
+        // 旧实现用 inv(H_coupling)（= θ 固定的条件协方差），系统性偏小。
         std::vector<int64_t> free_idx;
         for (int j = 0; j < 2 * n; ++j)
             if (j != 0 && j != n) free_idx.push_back(j);      // 参考方向固定
-        // θ 方向暂不传播（θ FD 的步长在 M~1e4 时被舍入噪声主导；等解析 dF 路线）
-        (void)ntheta;
-        const int nf = static_cast<int>(free_idx.size());
+        int nf = 0;
+        bool cov_ok = false;
+        torch::Tensor cov = couplingCovariance(H, n, nf, cov_ok);
+        TORCH_CHECK((int)free_idx.size() == nf,
+            "computeMatrixErrors: 自由方向计数不一致");
         if (nf == 0) {
             // 全固定配置（常见：只画图不拟合、或参数全被 fix_var 锁死）——
             // 没有参数误差可言，返回空让调用方跳过，绝不能把 writeResult 弄挂。
-            std::cout << "[ctpwa] getFitFractionMatrixErrors: 无自由方向（参数全固定），"
-                         "跳过参数误差矩阵" << std::endl;
+            std::cout << "[ctpwa] 参数误差矩阵: 无自由耦合方向，跳过" << std::endl;
             restoreTheta();
             return { torch::empty({0, 0}, opts2d), torch::empty({0, 0}, opts2d) };
         }
-        auto idx = torch::tensor(free_idx, torch::kInt64).to(H.device());
-        torch::Tensor Hf = H.index_select(0, idx).index_select(1, idx);
-        torch::Tensor cov;
-        {
-            auto hcpu = Hf.to(torch::kCPU).contiguous();
-            std::vector<double> hv(hcpu.data_ptr<double>(), hcpu.data_ptr<double>() + (size_t)nf * nf);
-            std::vector<double> ev(nf);
-            std::vector<double> hcopy = hv;
-            // 简单 Jacobi 预处理后的对称化 + 特征分解判正定
-            double scale = 0.0;
-            for (int i = 0; i < nf; ++i) scale = std::max(scale, std::abs(hv[(size_t)i * nf + i]));
-            if (scale <= 0.0) scale = 1.0;
-            torch::Tensor Ht = torch::from_blob(hcopy.data(), {nf, nf}, opts2d).clone();
-            Ht = 0.5 * (Ht + Ht.transpose(0, 1));
-            // eigvalsh 在病态输入上会直接抛 LinAlgError（实测 ls_filter 类配置
-            // 在随机参数点取 Hessian 时就会）。这里按"判不了 = 非正定"处理，
-            // 让 writeResult 跳过误差矩阵，而不是把整个写文件弄崩。
-            double emin = 0.0;
-            try {
-                auto eigs = torch::linalg_eigvalsh(Ht);
-                emin = eigs[0].item<double>();
-            } catch (const std::exception& e) {
-                std::cerr << "[ctpwa] Hessian 特征分解失败（" << e.what()
-                          << "），按非正定处理：跳过参数误差矩阵" << std::endl;
-                restoreTheta();
-                return { torch::empty({0, 0}, opts2d), torch::empty({0, 0}, opts2d) };
-            }
-            if (!(emin > 1e-8 * scale)) {
-                std::cerr << "[ctpwa] getFitFractionMatrixErrors: Hessian 自由块非正定 "
-                             "(min eig = " << emin << ")，参数误差不可靠 → 返回空" << std::endl;
-                restoreTheta();
-                return { torch::empty({0, 0}, opts2d), torch::empty({0, 0}, opts2d) };
-            }
-            cov = torch::linalg_inv(Ht);
+        if (!cov_ok) {
+            std::cerr << "[ctpwa] 参数误差矩阵: 联合 Hessian 自由块非正定或求逆失败"
+                         "（min eig / 数值问题），不写误差矩阵" << std::endl;
+            restoreTheta();
+            return { torch::empty({0, 0}, opts2d), torch::empty({0, 0}, opts2d) };
         }
         const double* h_cov = cov.data_ptr<double>();
 
@@ -5157,12 +5299,19 @@ public:
                 Wg[0] += C_diag[i];
                 for (int j = i + 1; j < np; ++j) Wg[0] += C_off[(size_t)i * np + j];
             }
-            TORCH_CHECK(Wg[0] > 0.0, "产生侧矩阵的相干总额非正，无法归一");
+            if (!(Wg[0] > 0.0) || !std::isfinite(Wg[0])) {
+                // 空 phsp_truth（或退化权重/耦合）不应抹掉有效的 rec 结果。
+                // 中心 writeResult 本来就不会写 W=0 的 gen 表；这里同样只
+                // 跳过 gen_err，不抛出异常打断整个文件。
+                std::cerr << "[ctpwa] phsp_truth 相干总额非正/非有限，"
+                             "跳过 interference_gen_err" << std::endl;
+                has_gen = false;
+            }
         }
 
         // 重建侧：常驻 B̄ 拷一次 host，之后每个方向只是 n×n 收缩（0 趟）
         std::vector<double> Br, Bi;
-        double W_total_rec = 1.0;
+        double W_total_rec = 0.0;
         {
             cudaSetDevice(primary_dev_);
             Br.resize((size_t)namp * namp);
@@ -5195,8 +5344,10 @@ public:
         auto contractRec = [&](const torch::Tensor& vec, std::vector<double>& Mout,
                                double& Wsum) {
             auto vc = vec.detach().to(torch::kCPU).contiguous();
-            const std::complex<double>* v =
-                reinterpret_cast<const std::complex<double>*>(vc.data_ptr());
+            TORCH_CHECK(vc.scalar_type() == TORCH_COMPLEX,
+                "contractRec: vector dtype 与 .so 复数精度不一致");
+            const ctC10Complex* v =
+                reinterpret_cast<const ctC10Complex*>(vc.data_ptr());
             // 与 phspMatrixFromGram 同一口径：行/列 = 分波（链 × 共振态组合），
             // 分波内多个 LS 相干求和（nSLvectors_ 给出每段长度）。
             const int npart = (int)nSLvectors_.size();
@@ -5210,7 +5361,9 @@ public:
                     for (int k = pst[p]; k < pst[p + 1]; ++k)
                         for (int l = pst[q]; l < pst[q + 1]; ++l) {
                             std::complex<double> b(Br[(size_t)k * namp + l], Bi[(size_t)k * namp + l]);
-                            acc += v[k] * std::conj(v[l]) * std::conj(b);
+                            const std::complex<double> vk(v[k].real(), v[k].imag());
+                            const std::complex<double> vl(v[l].real(), v[l].imag());
+                            acc += vk * std::conj(vl) * std::conj(b);
                         }
                     double val = (p == q ? 1.0 : 2.0) * acc.real() * W_total_rec;
                     Mout[(size_t)p * npart + q] = val;
@@ -5399,42 +5552,41 @@ public:
         // ===== 误差: σ² = σ_param² + σ_stat² =====
         std::vector<double> eff_errors(npartials, 0.0);
 
-        // 参数误差（同 getFitFractions: H⁻¹ 用 mask 掉固定方向的自由块）
+        // 参数误差（同 getFitFractions: 联合 Hessian 时对 θ 取边际协方差）
         torch::Tensor hessian;
         if (hessian_in.numel() > 0)
-            hessian = hessian_in.slice(0, 0, n2).slice(1, 0, n2);
+            hessian = hessian_in;
         else
             hessian = computeCouplingHessian(vector);
-        if (hessian.numel() > 0 && hessian.size(0) == n2) {
+        int n_free = 0;
+        bool cov_ok = false;
+        torch::Tensor cov = couplingCovariance(hessian, n, n_free, cov_ok);
+        if (n_free > 0 && cov_ok) {
             std::vector<int64_t> free_idx;
             for (int j = 0; j < n2; ++j)
                 if (j != 0 && j != n) free_idx.push_back(j);
-            const int n_free = (int)free_idx.size();
-            if (n_free == 0) {
-                // 全部方向固定(如单链仅参考耦合): 无自由参数可传播, 参数误差为 0
-            } else {
-            auto idx = torch::tensor(free_idx, torch::kInt64).to(hessian.device());
-            torch::Tensor H_free = hessian.index_select(0, idx).index_select(1, idx);
-            auto eig = torch::linalg_eigvalsh(H_free);
-            if (eig[0].item<double>() > 1e-8) {
-                torch::Tensor cov = torch::linalg_inv(H_free).cpu();
-                std::vector<double> h_cov(n_free * n_free);
-                std::memcpy(h_cov.data(), cov.data_ptr<double>(), n_free * n_free * sizeof(double));
+            TORCH_CHECK((int)free_idx.size() == n_free,
+                "getEfficiency: 自由方向计数不一致");
+            std::vector<double> h_cov((size_t)n_free * n_free);
+            std::memcpy(h_cov.data(), cov.data_ptr<double>(),
+                        h_cov.size() * sizeof(double));
 
-                std::vector<double> J(npartials * n_free, 0.0);
-                for (int fj = 0; fj < n_free; ++fj) {
-                    const int j = free_idx[fj];
-                    for (int i = 0; i < npartials; ++i) {
-                        double e_p = effOf(eff_p_partial[j * npartials + i],
-                                           tr_p_partial[j * npartials + i]);
-                        double e_m = effOf(eff_m_partial[j * npartials + i],
-                                           tr_m_partial[j * npartials + i]);
-                        J[i * n_free + fj] = (e_p - e_m) / (2.0 * eps_j[j]);
-                    }
+            std::vector<double> J(npartials * n_free, 0.0);
+            for (int fj = 0; fj < n_free; ++fj) {
+                const int j = free_idx[fj];
+                for (int i = 0; i < npartials; ++i) {
+                    double e_p = effOf(eff_p_partial[j * npartials + i],
+                                       tr_p_partial[j * npartials + i]);
+                    double e_m = effOf(eff_m_partial[j * npartials + i],
+                                       tr_m_partial[j * npartials + i]);
+                    J[i * n_free + fj] = (e_p - e_m) / (2.0 * eps_j[j]);
                 }
-                computeBFErrors(J.data(), h_cov.data(), eff_errors.data(), npartials, n_free);
             }
-            }
+            computeBFErrors(J.data(), h_cov.data(), eff_errors.data(),
+                            npartials, n_free);
+        } else if (n_free > 0) {
+            std::cerr << "[ctpwa] getEfficiency: Hessian 自由块非正定/求逆失败，"
+                         "跳过参数误差" << std::endl;
         }
 
         // MC 统计误差（tf-pwa add_int_error 同款）:
@@ -5470,7 +5622,7 @@ public:
     {
         auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(0));
         if (nEl == 0) return torch::empty({0}, opts);
-        if (!float_amps_) {
+        if (!float_amps_ || ctIsFloatComplex) {
             return torch::from_blob(base + offset_el, {nEl}, opts).clone();
         }
         const float2* fbase = reinterpret_cast<const float2*>(base) + offset_el;
@@ -5634,6 +5786,11 @@ public:
     // 抽出来是为了让 reCalcAmp(θ) 之后 B̄ 也新鲜（此前只在 getHessian 里更新）。
     void rebuildPhspGram()
     {
+            // 每次调用只恢复一次（不是逐批/逐事件操作），避免 reCalcAmp 后
+            // raw current device 停在最后一张卡；异常路径也同样恢复。
+            auto device_guard = makeScopeExit([this]() {
+                cudaSetDevice(primary_dev_);
+            });
             int primary_dev = primary_dev_;
             // Pre-compute total phsp weight for correct global normalization
             double W_total = 0.0;
@@ -5669,7 +5826,7 @@ public:
                     ctComplex* d_phsp_scaled;
                     cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
                     // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
-                    if (float_amps_) {
+                    if (float_amps_ && !ctIsFloatComplex) {
                         const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
                             + (size_t)c0 * n_polar_ * n_amplitudes_;
                         CTPWA_LAUNCH(castF2ToDouble2Kernel, (nTot + 255) / 256, 256, 0, 
@@ -5879,7 +6036,7 @@ public:
             for (int g = 0; g < n_gpu; ++g) {
                 cudaSetDevice(g);
                 ctComplex* a = amps[g];
-                if (float_amps_ && a) {
+                if (float_amps_ && !ctIsFloatComplex && a) {
                     const size_t n_el = static_cast<size_t>(counts[g]) *
                         static_cast<size_t>(n_polar_) *
                         static_cast<size_t>(n_amplitudes_);
@@ -6704,7 +6861,7 @@ private:
                     // batch_cap ≤ ~200MB/批 → 有界，与 phsp 总量无关）。
                     ctComplex* d_batch_up = nullptr;   // 非空 = d_batch_r 指向它的 double 上转段
                     const ctComplex* d_batch_r = d_batch[gpu];
-                    if (float_amps_) {
+                    if (float_amps_ && !ctIsFloatComplex) {
                         d_batch_up = upcastAmpSegToDouble(d_batch[gpu], (size_t)nTot);
                         d_batch_r = d_batch_up;
                     }
@@ -6759,6 +6916,16 @@ private:
                         } else {
                             int grid2 = (nTot + 255) / 256;
                             CTPWA_LAUNCH(castPhspBatchToDoubleKernel, grid2, 256, 0, d_batch[gpu], d_batch_d, nTot);
+                        }
+                        // 与 float32 分支**同一归一化**：A ← A·sqrt(w/W_total)。
+                        // 之前漏了这一步，double 矩阵是 Σ A A^H（未加权/未除 W），
+                        // 下游又乘回 W_total → W_rec 大 N 倍、有 phsp_weights 时整个
+                        // interference_rec 变成无权重矩阵。
+                        {
+                            const double* d_w = (gpu < (int)phsp_weights_.size())
+                                ? phsp_weights_[gpu] : nullptr;
+                            scalePhspAmpsDouble(d_batch_d, d_w ? d_w + c0 : nullptr,
+                                nch, n_polar_, n_amplitudes_, 1.0 / W_total);
                         }
                         cuDoubleComplex* d_md;
                         cudaMalloc(&d_md, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
@@ -6817,7 +6984,7 @@ private:
                     const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
                     ctComplex* d_phsp_scaled;
                     cudaMalloc(&d_phsp_scaled, nch_tot * sizeof(ctComplex));
-                    if (float_amps_) {
+                    if (float_amps_ && !ctIsFloatComplex) {
                         // float2 A 块 → double 块（A 元素偏移 = c0*nPolar*nAmp，单位元素数）
                         const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
                             + (size_t)c0 * n_polar_ * n_amplitudes_;

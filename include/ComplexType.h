@@ -71,6 +71,7 @@ inline __host__ __device__ ctComplex ctMake(double re, double im)
 #define CUBLAS_CGEMM cublasZgemm
 #define CUBLAS_CGEMM_STRIDED_BATCHED cublasZgemmStridedBatched
 #define CUBLAS_CDGMM cublasZdgmm
+#define CUBLAS_CDOTC cublasZdotc
 
 using ctFloat = double;
 using ctFloat2 = double2;
@@ -118,6 +119,7 @@ inline __host__ __device__ ctComplex ctMake(double re, double im)
 #define CUBLAS_CGEMM cublasCgemm
 #define CUBLAS_CGEMM_STRIDED_BATCHED cublasCgemmStridedBatched
 #define CUBLAS_CDGMM cublasCdgmm
+#define CUBLAS_CDOTC cublasCdotc
 
 using ctFloat = float;
 using ctFloat2 = float2;
@@ -145,6 +147,16 @@ constexpr auto TORCH_COMPLEX_STR = "complex64";
 constexpr auto PRECISION_NAME = "float";
 
 #endif
+
+// 编译期精度判据：
+//   ctIsFloatComplex = true  → 原生 float .so（CTPWA_COMPLEX=float），
+//                              ctComplex 本身就是 cuComplex/float2，
+//                              **不存在** "A 存 float2、计算用 double" 的混合档。
+//   ctIsFloatComplex = false → double .so。若同时 float_amps_==true，才是
+//                              "A 存 float2、核心计算 double" 的混合精度模式。
+// 需要把 A 上转为 cuDoubleComplex 的低频路径（writeResult/Hessian/getIntensity…）
+// 必须用 float_amps_ && !ctIsFloatComplex 守卫；原生 float 下直接读 A 即可。
+constexpr bool ctIsFloatComplex = (sizeof(ctComplex) == sizeof(cuComplex));
 
 // ====================================================================
 // 通用 float2 复数辅助（混合精度用: double .so + config precision:float 时

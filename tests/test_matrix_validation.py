@@ -2,7 +2,7 @@
 
 这些检查不依赖矩阵是怎么算出来的，只依赖它必须满足的数学性质：
 1. 归一化后 trace + Σ_{i<j} = 1；对角 ≥ 0；|I_ij| ≤ 2√(F_i F_j)（Cauchy–Schwarz）；
-   2Re(G) 型矩阵半正定（G 是逐事例 partial 振幅的 Gram）。
+   非对角除回因子 2 后，Re(G) 半正定（G 是逐事例 partial 振幅的 Gram）。
 2. 规范不变：所有耦合同乘一个复数（整体模长/相位）→ 份额不变。
 3. phsp 与 phsp_truth 指同一文件时 rec 与 gen 必须逐元素相等。
 4. 独立路径：rec 矩阵对角 = saved_weight 树里 weight_i/totalweight 的和（另一套 kernel）。
@@ -49,8 +49,13 @@ def test_matrix_invariants(make_analysis):
         for i in range(len(d)):
             for j in range(i + 1, len(d)):
                 assert abs(F[i, j]) <= 2 * np.sqrt(d[i] * d[j]) + 1e-12
-        # 2Re(Gram) 半正定
-        assert np.linalg.eigvalsh(F).min() > -1e-10
+        # 存储约定是 diag=G_ii/W、off=2Re(G_ij)/W；带因子 2 的
+        # F 本身不必 PSD。除回非对角的 2 后，Re(Gram) 才必须 PSD。
+        G = F.copy()
+        iu = np.triu_indices(len(F), 1)
+        G[iu] *= 0.5
+        G[(iu[1], iu[0])] *= 0.5
+        assert np.linalg.eigvalsh(G).min() > -1e-10
 
 
 def test_matrix_gauge_invariance(make_analysis):

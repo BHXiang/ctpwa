@@ -67,6 +67,20 @@ def _fmt(x, sig=4):
     return f"{x:.{sig}g}"
 
 
+def per_wave_efficiency(mats, meta):
+    """逐波效率 ε_i = (P_ii/N_rec)/(T_ii/N_gen)，由归一化矩阵 + integrals 还原。
+
+    mats/ meta 里的矩阵是 P_ii/W_rec、T_ii/W_gen；必须先乘回 W 才是原始积分。
+    单看 (diag/N) 会漏掉 W_rec/W_gen 因子（旧版 bug）。
+    """
+    Wr, Wg = meta.get("W_rec"), meta.get("W_gen")
+    Nr, Ng = meta.get("N_rec"), meta.get("N_gen")
+    if not (Wr and Wg and Nr and Ng):
+        return None
+    di, dr = np.diag(mats["gen"]), np.diag(mats["rec"])
+    return (dr * Wr / Nr) / (di * Wg / Ng)
+
+
 def print_matrix(name, M, E, labels, W=None, N=None):
     n = M.shape[0]
     diag = np.diag(M)
@@ -158,11 +172,11 @@ def main(argv=None):
             print("== 效率（由两张表直接得到）==")
             why = "" if (Nr is None or Ng is None) else "  (两样本同源产生时)"
             print(f"   平均效率 ε̄ = W_rec/W_gen = {eps_bar:.6f}{why}")
-            if Nr and Ng:
-                di, dr = np.diag(mats["gen"]), np.diag(mats["rec"])
-                eps_i = (dr / Nr) / (di / Ng)
+            eps_i = per_wave_efficiency(mats, meta)
+            if eps_i is not None:
                 print(f"   每波效率 ε_i = (P_ii/N_rec)/(T_ii/N_gen) = "
                       f"{np.round(eps_i, 6).tolist()}")
+                print("   注: 矩阵已是 P_ii/W、T_ii/W，公式里的 P_ii/T_ii 是乘回 W 后的原始积分")
                 print("   注: ε_i 是相对值 ε_i^abs/ε_all（cut 后样本分布 ∝ εdΦ/∫ε）")
             print()
 

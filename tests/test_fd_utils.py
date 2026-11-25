@@ -91,7 +91,10 @@ def test_noisy_fd_never_reported_as_fail():
     def grad(p):
         p = p.detach()
         return A @ p + eps * torch.sin(p / delta)
-    p = torch.randn(6, dtype=torch.float64)
+    # 固定本用例的 p：全局 RNG 状态随测试顺序变化，某些点会落在线性化
+    # 判定区而使 n_fd_noisy=0，导致全套件随机失败（单独特跑又通过）。
+    p = torch.randn(6, dtype=torch.float64,
+                    generator=torch.Generator().manual_seed(0))
     rep = compare_hessian(A.numpy(), grad, p, sig_frac=1e-6)
     assert rep.verdict != "FAIL", rep.summary()
     assert rep.n_fd_noisy > 0, rep.summary()

@@ -85,4 +85,15 @@ else
   echo "多卡一致性 ✓"
 fi
 
+# NLL/梯度一致并不能发现派生量错误：加权 Gram、truth 分批、空 GPU 分片、
+# writeResult 的 N/W/矩阵/误差都要单独做 1卡 vs N卡断言。
+echo; echo "===== 5.5) 多卡派生量（加权 rec/gen + err、streaming、n_batch<n_gpus）====="
+$PY "$HERE/multigpu_results.py" 2>&1
+MGR_RC=$?
+if [ $MGR_RC -ne 0 ]; then
+  echo "!!! 多卡派生量未通过 (rc=$MGR_RC) —— 不要发布"
+  exit $MGR_RC
+fi
+echo "多卡派生量一致性 ✓"
+
 echo "=== 结束: $(date) ==="
