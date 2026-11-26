@@ -6622,6 +6622,9 @@ private:
             amp_calc_.setFloatOutput(float_amps_);
             // d_dF 表存储档位: 仅全 float 档存 float2（hybrid 保持 double 语义）
             amp_calc_.setDFloat(prec_mode_ == PrecMode::Float);
+            // 容量预检必须使用 A 的运行时存储档位：double .so + auto/hybrid
+            // 实际是 float2(8B)，不能再按 sizeof(ctComplex)=16B 高估一倍。
+            device_mgr_.setAmplitudeBytes(float_amps_ ? sizeof(float2) : sizeof(ctComplex));
         }
         if (n_gpus_ == 0) {
             std::cerr << "ERROR: 无可用 CUDA 设备。ctpwa 当前仅支持 GPU 计算"
@@ -6668,25 +6671,36 @@ private:
 
         // 内存预检：输入数据能否被设备集承载（含每 GPU 事件分布）
         {
-            // 每个 GPU 的峰值事件数 = data/phsp/bkg 的最大者。
-            // phsp 流式模式下 phsp 不驻留（构造期按批算完即弃），峰值只按 data/bkg 估
-            std::vector<int> peak_events(n_gpus_, 0);
+            // 常驻振幅表按该 GPU 的 phsp+data+bkg 总事件数分配，不能用单个
+            // 样本的最大值估；其他临时 buffer 用它作上界是可接受的保守估计。
+            // phsp 流式模式下 phsp 不驻留，只统计 data/bkg。
+            std::vector<int> resident_events(n_gpus_, 0);
             for (int gpu = 0; gpu < n_gpus_; ++gpu)
                 for (size_t j = (phsp_streamed ? 1 : 0); j < events_[gpu].size(); ++j)
-                    peak_events[gpu] = std::max(peak_events[gpu], events_[gpu][j]);
+                    resident_events[gpu] += events_[gpu][j];
             bool has_bkg = (init_events.size() > 2 && init_events[2] > 0);
             auto cap = device_mgr_.checkCapacity(
-                peak_events, n_amplitudes_, n_polar_, n_gls_, particles_.size(),
+                resident_events, n_amplitudes_, n_polar_, n_gls_, particles_.size(),
                 has_bkg, params_.nFreeTheta());
             // 预检后打印设备列表（含每 GPU 预计占用）
             device_mgr_.print();
             if (cap.overall == DeviceManager::CapacityStatus::FAIL) {
                 std::cerr << "ERROR: 内存预检失败——GPU " << cap.failing_device
                           << " 无法承载数据: " << cap.failing_buffer
-                          << " 需要 " << cap.required_bytes / 1e6
+                          << " 预计总计 " << cap.required_bytes / 1e6
                           << " MiB，可用 " << cap.available_bytes / 1e6
-                          << " MiB。请减少事件数或使用多 GPU。" << std::endl;
-                throw std::runtime_error("input data exceeds device memory");
+                          << " MiB（事件数 " << resident_events[cap.failing_device]
+                          << "）。请减少事件数或使用多 GPU。" << std::endl;
+                for (const auto& [name, bytes] : cap.breakdown) {
+                    std::cerr << "    - " << name << ": "
+                              << bytes / 1048576.0 << " MiB" << std::endl;
+                }
+                if (std::getenv("CTPWA_SKIP_MEM_CHECK") != nullptr) {
+                    std::cerr << "WARNING: CTPWA_SKIP_MEM_CHECK 已设置，跳过预检；"
+                                 "若实际显存不足会在 cudaMalloc 处报错。" << std::endl;
+                } else {
+                    throw std::runtime_error("input data exceeds device memory");
+                }
             } else if (cap.overall == DeviceManager::CapacityStatus::WARN) {
                 std::cerr << "WARNING: 内存占用超过可用显存的 80%，"
                              "建议减少事件数或增加 GPU。" << std::endl;

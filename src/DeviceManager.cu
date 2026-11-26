@@ -239,6 +239,7 @@ DeviceManager::MemEstimate DeviceManager::estimate(
 
     const double ne = (double)n_events_per_gpu;
     const double cs = (double)complexSize();       // complex 值大小 (8/16)
+    const double amp_cs = (double)amplitudeBytes(); // A 的运行时存储大小
     const double sl = 16.0;                        // thrust::complex<double> 固定 16B
     const double db = 8.0;                         // double
 
@@ -247,7 +248,7 @@ DeviceManager::MemEstimate DeviceManager::estimate(
     };
 
     // ---- 事件相关（per GPU，用最大样本的事件数估算峰值）----
-    double amp = ne * n_amplitudes * n_polar * cs;       // d_all_amplitudes
+    double amp = ne * n_amplitudes * n_polar * amp_cs;   // d_all_amplitudes（运行时档位）
     double slamp = ne * n_polar * n_slcombs * sl;        // d_slamps
     double mom = ne * n_particles * 32.0;                // d_momenta (LorentzVector = 4×double)
     double T = ne * n_polar * cs;                        // d_T
@@ -313,22 +314,24 @@ DeviceManager::CapacityResult DeviceManager::checkCapacity(
                                            : (double)d.total_memory;
 
         if (need > avail) {
-            // 找出超限的具体 buffer（用于报错信息）
-            const char* worst = "";
-            double worst_need = 0.0;
-            for (const auto& [name, bytes] : m.breakdown) {
-                if (bytes > worst_need) { worst_need = bytes; worst = name.c_str(); }
+            // 记录第一张失败卡，但继续估算其余 GPU：
+            // 否则 print() 会把后续 GPU 显示成 0 B，看起来像没有被使用。
+            if (result.overall != CapacityStatus::FAIL) {
+                const char* worst = "";
+                double worst_need = 0.0;
+                for (const auto& [name, bytes] : m.breakdown) {
+                    if (bytes > worst_need) { worst_need = bytes; worst = name.c_str(); }
+                }
+                result.overall = CapacityStatus::FAIL;
+                result.failing_device = (int)i;
+                result.failing_buffer = worst;
+                result.required_bytes = need;
+                result.available_bytes = avail;
+                result.breakdown = m.breakdown;
             }
-            result.overall = CapacityStatus::FAIL;
-            result.failing_device = (int)i;
-            result.failing_buffer = worst;
-            result.required_bytes = need;
-            result.available_bytes = avail;
-            return result;
-        }
-
-        if (need > avail * warn_fraction) {
-            result.overall = CapacityStatus::WARN;   // 继续检查后续 GPU，保留最差状态
+        } else if (need > avail * warn_fraction &&
+                   result.overall == CapacityStatus::OK) {
+            result.overall = CapacityStatus::WARN;
         }
     }
 

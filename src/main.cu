@@ -211,7 +211,10 @@ static void bind_ctpwa(pybind11::module_& m)
         .def("complexPrecision", [](const DeviceManager& dm) {
             return (int)dm.complexPrecision(); })
         .def("compiledPrecision", [](const DeviceManager&) {
-            return std::string(PRECISION_NAME); });
+            return std::string(PRECISION_NAME); })
+        .def("setAmplitudeBytes", &DeviceManager::setAmplitudeBytes,
+             pybind11::arg("bytes"), "设置运行时驻留振幅 A 的每元素字节数（8/16）")
+        .def("amplitudeBytes", &DeviceManager::amplitudeBytes);
 
     pybind11::class_<analysis>(m, "analysis")
         .def(pybind11::init<const std::string&, int>(),

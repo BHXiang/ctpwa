@@ -248,6 +248,20 @@ def test_estimate_positive():
     assert gpu2 > gpu, "事件数越多内存需求越大"
 
 
+def test_estimate_uses_runtime_amplitude_bytes():
+    """auto/hybrid 的 A 是 float2(8B)，预检不能按 double 的 16B 高估。"""
+    import ctpwa
+
+    dm = ctpwa.DeviceManager()
+    dm.detect()
+    dm.setAmplitudeBytes(16)
+    gpu16, _ = dm.estimateMemory(1000, 4, 3, 1, 3, True)
+    dm.setAmplitudeBytes(8)
+    gpu8, _ = dm.estimateMemory(1000, 4, 3, 1, 3, True)
+    assert dm.amplitudeBytes() == 8
+    assert gpu16 - gpu8 == 1000 * 4 * 3 * 8
+
+
 def test_complex_precision():
     """编译精度一致性：complexSize 与 compiledPrecision 匹配。
 

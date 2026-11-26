@@ -83,6 +83,13 @@ public:
     // 单个 complex 值的内存占用: Float→8B, Double→16B
     size_t complexSize() const;
 
+    // 运行时驻留振幅 A 的每元素字节数（8=float2，16=double2）。
+    // 缺省 0 = 回退到编译期 complexSize(); 调用方在 precision 解析后设置。
+    void setAmplitudeBytes(size_t bytes) { amplitude_bytes_ = bytes; }
+    size_t amplitudeBytes() const {
+        return amplitude_bytes_ ? amplitude_bytes_ : complexSize();
+    }
+
     // 运行时存储档位说明（由 analysis 初始化时注入; print() 展示）:
     // 例: "A float2(8B) | dF double2(16B) | 核心 double (precision: auto)"
     void setStorageNote(const std::string& n) { storage_note_ = n; }
@@ -124,6 +131,8 @@ public:
         std::string failing_buffer;      // FAIL 时具体的 buffer 名
         double required_bytes = 0.0;     // FAIL 时该 GPU 需要的字节
         double available_bytes = 0.0;    // FAIL 时该 GPU 的可用显存
+        // FAIL 时该 GPU 的估算明细（便于定位到底是 A、SL 表还是临时 buffer）
+        std::vector<std::pair<std::string, double>> breakdown;
     };
 
     // 预检：给定的每-GPU 事件分布能否被设备集承载。
@@ -141,6 +150,7 @@ private:
     // 为空表示还没估算过——print() 此时回退显示空闲量）。checkCapacity 是
     // const 接口, 故为 mutable。
     mutable std::vector<double> estimated_usage_;
+    size_t amplitude_bytes_ = 0;   // 0 = 使用 complexSize()
     ComplexPrecision complex_precision_ = ComplexPrecision::Float;
     std::string storage_note_;   // 运行时存储档位（analysis 注入; 空则不打印）
 };

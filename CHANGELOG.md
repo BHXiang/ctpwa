@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **内存预检误报（双卡仍按单卡大表拒绝）**：
+  - `d_all_amplitudes` 按运行时实际存储大小估算；double `.so` 的
+    `precision:auto/hybrid` 是 float2 8 B，不再按 16 B 高估一倍；
+  - 按每 GPU 的 phsp+data+bkg 总事件数估算常驻振幅，而不是最大单样本；
+  - 某张 GPU 失败后继续估算其余 GPU，不再把 GPU1 显示成 `0 B`；
+  - 失败信息打印总预计值和逐 buffer 明细；
+  - 新增 `CTPWA_SKIP_MEM_CHECK=1` 应急开关，设置后预检失败仍继续，
+    真实显存不足由 `cudaMalloc` 报错。
+
 ## [v0.3.26] - 2026-11-26
 
 ### Fixed
