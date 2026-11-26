@@ -13,7 +13,8 @@
 | P0-A 还原主卡 → `ensure_device` | ✅ | `5e3ab26` |
 | P0-C `primary_dev` 显式化 | ✅ | `d0eab60` |
 | P0-B 多卡循环内的 set（128 处） | ⏸ **等 GPU** | — |
-| P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | 见下 |
+| P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | `9e91283` |
+| 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
 
@@ -78,6 +79,11 @@ Analysis.cu 的 6 个调用点显式传 `primary_dev_`（局部作用域里是 `
 | `releaseStaticData` | 删掉 `std::set<DeviceMomenta*> drop` + 重建登记表那 30 行，改为 `releasePermMomenta()`：所有者向量 `resize(n_gpu)`，尾部析构自动释放 |
 | 析构 | `d_mom_structs_.clear()` 即可；上下文已销毁的分支先 `disarmMomentaOwners()` |
 
+**验证**：全量逐文件扫描 251 passed / 7 failed / 30 skipped，与重构前基线逐文件
+对比**只有 7 个 devify 过的文件变化（全部是增加通过）**，无一处回退；新增
+`tests/test_ownership.py` 3 个用例（ident2/ident3 反复构造→NLL→release→销毁，
+CPU 后端 double free 会直接 abort）。CUDA 侧只编译验证：EXIT=0、0 错误。
+
 **顺带发现的一个真问题**：CPU 后端 `Tensor::get_device()` 返回 **-1**，而
 `getNLL` 里 `const int primary_dev = vector.get_device()` 的这个值被当设备号用。
 以前 `cudaSetDevice(-1)` 静默失败（不切设备），P0 的 `ensure_device` 把它变成
@@ -127,6 +133,17 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 `ctpwa::set_device/current_device` 两后端都能解析。
 
 **没有做**的：CUDA 的运行时行为（多卡设备归属、性能）——那需要真 GPU，等空闲。
+
+---
+
+## 门禁现状（P2 后）
+
+| 指标 | 重构前 | 现在 |
+|---|---|---|
+| 门禁 passed | 183 | **251 + 3**（新增 test_ownership） |
+| 其中数值用例 | 0（全 skip） | **37**（含 golden NLL / golden 梯度 / 梯度 vs FD） |
+| failed | 8 | 7（均已定位为 CPU 构建固有） |
+| 裸 `cudaSetDevice` 违规 | 208 | **127** |
 
 ---
 
