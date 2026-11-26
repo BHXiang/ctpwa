@@ -181,6 +181,7 @@ SOURCES_CORE = [
     "src/CouplingHessian.cu", # P4：耦合方向 Hessian
     "src/FullHessian.cu",    # P4：统一 Hessian（685 行）
     "src/ResultWriter.cu",   # P4：writeResult / writeInterfResult（1836 行）
+    "src/Initialize.cu",     # P4：initialize / initializeDecayChains / getIntensity
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
