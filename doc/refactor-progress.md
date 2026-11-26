@@ -78,6 +78,32 @@ Analysis.cu 的 6 个调用点显式传 `primary_dev_`（局部作用域里是 `
 
 ---
 
+## CUDA 构建验证（只编译，不占用 GPU）
+
+P0/P1 之后 CUDA 路径必须仍然能编（用户明确：不能把 CUDA 改成 CPU）。验证方式是
+**只编译、不运行**——nvcc 编译不需要 GPU 设备，只有运行期才需要：
+
+```bash
+CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_ext --inplace
+```
+
+实测（2026-11-27）：
+
+| 项 | 结果 |
+|---|---|
+| 退出码 | 0（20/20 步，含 `-dlink` RDC 链接） |
+| 编译错误 | 0 |
+| 产物 | `ctpwa/_cuda.so` 14.2 MB（单架构 sm_86；8 架构时 17.8 MB） |
+| `ldd` 缺失库 | 0 |
+| 未解析的 `ctpwa::` 符号 | 0 |
+
+也就是说 17 个 TU + `-rdc=true` 的组合在 CUDA 侧同样成立，`DeviceGuard.h` 里的
+`ctpwa::set_device/current_device` 两后端都能解析。
+
+**没有做**的：CUDA 的运行时行为（多卡设备归属、性能）——那需要真 GPU，等空闲。
+
+---
+
 ## 当前门禁口径
 
 ```bash
