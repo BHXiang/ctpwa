@@ -843,7 +843,36 @@ CPU 与 GPU 的 A/B 指纹对比出现分叉：
 
 ---
 
-## 一键验收（本轮新增）
+## P4（第十七步）：`Analysis.h` 里其实有两个类 —— 拆出 `NLLFunction`
+
+`Analysis.h` 一直是"helpers + **NLLFunction** + analysis"三段。`NLLFunction`
+是 torch `autograd::Function` 的 forward/backward 实现，与 `analysis` 的唯一关系是
+被 `getNLL` 调用。搬进 `include/NLLFunction.h` 后：
+
+| 文件 | 行数 |
+|---|---|
+| `include/Analysis.h` | 2423 → **1656** |
+| `include/NLLFunction.h` | 776（新） |
+
+从重构前的 `Analysis.cu` 7624 行算起：**累计 −5968 行**。
+
+### A/B 判据的两轮修正（都来自实测，值得单独记）
+
+| 版本 | 判据 | 被什么击穿 |
+|---|---|---|
+| v1 | 整条向量 `max|Δ|/‖v‖∞` | `interp` 有 ≈0 的梯度分量，绝对差 9e-13 → 算成 7.9e-8 |
+| v2 | 逐元素 `atol + rtol·max(|a|,|b|)`，atol=1e-12 | `grad[0]`（固定参考振幅方向，解析应为 0）逐次抖动 ~1e-12 |
+| **v3（现）** | `1e-8·‖v‖∞ + rtol·max(|a|,|b|)`，rtol 默认 1e-7 | —— |
+
+v3 的依据：**CPU 梯度路径本身有 ~8e-8 的逐次运行抖动**（同一份二进制跑两次就不同，
+`interp` 的查找表路径最明显）。这不是重构引入的，但意味着"逐位相等"在 CPU 上不是
+可用的判据；而 GPU 上的 A/B 仍然是**逐位相同**（`nll` 的 Δ 恰好是 0）。
+
+三组对照在新判据下都是"全部一致"：重构 vs 基线、重构自两次、GPU 基线 vs GPU 重构。
+
+---
+
+## 一键验收（上一轮新增）
 
 ```bash
 bash scripts/verify_all.sh              # CPU：构建 + 设备纪律(--strict) + 门禁 + A/B + host 单测
