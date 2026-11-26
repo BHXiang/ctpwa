@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.3.27] - 2026-11-27
+
 ### Fixed
 
 - **内存预检误报（双卡仍按单卡大表拒绝）**：
@@ -12,6 +14,23 @@
   - 失败信息打印总预计值和逐 buffer 明细；
   - 新增 `CTPWA_SKIP_MEM_CHECK=1` 应急开关，设置后预检失败仍继续，
     真实显存不足由 `cudaMalloc` 报错。
+- **大模型 SL 静态表峰值**：按独立 chain×JP 计数 SL 表，不再按重复展开的
+  总振幅数估算；无 `trans/var_equal` 时，固定 JP 的 SL 表在振幅物化后立即
+  释放，预检按真实构造峰值估算。`CTPWA_KEEP_SLAMP=1` 可关闭该优化做对照。
+- **大 `nPolar×nAmp` 的 phsp Gram 分块**：块大小改为按当前空闲显存自适应，
+  单块不超过 512 MiB 且不超过空闲显存的 1/8；相关分配全部改为带错误检查的
+  `ctpwaCheckedMalloc`。
+- **大 n Hessian 的 shared memory 超限**：新增 global-memory B 的回退 kernel，
+  只将 `v/Bu/S` 放入 shared；根据设备 `MaxSharedMemoryPerBlockOptin` 自动
+  在普通 kernel 与大 n kernel 之间切换，修复 V100/A100 上 n 较大时的
+  shared memory 超限。
+- **阈值处 `q0=0` 的 BWR 奇点**：BWR 模板与解析导数在 `q0=0` 时按极限取
+  `(q/q0)^n=1`，并跳过 `1/q0` 相关项，避免阈值态产生 NaN。
+
+### Added
+
+- 新增 `MODULARIZATION.md`：设备/内存布局、资源所有权、错误处理和后续拆分方案。
+- 新增 `scripts/cluster/job_sanitize.sh`：单测试 compute-sanitizer 作业模板。
 
 ## [v0.3.26] - 2026-11-26
 
