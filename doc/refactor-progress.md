@@ -22,6 +22,7 @@
 | P4 第二步（`analysis` 变成可包含的头 + 首个方法迁出） | ✅ | `0cbad61` |
 | P4 第三步（`PhspGram` 显式输入模块） | ✅ | `b5b7975` |
 | P4 第四步（`MatrixErrors` + 共享 helper 头） | ✅ | `8c0e86a` |
+| P4 第五步（`SLAmpsIO`） | ✅ | `cd05b49` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -329,6 +330,38 @@ EXIT=0、0 错误。
 
 `Analysis.h` 7529 → **7266 行**。门禁 254 passed / 7 failed / 56 skipped / 4 known
 errors（`test_matrix_errors` 7 个用例正好覆盖这条路径）。
+
+---
+
+## P4（第五步）：SL 振幅导出 + 一次失败的尝试与它的结论
+
+**成功**：`getSLAmpsTensor` / `saveSLAmps` 两个 const 成员只用到 `amp_calc_` 与
+`phsp_freed_`，抽成 `ctpwa::slAmpsTensor` / `saveSLAmpsToFile`（`include/SLAmpsIO.h`
++ `src/SLAmpsIO.cu`），`Analysis.h` 7266 → **7219 行**。
+
+**失败并回退**：本想顺手搬 `computeTruthIntegrals`（77 行，看似只依赖 `nSLvectors_`）。
+实际编译暴露出一串隐藏依赖：
+
+```
+nSLvectors_ →  ok
+float_amps_ / n_polar_ / n_amplitudes_ →  再加 3 个参数
+upcastAmpSegToDouble（static 函数）→ 要上移到共享头
+  └→ castF2ToDouble2Kernel（__global__）→ **不能**放进共享头
+     （多 TU 包含会多重定义；放 .cu 又需要一个新 TU 与声明）
+computeBranchingFractions（别处的自由函数）→ 还要把头也搬
+```
+
+**结论（写进 P4 的方法论）**：god class 的隐性成本不只在类本身，还在它**顺带定义**
+的 static helper 与 kernel。批量搬函数之前要先做一轮"共享 helper 上移"：
+
+| 要上移的东西 | 去处 | 注意 |
+|---|---|---|
+| `ctpwa_dev` / `ctpwa_is_cuda_like` / `makeScopeExit` / `CUDA_CHECK` | `BackendHelpers.h`（已完成） | 纯 host，可直接放头 |
+| `upcastAmpSegToDouble` 等上转工具 | `MixedPrecision.h` + `.cu` | 依赖 `__global__` kernel，必须头声明 + 单独 TU 定义 |
+| `castF2ToDouble2Kernel` 等 kernel | 新 TU 或 `ComputeBF` 已有 TU | `__global__` 不能进头（CPU 后端会多重定义） |
+
+所以下一轮的第一个任务不是搬函数，而是**把这批 helper 归位**——之后
+`computeTruthIntegrals`、`ampSegmentToTensor` 这类函数才能干净搬走。
 
 ---
 
