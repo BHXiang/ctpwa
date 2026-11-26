@@ -151,6 +151,10 @@ grep -c 'h_perm_maps_\|h_signs_' src/PermTopology.cu
 
 两项实测都是 0。
 
+**验证**：全量逐文件扫描 **254 passed / 7 failed / 30 skipped**，与 baseline3
+**逐行相同**（置换拓扑的敏感用例 `test_identical` 11 passed、`test_barrier` 7
+passed 都在其中）；CUDA 侧只编译 EXIT=0、0 错误。
+
 ---
 
 ## P0-B 为什么停在这里（128 处多卡循环内的 set）
