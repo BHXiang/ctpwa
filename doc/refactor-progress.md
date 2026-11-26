@@ -14,7 +14,8 @@
 | P0-C `primary_dev` 显式化 | ✅ | `d0eab60` |
 | P0-B 多卡循环内的 set（128 处） | ⏸ **等 GPU** | — |
 | P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | `9e91283` |
-| P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | 见下 |
+| P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | `7c808a8` |
+| P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | 见下 |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -116,6 +117,39 @@ CPU 后端 double free 会直接 abort）。CUDA 侧只编译验证：EXIT=0、0
 | 全量逐文件扫描 | 254 passed / 7 failed / 30 skipped，与 baseline2 对比**只多出 test_ownership 的 3 个**，其余逐行相同 |
 | 裸 `cudaSetDevice` 违规 | 127 → **125** |
 | CUDA 只编译 | EXIT=0，0 错误 |
+
+---
+
+## P3（第一步）：衰变描述类型与置换拓扑从 SL 表类里抽出来
+
+**问题**：`AmpGen.cuh` 一个头里塞着三类东西——衰变描述（`SL`/`Amp2BD`/
+`DecayNodeHost`）、设备结构体（`DeviceMomenta`）、SL 振幅表类（`AmpCasDecay`，
+含 6 张设备表与 JIT 状态）。后果是任何"只想描述一条衰变链"的代码都必须先能
+编译整个设备层；而全同粒子置换拓扑这种**纯组合逻辑**只能通过构造一个持有设备表
+的对象才能算——于是它无法脱离 GPU 单测。
+
+**改动**：
+
+| 新增 | 内容 | 依赖 |
+|---|---|---|
+| `include/DecayDesc.h` | `SL`、`Amp2BD`（声明）、`DecayNodeHost` | 只依赖 C++ 标准库 + `CudaCompat.h`（SL 的 `__host__ __device__`） |
+| `include/PermTopology.h` | `PermTopology`（每 σ 的重建映射 + 符号）、`buildPermTopology()` | 只依赖 `DecayDesc.h` 与标准库 |
+| `src/PermTopology.cu` | 200 行置换拓扑算法（原 `AmpCasDecay::buildPermTopologies` 的 210 行） | 新 TU，纯 host |
+
+`AmpCasDecay::buildPermTopologies()` 缩成 6 行接线；`AmpGen.cuh` 里
+`DecayNodeHost` 保留 `using DecayNodeHost = ::DecayNodeHost;` 以兼容既有写法。
+
+**判据（可机械检查）**：
+
+```bash
+# 设备 API / 设备类型：都为 0
+grep -cE 'cudaMalloc|cudaMemcpy|cudaSetDevice|cudaFree|thrust::|torch::' \
+     include/DecayDesc.h include/PermTopology.h src/PermTopology.cu
+# 原类的成员残留：为 0
+grep -c 'h_perm_maps_\|h_signs_' src/PermTopology.cu
+```
+
+两项实测都是 0。
 
 ---
 

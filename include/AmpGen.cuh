@@ -2,6 +2,7 @@
 #define AMPGEN_CUH
 
 #include <Amplitude.cuh>
+#include <DecayDesc.h>   // SL / Amp2BD / DecayNodeHost（衰变描述）
 #include <Config.cuh>
 #include <ResModel.cuh>
 #include <Resonance.cuh>
@@ -22,12 +23,6 @@
 #include <vector>
 #include <JITCustom.cuh>
 
-// 自旋-轨道组合结构体
-struct SL {
-    int S; // 2s+1
-    int L;
-    __host__ __device__ SL(int s = 0, int l = 0) : S(s), L(l) {}
-};
 
 // // 粒子信息结构体
 // struct Particle
@@ -70,45 +65,12 @@ struct DeviceMomenta {
     __device__ LorentzVector getMomentum(int event_idx, int particle_idx) const;
 };
 
-// 两体衰变振幅类
-class Amp2BD {
-public:
-    Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
-           bool identical_daughters = false, bool is_boson = true,
-           int maxL = -1, bool p_break = false, bool has_bf = true,
-           double bf_d = 3.0,
-           std::set<std::pair<int, int>> sl_filter = {});
-    const std::vector<SL>& getSL() const { return spinOrbitCombinations_; }
-    const std::array<int, 3>& getJValues() const { return jvalues_; }
-    const std::array<int, 3>& getParities() const { return parities_; }
-    bool getPbreak() const { return p_break_; }
-    bool getHasBf() const { return has_bf_; }
-    double getBfD() const { return bf_d_; }
-
-private:
-    std::vector<SL> ComSL(const std::array<int, 3>& spins,
-        const std::array<int, 3>& parities);
-    std::array<int, 3> jvalues_;
-    std::array<int, 3> parities_;
-    bool identical_daughters_;
-    bool is_boson_; // true=boson(symmetric, +), false=fermion(antisymmetric, -)
-    int maxL_;      // 轨道角动量上限; -1 = 无限制
-    bool p_break_;  // 宇称是否破缺（弱衰变）
-    bool has_bf_;   // 是否有势垒因子（三级作用域决议后的最终值）
-    double bf_d_;   // 势垒半径 d
-    std::set<std::pair<int, int>> sl_filter_; // 允许的 (S, L) 分波白名单; 空 = 全允许
-    std::vector<SL> spinOrbitCombinations_;
-};
 
 // 级联衰变振幅类
 class AmpCasDecay {
 private:
-    struct DecayNodeHost {
-        Amp2BD amp;
-        std::string mother;
-        std::string daug1;
-        std::string daug2;
-    };
+    // 衰变描述类型已上移到 DecayDesc.h（P3）；保留类内别名使既有代码不用改
+    using DecayNodeHost = ::DecayNodeHost;
 
     struct ParticleInfo {
         int spin;
