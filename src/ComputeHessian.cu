@@ -29,6 +29,9 @@ static void hessCheckedMalloc(void** ptr, size_t bytes, const char* what)
     }
 }
 
+[[noreturn]] static void throwCudaError(const char* what, cudaError_t err,
+                                         int n, size_t smem, int limit);
+
 // 就地共轭kernel
 CTPWA_KERNEL void conjKernel(ctComplex* data, std::ptrdiff_t N) {
     const std::ptrdiff_t i = CTPWA_TID();
@@ -179,6 +182,85 @@ CTPWA_KERNEL void perEventHessianKernel(
 #endif
 }
 
+// 大 n 回退：B 留在 global memory，只在 shared 保存 v/Bu/S。
+// 原 kernel 需要 n²·sizeof(ctComplex)+5n·8B shared，n=137 时约 306KB，
+// 超过 V100/A100 单 block 上限；本版本只需 (4n+1)·8B。
+CTPWA_KERNEL void perEventHessianKernelLarge(
+    const ctComplex* __restrict__ d_B,
+    const ctComplex* __restrict__ d_v,
+    const double* __restrict__ d_weights,
+    double* __restrict__ d_hessian_chunk,
+    int nEvents, int n)
+{
+#if defined(CTPWA_HAS_CUDA)
+    const int n2 = 2 * n;
+    const int hess_sz = n2 * n2;
+    const int evt = blockIdx.x;
+    if (evt >= nEvents) return;
+
+    extern __shared__ double hsmem_large[];
+    double* svr = hsmem_large;
+    double* svi = svr + n;
+    double* sBu = svi + n;
+    double* sS = sBu + 2 * n;
+
+    const ctComplex* Bk = d_B + (std::ptrdiff_t)evt * n * n;
+    for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        svr[idx] = d_v[idx].x;
+        svi[idx] = d_v[idx].y;
+    }
+    __syncthreads();
+
+    double weight = (d_weights != nullptr) ? d_weights[evt] : 1.0;
+    for (int i = threadIdx.x; i < n2; i += blockDim.x) {
+        double sum = 0.0;
+        if (i < n) {
+            for (int j = 0; j < n; ++j)
+                sum += Bk[i * n + j].x * svr[j] + Bk[i * n + j].y * svi[j];
+        } else {
+            const int ii = i - n;
+            for (int j = 0; j < n; ++j)
+                sum += -Bk[ii * n + j].y * svr[j] + Bk[ii * n + j].x * svi[j];
+        }
+        sBu[i] = sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        double S = 0.0;
+        for (int i = 0; i < n; ++i) S += svr[i] * sBu[i] + svi[i] * sBu[n + i];
+        if (S <= 0.0) S = 1e-30;
+        *sS = S;
+    }
+    __syncthreads();
+
+    const double invS = 1.0 / *sS;
+    const double invS2 = invS * invS;
+    double* hess_out = d_hessian_chunk + (std::ptrdiff_t)evt * hess_sz;
+    for (int idx = threadIdx.x; idx < hess_sz; idx += blockDim.x) {
+        const int i = idx / n2, j = idx % n2;
+        double val = 4.0 * weight * sBu[i] * sBu[j] * invS2;
+        int a, b;
+        if (i < n && j < n) {
+            a = i; b = j;
+            val += -2.0 * weight * Bk[a * n + b].x * invS;
+        } else if (i < n && j >= n) {
+            a = i; b = j - n;
+            val += -2.0 * weight * Bk[a * n + b].y * invS;
+        } else if (i >= n && j < n) {
+            a = i - n; b = j;
+            val += 2.0 * weight * Bk[a * n + b].y * invS;
+        } else {
+            a = i - n; b = j - n;
+            val += -2.0 * weight * Bk[a * n + b].x * invS;
+        }
+        hess_out[idx] = val;
+    }
+#else
+    perEventHessianKernel(d_B, d_v, d_weights, d_hessian_chunk, nEvents, n);
+#endif
+}
+
 // Step C: 沿events维度归约 per-event Hessian → 单次atomicAdd到全局
 CTPWA_KERNEL void reduceHessianKernel(
     const double* __restrict__ d_hessian_chunk,  // nEvents × 4n²
@@ -286,12 +368,29 @@ void computeDataHessianContrib(
 
         // 2. Per-event Hessian (含S和Bu计算；B 已共轭 → 标准约定 [[R,-C],[C,R]])
         {
-            size_t shm = (size_t)(n * n) * sizeof(ctComplex)
-                       + (size_t)(5 * n) * sizeof(double);
-            cudaFuncSetAttribute(perEventHessianKernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
-            CTPWA_LAUNCH_SERIAL(perEventHessianKernel, chunk, kBlockSize, shm, d_B, d_vector, w_chunk,
-                d_hessian_chunk, chunk, n);
+            const size_t shm = (size_t)(n * n) * sizeof(ctComplex)
+                             + (size_t)(5 * n) * sizeof(double);
+            int dev = 0, smem_optin = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&smem_optin,
+                cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+            if (shm <= (size_t)smem_optin) {
+                cudaError_t err = cudaFuncSetAttribute(perEventHessianKernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+                if (err != cudaSuccess)
+                    throwCudaError("perEventHessianKernel", err, n, shm, smem_optin);
+                CTPWA_LAUNCH_SERIAL(perEventHessianKernel, chunk, kBlockSize, shm,
+                    d_B, d_vector, w_chunk, d_hessian_chunk, chunk, n);
+            } else {
+                // 大 n 不把整份 B 放进 shared；只保存 v/Bu/S，避免 shared 超限。
+                const size_t shm_large = (size_t)(4 * n + 1) * sizeof(double);
+                cudaError_t err = cudaFuncSetAttribute(perEventHessianKernelLarge,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm_large);
+                if (err != cudaSuccess)
+                    throwCudaError("perEventHessianKernelLarge", err, n, shm_large, smem_optin);
+                CTPWA_LAUNCH_SERIAL(perEventHessianKernelLarge, chunk, kBlockSize, shm_large,
+                    d_B, d_vector, w_chunk, d_hessian_chunk, chunk, n);
+            }
         }
 
         // 3. 归约 per-event → 全局（每chunk仅 4n² 次atomicAdd）

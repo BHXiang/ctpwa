@@ -5917,6 +5917,22 @@ public:
         return h;
     }
 
+    // phsp Gram 的 double 上转/缩放块不能超过 512 MiB，且至多占当前空闲显存的
+    // 1/8。大 nPolar×nAmp 模型若仍按固定 150k 事件分批，单块可达数 GB。
+    int phspGramBatchEvents() const
+    {
+        const size_t per_event = (size_t)n_polar_ * n_amplitudes_ * sizeof(ctComplex);
+        size_t free_b = 0, total_b = 0;
+        cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+        TORCH_CHECK(err == cudaSuccess,
+            "phspGramBatchEvents: cudaMemGetInfo 失败: ", cudaGetErrorString(err));
+        const size_t cap = 512ULL * 1024ULL * 1024ULL;
+        const size_t budget = std::min(cap, free_b / 8);
+        size_t n = per_event > 0 ? budget / per_event : 150000;
+        n = std::min<size_t>(150000, std::max<size_t>(1, n));
+        return static_cast<int>(n);
+    }
+
     // 从常驻振幅重算 phsp 的 Gram B̄ = Σ_e (w_e/W_total) A_e A_e^H。
     // 与 getHessian 里原来那段一致（分块 scalePhspAmpsKernel + CGEMM + 跨卡 axpy）；
     // 抽出来是为了让 reCalcAmp(θ) 之后 B̄ 也新鲜（此前只在 getHessian 里更新）。
@@ -5947,11 +5963,11 @@ public:
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
             // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
             // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
-            const int kPhspBatch = 150000;  // 150k 事件/块 ≈ 3×29×16×150k ≈ 209MB
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
                 cudaSetDevice(gpu);
+                const int kPhspBatch = phspGramBatchEvents();
                 const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
                 cublasHandle_t h;
                 cublasCreate(&h);
@@ -5960,7 +5976,8 @@ public:
                     int nch = std::min(kPhspBatch, nPhsp - c0);
                     int nTot = nch * n_polar_ * n_amplitudes_;
                     ctComplex* d_phsp_scaled;
-                    cudaMalloc(&d_phsp_scaled, nTot * sizeof(ctComplex));
+                    ctpwaCheckedMalloc((void**)&d_phsp_scaled,
+                        (size_t)nTot * sizeof(ctComplex), "phsp Gram scaled batch");
                     // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
                     if (float_amps_ && !ctIsFloatComplex) {
                         const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
@@ -5978,7 +5995,9 @@ public:
                         1.0 / W_total, 0);
 
                     ctComplex* d_phsp_gpu;
-                    cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                    ctpwaCheckedMalloc((void**)&d_phsp_gpu,
+                        (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex),
+                        "phsp Gram batch matrix");
                     ctComplex beta = ctMake(0.0f, 0.0f);
                     CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nch * n_polar_,
                         &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
@@ -6679,8 +6698,42 @@ private:
                 for (size_t j = (phsp_streamed ? 1 : 0); j < events_[gpu].size(); ++j)
                     resident_events[gpu] += events_[gpu][j];
             bool has_bkg = (init_events.size() > 2 && init_events[2] > 0);
+            // SL 表按独立的 chain×JP 级联组合分配，同一 JP 下的全部共振态组合
+            // 共享一张表。无 trans/var_equal 时，固定 JP 的表在 A 物化后立即释放；
+            // 此时构造期峰值 = max(此前自由 JP 的保留表 + 当前 JP 表)，而不是全表求和。
+            const bool early_sl_release = earlyStaticSLReleaseEnabled();
+            const auto& config_res = config_parser_.getResonances();
+            int n_slcombs_total = 0;
+            int n_slcombs_retained = 0;
+            for (const auto& chain_info : chains_info_) {
+                TORCH_CHECK(chain_info.slcombs_per_jp.size() == chain_info.intermediate_combs.size(),
+                    "ChainInfo ", chain_info.name, " 的 SL 计数与 JP 组合数不一致");
+                for (size_t ci = 0; ci < chain_info.intermediate_combs.size(); ++ci) {
+                    const int nsl = chain_info.slcombs_per_jp[ci];
+                    if (!early_sl_release) {
+                        n_slcombs_total += nsl;
+                        continue;
+                    }
+                    // 同一 cas 下只要有一个共振态组合含自由参数，整张 SL 表都要保留。
+                    // fix_var 可能进一步把它固定，因此这里的保留估计只会偏保守。
+                    bool keep_cas = false;
+                    for (const auto& particle : chain_info.intermediate_combs[ci]) {
+                        const auto key = std::make_pair(particle.name,
+                            std::vector<int>{particle.spin, particle.parity});
+                        const auto ri = chain_info.intermediate_resonance_map.find(key);
+                        if (ri == chain_info.intermediate_resonance_map.end()) continue;
+                        for (const auto& res : ri->second) {
+                            const auto cfg = config_res.find(res.getName());
+                            if (cfg != config_res.end() && !cfg->second.free.empty())
+                                keep_cas = true;
+                        }
+                    }
+                    n_slcombs_total = std::max(n_slcombs_total, n_slcombs_retained + nsl);
+                    if (keep_cas) n_slcombs_retained += nsl;
+                }
+            }
             auto cap = device_mgr_.checkCapacity(
-                resident_events, n_amplitudes_, n_polar_, n_gls_, particles_.size(),
+                resident_events, n_amplitudes_, n_polar_, n_slcombs_total, particles_.size(),
                 has_bkg, params_.nFreeTheta());
             // 预检后打印设备列表（含每 GPU 预计占用）
             device_mgr_.print();
@@ -7128,13 +7181,14 @@ private:
                 // resident 模式构造期 B̄ 构建。float 模式下 A 为 float2（8B/元素），
                 // B̄ 保持 double（phsp_factor 恒走 double 轨道）→ 按块上转 double 再
                 // 走原 scale+CGEMM（峰值 = 单块，与 getHessian 分块重建同模式）。
-                const int kPhspBatch = 150000;  // 150k 事件/块
+                const int kPhspBatch = phspGramBatchEvents();
                 for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
                     int nch = std::min(kPhspBatch, nPhsp - c0);
                     int nch_tot = nch * n_polar_ * n_amplitudes_;
                     const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
                     ctComplex* d_phsp_scaled;
-                    cudaMalloc(&d_phsp_scaled, nch_tot * sizeof(ctComplex));
+                    ctpwaCheckedMalloc((void**)&d_phsp_scaled,
+                        (size_t)nch_tot * sizeof(ctComplex), "phsp Gram scaled batch");
                     if (float_amps_ && !ctIsFloatComplex) {
                         // float2 A 块 → double 块（A 元素偏移 = c0*nPolar*nAmp，单位元素数）
                         const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
@@ -7152,7 +7206,9 @@ private:
                         1.0 / W_total, 0);
 
                     ctComplex* d_phsp_gpu;
-                    cudaMalloc(&d_phsp_gpu, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+                    ctpwaCheckedMalloc((void**)&d_phsp_gpu,
+                        (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex),
+                        "phsp Gram batch matrix");
                     cublasHandle_t h;
                     cublasCreate(&h);
                     ctComplex alpha = ctMake(1.0f, 0.0f);
@@ -7491,6 +7547,17 @@ private:
             vspace_names.insert(vspace_names.end(), rnames.begin(), rnames.end());
             params_.setParamNames(vspace_names);
         }
+    }
+
+    // 是否能在主振幅构造时按 JP 组提前释放固定 SL 表。
+    // trans/var_equal 的自由参数归属要等所有 block 注册后才能确定，必须保留到
+    // 原来的统一释放阶段；CTPWA_KEEP_SLAMP=1 时同样禁用提前释放。
+    bool earlyStaticSLReleaseEnabled() const
+    {
+        if (std::getenv("CTPWA_KEEP_SLAMP") != nullptr) return false;
+        for (const auto& c : config_parser_.getConstraints())
+            if (c.type == "trans" || c.type == "var_equal") return false;
+        return true;
     }
 
     // theta_override: 自由共振态参数（按 amp_calc slots 顺序；nullptr = 用配置初始值）。
@@ -7865,6 +7932,10 @@ private:
                     gls_index += cas->getNSLCombs();
                 }
                 block_cursor += static_cast<int>(resonance_combinations.size());
+                // 当前 JP 的全部共振组合已物化到 A。无跨块共享约束时，立即释放
+                // 无自由参数的 SL 表，避免所有 JP 的表一直叠加到构造末尾。
+                if (amp_calc && earlyStaticSLReleaseEnabled())
+                    amp_calc->releaseStaticCasData();
             }
         }
 

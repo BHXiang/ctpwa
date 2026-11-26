@@ -115,7 +115,7 @@ public:
     //   n_events_per_gpu: 该 GPU 的事件数（data + phsp 分开后按 GPU 分到的最大者）
     //   n_amplitudes: 振幅总数
     //   n_polar: 极化数
-    //   n_slcombs: 单链 SL 组合数（d_slamps 用）
+    //   n_slcombs: 所有独立 chain×JP 级联组合的 SL 表计数之和（共享表不重复）
     //   n_particles: 末态粒子数（d_momenta 用）
     //   has_bkg: 是否有背景样本
     //   n_theta: 自由共振态参数数（d_grad_res 用）

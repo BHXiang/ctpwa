@@ -202,6 +202,9 @@ void DecayInfo::buildDecayChains(
             }
 
             auto slcombs = cas->getSLCombinations();
+            // 一张 cas/JP 的 SL 表会被下面所有 resonance_combinations 共享。
+            // 保存未按共振态重复展开的计数，供 Analysis 的逐卡显存预检使用。
+            info.slcombs_per_jp.push_back(static_cast<int>(slcombs.size()));
 
             // Print decay chain structure for this J^P combination
             // （默认关闭, 5 体全模型会刷屏; CTPWA_VERBOSE_CHAINS=1 打开调试）
