@@ -791,6 +791,26 @@ CPU 与 GPU 的 A/B 指纹对比出现分叉：
 结论：**重构在 CUDA 上与重构前逐位一致**；上面那个 CPU↔GPU 的 0.5% Hessian 差异
 是**固有的跨后端差异（重构前就存在）**，与本次改造无关。
 
+### GPU 全套测试（分三批 + MC，共 ~263 passed / 0 failed）
+
+| 批次 | 覆盖 | 结果 |
+|---|---|---|
+| 1 | `test_numerical` / `hessian_diagnostics` / `hessian_bwr_spec` | 48 passed + 1 xfail |
+| 2 | float 档 / precision / efficiency / identical / matrix_errors / write_result / mc_amplitude | 59 passed |
+| 3 | constraints / barrier / custom* / interp / nested / free_phsp* / interference / matrix_validation / legends / plot_obs / trans_host / deep_chains | 88 passed |
+| 4 | endtoend / **ownership** / structure / reparam / fit_mode / theta / fd_utils / mod_kernel | 55 passed |
+| 5 | `test_mc` | 13 passed |
+
+未跑：`test_memory_monitor`（用例针对 A100-40GB 的 400 万事件 phsp，8GB 卡上无意义）、
+`test_cpu_*`（CPU 构建专属）。
+
+**跑出来两个我自己的测试 bug**（不是代码 bug）：
+
+1. `test_ownership` 的参数写死 CPU 张量 → CUDA 构建里 analysis 检查"params 必须位于
+   主设备"，直接报错。改成按后端选设备。
+2. NLL 可复现性断言用逐位相等 → GPU 归约顺序不确定，重复构造差最后几位
+   （相对差 5e-16）。改成 1e-12 相对容差，并注明 CPU 仍逐位相同。
+
 产物：`doc/parity/fingerprint-baseline-gpu-sm120.json`、
 `doc/parity/fingerprint-refactor-gpu-sm120.json`、
 `doc/parity/compare-gpu-baseline-vs-refactor.txt`。
