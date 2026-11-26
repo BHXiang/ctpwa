@@ -38,6 +38,7 @@
 #include <TruthIntegrals.h> // ctpwa::computeTruthIntegrals（P4 抽出）
 #include <BatchIntegrals.h> // ctpwa::computeFileBatchIntegrals（P4 抽出）
 #include <FitFractions.h>   // fitFractions / efficiency / matrixForSample（P4 抽出）
+#include <Polarization.h>   // initializePolarization（P4 抽出）
 
 // ---------------------------------------------------------------------------
 // 后端无关的设备 helper：CPU 后端下所有张量都在 CPU 上，CUDA 后端保持原语义。
@@ -5837,77 +5838,12 @@ private:
 
     void initializePolarization()
     {
-        int n = particles_.size();
-
-        // 收集每粒子的维度 (2J+1) 和允许的张量索引列表
-        std::vector<int> dims(n);
-        std::vector<std::vector<int>> keep(n); // 空 = 保留全部
-        bool any_masked = false;
-
-        for (int i = 0; i < n; ++i) {
-            dims[i] = particles_[i].spin;
-            if (particles_[i].is_polarized()) {
-                any_masked = true;
-                int dim_j = dims[i];
-                for (int two_m : particles_[i].polarization_2m) {
-                    keep[i].push_back((dim_j - 1 - two_m) / 2);
-                }
-            }
-        }
-
-        // 原始 C-order strides: orig_strides[i] = prod_{j>i} dims[j]
-        std::vector<int> orig_strides(n);
-        orig_strides[n - 1] = 1;
-        for (int i = n - 2; i >= 0; --i)
-            orig_strides[i] = orig_strides[i + 1] * dims[i + 1];
-
-        // 总张量极化数
-        n_polar_total_ = 1;
-        for (int d : dims) n_polar_total_ *= d;
-
-        // 有效维度（mask 后）和 masked strides
-        std::vector<int> eff_dims(n);
-        std::vector<int> masked_strides(n);
-        for (int i = 0; i < n; ++i)
-            eff_dims[i] = keep[i].empty() ? dims[i] : (int)keep[i].size();
-        masked_strides[n - 1] = 1;
-        for (int i = n - 2; i >= 0; --i)
-            masked_strides[i] = masked_strides[i + 1] * eff_dims[i + 1];
-
-        // 有效极化态数
-        n_polar_ = 1;
-        for (int d : eff_dims) n_polar_ *= d;
-
-        // 构建完整映射: output_idx → tensor_idx
-        if (any_masked) {
-            polarization_map_.resize(n_polar_);
-            for (int out = 0; out < n_polar_; ++out) {
-                int rem = out;
-                int tensor_idx = 0;
-                for (int p = 0; p < n; ++p) {
-                    int j = rem / masked_strides[p];
-                    rem %= masked_strides[p];
-                    int i = keep[p].empty() ? j : keep[p][j];
-                    tensor_idx += i * orig_strides[p];
-                }
-                polarization_map_[out] = tensor_idx;
-            }
-        }
-        else {
-            polarization_map_.clear();
-        }
-
-        std::cout << "polarization: " << n_polar_;
-        // std::cout  << " (total tensor states: " << n_polar_total_ << ")";
-        // if (!polarization_map_.empty()) {
-        //     std::cout << ", map: [";
-        //     for (size_t i = 0; i < polarization_map_.size(); ++i) {
-        //         if (i > 0) std::cout << ", ";
-        //         std::cout << polarization_map_[i];
-        //     }
-        //     std::cout << "]";
-        // }
-        std::cout << std::endl;
+        // P4：组合数学在 ctpwa::initializePolarization（include/Polarization.h）
+        ctpwa::PolarizationInit pol = ctpwa::initializePolarization(particles_);
+        n_polar_total_ = pol.n_polar_total;
+        n_polar_ = pol.n_polar;
+        polarization_map_ = std::move(pol.map);
+        std::cout << "polarization: " << n_polar_ << std::endl;
     }
 
     void initializeDecayChains()

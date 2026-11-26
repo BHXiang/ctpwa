@@ -176,6 +176,7 @@ SOURCES_CORE = [
     "src/TruthIntegrals.cu", # P4：产生侧分波积分
     "src/BatchIntegrals.cu", # P4：分批全样本积分
     "src/FitFractions.cu",   # P4：份额/效率/按样本矩阵
+    "src/Polarization.cu",   # P4：初态极化索引映射（纯 host）
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
