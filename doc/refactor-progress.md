@@ -34,6 +34,7 @@
 | P4 第十一步（`HessianContrib`） | ✅ | `1b503b1` |
 | P4 第十二步（`CouplingHessian` 137 行） | ✅ | `bb95a4b` |
 | **P4 第十三步（`FullHessian` 685 行，最大单体）** | ✅ | `4641bff` |
+| **P4 第十四步（写入器搬出 header，−1830 行）** | ✅ | `5a58c7c` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -683,6 +684,34 @@ CUDA 只编译 0 错误。
 **门禁补洞**：段错误时 pytest 不打印 `N failed`，只看 failed/errors 会把整层信号错误
 当成全绿（本轮实测：segfault 后 passed 258→122 却报"通过"）。现在
 `rc ∉ {0,1,5}` 一律算失败并列出文件名。这是"门禁自己也可能骗人"的一次实例。
+
+---
+
+## P4（第十四步）：写入器搬出 god header —— -1830 行
+
+第 8 轮把 `class analysis` 搬进头文件之后，出现了一条**零风险**的迁出路径：
+
+    「类内内联定义」 → 「类内声明 + 新 TU 里 analysis::method 的定义」
+
+不改一行方法体、不动任何接口、不需要 ctx/回调。这比"改成自由函数 + ctx"
+省事得多——后者只在真要把方法变成**模块接口**时才需要。
+
+| 项 | 数值 |
+|---|---|
+| `writeResult` | 1548 行 body |
+| `writeInterfResult` | 280 行 body |
+| `Analysis.h` | 5568 → **3738** 行 |
+| `src/ResultWriter.cu` | 1852 行（新 TU） |
+
+**头部卫生问题（第一次暴露）**：`Analysis.h` 里还有 4 个 `CTPWA_KERNEL` 定义和 3 个
+非 inline 自由函数。第二个 TU include 这个头时立刻 `multiple definition`（实测）。
+处理：kernel 加 `static`（CUDA 下 `static __global__` 合法，内部链接），自由函数加
+`inline`。更彻底的做法是把 kernel 挪进 `.cu` + 头里只留声明——留给后续。
+
+门禁 258/0/63；A/B 指纹逐位一致；CUDA 只编译 0 错误。
+
+**这条路径对剩下的方法同样适用**：`initialize`（770）、`computePhspHessian` 等都可以
+先"无脑搬出 header"，再决定要不要变成模块接口。
 
 ---
 
