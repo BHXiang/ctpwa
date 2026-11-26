@@ -28,6 +28,7 @@
 | **A/B 数值对照（vs v0.3.27 基线）** | ✅ | `c95eddb` |
 | P4 第七步（`BatchIntegrals` 247 行） | ✅ | `b94ebbc` |
 | P4 第八步（`FitFractions` 约 330 行） | ✅ | `f73483a` |
+| P4 第九步（`rebuildPhspGram` + helper 上移） | ✅ | `9021595` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -531,6 +532,27 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 | `computeBFErrors` | `ComputeBF.cuh` 里本来就有声明，include 即可 |
 
 `Analysis.h` 6859 → **6567 行**。门禁 254/7/56/4；A/B 指纹逐位一致；CUDA 编译 0 错误。
+
+---
+
+## P4（第九步）：`rebuildPhspGram` 并入 `PhspGram`，helper 再上移
+
+`rebuildPhspGram`（90 行）是 B̄ 的分块重建，和已抽出的 `phspMatrixFromGram` 是同一个
+模块的事，所以并进 `PhspGram`，参数显式化：
+
+| 参数 | 说明 |
+|---|---|
+| 7 个只读（振幅/事件/权重/精度标志/维度/设备） | 值或 const 引用 |
+| `ctComplex** d_matrix_io` | **读写**输出（先 memset 再逐块 axpy 累加） |
+| `std::function<int()> batch_events` | 每块事件数依赖当前空闲显存，只能用回调 |
+
+顺带再把 `ctpwaCheckedMalloc`（OOM 诊断用的分配包装）上移到 `BackendHelpers.h`——
+又一条"god class 顺带定义的 static helper"，搬出去的模块都要用。
+
+`Analysis.h` 6556 → **6471 行**。门禁 254/7/56/4；A/B 指纹逐位一致；CUDA 编译 0 错误。
+
+**流程改进生效**：这轮两次 prefix 替换（`n_polar_` / `primary_dev_`）都先 `assert` 检查
+再落盘，没有再出现"改到局部变量名"的事故。
 
 ---
 
