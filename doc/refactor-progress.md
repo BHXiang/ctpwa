@@ -108,8 +108,14 @@ CPU 后端 double free 会直接 abort）。CUDA 侧只编译验证：EXIT=0、0
 | 调用点 | 30 处 `cas->getX()[gpu]` → `cas->getX(gpu)`；39 处 `d_X_[i]` → `d_X_[i].data()` |
 | 析构的失效上下文分支 | 六个表逐个 `disarm()`，与四动量一致 |
 
-**验收**：`grep 'cudaFree(d_slamp_tab_\|cudaMalloc(&d_slamp_tab_' src/` 已为空
-——六张表的分配/释放只剩 DevBuffer 一条路。
+**验收**：
+
+| 项 | 结果 |
+|---|---|
+| `grep 'cudaFree(d_slamp_tab_\|cudaMalloc(&d_slamp_tab_' src/` | 空（分配/释放只剩 DevBuffer 一条路） |
+| 全量逐文件扫描 | 254 passed / 7 failed / 30 skipped，与 baseline2 对比**只多出 test_ownership 的 3 个**，其余逐行相同 |
+| 裸 `cudaSetDevice` 违规 | 127 → **125** |
+| CUDA 只编译 | EXIT=0，0 错误 |
 
 ---
 
