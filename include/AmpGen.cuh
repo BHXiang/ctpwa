@@ -370,6 +370,7 @@ public:
     // d_grad_res: 输出 [nFreeResParams] double，在 primary GPU 上
     // d_v_per_gpu: 每GPU的耦合向量指针，避免跨设备访问
     void computeResonanceGradient(
+        int primary_dev,                    // d_grad_res / 耦合表所在设备（显式传入，勿猜 current）
         const std::vector<ctComplex*>& d_w,
         const std::vector<int>& n_events,
         double* d_grad_res,
@@ -385,6 +386,7 @@ public:
     // d_v_per_gpu: 每GPU的耦合向量指针（interleaved格式）
     // d_amp_per_gpu: 每GPU的振幅指针
     void computeUnifiedHessian(
+        int primary_dev,                    // d_hess / phsp 矩阵所在设备（显式传入，勿猜 current）
         const std::vector<int>& n_events,
         double* d_hess, int hess_ld,
         const std::vector<int>& t_offset,

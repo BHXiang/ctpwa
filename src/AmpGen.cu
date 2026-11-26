@@ -3926,6 +3926,7 @@ CTPWA_KERNEL void applyBkgWeightsKernel(
 // AmpCalc::computeResonanceGradient
 // ---------------------------------------------------------------------------
 void AmpCalc::computeResonanceGradient(
+    int primary_dev,
     const std::vector<ctComplex*>& d_w,
     const std::vector<int>& n_events,
     double* d_grad_res,
@@ -3938,7 +3939,8 @@ void AmpCalc::computeResonanceGradient(
     if (n_free == 0 || blocks_.empty()) return;
     bool has_offset = (t_offset.size() == d_w.size());
     bool has_dv = (d_v_per_gpu.size() == d_w.size());
-    int primary_dev = 0; cudaGetDevice(&primary_dev);  // d_grad_res lives here
+    // primary_dev 由调用方显式传入（P0）：这里**不能** cudaGetDevice ——
+    // torch 的 .to()/多 GPU 循环会把它切走，d_grad_res 就会落在错卡上。
 
     constexpr int kBlockSize = 256;
 
@@ -4060,6 +4062,7 @@ void AmpCalc::computeResonanceGradient(
 }
 
 void AmpCalc::computeUnifiedHessian(
+    int primary_dev,
     const std::vector<int>& n_events,
     double* d_hess, int hess_ld,
     const std::vector<int>& t_offset,
@@ -4084,7 +4087,7 @@ void AmpCalc::computeUnifiedHessian(
     bool hprof = getenv("CTPWA_PROF") != nullptr;
     auto uhT0 = std::chrono::high_resolution_clock::now();
 
-    int primary_dev = 0; cudaGetDevice(&primary_dev);  // capture caller's device
+    // primary_dev 由调用方显式传入（P0），理由同 computeResonanceGradient。
     int hess_sz = hess_ld * hess_ld;
 
     // Temp buffer info per block (stored for stage 2 cross-block)
