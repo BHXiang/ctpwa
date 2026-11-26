@@ -3676,7 +3676,8 @@ public:
         if (nt > 0 && theta.numel() > 0) {
             int P = nt;
             int n_gpu = static_cast<int>(d_all_amplitudes_.size());
-            int primary_dev = dev.index();
+            // CPU 张量的 dev.index() 是 -1；归一化到 0（该值当设备号用）
+            int primary_dev = dev.is_cuda() ? dev.index() : 0;
 
             torch::Tensor extended_v = is_coupling ? vector : params_.extendVector(vector, dev);
             int n_ext = extended_v.numel();
@@ -3880,7 +3881,8 @@ public:
             double* d_g_v = nullptr;
             {
                 int n_gpu = static_cast<int>(d_all_amplitudes_.size());
-                int primary_dev = dev.index();
+                // CPU 张量的 dev.index() 是 -1；归一化到 0（该值当设备号用）
+            int primary_dev = dev.is_cuda() ? dev.index() : 0;
                 const auto& cm = params_.couplingMatrix();
                 int na = cm.n_amps;
 
