@@ -19,6 +19,7 @@
 | P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | `ee9178b` |
 | P4 第一步（数据读取模块） | ✅ | `7cab902` |
 | P2 第三批（`AmpCalc` 四个大缓冲） | ✅ | `a9dc6db` |
+| P4 第二步（`analysis` 变成可包含的头 + 首个方法迁出） | ✅ | `0cbad61` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -237,6 +238,41 @@ RuntimeError: 没有可用的 ctpwa 后端 ... ImportError: _cpu.so: undefined s
 失败就直接把真实 import 错误打出来并退出（exit 2），不再让 41 行噪音淹没它。
 
 **验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors（与 baseline3 一致）；
+CUDA 只编译 EXIT=0、0 错误。
+
+---
+
+## P4（第二步）：解除 god class 的结构性阻塞
+
+**阻塞点**：`class analysis` 的 57 个方法全部是**类内内联定义**，而且没有头文件 ——
+`main.cu` 只能靠 `#include "Analysis.cu"` 把整个 god class 文本内联进来。在这种形态下，
+"把某个方法搬到新模块"在语法上根本做不到：类定义不出现在任何头里，别的 TU 无法写
+`analysis::method`。
+
+**做法**（同一个 TU、同一份代码，行为不变）：
+
+| 文件 | 变化 |
+|---|---|
+| `include/Analysis.h`（新，7594 行） | 原 `Analysis.cu` 全文（工具函数 + 类定义）原样搬入 |
+| `src/Analysis.cu` | 7624 行 → **5 行**（只剩 `#include <Analysis.h>`） |
+| `include/MatrixStats.h` + `src/MatrixStats.cu`（新） | `ctpwa::couplingCovariance` |
+
+**解锁演示**：`couplingCovariance` 一个成员变量都不读（纯张量数学：取自由方向、
+对称化、eigvalsh 判正定、求逆），把它抽成自由函数后，成员只剩一行委派：
+
+```cpp
+torch::Tensor couplingCovariance(const torch::Tensor& H, int n,
+                                 int& nf_out, bool& ok) const
+{
+    return ctpwa::couplingCovariance(H, n, nf_out, ok);
+}
+```
+
+这是 P4 第一个真正搬出 god class 的函数。**注意它的意义在"解锁"而不是"减重"**：
+`Analysis.h` 仍有 ~6300 行类定义，但从此每轮可以按方法逐个改成
+"类内声明 + 新 TU 定义"，而不用一次性重写 6000 行。
+
+**验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors（与基线一致）；
 CUDA 只编译 EXIT=0、0 错误。
 
 ---
