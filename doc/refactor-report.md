@@ -1,6 +1,6 @@
 # CTPWA 模块化改造：交付报告
 
-> 分支 `refactor/modular`（从 `main@030baf5` = v0.3.27 起），61 个提交。
+> 分支 `refactor/modular`（从 `main@030baf5` = v0.3.27 起），68 个提交。
 > 计划见 `doc/modularization-plan.md`，过程见 `doc/refactor-progress.md`，
 > 发布流程见 `doc/refactor-release-workflow.md`。
 
@@ -14,7 +14,7 @@
 | **P1** 真翻译单元 | 拆掉文本内联的 12.8k 行单 TU | ✅ 17 TU，改一个文件 9.3 s（原 15 min） |
 | **P2** DevBuffer 所有权 | 一个设备指针只有一处 free 路径 | ✅ `AmpCasDecay` 全部 + `AmpCalc` 四大缓冲 |
 | **P3** DecayInfo 与 SL 表解耦 | 衰变描述可脱离 GPU 构造/检查 | ✅ `DecayChainDesc` + host 单测 |
-| **P4** god class 拆分 | `analysis` 从 7624 行拆开 | ✅ 类定义 6300 → ~1600 行，18 个模块 |
+| **P4** god class 拆分 | `analysis` 从 7624 行拆开 | ✅ `Analysis.h` 7624 → **1656 行**；方法实现分在 6 个 TU，领域逻辑分在 12 个模块 |
 
 **验证强度**（本次改造的最强证据，逐条可复跑）：
 - CPU 门禁 **258 passed / 0 failed / 63 skipped**（全绿，红即回归）
@@ -31,10 +31,12 @@
 ```
 src/
   main.cu                 378   pybind 绑定 + 后端探针（只 include <Analysis.h>）
+  NLLFunction.h（头）     776   torch autograd::Function 的 forward/backward
+                                 （原本活在 Analysis.h 里的第二个类）
   AnalysisMethods.cu      266   analysis 的装配层成员（ctx 填充 + 调自由函数）
   Initialize.cu          1119   initialize / initializeDecayChains / getIntensity
   ResultWriter.cu        1852   writeResult / writeInterfResult
-include/Analysis.h       2423   analysis 的声明 + 成员 + 约定注释（无方法体）
+include/Analysis.h       1656   analysis 的声明 + 成员 + 约定注释（无方法体）
 
   —— 以下为本次抽出的领域模块（每个都有显式输入结构体/自由函数）——
   DataReader.cu           343   .dat / ROOT TTree 读取（纯 host）
@@ -55,7 +57,7 @@ include/Analysis.h       2423   analysis 的声明 + 成员 + 约定注释（无
   BackendHelpers.h              ctpwa_dev / makeScopeExit / CUDA_CHECK / ctpwaCheckedMalloc
 ```
 
-`src/` 36 个源文件、`include/` 42 个头（含 `cpu_shims/` 与 kernel 头）。每个抽出的模块都配一个**只读输入结构体**
+`src/` 36 个源文件、`include/` 43 个头（含 `cpu_shims/` 与 kernel 头）。每个抽出的模块都配一个**只读输入结构体**
 （`PhspGramInputs` / `BatchIntegralCtx` / `FullHessianCtx` …），字段就是该函数真正读的
 成员，`std::function` 只留真正属于 `analysis` 的算法。
 
@@ -105,9 +107,18 @@ double free"的整类问题。
 
 | 对比 | NLL | 梯度 | Hessian |
 |---|---|---|---|
-| CPU 重构版 **vs** CPU v0.3.27 | **0（逐位）** | ≤4e-12 绝对 | **0（逐位）** |
+| CPU 重构版 **vs** CPU v0.3.27 | **0（逐位）** | 1e-12 级（见下） | **0（逐位）** |
 | GPU 重构版 **vs** GPU v0.3.27 | **0（逐位）** | ≤1.3e-13 | ≤1.7e-10 |
 | CPU vs GPU（同一份重构代码） | ≤1e-9 | 1e-8 | **0.5%**（`with_trans`） |
+
+**判据是怎么定的**（三轮实测，见 `scripts/ab_fingerprint.py` 注释）：
+最终用 `|Δ| <= 1e-8·‖v‖∞ + 1e-7·max(|a|,|b|)`。原因不是"放宽到能过"，而是实测发现：
+
+* CPU 梯度路径**本身**有 ~8e-8 的逐次运行抖动（同一份二进制跑两次就不同，
+  `interp` 的查找表路径最明显）——所以"逐位相等"在 CPU 上不是可用判据；
+* `grad[0]`（被固定的参考振幅方向）解析上为 0，实际是 ~1e-4 的抵消噪声，
+  逐次抖动 ~1e-12，只能用"相对向量尺度"的绝对容差衡量；
+* **GPU 上的 A/B 仍然逐位相同**（nll 的 Δ 恰好是 0）。
 
 最后一行不是回归：**v0.3.27 原版在 CPU/GPU 之间就有同样的 0.5%**，属固有跨后端差异
 （见 `doc/parity/compare-gpu-baseline-vs-refactor.txt`）。
