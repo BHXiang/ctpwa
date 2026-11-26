@@ -25,6 +25,7 @@
 | P4 第五步（`SLAmpsIO`） | ✅ | `cd05b49` |
 | P4 第六步（helper 上移 + `TruthIntegrals`） | ✅ | `fa8f7fd` |
 | G3 CI 门禁（CPU + CUDA 只编译） | ✅ | `f383d62` |
+| **A/B 数值对照（vs v0.3.27 基线）** | ✅ | `c95eddb` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -488,6 +489,42 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 | 其中数值用例 | 0（全 skip） | **37**（含 golden NLL / golden 梯度 / 梯度 vs FD） |
 | failed | 8 | 7（均已定位为 CPU 构建固有） |
 | 裸 `cudaSetDevice` 违规 | 208 | **127** |
+
+---
+
+## A/B 数值对照（第一次真有"基线 vs 重构"的逐值证据）
+
+objective 要求"记录每阶段基线与 A/B 数值对照"。此前只有"测试是否通过"和
+"逐文件 PASS/FAIL 是否与基线一致"——那证明的是**测试断言**没变，不是**数值**没变。
+
+本轮补上：
+
+1. `scripts/ab_fingerprint.py`：固定 seed（**参数在 CPU 上生成再搬**，避免
+   `torch.Generator(device=cuda)` 的随机流差异）算 NLL / 梯度 / Hessian，dump JSON，
+   `--compare` 逐值比。
+2. `git worktree add baseline_wt main` 重建 **v0.3.27 的原始代码**（不是靠记忆，
+   是同一台机器上现编的一份），两套构建跑同一脚本。
+
+结果（`doc/parity/compare-baseline-vs-refactor.txt`）：
+
+| config | nll max\|Δ\| | hess max\|Δ\| | grad 最大相对差 |
+|---|---|---|---|
+| simple | 0 | 0 | 1.5e-15 |
+| with_trans | 0 | 0 | 7.2e-16 |
+| flatte | 0 | 0 | 4.0e-15 |
+| gs | 0 | 0 | 4.2e-15 |
+| interp | 0 | 0 | 0 |
+| ident2 | 0 | 0 | 7.2e-15 |
+| ident3 | 0 | 0 | 1.9e-15 |
+
+**NLL 与 Hessian 逐位相同**；梯度的 1e-15 级差异是 autograd 累加顺序，不是行为变化。
+
+这条对照现在是可复跑的：基线指纹存在 `doc/parity/fingerprint-baseline-v0.3.27.json`，
+每个阶段只要重跑一次 `--compare` 就能确认"这一阶段仍然没动物理"。
+
+顺带修掉一个潜伏问题：`getHessian` 里两处 `primary_dev = dev.index()`，在 CPU 张量上
+`dev.index()` 是 **-1**，却被当设备号用（`ensure_device(-1)` 会打错误日志）。
+归一化为 0，与 `getNLL` 那处一致。
 
 ---
 
