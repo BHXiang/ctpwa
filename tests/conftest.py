@@ -93,7 +93,11 @@ def cpu_device():
 
 @pytest.fixture(scope="session")
 def device():
-    assert torch.cuda.is_available(), "ctpwa 需要 CUDA GPU"
+    # 无 CUDA 时 skip 而不是 error：CPU 构建（CI 无卡 runner / 本机无卡）下
+    # 这些用例应当"跳过"而不是把整个测试套件标红。语义不变——需要真 GPU 的
+    # 用例在无卡机器上依然不会被执行。
+    if not torch.cuda.is_available():
+        pytest.skip("需要 CUDA GPU（当前无可用设备）；CPU 构建下跳过")
     # 显式 cuda:0：torch.device('cuda') 解析到运行时当前设备，多 GPU 下
     # 会被内部 per-GPU 循环/用户 .to(cuda:1) 切走，导致 params 落在非主 GPU
     # （触发 analysis 的 params 位置检查，实测双卡测试套件必现）
