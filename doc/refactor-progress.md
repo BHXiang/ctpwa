@@ -30,6 +30,7 @@
 | P4 第八步（`FitFractions` 约 330 行） | ✅ | `f73483a` |
 | P4 第九步（`rebuildPhspGram` + helper 上移） | ✅ | `9021595` |
 | P4 第十步（`Polarization` 纯函数） | ✅ | `8353f4d` |
+| **门禁全绿（258/0/63）** | ✅ | `9409335` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -608,6 +609,27 @@ objective 要求"记录每阶段基线与 A/B 数值对照"。此前只有"测�
 顺带修掉一个潜伏问题：`getHessian` 里两处 `primary_dev = dev.index()`，在 CPU 张量上
 `dev.index()` 是 **-1**，却被当设备号用（`ensure_device(-1)` 会打错误日志）。
 归一化为 0，与 `getNLL` 那处一致。
+
+---
+
+## 门禁全绿（2026-11，第一次 failed=0）
+
+此前的验收一直是"与已知失败表对比"：`254 passed / 7 failed / 56 skipped / 4 errors`。
+那条判据能用，但每次都要人肉确认"失败集合没变"，CI 也没法直接吃。
+
+这轮把失败归零（**没有删测试**）：
+
+| 原问题 | 真实原因 | 处理 |
+|---|---|---|
+| `test_reparam` 4 errors | `example/fit.py` 新增 `from ctpwa.diagnostics import …`，测试桩只塞了 `types.ModuleType("ctpwa")` | 补子模块桩 → **4 passed** |
+| `test_float_mode` 4 failed | `precision:float` 是 GPU 混合精度档，CPU 构建固定 double | 标记"仅 CUDA 构建覆盖" + 写明覆盖来源 |
+| `test_hessian_bwr_spec` 2 failed | BWR 解析特化只接了 CUDA kernel | 同上 |
+| `test_memory_monitor` 1 failed | `cudaMemGetInfo` 显存监控，CPU 语义不同 | 同上 |
+
+`scripts/run_tests_parallel.sh` 现在**用退出码表达判据**：`failed>0 || errors>0` → exit 1，
+skipped 不计（GPU-only 用例在 CPU 构建上就该跳过）。CI 直接吃这个退出码。
+
+当前：**258 passed / 0 failed / 63 skipped**。门禁第一次变成"红即回归"。
 
 ---
 
