@@ -33,10 +33,10 @@ HESSIAN_SYM_ATOL = 1e-6
 # ============================================================
 
 @pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp", "static_nodes"])
-def test_nll_reproducible(make_analysis, device, config_key):
+def test_nll_reproducible(make_analysis, dev, config_key):
     """同一参数两次计算 NLL，结果必须完全一致（防 GPU 状态残留）。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
 
     nll1 = ana.getNLL(params).item()
     nll2 = ana.getNLL(params).item()
@@ -46,10 +46,10 @@ def test_nll_reproducible(make_analysis, device, config_key):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans", "interp", "baryon_cp", "hess_mult", "static_nodes"])
-def test_nll_finite(make_analysis, device, config_key):
+def test_nll_finite(make_analysis, dev, config_key):
     """NLL 必须为有限实数。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     nll = ana.getNLL(params).item()
     assert torch.isfinite(torch.tensor(nll)), f"{config_key}: NLL 非有限: {nll}"
 
@@ -59,10 +59,10 @@ def test_nll_finite(make_analysis, device, config_key):
     "—— 该 config 从未进入 NLL 级测试 (只被结构/trans 测试用到)。定位线索: 顶层顶点 "
     "Jpsi→eta+chic1(1,+) 同时允许 L=0 与 L=2; 把顶层限制成单个奇 L 后 NLL 正常。"
     "修好 (config 或 kernel) 后请删除本 xfail。"))
-def test_nll_finite_with_deep_trans(make_analysis, device):
+def test_nll_finite_with_deep_trans(make_analysis, dev):
     """回归: 深层 trans config 的 NLL 必须是有限值。"""
     ana = make_analysis("with_deep_trans")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     nll = ana.getNLL(params).item()
     assert torch.isfinite(torch.tensor(nll)) and abs(nll) < 1e10, (
         f"with_deep_trans: NLL 非有限 (={nll})")
@@ -72,7 +72,7 @@ def test_nll_finite_with_deep_trans(make_analysis, device):
 # 重子（费米子）CP 共轭对
 # ============================================================
 
-def test_baryon_cp_shared_params(make_analysis, device):
+def test_baryon_cp_shared_params(make_analysis, dev):
     """CP 共轭对 (N+ -> p eta / N- -> pbar eta) 引用同一共振 N:
     - Resonances 段不写 JP，量子数由 intermediates 各自赋值（1/2+ vs 1/2-）
     - 同 rname 参数槽全局共享: n_theta == 2 (m0, w0)，而非 4
@@ -82,14 +82,14 @@ def test_baryon_cp_shared_params(make_analysis, device):
     assert ana.getNFreeTheta() == 2, (
         f"CP 共轭对应共享 m/Gamma 参数槽（期望 2，实际 {ana.getNFreeTheta()}）"
     )
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
     nll = ana.getNLL(params)
     assert torch.isfinite(nll), "NLL 非有限"
     grad = torch.autograd.grad(nll, params)[0]
     assert torch.isfinite(grad).all(), "梯度存在 NaN/Inf"
 
 
-def test_baryon_cp_shuffle_order(make_analysis, device):
+def test_baryon_cp_shuffle_order(make_analysis, dev):
     """CP 共轭对 + trans + 链 B 共振顺序打乱:
     - 同 rname 共享按名字配对（顺序无关）: n_theta == 4（两共振各 m/Gamma）
     - 参数初始值完整（N1650 与 N1880 都保留自己的槽，不被位置对应错配掉）
@@ -103,17 +103,17 @@ def test_baryon_cp_shuffle_order(make_analysis, device):
     assert abs(m0s[0] - 1.6366) < 1e-3 and abs(m0s[1] - 1.8017) < 1e-3, (
         f"参数初始值应包含 N1650(1.6366) 与 N1880(1.8017)，实际 {fr[0].tolist()}"
     )
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
     nll = ana.getNLL(params)
     assert torch.isfinite(nll), "NLL 非有限"
     grad = torch.autograd.grad(nll, params)[0]
     assert torch.isfinite(grad).all(), "梯度存在 NaN/Inf"
 
 
-def test_nll_autograd_tensor(make_analysis, device):
+def test_nll_autograd_tensor(make_analysis, dev):
     """getNLL 返回值应能参与 autograd 求梯度。"""
     ana = make_analysis("simple")
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
     nll = ana.getNLL(params)
     grad = torch.autograd.grad(nll, params, retain_graph=True)[0]
     assert grad.shape == params.shape
@@ -148,13 +148,13 @@ def _fd_gradient(ana, params, eps=FD_EPS):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "with_trans", "flatte", "gs", "interp", "baryon_cp"])
-def test_gradient_vs_fd(make_analysis, device, config_key):
+def test_gradient_vs_fd(make_analysis, dev, config_key):
     """autograd 梯度 vs 中心差分，相对误差 < 1e-3。
 
     注意：这一步较慢（每个参数 2 次 forward），只测两个 config。
     """
     ana = make_analysis(config_key)
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
 
     nll = ana.getNLL(params)
     grad_ad = torch.autograd.grad(nll, params)[0].detach().cpu().double()
@@ -182,19 +182,19 @@ def test_gradient_vs_fd(make_analysis, device, config_key):
 # Hessian 性质
 # ============================================================
 
-def test_hessian_symmetric(make_analysis, device):
+def test_hessian_symmetric(make_analysis, dev):
     """Hessian 必须对称（H_ij == H_ji）。"""
     ana = make_analysis("simple")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     H = ana.getHessian(params).detach().cpu().double()
     asym = (H - H.T).abs().max().item()
     assert asym < HESSIAN_SYM_ATOL, f"Hessian 不对称，max|H-H^T| = {asym:.2e}"
 
 
-def test_hessian_finite(make_analysis, device):
+def test_hessian_finite(make_analysis, dev):
     """Hessian 必须为有限值。"""
     ana = make_analysis("simple")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     H = ana.getHessian(params).detach().cpu()
     assert torch.isfinite(H).all(), "Hessian 存在 NaN/Inf"
 
@@ -273,7 +273,7 @@ def _max_mult_factors(config_path) -> int:
                for a in di.amplitudeNames())
 
 
-def test_hessian_fd_report_mult_factor(make_analysis, device):
+def test_hessian_fd_report_mult_factor(make_analysis, dev):
     """稳健版比较（fd_utils.compare_hessian）在 >=3 因子 config 上必须 PASS。
 
     与 test_hessian_vs_finite_difference_mult_factor 的区别: 这里用带
@@ -281,7 +281,7 @@ def test_hessian_fd_report_mult_factor(make_analysis, device):
     避免大 |NLL|/float32 舍入下把 FD 噪声误判成 kernel 错误。
     """
     ana = make_analysis("hess_mult")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     grad = fd_utils.analysis_grad_fn(ana)
     H, idxs = fd_utils.analysis_hessian_block(ana, params)
     rep = fd_utils.compare_hessian(H, grad, params, idxs)
@@ -293,10 +293,10 @@ def test_hessian_fd_report_mult_factor(make_analysis, device):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "no_trans", "with_trans"])
-def test_hessian_vs_finite_difference(make_analysis, device, config_key):
+def test_hessian_vs_finite_difference(make_analysis, dev, config_key):
     """每个振幅 <=2 个乘法因子 (无自由 step 参数): 解析 Hessian 必须等于中心差分。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     assert _max_mult_factors(CONFIGS_DIR / f"{config_key}.yml") <= 2, (
         f"{config_key}: 该 config 出现了 >=3 因子振幅, 应改用 hess_mult 那类断言")
     rel, (i, j), ha, hf = _hessian_fd_worst(ana, params)
@@ -305,7 +305,7 @@ def test_hessian_vs_finite_difference(make_analysis, device, config_key):
         f"(H_an={ha:.6g}, H_fd={hf:.6g})")
 
 
-def test_hessian_vs_finite_difference_mult_factor(make_analysis, device):
+def test_hessian_vs_finite_difference_mult_factor(make_analysis, dev):
     """存在 3 因子振幅 (chain×step×step) 时, 解析 Hessian 仍必须等于中心差分。
 
     回归背景: hessianFullTransformKernel 的二阶项曾把 ∂²v/∂p_j∂p_k 硬编码成 ±1
@@ -313,7 +313,7 @@ def test_hessian_vs_finite_difference_mult_factor(make_analysis, device):
     ratio≠1 时解析 Hessian 错 (实测 18 个元错 20%~105%, 含符号翻转)。已修。
     """
     ana = make_analysis("hess_mult")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     assert _max_mult_factors(CONFIGS_DIR / "hess_mult.yml") >= 3, (
         "hess_mult 结构已变: 不再有 3 因子振幅, 本测试失去意义")
     rel, (i, j), ha, hf = _hessian_fd_worst(ana, params)
@@ -331,7 +331,7 @@ def test_hessian_vs_finite_difference_mult_factor(make_analysis, device):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "with_trans"])
-def test_phsp_hessian_large_n_fallback(make_analysis, device, monkeypatch, config_key):
+def test_phsp_hessian_large_n_fallback(make_analysis, dev, monkeypatch, config_key):
     """phsp Hessian 的 global-memory 回退（大 n）与 shared-memory 快路径必须数值一致。
 
     回归背景: phspHessianKernel 把 n×n 的 phsp 矩阵放共享内存，需求
@@ -342,7 +342,7 @@ def test_phsp_hessian_large_n_fallback(make_analysis, device, monkeypatch, confi
     这里把"本卡共享内存上限"人为下调到 1KB，强制走回退分支对比两条路径。
     """
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
 
     H_small = ana.getHessian(params).detach().cpu().double()
     monkeypatch.setenv("CTPWA_PHSP_HESS_MAX_SMEM", "1024")
@@ -366,7 +366,7 @@ def test_phsp_hessian_large_n_fallback(make_analysis, device, monkeypatch, confi
 # 不测 theta=0 等非法输入（theta 由物理 bounds 约束，正常流程不会出现）。
 
 @pytest.mark.parametrize("config_key", ["no_trans", "with_trans"])
-def test_nll_coupling_zero_protection(make_analysis, device, config_key):
+def test_nll_coupling_zero_protection(make_analysis, dev, config_key):
     """自由耦合全 0（边界输入）时：NLL 与梯度必须有限。
 
     注意：v0=1 固定参考振幅使 factor 恒非零，通常不触发 1e30 保护；
@@ -378,12 +378,12 @@ def test_nll_coupling_zero_protection(make_analysis, device, config_key):
     assert n_vec > 1, f"{config_key}: 应有自由耦合参数"
     n_th = ana.getNFreeTheta()
 
-    p = torch.zeros(2 * n_vec + n_th, dtype=torch.float64, device=device)
+    p = torch.zeros(2 * n_vec + n_th, dtype=torch.float64, device=dev)
     p[0] = 1.0
     p[n_vec] = 0.0
     # 自由耦合全 0（v0=1 固定参考除外），theta 用标称值（合法输入）
     p[2 * n_vec :] = ana.getFreeResParams()[0].to(
-        device=device, dtype=torch.float64
+        device=dev, dtype=torch.float64
     ).requires_grad_(True)
 
     nll = ana.getNLL(p)
@@ -393,19 +393,19 @@ def test_nll_coupling_zero_protection(make_analysis, device, config_key):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "with_trans"])
-def test_nll_large_coupling_finite(make_analysis, device, config_key):
+def test_nll_large_coupling_finite(make_analysis, dev, config_key):
     """耦合极大（优化器试探）时：NLL 与梯度必须有限。"""
     ana = make_analysis(config_key)
     n_vec = ana.getNVector()
     n_th = ana.getNFreeTheta()
 
-    p = torch.zeros(2 * n_vec + n_th, dtype=torch.float64, device=device)
+    p = torch.zeros(2 * n_vec + n_th, dtype=torch.float64, device=dev)
     p[0] = 1.0
     p[n_vec] = 0.0
     p[1:n_vec] = 1e6
     p[n_vec + 1 : 2 * n_vec] = 1e6
     p[2 * n_vec :] = ana.getFreeResParams()[0].to(
-        device=device, dtype=torch.float64
+        device=dev, dtype=torch.float64
     ).requires_grad_(True)
 
     nll = ana.getNLL(p)
@@ -418,7 +418,7 @@ def test_nll_large_coupling_finite(make_analysis, device, config_key):
 # Golden value 回归
 # ============================================================
 
-def test_golden_nll(make_analysis, device, base_params):
+def test_golden_nll(make_analysis, dev, base_params):
     """固定参数 → NLL 必须等于 golden 记录值（防数值回归）。"""
     ana = make_analysis("simple")
     nll = ana.getNLL(base_params).item()
@@ -428,7 +428,7 @@ def test_golden_nll(make_analysis, device, base_params):
     )
 
 
-def test_golden_gradient(make_analysis, device, base_params):
+def test_golden_gradient(make_analysis, dev, base_params):
     """固定参数 → 梯度必须等于 golden 记录值。
 
     排除固定参考参数（v0=1+0i）：其梯度是数值噪声（应≈0），

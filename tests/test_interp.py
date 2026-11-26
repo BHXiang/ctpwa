@@ -75,10 +75,10 @@ def _flat_table(src: Path, dst: Path):
             fo.write(f"{line.split()[0]} 1.0 0.0\n")
 
 
-def _nll(cfg_path, device):
+def _nll(cfg_path, dev):
     import ctpwa
     ana = ctpwa.analysis(str(cfg_path))
-    return float(ana.getNLL(make_params(ana, device)))
+    return float(ana.getNLL(make_params(ana, dev)))
 
 
 def _wave_hist(root_path):
@@ -97,13 +97,13 @@ def _wave_hist(root_path):
     return 0.5 * (edges[:-1] + edges[1:]), np.asarray(vals, dtype=float)
 
 
-def _write_result(cfg_path, out_path, device):
+def _write_result(cfg_path, out_path, dev):
     import ctpwa
     ana = ctpwa.analysis(str(cfg_path))
-    ana.writeResult(make_params(ana, device), str(out_path))
+    ana.writeResult(make_params(ana, dev), str(out_path))
 
 
-def test_interp_table_enters_amplitude(device, tmp_path):
+def test_interp_table_enters_amplitude(dev, tmp_path):
     """输入表必须是 bump 而非 F≡1：两表 NLL 必须显著不同。
 
     修复前两值完全相等（表被丢弃）；修复后实测 395.9 vs 1037.1。
@@ -115,15 +115,15 @@ def test_interp_table_enters_amplitude(device, tmp_path):
     cfg_flat = tmp_path / "flat.yml"
     _write_cfg(cfg_flat, "shape", _interp_block(flat))
 
-    n_shape = _nll(cfg_shape, device)
-    n_flat = _nll(cfg_flat, device)
+    n_shape = _nll(cfg_shape, dev)
+    n_flat = _nll(cfg_flat, dev)
     assert abs(n_shape - n_flat) > 1.0, (
         f"Interp 表未进入振幅：shape NLL={n_shape} 与 flat NLL={n_flat} 相同"
         "（检查 computeNodeFactor 的 Interp 分支 / options 解析）"
     )
 
 
-def test_interp_options_nested_and_direct_agree(device, tmp_path):
+def test_interp_options_nested_and_direct_agree(dev, tmp_path):
     """嵌套 options:{file,method} 与直接 file: 两种写法必须等价（解析器回归）。"""
     nested = tmp_path / "nested.yml"
     _write_cfg(nested, "shape", _interp_block(SHAPE_TABLE))
@@ -133,10 +133,10 @@ def test_interp_options_nested_and_direct_agree(device, tmp_path):
         .replace("    options:\n      file:", "    file:")
         .replace("      method: linear\n", "")
     )
-    assert abs(_nll(nested, device) - _nll(direct, device)) < 1e-6
+    assert abs(_nll(nested, dev) - _nll(direct, dev)) < 1e-6
 
 
-def test_interp_reproduces_bw_shape(device, tmp_path):
+def test_interp_reproduces_bw_shape(dev, tmp_path):
     """形状固化：Interp 读 BW 表 必须复现 BW 模型的分波直方图。
 
     表 = ctpwa BW<T> 闭式 F(m) = (m0²−m² + i·m0·g0)/s（无 Bf、无 q/q0），
@@ -161,8 +161,8 @@ def test_interp_reproduces_bw_shape(device, tmp_path):
     _write_cfg(cfg_ip, "res", _interp_block(tab))
 
     out_bw, out_ip = tmp_path / "bw.root", tmp_path / "ip.root"
-    _write_result(cfg_bw, out_bw, device)
-    _write_result(cfg_ip, out_ip, device)
+    _write_result(cfg_bw, out_bw, dev)
+    _write_result(cfg_ip, out_ip, dev)
 
     c_bw, v_bw = _wave_hist(out_bw)
     c_ip, v_ip = _wave_hist(out_ip)

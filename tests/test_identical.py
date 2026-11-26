@@ -37,10 +37,10 @@ def _fd_gradient(ana, params, eps=FD_EPS):
 
 
 @pytest.mark.parametrize("config_key", ["ident2", "ident3", "ident4"])
-def test_nll_symmetric_under_swap(make_analysis, device, config_key):
+def test_nll_symmetric_under_swap(make_analysis, dev, config_key):
     """交换数据中全同粒子标签（ident2: pi01↔pi02；ident3: (12) 交换）后 NLL 必须不变。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     nll1 = ana.getNLL(params).item()
 
     import ctpwa
@@ -74,7 +74,7 @@ def _pair_mass(a, b):
     return np.sqrt(np.maximum(e * e - p2, 0.0))
 
 
-def test_model_hist_matches_weights(make_analysis, device, tmp_path):
+def test_model_hist_matches_weights(make_analysis, dev, tmp_path):
     """hfit 必须与"权重 × 末态四动量"独立重算的投影一致（防填充错位）。
 
     hfit 走的是 phsp 权重 → 直方图 的链路；若权重与动量错位（偏移/分批指针
@@ -84,7 +84,7 @@ def test_model_hist_matches_weights(make_analysis, device, tmp_path):
     import uproot
 
     ana = make_analysis("ident4")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     out = tmp_path / "ident4_fill.root"
     ana.writeResult(params, str(out), 1)
 
@@ -104,7 +104,7 @@ def test_model_hist_matches_weights(make_analysis, device, tmp_path):
             )
 
 
-def test_model_intensity_symmetric(make_analysis, device, tmp_path):
+def test_model_intensity_symmetric(make_analysis, dev, tmp_path):
     """逐事件模型强度必须对全同粒子标签交换不变：w(x) == w(σx)（精确判定）。
 
     为什么不用 M(Ks1 ω) 与 M(Ks2 ω) 的 hfit 差来判定：模型投影是对有限 phsp
@@ -117,7 +117,7 @@ def test_model_intensity_symmetric(make_analysis, device, tmp_path):
     """
     ana_a = make_analysis("ident4")
     ana_b = make_analysis("ident4_phsp_swap")
-    params = make_params(ana_a, device)
+    params = make_params(ana_a, dev)
 
     out_a = tmp_path / "ident4_wA.root"
     out_b = tmp_path / "ident4_wB.root"
@@ -135,10 +135,10 @@ def test_model_intensity_symmetric(make_analysis, device, tmp_path):
 
 
 @pytest.mark.parametrize("config_key", ["ident2", "ident3", "ident4"])
-def test_gradient_vs_fd(make_analysis, device, config_key):
+def test_gradient_vs_fd(make_analysis, dev, config_key):
     """autograd 梯度 vs 中心差分（覆盖 σ 求和路径的 v 和 θ 梯度）。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
 
     nll = ana.getNLL(params)
     grad_ad = torch.autograd.grad(nll, params)[0].detach().cpu().double()
@@ -162,10 +162,10 @@ def test_gradient_vs_fd(make_analysis, device, config_key):
 
 
 @pytest.mark.parametrize("config_key", ["ident2", "ident3", "ident4"])
-def test_hessian_symmetric_finite(make_analysis, device, config_key):
+def test_hessian_symmetric_finite(make_analysis, dev, config_key):
     """Hessian 对称 + 有限（覆盖 σ 求和的 Hessian 路径）。"""
     ana = make_analysis(config_key)
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     H = ana.getHessian(params).detach().cpu().double()
     asym = (H - H.T).abs().max().item()
     assert asym < HESSIAN_SYM_ATOL, f"{config_key}: Hessian 不对称 max={asym:.2e}"

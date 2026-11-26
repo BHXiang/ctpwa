@@ -32,7 +32,7 @@ GRAD_FD_REL = 5e-3
         ("custom_q0_func", "custom_q0"),
     ],
 )
-def test_dsl_model_matches_builtin(make_analysis, device, dsl_key, builtin_key):
+def test_dsl_model_matches_builtin(make_analysis, dev, dsl_key, builtin_key):
     """DSL 模型函数 vs 内置模型：自由参数数、NLL、梯度全部一致。"""
     ana_dsl = make_analysis(dsl_key)
     ana_ref = make_analysis(builtin_key)
@@ -44,7 +44,7 @@ def test_dsl_model_matches_builtin(make_analysis, device, dsl_key, builtin_key):
     assert ana_dsl.getNVector() == ana_ref.getNVector(), (
         f"{dsl_key} vector 数 != {builtin_key}")
 
-    params = make_params(ana_dsl, device)
+    params = make_params(ana_dsl, dev)
 
     nll_dsl = ana_dsl.getNLL(params).item()
     nll_ref = ana_ref.getNLL(params).item()
@@ -63,7 +63,7 @@ def test_dsl_model_matches_builtin(make_analysis, device, dsl_key, builtin_key):
         f"\n  DSL={grad_dsl.tolist()}\n  Ref={grad_ref.tolist()}")
 
 
-def test_custom_q0_func_gradient_vs_fd(make_analysis, device):
+def test_custom_q0_func_gradient_vs_fd(make_analysis, dev):
     """q0() 函数（1 参 / 3 参形式）梯度 vs 中心差分。
 
     重点：∂q0(p0)/∂p0 ≠ 0 必须被追踪 —— 若 q0() 函数分支退化为
@@ -72,7 +72,7 @@ def test_custom_q0_func_gradient_vs_fd(make_analysis, device):
     对 p0 高度敏感且归一化不完全抵消 → FD 信噪比好。
     """
     ana = make_analysis("custom_q0_func")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     t0 = 2 * ana.getNVector()
     assert t0 == 2 and ana.getNFreeTheta() == 2, "q0_func 应有 2 个自由参数"
 
@@ -82,7 +82,7 @@ def test_custom_q0_func_gradient_vs_fd(make_analysis, device):
         grad = torch.zeros_like(p_cpu)
         for i in range(p_cpu.numel()):
             step = max(abs(p_cpu[i].item()) * 1e-3, 5e-4)
-            pp = p_cpu.clone().to(device); pm = p_cpu.clone().to(device)
+            pp = p_cpu.clone().to(dev); pm = p_cpu.clone().to(dev)
             pp[i] += step; pm[i] -= step
             grad[i] = (ana.getNLL(pp).item() - ana.getNLL(pm).item()) / (2 * step)
         return grad

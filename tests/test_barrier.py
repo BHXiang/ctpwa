@@ -27,18 +27,18 @@ import torch
 from conftest import make_params
 
 
-def _nll_grad(ana, device):
+def _nll_grad(ana, dev):
     """构造初始参数并返回 (NLL, 梯度)。"""
-    p = make_params(ana, device).requires_grad_(True)
+    p = make_params(ana, dev).requires_grad_(True)
     nll = ana.getNLL(p).item()
     grad = torch.autograd.grad(ana.getNLL(p), p)[0].cpu().double()
     return nll, grad
 
 
-def _assert_same_physics(ana_a, ana_b, device):
+def _assert_same_physics(ana_a, ana_b, dev):
     """两个配置应给出完全相同的物理（NLL + 梯度）。"""
-    nll_a, grad_a = _nll_grad(ana_a, device)
-    nll_b, grad_b = _nll_grad(ana_b, device)
+    nll_a, grad_a = _nll_grad(ana_a, dev)
+    nll_b, grad_b = _nll_grad(ana_b, dev)
     assert nll_a == pytest.approx(nll_b, rel=1e-5), (
         f"NLL 不一致: {nll_a:.8f} vs {nll_b:.8f}"
     )
@@ -47,40 +47,40 @@ def _assert_same_physics(ana_a, ana_b, device):
     )
 
 
-def test_bf_defaults_unchanged(make_analysis, device):
+def test_bf_defaults_unchanged(make_analysis, dev):
     """显式 bf_d=3.0 与完全默认一致（默认值未被破坏）。"""
-    _assert_same_physics(make_analysis("bf"), make_analysis("bf_d3"), device)
+    _assert_same_physics(make_analysis("bf"), make_analysis("bf_d3"), dev)
 
 
-def test_has_bf_false_equals_bf_d_zero(make_analysis, device):
+def test_has_bf_false_equals_bf_d_zero(make_analysis, dev):
     """has_bf=false ≡ bf_d=0.0（Bf≡1）——证明 has_bf 真正移除势垒因子。"""
-    _assert_same_physics(make_analysis("bf_nobf"), make_analysis("bf_global0"), device)
+    _assert_same_physics(make_analysis("bf_nobf"), make_analysis("bf_global0"), dev)
 
 
-def test_resonance_overrides_global(make_analysis, device):
+def test_resonance_overrides_global(make_analysis, dev):
     """共振态级 bf_d 覆盖全局: (全局0.0 + 共振态4.0) == step 级 (0.0, 4.0)。"""
-    _assert_same_physics(make_analysis("bf_res4"), make_analysis("bf_steps"), device)
+    _assert_same_physics(make_analysis("bf_res4"), make_analysis("bf_steps"), dev)
 
 
-def test_step_overrides_resonance(make_analysis, device):
+def test_step_overrides_resonance(make_analysis, dev):
     """step 级 bf_d 覆盖共振态级: (全局0.0 + 共振态4.0 + step 0.0) == 全 0.0。"""
-    _assert_same_physics(make_analysis("bf_step0"), make_analysis("bf_global0"), device)
+    _assert_same_physics(make_analysis("bf_step0"), make_analysis("bf_global0"), dev)
 
 
-def test_intermediate_name_indirection(make_analysis, device):
+def test_intermediate_name_indirection(make_analysis, dev):
     """共振态名(r1) ≠ 中间态名(R_KK) 时，共振态级 bf_d 仍生效（链内查找）。"""
-    _assert_same_physics(make_analysis("bf_indirect"), make_analysis("bf_steps"), device)
+    _assert_same_physics(make_analysis("bf_indirect"), make_analysis("bf_steps"), dev)
 
 
-def test_has_bf_resonance_and_step_levels(make_analysis, device):
+def test_has_bf_resonance_and_step_levels(make_analysis, dev):
     """has_bf=false 在 resonance + step 级生效 == 全局关。"""
-    _assert_same_physics(make_analysis("bf_nobf2"), make_analysis("bf_nobf"), device)
+    _assert_same_physics(make_analysis("bf_nobf2"), make_analysis("bf_nobf"), dev)
 
 
-def test_barrier_really_applies_by_default(make_analysis, device):
+def test_barrier_really_applies_by_default(make_analysis, dev):
     """健全性: 默认有势垒因子时物理 ≠ 无势垒因子（Bf 真实参与计算）。"""
-    nll_bf, _ = _nll_grad(make_analysis("bf"), device)
-    nll_nobf, _ = _nll_grad(make_analysis("bf_nobf"), device)
+    nll_bf, _ = _nll_grad(make_analysis("bf"), dev)
+    nll_nobf, _ = _nll_grad(make_analysis("bf_nobf"), dev)
     assert nll_bf != pytest.approx(nll_nobf, rel=1e-3), (
         "默认 has_bf=true 应与 has_bf=false 显著不同"
     )

@@ -22,8 +22,8 @@ pytestmark = pytest.mark.skipif(
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
-def _nominal_params(ana, device):
-    return make_params(ana, device)
+def _nominal_params(ana, dev):
+    return make_params(ana, dev)
 
 
 def _read_phsp(n=None):
@@ -37,10 +37,10 @@ def _ratio_spread(a, b):
     return float(np.ptp(r) / np.mean(r))
 
 
-def test_get_intensity_matches_write_result(make_analysis, device, tmp_path):
+def test_get_intensity_matches_write_result(make_analysis, dev, tmp_path):
     """getIntensity / writeResult(totalweight) 逐事件应为常数比。"""
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     mom = _read_phsp()
 
     I = ana.getIntensity(mom, params)
@@ -59,16 +59,16 @@ def test_get_intensity_matches_write_result(make_analysis, device, tmp_path):
     assert _ratio_spread(I.numpy(), tw) < 1e-8
 
 
-def test_get_intensity_theta_dependence(make_analysis, device, tmp_path):
+def test_get_intensity_theta_dependence(make_analysis, dev, tmp_path):
     """theta 改变后，getIntensity 仍与 writeResult 的 totalweight 同比例。"""
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device).clone()
+    params = _nominal_params(ana, dev).clone()
     nv = ana.getNVector()
     nt = ana.getNFreeTheta()
     if nt:
         bounds = ana.getFreeResParams()  # [3, n]
-        lower = bounds[1].to(device=device, dtype=torch.float64)
-        upper = bounds[2].to(device=device, dtype=torch.float64)
+        lower = bounds[1].to(device=dev, dtype=torch.float64)
+        upper = bounds[2].to(device=dev, dtype=torch.float64)
         params[2 * nv :] = torch.clamp(
             params[2 * nv :] + 0.05 * (upper - lower), lower, upper
         )
@@ -87,10 +87,10 @@ def test_get_intensity_theta_dependence(make_analysis, device, tmp_path):
     assert _ratio_spread(I.numpy(), tw) < 1e-8
 
 
-def test_get_intensity_isolated(make_analysis, device):
+def test_get_intensity_isolated(make_analysis, dev):
     """getIntensity 用局部 AmpCalc，不应改变 NLL，也不应泄漏显存。"""
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     mom = _read_phsp(3000)
 
     nll0 = float(ana.getNLL(params))
@@ -106,9 +106,9 @@ def test_get_intensity_isolated(make_analysis, device):
     assert free0 - free1 < 128 * 1024 * 1024
 
 
-def test_generate_mc_unweighted(make_analysis, device):
+def test_generate_mc_unweighted(make_analysis, dev):
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     n = 2000
     res = ana.generateMC(n, params, seed=42, mode="unweighted", batch=10000)
 
@@ -139,9 +139,9 @@ def test_generate_mc_unweighted(make_analysis, device):
     assert I.max().item() <= st["max_weight"] * (1.0 + 1e-9)
 
 
-def test_generate_mc_weighted(make_analysis, device):
+def test_generate_mc_weighted(make_analysis, dev):
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     n = 3000
     res = ana.generateMC(n, params, seed=7, mode="weighted", batch=2000)
     ev, w, st = res["events"], res["weights"], res["stats"]
@@ -153,18 +153,18 @@ def test_generate_mc_weighted(make_analysis, device):
     assert st["max_weight"] == pytest.approx(float(w.max()), rel=1e-12)
 
 
-def test_generate_mc_seed_reproducible(make_analysis, device):
+def test_generate_mc_seed_reproducible(make_analysis, dev):
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     a = ana.generateMC(300, params, seed=11, mode="unweighted", batch=3000)
     b = ana.generateMC(300, params, seed=11, mode="unweighted", batch=3000)
     assert torch.equal(a["events"], b["events"])
     assert a["stats"]["max_weight"] == b["stats"]["max_weight"]
 
 
-def test_generate_mc_max_trials(make_analysis, device):
+def test_generate_mc_max_trials(make_analysis, dev):
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     res = ana.generateMC(
         10_000, params, seed=3, mode="unweighted", batch=100, max_trials=200
     )
@@ -173,10 +173,10 @@ def test_generate_mc_max_trials(make_analysis, device):
     assert res["stats"]["n_flat"] <= 200
 
 
-def test_generate_mc_distribution_vs_weighted(make_analysis, device):
+def test_generate_mc_distribution_vs_weighted(make_analysis, dev):
     """AR 样本的 m^2(K+K-) 分布应与 |M|^2 加权平坦样本一致（统计精度内）。"""
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     ar = ana.generateMC(5000, params, seed=123, mode="unweighted", batch=20000)
     wt = ana.generateMC(40000, params, seed=124, mode="weighted", batch=20000)
 
@@ -197,9 +197,9 @@ def test_generate_mc_distribution_vs_weighted(make_analysis, device):
     assert np.abs(h - hw).max() < 0.03
 
 
-def test_write_mc_roundtrip(make_analysis, device, tmp_path):
+def test_write_mc_roundtrip(make_analysis, dev, tmp_path):
     ana = make_analysis("simple")
-    params = _nominal_params(ana, device)
+    params = _nominal_params(ana, dev)
     res = ana.generateMC(200, params, seed=5, mode="unweighted", batch=2000)
     dat = tmp_path / "mc.dat"
     root = tmp_path / "mc.root"

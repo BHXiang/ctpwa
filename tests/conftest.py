@@ -92,6 +92,19 @@ def cpu_device():
 
 
 @pytest.fixture(scope="session")
+def dev():
+    """后端相关设备：CUDA 构建给 cuda:0，CPU 构建给 cpu。
+
+    用于**数值**用例（NLL/golden/梯度/Hessian）：这些在两种后端上都该跑，
+    只是设备不同。与 `device` 的区别是后者表示"此用例必须有真 GPU"。
+    """
+    import ctpwa
+    if ctpwa.backend() == "cuda":
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+@pytest.fixture(scope="session")
 def device():
     # 无 CUDA 时 skip 而不是 error：CPU 构建（CI 无卡 runner / 本机无卡）下
     # 这些用例应当"跳过"而不是把整个测试套件标红。语义不变——需要真 GPU 的
@@ -143,10 +156,11 @@ def make_params(ana, device, seed=SEED):
 
 
 @pytest.fixture(scope="session")
-def base_params(make_analysis, device):
-    """simple config 的合法初始参数（golden 测试用）。"""
+def base_params(make_analysis, dev):
+    """simple config 的合法初始参数（golden 测试用）。用 dev 而非 device：
+    golden 比对在 CPU 后端同样有效（double），不该因为没卡就跳过。"""
     ana = make_analysis("simple")
-    return make_params(ana, device)
+    return make_params(ana, dev)
 
 
 def load_golden(name: str) -> float:

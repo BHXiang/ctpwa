@@ -43,11 +43,11 @@ def _clamp_theta(params, ana, n_vec):
 
 
 @pytest.mark.parametrize("config_key", ["simple", "with_trans"])
-def test_fit_nll_decreases(make_analysis, device, config_key):
+def test_fit_nll_decreases(make_analysis, dev, config_key):
     """带 bounds 的梯度下降几步，NLL 必须单调下降（防梯度方向错误）。"""
     ana = make_analysis(config_key)
     n_vec = ana.getNVector()
-    params = _clamp_theta(make_params(ana, device).clone(), ana, n_vec)
+    params = _clamp_theta(make_params(ana, dev).clone(), ana, n_vec)
     params = params.requires_grad_(True)
     lr = 1e-3
     prev = None
@@ -67,11 +67,11 @@ def test_fit_nll_decreases(make_analysis, device, config_key):
             pytest.skip(f"{config_key}: 梯度极小，NLL 无变化（数值退化）")
 
 
-def test_fit_no_nan(make_analysis, device):
+def test_fit_no_nan(make_analysis, dev):
     """拟合过程中 NLL 与梯度始终保持有限（防 NaN 传播）。"""
     ana = make_analysis("with_trans")
     n_vec = ana.getNVector()
-    params = _clamp_theta(make_params(ana, device).clone(), ana, n_vec)
+    params = _clamp_theta(make_params(ana, dev).clone(), ana, n_vec)
     params = params.requires_grad_(True)
     for step in range(5):
         nll = ana.getNLL(params)
@@ -86,20 +86,20 @@ def test_fit_no_nan(make_analysis, device):
 # writeResult
 # ============================================================
 
-def test_write_result(make_analysis, device, outputs_dir):
+def test_write_result(make_analysis, dev, outputs_dir):
     """writeResult 正常生成输出文件（不崩溃）。"""
     ana = make_analysis("simple")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     out_file = str(outputs_dir / "test_result.root")
     ana.writeResult(params, out_file, 0)
     assert os.path.exists(out_file), "writeResult 未生成文件"
     assert os.path.getsize(out_file) > 0, "writeResult 输出为空文件"
 
 
-def test_write_result_with_trans(make_analysis, device, outputs_dir):
+def test_write_result_with_trans(make_analysis, dev, outputs_dir):
     """trans 约束下 writeResult 也应正常（防折叠参数路径崩溃）。"""
     ana = make_analysis("with_trans")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     out_file = str(outputs_dir / "test_result_trans.root")
     ana.writeResult(params, out_file, 0)
     assert os.path.exists(out_file), "writeResult 未生成文件"
@@ -109,14 +109,14 @@ def test_write_result_with_trans(make_analysis, device, outputs_dir):
 # reCalcAmp
 # ============================================================
 
-def test_recalc_amp_changes_nll(make_analysis, device):
+def test_recalc_amp_changes_nll(make_analysis, dev):
     """theta 扰动 → NLL 变化；reCalcAmp 手动更新不崩溃。
 
     注：getNLL 每次 forward 内部都 reComputeAmps(params 的 theta)，
     所以 reCalcAmp 的更新会被覆盖——这里验证的是 theta 参数路径本身。
     """
     ana = make_analysis("simple")
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     nll0 = ana.getNLL(params).item()
 
     n_vec = ana.getNVector()
@@ -139,7 +139,7 @@ def test_recalc_amp_changes_nll(make_analysis, device):
 # 真实数据冒烟（集群上）
 # ============================================================
 
-def test_real_data_smoke(make_analysis, device, real_data_available):
+def test_real_data_smoke(make_analysis, dev, real_data_available):
     """真实数据子集存在时，跑一次完整 NLL（集群发布前验证）。
 
     本地无真实数据时自动跳过。
@@ -154,12 +154,12 @@ def test_real_data_smoke(make_analysis, device, real_data_available):
     if not cfg_path.exists():
         pytest.skip("tests/configs/real_data.yml 不存在")
     ana = ctpwa.analysis(str(cfg_path))
-    params = make_params(ana, device)
+    params = make_params(ana, dev)
     nll = ana.getNLL(params).item()
     assert torch.isfinite(torch.tensor(nll)), f"真实数据 NLL 非有限: {nll}"
 
 
-def test_real_fit_benchmark(device, real_data_available):
+def test_real_fit_benchmark(dev, real_data_available):
     """真实数据拟合收敛基准（集群发布前验证）。
 
     与 fit_benchmark.py 生成的基准对比：
@@ -184,7 +184,7 @@ def test_real_fit_benchmark(device, real_data_available):
 
     cfg = TESTS_DIR / "configs" / "real_data.yml"
     ana = ctpwa.analysis(str(cfg))
-    params = make_params(ana, device).requires_grad_(True)
+    params = make_params(ana, dev).requires_grad_(True)
 
     n_vec = ana.getNVector()
     nll0 = ana.getNLL(params).item()
@@ -201,8 +201,8 @@ def test_real_fit_benchmark(device, real_data_available):
         updated = (params - lr * grad).detach()
         if ana.getNFreeTheta() > 0:
             free_res = ana.getFreeResParams()
-            lower = free_res[1].to(device=device, dtype=torch.float64)
-            upper = free_res[2].to(device=device, dtype=torch.float64)
+            lower = free_res[1].to(device=dev, dtype=torch.float64)
+            upper = free_res[2].to(device=dev, dtype=torch.float64)
             updated[2 * n_vec :] = torch.clamp(updated[2 * n_vec :], lower, upper)
         params = updated.requires_grad_(True)
 
