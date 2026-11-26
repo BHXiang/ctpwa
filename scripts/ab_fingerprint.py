@@ -85,13 +85,19 @@ def run(out_path, configs):
     print(f"[ab] wrote {out_path}", file=sys.stderr)
 
 
-def compare(a_path, b_path, rel_tol):
+def compare(a_path, b_path, rel_tol, atol):
+    """逐元素判定：|a-b| <= atol + rel_tol*max(|a|,|b|)。
+
+    为什么不用"整条向量的最大相对差"：梯度里常有 ≈0 的分量（例如被约束固定的方向），
+    绝对差 1e-12 在小分量上会变成很大的"相对差"，但物理上毫无意义。逐元素
+    atol + rtol 是数值比较的标准做法。
+    """
     a = json.loads(Path(a_path).read_text())
     b = json.loads(Path(b_path).read_text())
     ea = {e.get("config"): e for e in a["entries"]}
     eb = {e.get("config"): e for e in b["entries"]}
-    bad = 0
-    print(f"{'config':12s} {'field':10s} {'max|Δ|':>12s} {'max rel':>12s}  状态")
+    bad_total = 0
+    print(f"{'config':12s} {'field':6s} {'max|Δ|':>11s} {'max rel':>11s} {'坏点数':>7s}  状态")
     for name in sorted(set(ea) & set(eb)):
         x, y = ea[name], eb[name]
         for field in ("nll", "grad", "hess"):
@@ -100,18 +106,25 @@ def compare(a_path, b_path, rel_tol):
             va = x[field] if isinstance(x[field], list) else [x[field]]
             vb = y[field] if isinstance(y[field], list) else [y[field]]
             if len(va) != len(vb):
-                print(f"{name:12s} {field:10s} {'—':>12s} {'—':>12s}  长度不同 {len(va)} vs {len(vb)}")
-                bad += 1
+                print(f"{name:12s} {field:6s} {'—':>11s} {'—':>11s} {'—':>7s}  长度不同 {len(va)} vs {len(vb)}")
+                bad_total += 1
                 continue
-            max_abs = max(abs(p - q) for p, q in zip(va, vb))
-            scale = max(1e-30, max(abs(p) for p in va))
-            rel = max_abs / scale
-            ok = rel <= rel_tol
-            bad += 0 if ok else 1
-            print(f"{name:12s} {field:10s} {max_abs:12.3e} {rel:12.3e}  {'ok' if ok else 'MISMATCH'}")
-    print(f"\n判据: 相对差 <= {rel_tol:g}（重构不改变物理时应当逐位或近乎逐位相等）")
-    print("结论:", "全部一致" if bad == 0 else f"{bad} 项不一致")
-    return 1 if bad else 0
+            bad = 0
+            max_abs = 0.0
+            max_rel = 0.0
+            for p, q in zip(va, vb):
+                d = abs(p - q)
+                scale = max(abs(p), abs(q))
+                max_abs = max(max_abs, d)
+                if scale > 0:
+                    max_rel = max(max_rel, d / scale)
+                if d > atol + rel_tol * scale:
+                    bad += 1
+            bad_total += bad
+            print(f"{name:12s} {field:6s} {max_abs:11.3e} {max_rel:11.3e} {bad:7d}  {'ok' if bad==0 else 'MISMATCH'}")
+    print(f"\n判据: 逐元素 |Δ| <= atol({atol:g}) + rtol({rel_tol:g})·max(|a|,|b|)")
+    print("结论:", "全部一致" if bad_total == 0 else f"{bad_total} 个元素不一致")
+    return 1 if bad_total else 0
 
 
 def main():
@@ -120,9 +133,10 @@ def main():
     ap.add_argument("--configs", nargs="*", default=DEFAULT_CONFIGS)
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--rel-tol", type=float, default=1e-11)
+    ap.add_argument("--atol", type=float, default=1e-12)
     args = ap.parse_args()
     if args.compare:
-        return compare(args.compare[0], args.compare[1], args.rel_tol)
+        return compare(args.compare[0], args.compare[1], args.rel_tol, args.atol)
     if not args.out:
         ap.error("需要 --out 或 --compare")
     run(args.out, args.configs)

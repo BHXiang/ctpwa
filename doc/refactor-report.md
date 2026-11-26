@@ -105,7 +105,7 @@ double free"的整类问题。
 
 | 对比 | NLL | 梯度 | Hessian |
 |---|---|---|---|
-| CPU 重构版 **vs** CPU v0.3.27 | **0（逐位）** | ≤7e-15 相对 | **0（逐位）** |
+| CPU 重构版 **vs** CPU v0.3.27 | **0（逐位）** | ≤4e-12 绝对 | **0（逐位）** |
 | GPU 重构版 **vs** GPU v0.3.27 | **0（逐位）** | ≤1.3e-13 | ≤1.7e-10 |
 | CPU vs GPU（同一份重构代码） | ≤1e-9 | 1e-8 | **0.5%**（`with_trans`） |
 
@@ -127,7 +127,7 @@ analysis: 移除 0, 新增 0
 | 环境 | 结果 | 说明 |
 |---|---|---|
 | CPU（`scripts/run_tests_parallel.sh`） | **258 / 0 / 63** | 全绿；`failed>0 \|\| errors>0 \|\| 异常退出` 都算失败 |
-| GPU（RTX 5060, sm_120） | **约 263 passed / 0 failed** | 分五批跑；含 CPU 上 skip 的 float 档、BWR 特化 |
+| GPU（`scripts/run_tests_gpu.sh`，RTX 5060 / sm_120） | **263 passed / 9 skipped / 1 xfail** | 6 批；含 CPU 上 skip 的 float 档、BWR 特化 |
 
 未跑的用例及原因：`test_memory_monitor`（针对 A100-40GB 的 400 万事件 phsp，
 8GB 卡上无意义）、`test_cpu_*`（CPU 构建专属）。
@@ -161,6 +161,16 @@ bash scripts/check_device_calls.sh                   # 棘轮必须下降
 ---
 
 ## 5. 怎么复跑全部证据
+
+**一条命令全跑（推荐）**：
+
+```bash
+bash scripts/verify_all.sh              # CPU：构建 + 设备纪律 + 门禁 + A/B + host 单测
+bash scripts/verify_all.sh --with-gpu   # 再加 GPU 门禁与 GPU A/B（需要真卡）
+bash scripts/run_tests_gpu.sh           # 只跑 GPU 门禁（自动探测架构、分批、~10 分钟）
+```
+
+手工分解：
 
 ```bash
 # CPU 门禁（约 8 分钟）
