@@ -6,6 +6,7 @@
 #include <ResModel.cuh>
 #include <Resonance.cuh>
 #include <SymbolicDiff.cuh>  // Q0MassDep（getDaughterMassDep 签名）
+#include <DevBuffer.h>       // AmpCasDecay 四动量缓冲的唯一所有者
 
 #include <array>
 #include "ComplexType.h"
@@ -125,8 +126,11 @@ private:
     // 即用即弃，旧代码从不释放 → 每调用泄漏 n_events×n_particles×16B（issue #3）。
     // 这里记录下来，在**下次调用开头**释放（析构时 torch 已销毁 CUDA 上下文，
     // 不能在那里 cudaFree——见 ~AmpCasDecay 注释）。
-    std::vector<std::pair<int, DeviceMomenta*>> d_momenta_structs_;  // (gpu, ptr)
-    std::vector<std::pair<int, LorentzVector*>>  d_momenta_arrays_;   // (gpu, ptr)
+    // 每 GPU 四动量缓冲的**唯一所有者**（move-only，见 DevBuffer.h）。
+    // 按 σ 顺序追加：σ 的 n_gpu 个条目位于 [σ*n_gpu, (σ+1)*n_gpu)。
+    // 视图指针在 d_momenta_ / d_mom_sigma_ 里，不持有所有权。
+    std::vector<ctpwa::DevBuffer<DeviceMomenta>> d_mom_structs_;
+    std::vector<ctpwa::DevBuffer<LorentzVector>> d_mom_arrays_;
     std::vector<double*> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
     std::vector<DeviceMomenta*> d_momenta_;// = nullptr;
     std::vector<DecayNode*> d_decayNodes_;// = nullptr;
@@ -154,6 +158,10 @@ private:
     void addParticleIfNotExists(const std::string& name, int spin, int parity, double mass);
     // 释放本实例此前分配的每-GPU 四动量缓冲（一批 computeSLAmps 开头调用一次）
     void releaseMomentaBuffers();
+    // 只释放 σ≥1 的置换拓扑动量（σ=0 保留）——构造期物化完 A 之后省内存用
+    void releasePermMomenta();
+    // 进程退出期：丢弃所有权但不 free（上下文可能已销毁）
+    void disarmMomentaOwners() noexcept;
     std::vector<DeviceMomenta*> convertToDeviceMomenta(
         const std::vector<std::map<std::string, std::vector<LorentzVector>>>& finalMomenta,
         const std::map<std::string, int>& particleToIndex,

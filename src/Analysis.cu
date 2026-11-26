@@ -839,7 +839,9 @@ public:
         // 1. 将 vector 扩展向量
         torch::Tensor extended_vector = params_mgr->extendVector(vector, vector.device());
         int extended_n_gls = extended_vector.numel();
-        const int primary_dev = vector.get_device();
+        // torch 在 CPU 张量上返回 -1（没有设备索引）。这里统一归一化到 0：
+        // 该值随后被当作设备号使用（ensure_device / cudaMemcpy / peer copy）。
+        const int primary_dev = ctpwa_is_cuda_like(vector) ? vector.get_device() : 0;
 
         // 2. 将extended_vector分发到每个GPU（实际拷贝）
         std::vector<torch::Tensor> extended_vec_per_gpu;

@@ -168,6 +168,7 @@ AmpCasDecay::~AmpCasDecay()
     //   探测失败 → 跳过，行为与旧实现一致。
     if (cudaFree(nullptr) != cudaSuccess) {
         (void)cudaGetLastError();
+        disarmMomentaOwners();   // 只丢指针，不 free（上下文已销毁）
         return;
     }
     for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
@@ -179,8 +180,9 @@ AmpCasDecay::~AmpCasDecay()
         if (g < d_slCombination_.size() && d_slCombination_[g])   cudaFree(d_slCombination_[g]);
         if (g < d_polarization_map_.size() && d_polarization_map_[g]) cudaFree(d_polarization_map_[g]);
     }
-    for (auto& [dev, ptr] : d_momenta_structs_) { cudaSetDevice(dev); if (ptr) cudaFree(ptr); }
-    for (auto& [dev, ptr] : d_momenta_arrays_)  { cudaSetDevice(dev); if (ptr) cudaFree(ptr); }
+    // 四动量缓冲：DevBuffer 析构会在**各自的设备**上释放，无需在这里切设备。
+    d_mom_structs_.clear();
+    d_mom_arrays_.clear();
 }
 
 void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const std::string& daug1, const std::string& daug2)
@@ -557,16 +559,25 @@ std::vector<std::vector<SL>> AmpCasDecay::getSLCombinations() const
 // 调用一次（而不是每次 convertToDeviceMomenta 里），原因见该函数注释。
 void AmpCasDecay::releaseMomentaBuffers()
 {
-    for (auto& [dev, ptr] : d_momenta_structs_) {
-        cudaSetDevice(dev);
-        if (ptr) cudaFree(ptr);
-    }
-    for (auto& [dev, ptr] : d_momenta_arrays_) {
-        cudaSetDevice(dev);
-        if (ptr) cudaFree(ptr);
-    }
-    d_momenta_structs_.clear();
-    d_momenta_arrays_.clear();
+    d_mom_structs_.clear();   // 唯一所有者：DevBuffer 析构在各自设备上 free
+    d_mom_arrays_.clear();
+    d_mom_sigma_.clear();     // 视图一并失效（computeSLAmps 随后重建）
+    d_momenta_.clear();
+}
+
+// 只释放 σ≥1 的置换动量：所有者向量的前 n_gpu 个是 σ=0，保留。
+void AmpCasDecay::releasePermMomenta()
+{
+    const std::size_t keep = d_momenta_.size();
+    if (d_mom_structs_.size() > keep) d_mom_structs_.resize(keep);
+    if (d_mom_arrays_.size() > keep) d_mom_arrays_.resize(keep);
+    if (d_mom_sigma_.size() > 1) d_mom_sigma_.resize(1);
+}
+
+void AmpCasDecay::disarmMomentaOwners() noexcept
+{
+    for (auto& b : d_mom_structs_) b.disarm();
+    for (auto& b : d_mom_arrays_) b.disarm();
 }
 
 std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
@@ -677,12 +688,13 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
         }
 
         // 第三步：将数据复制到设备
-        DeviceMomenta* d_momenta_i;
-        cudaMalloc(&d_momenta_i, sizeof(DeviceMomenta));
+        // 所有权进 DevBuffer（单一所有者），下面只用它的 data() 视图
+        d_mom_structs_.emplace_back(static_cast<int>(i), std::size_t{1});
+        DeviceMomenta* d_momenta_i = d_mom_structs_.back().data();
 
         // 在设备端分配四动量数组
-        LorentzVector* d_momenta_array;
-        cudaMalloc(&d_momenta_array, host_momenta.size() * sizeof(LorentzVector));
+        d_mom_arrays_.emplace_back(static_cast<int>(i), host_momenta.size());
+        LorentzVector* d_momenta_array = d_mom_arrays_.back().data();
         cudaMemcpy(d_momenta_array, host_momenta.data(), host_momenta.size() * sizeof(LorentzVector), cudaMemcpyHostToDevice);
 
         // 设置设备端结构体参数
@@ -694,9 +706,7 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
         // 将结构体复制到设备
         cudaMemcpy(d_momenta_i, &h_momenta, sizeof(DeviceMomenta), cudaMemcpyHostToDevice);
 
-        d_momenta[i] = d_momenta_i;
-        d_momenta_structs_.emplace_back((int)i, d_momenta_i);
-        d_momenta_arrays_.emplace_back((int)i, d_momenta_array);
+        d_momenta[i] = d_momenta_i;   // 视图（所有权在 d_mom_structs_ 尾部）
     }
 
     return d_momenta;
@@ -1518,45 +1528,11 @@ void AmpCasDecay::releaseStaticData()
             cudaFree(d_sign_tab_[g]); d_sign_tab_[g] = nullptr;
         }
     }
-    // σ≥1 的全同粒子置换重建动量（仅 nSigma>1 的 cas 分配）
-    //
-    // ⚠ 这些缓冲同时也登记在 d_momenta_structs_/d_momenta_arrays_（供下次
-    // computeSLAmps 开头统一释放）里。只 cudaFree 不摘簿记 → 析构函数会对同一
-    // 指针再 free 一次（CPU 后端 malloc/free 直接 abort：
-    // "free(): double free detected in tcache 2"；CUDA 上是 cudaFree 二次释放）。
-    // 这里按指针匹配把对应条目从簿记里摘掉，并顺带释放同 σ 的四动量数组。
-    {
-        std::set<DeviceMomenta*> drop;
-        for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
-            for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g)
-                if (d_mom_sigma_[si][g]) drop.insert(d_mom_sigma_[si][g]);
-        for (size_t si = 1; si < d_mom_sigma_.size(); ++si)
-            for (size_t g = 0; g < d_mom_sigma_[si].size(); ++g) {
-                if (!d_mom_sigma_[si][g]) continue;
-                cudaSetDevice((int)g);
-                cudaFree(d_mom_sigma_[si][g]);
-                d_mom_sigma_[si][g] = nullptr;
-            }
-        if (!drop.empty()) {
-            std::vector<std::pair<int, DeviceMomenta*>> keep_structs;
-            std::vector<std::pair<int, LorentzVector*>> keep_arrays;
-            keep_structs.reserve(d_momenta_structs_.size());
-            keep_arrays.reserve(d_momenta_arrays_.size());
-            for (size_t k = 0; k < d_momenta_structs_.size(); ++k) {
-                if (drop.count(d_momenta_structs_[k].second)) {
-                    if (k < d_momenta_arrays_.size()) {
-                        cudaSetDevice(d_momenta_arrays_[k].first);
-                        if (d_momenta_arrays_[k].second) cudaFree(d_momenta_arrays_[k].second);
-                    }
-                } else {
-                    keep_structs.push_back(d_momenta_structs_[k]);
-                    if (k < d_momenta_arrays_.size()) keep_arrays.push_back(d_momenta_arrays_[k]);
-                }
-            }
-            d_momenta_structs_.swap(keep_structs);
-            d_momenta_arrays_.swap(keep_arrays);
-        }
-    }
+    // σ≥1 的全同粒子置换重建动量（仅 nSigma>1 的 cas 分配）。
+    // P2：所有权唯一（d_mom_structs_/d_mom_arrays_ 的尾部），这里只把所有者
+    // 向量 resize 回 n_gpu（σ=0 段）——DevBuffer 析构自动在各自设备上释放，
+    // 不再需要"按指针匹配把条目从另一张登记表里摘掉"那套补偿逻辑。
+    releasePermMomenta();
     slamp_released_ = true;
     // 逐链释放日志注释掉（真实分析每 ctor 刷屏）; 诊断时取消注释
     // fprintf(stderr, "[ctpwa] releaseStaticData: 链 %s 无自由参数，静态 SL 表已释放\n",

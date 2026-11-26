@@ -18,9 +18,14 @@
 
 ## 2. 总计
 
-| passed | failed | skipped | 文件数 |
-|---|---|---|---|
-| **183** | **8** → 修 P0-D 后 **7** | 26（另有 7 个文件整文件 skip，解析器未计入） | 41 |
+| 阶段 | passed | failed | skipped | 说明 |
+|---|---|---|---|---|
+| 重构前（v0.3.27） | 183 | 8 | 26（另有 7 个文件整文件 skip，解析器未计入） | 数值用例全 skip |
+| **P2 后（新基线）** | **251 + 3**（`test_ownership`） | **7** | 30 | 数值/物理用例已能在 CPU 上跑 |
+
+新基线 = `tmp/baseline2_table.txt`（逐文件表）+ `tests/test_ownership.py`（3 个）。
+七项失败：`test_float_mode` 4、`test_hessian_bwr_spec` 2、`test_memory_monitor` 1。
+`test_structure` 已修（24 passed）。
 
 耗时：全套约 6 分钟（逐文件串行，OMP_NUM_THREADS=4）。
 

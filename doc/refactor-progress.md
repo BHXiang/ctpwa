@@ -13,7 +13,7 @@
 | P0-A 还原主卡 → `ensure_device` | ✅ | `5e3ab26` |
 | P0-C `primary_dev` 显式化 | ✅ | `d0eab60` |
 | P0-B 多卡循环内的 set（128 处） | ⏸ **等 GPU** | — |
-| P2 DevBuffer | ⬜ | — |
+| P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | 见下 |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
 
@@ -57,6 +57,32 @@ Parameters 4）。`ensure_device` 语义完全等价：**已经是主卡则不�
 `cudaGetDevice(&primary_dev)`——它把"主设备"定义为**调用那一刻的 ambient 设备**，
 `torch.to()` 或多卡循环一改就会错卡（`bc22b52` 同类根因）。现在改成第一个形参，
 Analysis.cu 的 6 个调用点显式传 `primary_dev_`（局部作用域里是 `primary_dev`）。
+
+---
+
+## P2（第一批）：`AmpCasDecay` 的四动量缓冲改为单一所有权
+
+**问题**（`modularization-plan §2.4b`）：同一批设备指针同时登记在
+`d_mom_sigma_` 与 `d_momenta_structs_/d_momenta_arrays_` 两处。`releaseStaticData`
+只 free 一处，析构会对同一指针再 free 一次（CPU 后端直接
+`free(): double free detected`），补偿手段是"按指针匹配把条目从另一张登记表里摘掉"
+——用更复杂的簿记去补两套簿记。
+
+**改法**：
+
+| 改动 | 说明 |
+|---|---|
+| 新增 `include/DevBuffer.h` | move-only 所有者：构造即分配、析构在**自己的设备**上释放、禁拷贝；`disarm()` 供进程退出期（上下文已销毁）只丢指针不 free |
+| `d_momenta_structs_/arrays_`（`vector<pair<int,ptr>>`） | → `vector<ctpwa::DevBuffer<...>>`，成为唯一所有者 |
+| `d_momenta_` / `d_mom_sigma_` | 降级为**视图**（裸指针，无所有权） |
+| `releaseStaticData` | 删掉 `std::set<DeviceMomenta*> drop` + 重建登记表那 30 行，改为 `releasePermMomenta()`：所有者向量 `resize(n_gpu)`，尾部析构自动释放 |
+| 析构 | `d_mom_structs_.clear()` 即可；上下文已销毁的分支先 `disarmMomentaOwners()` |
+
+**顺带发现的一个真问题**：CPU 后端 `Tensor::get_device()` 返回 **-1**，而
+`getNLL` 里 `const int primary_dev = vector.get_device()` 的这个值被当设备号用。
+以前 `cudaSetDevice(-1)` 静默失败（不切设备），P0 的 `ensure_device` 把它变成
+可见的报错。已归一化：`ctpwa_is_cuda_like(vector) ? get_device() : 0`。
+（这类"CPU 上恰好不出事"的隐式越界，正是把裸调用换成检查型入口的额外收益。）
 
 ---
 
