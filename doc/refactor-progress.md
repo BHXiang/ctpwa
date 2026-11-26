@@ -31,6 +31,7 @@
 | P4 第九步（`rebuildPhspGram` + helper 上移） | ✅ | `9021595` |
 | P4 第十步（`Polarization` 纯函数） | ✅ | `8353f4d` |
 | **门禁全绿（258/0/63）** | ✅ | `9409335` |
+| P4 第十一步（`HessianContrib`） | ✅ | `1b503b1` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -630,6 +631,17 @@ objective 要求"记录每阶段基线与 A/B 数值对照"。此前只有"测�
 skipped 不计（GPU-only 用例在 CPU 构建上就该跳过）。CI 直接吃这个退出码。
 
 当前：**258 passed / 0 failed / 63 skipped**。门禁第一次变成"红即回归"。
+
+---
+
+## P4（第十一步）：`hessianSegmentContrib` → `HessianContrib`
+
+`getHessian` 那一簇里最先能搬的一块（58 行，8 个字段）。它能搬干净的原因是：
+调用的 `computeDataHessianContrib(Fast)` 本来就是 `ComputeHessian.cu` 的自由函数，
+所以**不需要任何回调**，纯参数化就够。
+
+`Analysis.h` 6408 → **6359 行**。门禁 258/0/63（全绿）；A/B 指纹逐位一致；
+CUDA 只编译 0 错误。
 
 ---
 
