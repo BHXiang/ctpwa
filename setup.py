@@ -180,6 +180,7 @@ SOURCES_CORE = [
     "src/HessianContrib.cu", # P4：单段 Hessian 贡献
     "src/CouplingHessian.cu", # P4：耦合方向 Hessian
     "src/FullHessian.cu",    # P4：统一 Hessian（685 行）
+    "src/ResultWriter.cu",   # P4：writeResult / writeInterfResult（1836 行）
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
