@@ -1,6 +1,6 @@
 # CTPWA 模块化改造：交付报告
 
-> 分支 `refactor/modular`（从 `main@030baf5` = v0.3.27 起），60 个提交。
+> 分支 `refactor/modular`（从 `main@030baf5` = v0.3.27 起），61 个提交。
 > 计划见 `doc/modularization-plan.md`，过程见 `doc/refactor-progress.md`，
 > 发布流程见 `doc/refactor-release-workflow.md`。
 
@@ -41,7 +41,7 @@ include/Analysis.h       2423   analysis 的声明 + 成员 + 约定注释（无
   DecayDesc.cu            110   Amp2BD 构造 + (S,L) 枚举（纯 host）
   PermTopology.cu         224   全同粒子置换拓扑（纯 host，有 C++ 单测）
   Polarization.cu          87   初态极化索引映射（纯 host）
-  MatrixStats.cu           ~60  couplingCovariance（纯张量数学）
+  MatrixStats.cu           64   couplingCovariance（纯张量数学）
   PhspGram.cu             204   phsp Gram → 干涉矩阵 / 重建 B̄
   MatrixErrors.cu         315   干涉矩阵的统计误差传播
   BatchIntegrals.cu       294   分批全样本积分（份额/效率/误差/写结果的底层）
@@ -55,7 +55,7 @@ include/Analysis.h       2423   analysis 的声明 + 成员 + 约定注释（无
   BackendHelpers.h              ctpwa_dev / makeScopeExit / CUDA_CHECK / ctpwaCheckedMalloc
 ```
 
-`src/` 36 个源文件、`include/` 21 个头。每个抽出的模块都配一个**只读输入结构体**
+`src/` 36 个源文件、`include/` 42 个头（含 `cpu_shims/` 与 kernel 头）。每个抽出的模块都配一个**只读输入结构体**
 （`PhspGramInputs` / `BatchIntegralCtx` / `FullHessianCtx` …），字段就是该函数真正读的
 成员，`std::function` 只留真正属于 `analysis` 的算法。
 
