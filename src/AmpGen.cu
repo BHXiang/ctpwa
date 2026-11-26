@@ -168,18 +168,23 @@ AmpCasDecay::~AmpCasDecay()
     //   探测失败 → 跳过，行为与旧实现一致。
     if (cudaFree(nullptr) != cudaSuccess) {
         (void)cudaGetLastError();
-        disarmMomentaOwners();   // 只丢指针，不 free（上下文已销毁）
+        // 只丢指针，不 free（上下文已销毁，驱动会统一回收）
+        disarmMomentaOwners();
+        for (auto& b : d_slamp_tab_) b.disarm();
+        for (auto& b : d_mom_tab_) b.disarm();
+        for (auto& b : d_sign_tab_) b.disarm();
+        for (auto& b : d_decayNodes_) b.disarm();
+        for (auto& b : d_slCombination_) b.disarm();
+        for (auto& b : d_polarization_map_) b.disarm();
         return;
     }
-    for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
-        cudaSetDevice((int)g);
-        if (d_slamp_tab_[g])       cudaFree(d_slamp_tab_[g]);
-        if (g < d_sign_tab_.size() && d_sign_tab_[g])             cudaFree(d_sign_tab_[g]);
-        if (g < d_mom_tab_.size() && d_mom_tab_[g])               cudaFree(d_mom_tab_[g]);
-        if (g < d_decayNodes_.size() && d_decayNodes_[g])         cudaFree(d_decayNodes_[g]);
-        if (g < d_slCombination_.size() && d_slCombination_[g])   cudaFree(d_slCombination_[g]);
-        if (g < d_polarization_map_.size() && d_polarization_map_[g]) cudaFree(d_polarization_map_[g]);
-    }
+    // 六张表的所有权都在 DevBuffer 里，clear() 会在各自设备上释放。
+    d_slamp_tab_.clear();
+    d_mom_tab_.clear();
+    d_sign_tab_.clear();
+    d_decayNodes_.clear();
+    d_slCombination_.clear();
+    d_polarization_map_.clear();
     // 四动量缓冲：DevBuffer 析构会在**各自的设备**上释放，无需在这里切设备。
     d_mom_structs_.clear();
     d_mom_arrays_.clear();
@@ -719,31 +724,20 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
     //   getFitFractions/getEfficiency 每个 batch 调用一次 computeSLAmps，
     //   实测每调用泄漏 ~1.5-2.2 GB，两次调用就把卡吃干 → cudaMalloc 失败 →
     //   旧代码不检查返回值 → nullptr 进 kernel → illegal memory access）。
-    for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
-        if (d_slamp_tab_[g])  { cudaFree(d_slamp_tab_[g]);  d_slamp_tab_[g]  = nullptr; }
-    }
-    for (size_t g = 0; g < d_mom_tab_.size(); ++g) {
-        if (d_mom_tab_[g])    { cudaFree(d_mom_tab_[g]);    d_mom_tab_[g]    = nullptr; }
-    }
-    for (size_t g = 0; g < d_sign_tab_.size(); ++g) {
-        if (d_sign_tab_[g])   { cudaFree(d_sign_tab_[g]);   d_sign_tab_[g]   = nullptr; }
-    }
-    for (size_t g = 0; g < d_decayNodes_.size(); ++g) {
-        if (d_decayNodes_[g]) { cudaFree(d_decayNodes_[g]); d_decayNodes_[g] = nullptr; }
-    }
-    for (size_t g = 0; g < d_slCombination_.size(); ++g) {
-        if (d_slCombination_[g]) { cudaFree(d_slCombination_[g]); d_slCombination_[g] = nullptr; }
-    }
-    for (size_t g = 0; g < d_polarization_map_.size(); ++g) {
-        if (d_polarization_map_[g]) { cudaFree(d_polarization_map_[g]); d_polarization_map_[g] = nullptr; }
-    }
-
-    d_slamp_tab_.resize(finalMomenta.size(), nullptr);
-    d_mom_tab_.resize(finalMomenta.size(), nullptr);
-    d_sign_tab_.resize(finalMomenta.size(), nullptr);
-    d_decayNodes_.resize(finalMomenta.size(), nullptr);
-    d_slCombination_.resize(finalMomenta.size(), nullptr);
-    d_polarization_map_.resize(finalMomenta.size(), nullptr);
+    // 本轮表的所有权都在 DevBuffer 里：clear() 即在各自设备上释放（无需切设备），
+    // 随后按 GPU 数重建空槽，下面逐 GPU 分配。
+    d_slamp_tab_.clear();
+    d_mom_tab_.clear();
+    d_sign_tab_.clear();
+    d_decayNodes_.clear();
+    d_slCombination_.clear();
+    d_polarization_map_.clear();
+    d_slamp_tab_.resize(finalMomenta.size());
+    d_mom_tab_.resize(finalMomenta.size());
+    d_sign_tab_.resize(finalMomenta.size());
+    d_decayNodes_.resize(finalMomenta.size());
+    d_slCombination_.resize(finalMomenta.size());
+    d_polarization_map_.resize(finalMomenta.size());
 
     // 所有粒子及其索引
     std::set<std::string> allParticles;
@@ -837,15 +831,16 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 throw std::runtime_error("slamp table exceeds device memory");
             }
         }
-        cudaError_t err = cudaMalloc(&d_slamp_tab_[i], slamp_bytes);
-        if (err != cudaSuccess) {
-            std::cerr << "ERROR: slamp 表分配失败: " << cudaGetErrorString(err)
-                      << "（需要 " << slamp_bytes / 1e6 << " MiB）" << std::endl;
+        d_slamp_tab_[i].allocate(static_cast<int>(i),
+                                 slamp_bytes / sizeof(thrust::complex<double>));
+        if (!d_slamp_tab_[i].data()) {
+            std::cerr << "ERROR: slamp 表分配失败（需要 " << slamp_bytes / 1e6
+                      << " MiB）" << std::endl;
             throw std::runtime_error("slamp table allocation failed");
         }
         if (nSigma > 1) {
-            cudaMalloc(&d_sign_tab_[i], (size_t)nSigma * sizeof(double));
-            cudaMemcpy(d_sign_tab_[i], h_signs_.data(),
+            d_sign_tab_[i].allocate(static_cast<int>(i), (size_t)nSigma);
+            cudaMemcpy(d_sign_tab_[i].data(), h_signs_.data(),
                        (size_t)nSigma * sizeof(double), cudaMemcpyHostToDevice);
             // σ 动量数组（DeviceMomenta 值拷贝，每项含各自的 momenta 指针）
             // σ 动量数组：DeviceMomenta 结构体在设备端，须 D2H 拷贝取值
@@ -853,8 +848,8 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             for (int s = 0; s < nSigma; ++s)
                 cudaMemcpy(&h_mom_arr[s], d_mom_sigma_[s][i],
                            sizeof(DeviceMomenta), cudaMemcpyDeviceToHost);
-            cudaMalloc(&d_mom_tab_[i], (size_t)nSigma * sizeof(DeviceMomenta));
-            cudaMemcpy(d_mom_tab_[i], h_mom_arr.data(),
+            d_mom_tab_[i].allocate(static_cast<int>(i), (size_t)nSigma);
+            cudaMemcpy(d_mom_tab_[i].data(), h_mom_arr.data(),
                        (size_t)nSigma * sizeof(DeviceMomenta), cudaMemcpyHostToDevice);
         }
 
@@ -868,8 +863,8 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         cudaMemcpy(d_dimj2, host_dj2.data(), decayChain_.size() * sizeof(int), cudaMemcpyHostToDevice);
 
         // 将衰变节点复制到设备
-        cudaMalloc(&d_decayNodes_[i], decayChain_.size() * sizeof(DecayNode));
-        cudaMemcpy(d_decayNodes_[i], host_decayNodes.data(), decayChain_.size() * sizeof(DecayNode), cudaMemcpyHostToDevice);
+        d_decayNodes_[i].allocate(static_cast<int>(i), decayChain_.size());
+        cudaMemcpy(d_decayNodes_[i].data(), host_decayNodes.data(), decayChain_.size() * sizeof(DecayNode), cudaMemcpyHostToDevice);
 
         // 准备设备端的SL组合
         std::vector<SL> host_slCombinations;
@@ -882,13 +877,13 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         }
 
         // 传递SL组合到设备
-        cudaMalloc(&d_slCombination_[i], host_slCombinations.size() * sizeof(SL));
-        cudaMemcpy(d_slCombination_[i], host_slCombinations.data(), host_slCombinations.size() * sizeof(SL), cudaMemcpyHostToDevice);
+        d_slCombination_[i].allocate(static_cast<int>(i), host_slCombinations.size());
+        cudaMemcpy(d_slCombination_[i].data(), host_slCombinations.data(), host_slCombinations.size() * sizeof(SL), cudaMemcpyHostToDevice);
 
         // 上传极化 mask 到设备
         if (!h_polarization_map_.empty()) {
-            cudaMalloc(&d_polarization_map_[i], h_polarization_map_.size() * sizeof(int));
-            cudaMemcpy(d_polarization_map_[i], h_polarization_map_.data(),
+            d_polarization_map_[i].allocate(static_cast<int>(i), h_polarization_map_.size());
+            cudaMemcpy(d_polarization_map_[i].data(), h_polarization_map_.data(),
                 h_polarization_map_.size() * sizeof(int), cudaMemcpyHostToDevice);
         }
 
@@ -966,7 +961,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         // 逐 σ 计算 SL 振幅（σ=0 恒等；σ≥1 用重建动量）
         for (int s = 0; s < nSigma; ++s)
         {
-            thrust::complex<double>* target = d_slamp_tab_[i] + (size_t)s * slamp_row;
+            thrust::complex<double>* target = d_slamp_tab_[i].data() + (size_t)s * slamp_row;
             const DeviceMomenta* dm = d_mom_sigma_[s][i];
             for (int start = 0; start < nEvents_[i]; start += batch_size)
             {
@@ -983,10 +978,10 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 thrust::complex<double>* d_amp_buffer;
                 cudaMalloc(&d_amp_buffer, n_events * scratch_per_sl * sizeof(thrust::complex<double>));
                 CTPWA_LAUNCH(computeSLAmpKernel, numBlocks, blockSize, 0, 
-                    target, d_amp_buffer, dm, d_decayNodes_[i], d_dimj, d_dimj1,
-                    d_dimj2, d_slCombination_[i], nSLCombs_, nEvents_[i], nPolarizations_,
+                    target, d_amp_buffer, dm, d_decayNodes_[i].data(), d_dimj, d_dimj1,
+                    d_dimj2, d_slCombination_[i].data(), nSLCombs_, nEvents_[i], nPolarizations_,
                     decayChain_.size(), (int)scratch_per_sl, n_events, start,
-                    d_polarization_map_.empty() ? nullptr : d_polarization_map_[i],
+                    d_polarization_map_.empty() ? nullptr : d_polarization_map_[i].data(),
                     nPolarizations_total_);
 
                 cudaDeviceSynchronize();
@@ -1442,48 +1437,48 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
             switch (m) {
             case 2:
                 CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 512, OutA>), gridDim, blockDim, 0, 
-                    out_amp, d_momenta_[i], d_slCombination_[i],
-                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    out_amp, d_momenta_[i], d_slCombination_[i].data(),
+                    d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
             case 3:
                 CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 1024, OutA>), gridDim, blockDim, 0, 
-                    out_amp, d_momenta_[i], d_slCombination_[i],
-                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    out_amp, d_momenta_[i], d_slCombination_[i].data(),
+                    d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
             case 4:
                 for (int k0 = 0; k0 < nPol_here; k0 += 8)
                     CTPWA_LAUNCH_P((&computeAmpsKernelT<8, 8, OutA>), gridDim, blockDim, 0, 
-                        out_amp, d_momenta_[i], d_slCombination_[i],
-                        d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                        out_amp, d_momenta_[i], d_slCombination_[i].data(),
+                        d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                         d_resonances, resonance_count, d_all_params, d_all_channels,
-                        d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                        d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
                         nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                         n_amplitudes, site, k0);
                 break;
             case 5:
                 for (int k0 = 0; k0 < nPol_here; k0 += 16)
                     CTPWA_LAUNCH_P((&computeAmpsKernelT<16, 16, OutA>), gridDim, blockDim, 0, 
-                        out_amp, d_momenta_[i], d_slCombination_[i],
-                        d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                        out_amp, d_momenta_[i], d_slCombination_[i].data(),
+                        d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                         d_resonances, resonance_count, d_all_params, d_all_channels,
-                        d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                        d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
                         nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                         n_amplitudes, site, 0);
                 break;
             default:  // 1 = A256：全量单 launch
                 CTPWA_LAUNCH_P((&computeAmpsKernelT<0, 256, OutA>), gridDim, blockDim, 0, 
-                    out_amp, d_momenta_[i], d_slCombination_[i],
-                    d_slamp_tab_[i], getNSigma(), d_mom_tab_[i], d_sign_tab_[i],
+                    out_amp, d_momenta_[i], d_slCombination_[i].data(),
+                    d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i], decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
@@ -1519,14 +1514,9 @@ void AmpCasDecay::releaseStaticData()
     // 释放 slamp 表（nSigma×nSL×nEv×nPol，本 cas 最大的常驻块）与 σ 相关表。
     // σ=0 恒等动量 d_momenta_ 保留（体积小；本轮只释放大表）。
     for (size_t g = 0; g < d_slamp_tab_.size(); ++g) {
-        cudaSetDevice((int)g);
-        if (d_slamp_tab_[g]) { cudaFree(d_slamp_tab_[g]); d_slamp_tab_[g] = nullptr; }
-        if (g < d_mom_tab_.size() && d_mom_tab_[g]) {
-            cudaFree(d_mom_tab_[g]); d_mom_tab_[g] = nullptr;
-        }
-        if (g < d_sign_tab_.size() && d_sign_tab_[g]) {
-            cudaFree(d_sign_tab_[g]); d_sign_tab_[g] = nullptr;
-        }
+        d_slamp_tab_[g].reset();      // 在各自设备上释放，无需切设备
+        if (g < d_mom_tab_.size()) d_mom_tab_[g].reset();
+        if (g < d_sign_tab_.size()) d_sign_tab_[g].reset();
     }
     // σ≥1 的全同粒子置换重建动量（仅 nSigma>1 的 cas 分配）。
     // P2：所有权唯一（d_mom_structs_/d_mom_arrays_ 的尾部），这里只把所有者
@@ -2699,7 +2689,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     }
 
     // 2. 为每个 GPU 分配持久化 DeviceResonance 和 flat 参数数组
-    int n_gpu = static_cast<int>(cas->getSLAmps().size());
+    int n_gpu = static_cast<int>(cas->nGpuTables());
     ResBlock block;
     block.cas_idx = cas_idx;
     block.site = site;
@@ -3517,17 +3507,17 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     ? block.d_static[gpu] : nullptr;
                 d.node_free_mask = d.d_static ? block.node_free_mask_ : 0xFFFFFFFFu;
                 d.d_momenta = cas->getMomenta()[gpu];
-                d.d_slComb = cas->getDeviceSLCombs()[gpu];
-                d.d_slamp_tab = cas->getSLAmpsTab()[gpu];
+                d.d_slComb = cas->getDeviceSLCombs(gpu);
+                d.d_slamp_tab = cas->getSLAmpsTab(gpu);
                 d.d_res = block.d_resonances[gpu];
                 d.d_all_params = block.d_all_params[gpu];
                 d.d_all_channels = block.d_all_channels[gpu];
-                d.d_decayNodes = cas->getDecayNodes()[gpu];
+                d.d_decayNodes = cas->getDecayNodes(gpu);
                 d.d_param_map = block.d_param_map_[gpu];
                 d.d_dF_tab = block.d_dF[gpu];
                 d.nSigma = cas->getNSigma();
-                d.d_mom_tab = cas->getMomentaTab()[gpu];
-                d.d_sign_tab = cas->getSignsTab()[gpu];
+                d.d_mom_tab = cas->getMomentaTab(gpu);
+                d.d_sign_tab = cas->getSignsTab(gpu);
                 d.resonance_count = block.resonance_count;
                 d.nFree = block.nFree;
                 for (int r = 0; r < block.resonance_count && r < 8; ++r) {
@@ -3561,8 +3551,8 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     if (dr.param_count > 0) rpo[dr.particle_idx] = dr.param_offset;
                 }
                 if (jitPrepareGrad(block.jit, gpu, cas->getMomenta()[gpu],
-                                   cas->getMomentaTab()[gpu], block.d_all_params[gpu],
-                                   rpo.data(), cas->getDeviceSLCombs()[gpu],
+                                   cas->getMomentaTab(gpu), block.d_all_params[gpu],
+                                   rpo.data(), cas->getDeviceSLCombs(gpu),
                                    cas->getDecayChainSize(),
                                    static_cast<int>(cas->getNEventsVec()[gpu]),
                                    static_cast<int>(cas->getNSLCombs()),
@@ -3594,9 +3584,9 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                         ? block.node_free_mask_ : 0xFFFFFFFFu;
                 CTPWA_LAUNCH(bwrPropTableKernel, grid_prop, 256, 0,
                     block.d_prop6[gpu], cas->getMomenta()[gpu],
-                    cas->getMomentaTab()[gpu], block.d_resonances[gpu],
+                    cas->getMomentaTab(gpu), block.d_resonances[gpu],
                     block.resonance_count, block.d_all_params[gpu],
-                    cas->getDecayNodes()[gpu], cas->getDecayChainSize(),
+                    cas->getDecayNodes(gpu), cas->getDecayChainSize(),
                     eff_mask, nEv, nSigma);
             }
             prof_tick("prop-table");
@@ -3614,10 +3604,10 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 const std::vector<DecayNode> h_nodes = cas->getHostDecayNodes();
                 CTPWA_LAUNCH(staticChainKernel, (total + 255) / 256, 256, 0,
                     block.d_static[gpu], cas->getMomenta()[gpu],
-                    cas->getMomentaTab()[gpu], block.d_resonances[gpu],
+                    cas->getMomentaTab(gpu), block.d_resonances[gpu],
                     block.resonance_count, block.d_all_params[gpu],
-                    cas->getDecayNodes()[gpu], (int)h_nodes.size(),
-                    cas->getDeviceSLCombs()[gpu], block.node_free_mask_,
+                    cas->getDecayNodes(gpu), (int)h_nodes.size(),
+                    cas->getDeviceSLCombs(gpu), block.node_free_mask_,
                     nEv, nSigma, nSLb);
                 block.static_ready[gpu] = 1;
             }
@@ -3852,7 +3842,7 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
 
         int grid = (nTotal + kBlockSize - 1) / kBlockSize;
         CTPWA_LAUNCH(computeEffectiveCouplingKernel, grid, kBlockSize, 0, 
-            block.d_T[gpu], cas->getSLAmps()[gpu],
+            block.d_T[gpu], cas->getSLAmps(gpu),
             d_v + block.site, nSL, nTotal, 0, nSL);
         // 无 sync：同 stream 隐式顺序；调用方负责最终同步
     }
@@ -3967,20 +3957,20 @@ void AmpCalc::computeResonanceGradient(
             }
 
             int nSigma = cas->getNSigma();
-            const double* d_sign_tab = cas->getSignsTab()[gpu];
+            const double* d_sign_tab = cas->getSignsTab(gpu);
             // P4 统一：所有 block 的 d_dF 由 computeCustomAmpsKernel（符号微分 aux）
             // 写入 [nSigma × nEv×nSL×Nfree] 布局，梯度统一走运行时 Nfree kernel
             // dF 存储随档位（dF_float_ 仅 Float 档 → float2），kernel 双实例分发
             if (dF_float_) {
                 CTPWA_LAUNCH(resonanceGradientKernelRuntime<float2>, grid, kBlockSize, 0, 
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu,
+                    d_w[gpu], cas->getSLAmpsTab(gpu), d_v_gpu,
                     reinterpret_cast<const float2*>(block.d_dF[gpu]),
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
                     cas->getNSigma(), d_sign_tab, Nlocal);
             } else {
                 CTPWA_LAUNCH(resonanceGradientKernelRuntime<ctComplex>, grid, kBlockSize, 0, 
-                    d_w[gpu], cas->getSLAmpsTab()[gpu], d_v_gpu,
+                    d_w[gpu], cas->getSLAmpsTab(gpu), d_v_gpu,
                     reinterpret_cast<const ctComplex*>(block.d_dF[gpu]),
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
@@ -4340,9 +4330,9 @@ void AmpCalc::computeUnifiedHessian(
                         if (dr.param_count > 0) rpo[dr.particle_idx] = dr.param_offset;
                     }
                     if (jitPrepareFull(blk.jit, gpu, cas->getMomenta()[gpu],
-                                       cas->getMomentaTab()[gpu],
+                                       cas->getMomentaTab(gpu),
                                        blk.d_all_params[gpu], rpo.data(),
-                                       cas->getDeviceSLCombs()[gpu], dsz,
+                                       cas->getDeviceSLCombs(gpu), dsz,
                                        nch, evt_off_c, nSL, nSigma)) {
                         jitLaunchFull(blk.jit, gpu);
                         jit_full = blk.jit.full_buf[gpu];
@@ -4361,9 +4351,9 @@ void AmpCalc::computeUnifiedHessian(
                         d_S_re, d_S_im, bt.d_g, nch, nPol, Npr);
                 } else {
                 CTPWA_LAUNCH_SEQ(computeCustomHessianKernel, grid, kBlockSize, 0, 
-                    cas->getSLAmpsTab()[gpu], d_v_blk,
-                    cas->getMomenta()[gpu], cas->getDecayNodes()[gpu], dsz,
-                    cas->getDeviceSLCombs()[gpu], blk.d_resonances[gpu],
+                    cas->getSLAmpsTab(gpu), d_v_blk,
+                    cas->getMomenta()[gpu], cas->getDecayNodes(gpu), dsz,
+                    cas->getDeviceSLCombs(gpu), blk.d_resonances[gpu],
                     blk.d_all_params[gpu], blk.d_all_channels[gpu], bt.d_gidx,
                     d_pmap, Npr,
                     d_hess_g, hess_ld, nch, nSL, nPol, default_weight, d_w_c,
@@ -4372,7 +4362,7 @@ void AmpCalc::computeUnifiedHessian(
                     d_pI_ptr, d_pg_g, d_phA_g,
                     bt.d_res_off, bt.d_res_cnt, Nres, jit_target_node,
                     evt_off_c,
-                    nSigma, cas->getMomentaTab()[gpu], cas->getSignsTab()[gpu],
+                    nSigma, cas->getMomentaTab(gpu), cas->getSignsTab(gpu),
                     jit_full, use_bwr_spec);
                 }
                 cudaDeviceSynchronize();
@@ -4483,14 +4473,14 @@ void AmpCalc::computeUnifiedHessian(
                 CTPWA_LAUNCH_SEQ(hessianMixedBlockKernel, grid, kBlockSize, 0, 
                     d_S_re, d_S_im, d_I_full,
                     d_amp_c,
-                    cas_list_[blk.cas_idx]->getSLAmpsTab()[gpu],
+                    cas_list_[blk.cas_idx]->getSLAmpsTab(gpu),
                     bt.d_g, bt.d_dS_re, bt.d_dS_im,
                     bt.d_dF_re, bt.d_dF_im, bt.d_gidx,
                     d_mix_g, nFreeResParams(),
                     nch, nSL, Npr, nPol, n_amp_total, blk.site,
                     nTotal_slamp, default_weight, d_w_c, d_msum_g, evt_off_c,
                     cas_list_[blk.cas_idx]->getNSigma(),
-                    cas_list_[blk.cas_idx]->getSignsTab()[gpu]);
+                    cas_list_[blk.cas_idx]->getSignsTab(gpu));
                 cudaDeviceSynchronize();
             }
 

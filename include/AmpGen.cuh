@@ -118,10 +118,10 @@ private:
 
     // 全同粒子置换拓扑（coset）：
     // d_slamp_tab_[gpu] = [nSigma × nEv×nSL×nPol]，σ=0 行 = 恒等 SL 振幅
-    std::vector<thrust::complex<double>*> d_slamp_tab_;  // [gpu]
+    std::vector<ctpwa::DevBuffer<thrust::complex<double>>> d_slamp_tab_;  // [gpu] 唯一所有者
     bool slamp_released_ = false;   // true = 静态 SL 表已释放（固定链组合，A 已物化）
     std::vector<std::vector<DeviceMomenta*>> d_mom_sigma_; // [σ][gpu]：σ 拓扑的重建四动量（σ=0 复用 d_momenta_）
-    std::vector<DeviceMomenta*> d_mom_tab_;  // [gpu]：[nSigma] DeviceMomenta 值数组（kernel 用）
+    std::vector<ctpwa::DevBuffer<DeviceMomenta>> d_mom_tab_;  // [gpu]：[nSigma] DeviceMomenta 值数组（kernel 用）
     // convertToDeviceMomenta 每次调用分配的每 GPU 四动量缓冲：返回的指针由调用方
     // 即用即弃，旧代码从不释放 → 每调用泄漏 n_events×n_particles×16B（issue #3）。
     // 这里记录下来，在**下次调用开头**释放（析构时 torch 已销毁 CUDA 上下文，
@@ -131,11 +131,11 @@ private:
     // 视图指针在 d_momenta_ / d_mom_sigma_ 里，不持有所有权。
     std::vector<ctpwa::DevBuffer<DeviceMomenta>> d_mom_structs_;
     std::vector<ctpwa::DevBuffer<LorentzVector>> d_mom_arrays_;
-    std::vector<double*> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
+    std::vector<ctpwa::DevBuffer<double>> d_sign_tab_;     // [gpu]: [nSigma]（sign[0]=+1）
     std::vector<DeviceMomenta*> d_momenta_;// = nullptr;
-    std::vector<DecayNode*> d_decayNodes_;// = nullptr;
-    std::vector<SL*> d_slCombination_;// = nullptr;
-    std::vector<int*> d_polarization_map_;  // GPU polarization mask: output_idx -> tensor_idx
+    std::vector<ctpwa::DevBuffer<DecayNode>> d_decayNodes_;
+    std::vector<ctpwa::DevBuffer<SL>> d_slCombination_;
+    std::vector<ctpwa::DevBuffer<int>> d_polarization_map_;  // GPU polarization mask: output_idx -> tensor_idx
     std::vector<int> h_polarization_map_;   // host copy, used to upload to GPU in computeSLAmps
     size_t nPolarizations_total_;           // total tensor polarizations (before masking)
     // 跨链全同粒子组：(成员名列表, is_boson)；computeSLAmps 中生成子树感知的置换拓扑
@@ -211,18 +211,20 @@ public:
     int getDecayChainSize() const { return static_cast<int>(decayChain_.size()); }
     const std::vector<size_t>& getNEventsVec() const { return nEvents_; }
     // σ=0 行（恒等 SL 振幅）——tab 的起始指针
-    const std::vector<thrust::complex<double>*>& getSLAmps() const { return d_slamp_tab_; }
+    thrust::complex<double>* getSLAmps(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_slamp_tab_.size())) ? d_slamp_tab_[gpu].data() : nullptr; }
     // 全同粒子置换拓扑（coset）访问
     int getNSigma() const { return static_cast<int>(h_signs_.size()); }
-    const std::vector<thrust::complex<double>*>& getSLAmpsTab() const { return d_slamp_tab_; }
+    thrust::complex<double>* getSLAmpsTab(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_slamp_tab_.size())) ? d_slamp_tab_[gpu].data() : nullptr; }
     const std::vector<std::vector<DeviceMomenta*>>& getMomentaSigma() const { return d_mom_sigma_; }
-    const std::vector<DeviceMomenta*>& getMomentaTab() const { return d_mom_tab_; }
-    const std::vector<double*>& getSignsTab() const { return d_sign_tab_; }
+    DeviceMomenta* getMomentaTab(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_mom_tab_.size())) ? d_mom_tab_[gpu].data() : nullptr; }
+    double* getSignsTab(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_sign_tab_.size())) ? d_sign_tab_[gpu].data() : nullptr; }
     const std::vector<double>& getSignsHost() const { return h_signs_; }
     const std::vector<DeviceMomenta*>& getMomenta() const { return d_momenta_; }
-    const std::vector<DecayNode*>& getDecayNodes() const { return d_decayNodes_; }
-    const std::vector<SL*>& getDeviceSLCombs() const { return d_slCombination_; }
-    const std::vector<int*>& getPolarizationMap() const { return d_polarization_map_; }
+    DecayNode* getDecayNodes(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_decayNodes_.size())) ? d_decayNodes_[gpu].data() : nullptr; }
+    SL* getDeviceSLCombs(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_slCombination_.size())) ? d_slCombination_[gpu].data() : nullptr; }
+    // 表按 GPU 数：d_slamp_tab_ 的长度（每 GPU 一行表）
+    int nGpuTables() const { return static_cast<int>(d_slamp_tab_.size()); }
+    int* getPolarizationMap(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_polarization_map_.size())) ? d_polarization_map_[gpu].data() : nullptr; }
     int getParticleIndex(const std::string& tag) const {
         auto it = particleToIndex_.find(tag);
         return (it != particleToIndex_.end()) ? it->second : -1;

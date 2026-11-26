@@ -5838,7 +5838,7 @@ public:
         int nSL = static_cast<int>(cas->getNSLCombs());
         int total = nEv * nPol * nSL;
         thrust::complex<double>* h_buf = new thrust::complex<double>[total];
-        cudaMemcpy(h_buf, cas->getSLAmps()[0], total * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_buf, cas->getSLAmps(0), total * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
         FILE* f = fopen(filename.c_str(), "wb");
         fwrite(h_buf, sizeof(thrust::complex<double>), total, f);
         fclose(f);
@@ -5872,7 +5872,7 @@ public:
             int nSL = static_cast<int>(cas->getNSLCombs());
             int n = nEv * nPol * nSL;
             thrust::complex<double>* h_buf = new thrust::complex<double>[n];
-            cudaMemcpy(h_buf, cas->getSLAmps()[0], n * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_buf, cas->getSLAmps(0), n * sizeof(thrust::complex<double>), cudaMemcpyDeviceToHost);
             for (int s = 0; s < nSL; ++s)
                 for (int e = 0; e < nEv; ++e)
                     for (int p = 0; p < nPol; ++p) {

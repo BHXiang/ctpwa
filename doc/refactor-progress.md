@@ -14,6 +14,7 @@
 | P0-C `primary_dev` 显式化 | ✅ | `d0eab60` |
 | P0-B 多卡循环内的 set（128 处） | ⏸ **等 GPU** | — |
 | P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | `9e91283` |
+| P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | 见下 |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -89,6 +90,26 @@ CPU 后端 double free 会直接 abort）。CUDA 侧只编译验证：EXIT=0、0
 以前 `cudaSetDevice(-1)` 静默失败（不切设备），P0 的 `ensure_device` 把它变成
 可见的报错。已归一化：`ctpwa_is_cuda_like(vector) ? get_device() : 0`。
 （这类"CPU 上恰好不出事"的隐式越界，正是把裸调用换成检查型入口的额外收益。）
+
+---
+
+## P2（第二批）：`AmpCasDecay` 六张设备表改为单一所有权
+
+同一类问题、更大量的一处：`d_slamp_tab_` / `d_mom_tab_` / `d_sign_tab_` /
+`d_decayNodes_` / `d_slCombination_` / `d_polarization_map_` 原来有**三条释放路径**
+（构造期清理块、`releaseStaticData`、析构函数），每条都要自己 `cudaSetDevice(g)` 再
+`cudaFree`，且必须保证"谁先放、放完置空"，否则二次释放。
+
+| 改动 | 说明 |
+|---|---|
+| 六个成员 | `std::vector<T*>` → `std::vector<ctpwa::DevBuffer<T>>`（唯一所有者） |
+| 三条释放路径 | 统一成 `clear()` / `reset()`，**不需要** `cudaSetDevice`（DevBuffer 在自己的设备上释放） |
+| 访问器 | `const std::vector<T*>& getX()` → `T* getX(int gpu)`（带边界检查），新增 `nGpuTables()` |
+| 调用点 | 30 处 `cas->getX()[gpu]` → `cas->getX(gpu)`；39 处 `d_X_[i]` → `d_X_[i].data()` |
+| 析构的失效上下文分支 | 六个表逐个 `disarm()`，与四动量一致 |
+
+**验收**：`grep 'cudaFree(d_slamp_tab_\|cudaMalloc(&d_slamp_tab_' src/` 已为空
+——六张表的分配/释放只剩 DevBuffer 一条路。
 
 ---
 
