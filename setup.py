@@ -172,6 +172,7 @@ SOURCES_CORE = [
     "src/MatrixStats.cu",    # P4：矩阵统计（纯张量数学）
     "src/PhspGram.cu",       # P4：phsp Gram → 干涉矩阵
     "src/MatrixErrors.cu",   # P4：干涉矩阵统计误差
+    "src/SLAmpsIO.cu",       # P4：SL 振幅表导出
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
