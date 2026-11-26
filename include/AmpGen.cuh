@@ -249,13 +249,13 @@ public:
         std::vector<DeviceResonance*> d_resonances;   // 每个 GPU 一份，持久化，OWNED
         std::vector<double*> d_all_params;            // 每个 GPU：flat 自由参数数组
         std::vector<double*> d_all_channels;          // 每个 GPU：flat channel masses（Flatte）
-        std::vector<ctComplex*> d_T;                  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
-        std::vector<ctComplex*> d_dF;                 // 每个 GPU：∂F/∂θ 复数导数 [nEv×nSL×Nfree]（符号微分 aux 输出）
+        std::vector<ctpwa::DevBuffer<ctComplex>> d_T;  // 每个 GPU：有效耦合 T_{e,p}（nEvents×nPolar）
+        std::vector<ctpwa::DevBuffer<ctComplex>> d_dF; // 每个 GPU：按字节分配（float2/double2 两种宽度）
         // SL 复用表（每 GPU）：[res][nSigma][nEv][8] = [R,I,Rm,Im,Rg,Ig,∂q0ln re,im]
         // BWR 节点"与 L 无关"的传播子整块；主 kernel 每 SL 只补顶点 Bv。
-        std::vector<double*> d_prop6;
+        std::vector<ctpwa::DevBuffer<double>> d_prop6;
         // 固定节点预算（每 GPU）：[sigma][nEv][nSL] 复数 = Π(静态节点因子)
-        std::vector<double*> d_static;
+        std::vector<ctpwa::DevBuffer<double>> d_static;
         std::vector<char> static_ready;                // 每 GPU：表已填充（只填一次）
         unsigned int node_free_mask_ = 0xFFFFFFFFu;    // bit i = 节点 i 留在热循环
         int n_static_nodes_ = 0;                       // 折进表的节点数（诊断）

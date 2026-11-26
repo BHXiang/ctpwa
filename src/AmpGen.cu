@@ -2228,6 +2228,11 @@ void AmpCalc::release()
     };
 
     for (auto& b : blocks_) {
+        // 这四个是 DevBuffer（唯一所有者）：clear() 即在各自设备上释放，无需切设备
+        b.d_T.clear();
+        b.d_dF.clear();
+        b.d_prop6.clear();
+        b.d_static.clear();
         int ng = 0;
         bump(ng, b.d_resonances.size());
         bump(ng, b.d_all_params.size());
@@ -2257,10 +2262,6 @@ void AmpCalc::release()
             free_at(b.d_resonances);
             free_at(b.d_all_params);
             free_at(b.d_all_channels);
-            free_at(b.d_T);
-            free_at(b.d_dF);
-            free_at(b.d_prop6);
-            free_at(b.d_static);
             free_at(b.d_res_idx_);
             free_at(b.d_param_idx_);
             free_at(b.d_global_offset_);
@@ -2394,8 +2395,8 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     block.d_resonances.resize(n_gpu, nullptr);
     block.d_all_params.resize(n_gpu, nullptr);
     block.d_all_channels.resize(n_gpu, nullptr);
-    block.d_T.resize(n_gpu, nullptr);
-    block.d_dF.resize(n_gpu, nullptr);
+    block.d_T.clear();  block.d_T.resize(n_gpu);
+    block.d_dF.clear(); block.d_dF.resize(n_gpu);
 
     // 构建主机端 DeviceResonance 数组 + flat params + flat channels
     std::vector<DeviceResonance> h_res;
@@ -3073,21 +3074,21 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             // 分配在懒分配首帧，档位构造期固定。
             size_t dF_bytes = dF_size * (dF_float_ ? sizeof(float2) : sizeof(ctComplex));
             if (!block.d_dF[gpu])
-                cudaMalloc(&block.d_dF[gpu], dF_bytes);
+                block.d_dF[gpu].allocate_bytes(gpu, dF_bytes);
             // SL 复用表（仅当块内有 BWR 共振态才分配）：
             // [res][nSigma][nEv][8] doubles，传播子每事例每共振态一份。
-            if (!block.d_prop6.size()) block.d_prop6.assign(n_gpu, nullptr);
+            if (block.d_prop6.empty()) { block.d_prop6.clear(); block.d_prop6.resize(n_gpu); }
             bool has_bwr = false;
             for (const auto& dr : h_templates_[bi])
                 if (dr.bwr_flag && dr.param_count == 2) { has_bwr = true; break; }
             if (has_bwr && prop6Enabled() && !block.d_prop6[gpu]) {
                 size_t prop_bytes = (size_t)std::max(1, block.resonance_count)
                                   * (size_t)nSigma * (size_t)nEv * 8 * sizeof(double);
-                cudaMalloc(&block.d_prop6[gpu], prop_bytes);
+                block.d_prop6[gpu].allocate_bytes(gpu, prop_bytes);
             }
             // ---- 固定节点预算：节点分类（host，一次）+ 静态链因子表分配 ----
             // 分类与表内容都不随 θ 变化（静态节点参数固定、动量固定），故只算一次。
-            if (block.d_static.empty()) block.d_static.assign(n_gpu, nullptr);
+            if (block.d_static.empty()) block.d_static.resize(n_gpu);
             if (block.static_ready.size() != (size_t)n_gpu)
                 block.static_ready.assign(n_gpu, 0);
             if (staticEnabled() && !block.d_static[gpu] && !block.static_ready[gpu]) {
@@ -3153,7 +3154,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                                          * n_polar * sizeof(ctComplex);
                 const bool fits_budget = (table_bytes * 2 <= slamp_bytes);
                 if (ok && n_static > 0 && fits_budget) {
-                    cudaMalloc(&block.d_static[gpu], table_bytes);
+                    block.d_static[gpu].allocate_bytes(gpu, table_bytes);
                 } else {
                     block.static_ready[gpu] = 1;   // 无静态节点/超预算 → 永不建表
                 }
@@ -3198,10 +3199,10 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 auto& cas = cas_list_[block.cas_idx];
                 ADBlockDesc d;
                 d.d_prop6 = (prop6Enabled() && !block.d_prop6.empty())
-                    ? block.d_prop6[gpu] : nullptr;
+                    ? block.d_prop6[gpu].data() : nullptr;
                 d.nPropRes = d.d_prop6 ? block.resonance_count : 0;
                 d.d_static = (staticEnabled() && !block.d_static.empty())
-                    ? block.d_static[gpu] : nullptr;
+                    ? block.d_static[gpu].data() : nullptr;
                 d.node_free_mask = d.d_static ? block.node_free_mask_ : 0xFFFFFFFFu;
                 d.d_momenta = cas->getMomenta()[gpu];
                 d.d_slComb = cas->getDeviceSLCombs(gpu);
@@ -3211,7 +3212,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 d.d_all_channels = block.d_all_channels[gpu];
                 d.d_decayNodes = cas->getDecayNodes(gpu);
                 d.d_param_map = block.d_param_map_[gpu];
-                d.d_dF_tab = block.d_dF[gpu];
+                d.d_dF_tab = block.d_dF[gpu].data();
                 d.nSigma = cas->getNSigma();
                 d.d_mom_tab = cas->getMomentaTab(gpu);
                 d.d_sign_tab = cas->getSignsTab(gpu);
@@ -3280,7 +3281,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                     (staticEnabled() && !block.d_static.empty() && block.d_static[gpu])
                         ? block.node_free_mask_ : 0xFFFFFFFFu;
                 CTPWA_LAUNCH(bwrPropTableKernel, grid_prop, 256, 0,
-                    block.d_prop6[gpu], cas->getMomenta()[gpu],
+                    block.d_prop6[gpu].data(), cas->getMomenta()[gpu],
                     cas->getMomentaTab(gpu), block.d_resonances[gpu],
                     block.resonance_count, block.d_all_params[gpu],
                     cas->getDecayNodes(gpu), cas->getDecayChainSize(),
@@ -3300,7 +3301,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
                 if (total <= 0) continue;
                 const std::vector<DecayNode> h_nodes = cas->getHostDecayNodes();
                 CTPWA_LAUNCH(staticChainKernel, (total + 255) / 256, 256, 0,
-                    block.d_static[gpu], cas->getMomenta()[gpu],
+                    block.d_static[gpu].data(), cas->getMomenta()[gpu],
                     cas->getMomentaTab(gpu), block.d_resonances[gpu],
                     block.resonance_count, block.d_all_params[gpu],
                     cas->getDecayNodes(gpu), (int)h_nodes.size(),
@@ -3533,13 +3534,13 @@ void AmpCalc::computeEffectiveCoupling(const ctComplex* d_v, int n_amplitudes)
         int nPol = static_cast<int>(cas->getNPolarizations());
         int nTotal = nEv * nPol;
 
-        if (block.d_T[gpu] == nullptr) {
-            cudaMalloc(&block.d_T[gpu], nTotal * sizeof(ctComplex));
+        if (!block.d_T[gpu]) {
+            block.d_T[gpu].allocate(gpu, nTotal);
         }
 
         int grid = (nTotal + kBlockSize - 1) / kBlockSize;
         CTPWA_LAUNCH(computeEffectiveCouplingKernel, grid, kBlockSize, 0, 
-            block.d_T[gpu], cas->getSLAmps(gpu),
+            block.d_T[gpu].data(), cas->getSLAmps(gpu),
             d_v + block.site, nSL, nTotal, 0, nSL);
         // 无 sync：同 stream 隐式顺序；调用方负责最终同步
     }
@@ -3661,14 +3662,14 @@ void AmpCalc::computeResonanceGradient(
             if (dF_float_) {
                 CTPWA_LAUNCH(resonanceGradientKernelRuntime<float2>, grid, kBlockSize, 0, 
                     d_w[gpu], cas->getSLAmpsTab(gpu), d_v_gpu,
-                    reinterpret_cast<const float2*>(block.d_dF[gpu]),
+                    reinterpret_cast<const float2*>(block.d_dF[gpu].data()),
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
                     cas->getNSigma(), d_sign_tab, Nlocal);
             } else {
                 CTPWA_LAUNCH(resonanceGradientKernelRuntime<ctComplex>, grid, kBlockSize, 0, 
                     d_w[gpu], cas->getSLAmpsTab(gpu), d_v_gpu,
-                    reinterpret_cast<const ctComplex*>(block.d_dF[gpu]),
+                    reinterpret_cast<const ctComplex*>(block.d_dF[gpu].data()),
                     d_global_idx, d_grad_per_gpu_[gpu],
                     nEv, nPol, nSL, sign, evt_off, block.site, n_events_total,
                     cas->getNSigma(), d_sign_tab, Nlocal);

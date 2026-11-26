@@ -40,6 +40,7 @@ public:
     {
         other.ptr_ = nullptr;
         other.n_ = 0;
+        other.bytes_ = 0;
         other.dev_ = -1;
     }
 
@@ -50,8 +51,10 @@ public:
             ptr_ = other.ptr_;
             dev_ = other.dev_;
             n_ = other.n_;
+            bytes_ = other.bytes_;
             other.ptr_ = nullptr;
             other.n_ = 0;
+            other.bytes_ = 0;
             other.dev_ = -1;
         }
         return *this;
@@ -59,6 +62,26 @@ public:
 
     DevBuffer(const DevBuffer&) = delete;
     DevBuffer& operator=(const DevBuffer&) = delete;
+
+    // 按字节分配（元素宽度随精度档位变化时用，例如 dF 存 float2 或 double2）
+    void allocate_bytes(int dev, std::size_t bytes)
+    {
+        reset();
+        if (bytes == 0) return;
+        void* p = nullptr;
+        {
+            DeviceGuard guard(dev);
+            p = alloc(bytes);
+        }
+        if (p) {
+            ptr_ = static_cast<T*>(p);
+            dev_ = dev;
+            n_ = bytes / sizeof(T);
+            bytes_ = bytes;
+        }
+    }
+
+    std::size_t bytes() const { return bytes_ ? bytes_ : n_ * sizeof(T); }
 
     // 释放后重新分配；分配失败时保持空（不抛异常，行为与原 cudaMalloc 一致）。
     void allocate(int dev, std::size_t n)
@@ -86,6 +109,7 @@ public:
             ptr_ = nullptr;
         }
         n_ = 0;
+        bytes_ = 0;
         dev_ = -1;
     }
 
@@ -94,6 +118,7 @@ public:
     {
         ptr_ = nullptr;
         n_ = 0;
+        bytes_ = 0;
         dev_ = -1;
     }
 
@@ -106,6 +131,7 @@ private:
     T* ptr_ = nullptr;
     int dev_ = -1;
     std::size_t n_ = 0;
+    std::size_t bytes_ = 0;
 };
 
 }  // namespace ctpwa
