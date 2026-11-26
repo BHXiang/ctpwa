@@ -23,6 +23,14 @@ export CTPWA_QUIET=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export OUTDIR
 
+# 预检：能 import 才继续。.so 缺符号时 pytest 会给出 41 个 "usage error"，
+# 那种噪音掩盖真正原因（实测过一次：头文件里 one 个签名写错 → undefined symbol）。
+if ! python3 -c "import ctpwa; ctpwa.backend()" >/dev/null 2>&1; then
+    echo "❌ ctpwa 无法加载（多半是 .so 缺符号 / 构建不完整）："
+    python3 -c "import ctpwa" 2>&1 | tail -3
+    exit 2
+fi
+
 run_one() {
     f="$1"
     local t0=$(date +%s)
