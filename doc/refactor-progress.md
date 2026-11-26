@@ -755,6 +755,37 @@ CUDA 只编译 0 错误。
 
 ---
 
+## CUDA 后端首次运行时验证（RTX 5060 / sm_120）
+
+25 轮重构全部只在 **CPU 后端**验证过（CUDA 侧只做过"能编译"）。本轮拿到 GPU 后第一次真跑：
+
+```bash
+CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="12.0" python3 setup.py build_ext --inplace
+```
+
+| 检查 | 结果 |
+|---|---|
+| `import ctpwa` + 后端探测 | `backend=cuda`, `build_info.has_cuda=True`，无回退 |
+| `test_numerical` + `test_hessian_diagnostics` + `test_hessian_bwr_spec` | **48 passed / 1 xfailed**（含 CPU 上被 skip 的 BWR 解析特化用例） |
+| golden NLL / 梯度 vs FD / Hessian 对称性 | 全过 —— **golden 值本身是重构前在 GPU 上生成的**，这等于一次跨版本数值对照 |
+
+结论：**重构没有破坏 CUDA 路径**。这比"能编译"强得多，但仍是单卡。
+
+### 未解释的观察（不与重构相关，但值得记录）
+
+CPU 与 GPU 的 A/B 指纹对比出现分叉：
+
+| config | 字段 | 绝对差 | 说明 |
+|---|---|---|---|
+| 多数 config | nll | ≤1e-6 | 与 skill 里"1e-11"的量级不同，但那是针对特定配置 |
+| `with_trans` | hess[80] | −290.0 vs −287.4（**0.5%**） | 超出"两后端 1e-12"的预期，需要归因 |
+| `interp` | grad[0] | 1.15e-5 vs 1.34e-4 | 两者都≈0，相对差无意义 |
+
+**归因方法已就绪**：`baseline_wt`（v0.3.27 原版）正在编译 sm_120 的 CUDA 后端，
+下一轮用"GPU 基线 vs GPU 重构"对比即可判断这是**固有跨后端差异**还是**重构引入**。
+
+---
+
 ## 当前门禁口径
 
 ```bash
