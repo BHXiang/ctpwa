@@ -40,6 +40,7 @@
 #include <FitFractions.h>   // fitFractions / efficiency / matrixForSample（P4 抽出）
 #include <Polarization.h>   // initializePolarization（P4 抽出）
 #include <HessianContrib.h> // hessianSegmentContrib（P4 抽出）
+#include <CouplingHessian.h> // computeCouplingHessian（P4 抽出）
 
 // ---------------------------------------------------------------------------
 // 后端无关的设备 helper：CPU 后端下所有张量都在 CPU 上，CUDA 后端保持原语义。
@@ -325,22 +326,6 @@ static std::string sanitizeROOTName(const std::string& s) {
 //////////////////////////////////////////////////////////////
 /// Hessian fast-path switch: CTPWA_HESS_FAST=0 → legacy CGEMM path
 ///////////////////////////////////////////////////////////////
-static inline bool hessianFastPathEnabled() {
-#if defined(CTPWA_BACKEND_CPU)
-    // CPU 后端只移植了 fast 路径（gnBlockReduce + 加权 Gram）。legacy 路径
-    // （perEventHessian + reduceHessian 的 chunk 循环）在 CPU 上尚未验证，
-    // 会读到未初始化的 chunk 缓冲（实测 NaN）→ 这里强制走 fast 并明确告知。
-    const char* e = getenv("CTPWA_HESS_FAST");
-    if (e != nullptr && atoi(e) == 0) {
-        std::cerr << "[ctpwa] CPU 后端不支持 CTPWA_HESS_FAST=0（legacy Hessian 路径"
-                     "尚未移植），已改用 fast 路径\n";
-    }
-    return true;
-#else
-    const char* e = getenv("CTPWA_HESS_FAST");
-    return (e == nullptr) || (atoi(e) != 0);
-#endif
-}
 
 // ----------------------------------------------------------------
 // phsp 流式模式辅助 kernel（Constraints.free_phsp_amplitudes）
@@ -3255,140 +3240,24 @@ public:
     // 输入: 自由耦合 p（complex [n_free]）；内部先映射为振幅 v 再对 v 求 Hessian。
     torch::Tensor computeCouplingHessian(torch::Tensor vector)
     {
-        TORCH_CHECK(ctpwa_is_cuda_like(vector),
-            "vector 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
-        TORCH_CHECK(vector.dtype() == TORCH_COMPLEX, "vector dtype must match .so complex precision (double/float 编译)");
-        TORCH_CHECK(vector.dim() == 1, "vector must be 1-dimensional");
-        TORCH_CHECK(ctpwa_on_primary(vector, primary_dev_),
-            "vector 必须位于主设备 (primary=" + std::to_string(primary_dev_) +
-            ")，当前在 " + vector.device().str());
-
-        // 自由耦合 p → 振幅 v（乘法链映射；无耦合矩阵时恒等）
-        torch::Tensor extended_vector = freeParamsToAmplitudes(vector);
-        const int n = extended_vector.numel();  // = n_amps
-        torch::Device dev = vector.device();
-        torch::Tensor extended_vector_conj = extended_vector.conj();
-        const ctComplex* d_vec = reinterpret_cast<const ctComplex*>(extended_vector.data_ptr());
-        const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
-
-        // 计算phsp量 (与forward pass一致)
-        cudaSetDevice(dev.index());
-        ctComplex* d_P_vec;
-        cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
-        ctPhspReal* d_pr, * d_pi;
-        cudaMalloc(&d_pr, sizeof(ctPhspReal));
-        cudaMalloc(&d_pi, sizeof(ctPhspReal));
-        // 用d_vec（非共轭）与phspHessianKernel的Pu/tildeP约定保持一致
-        computeQuadraticForm(d_phsp_matrix_, d_vec, d_P_vec, d_pr, d_pi, n_amplitudes_);
-        ctPhspReal phr, phi;
-        cudaMemcpy(&phr, d_pr, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&phi, d_pi, sizeof(ctPhspReal), cudaMemcpyDeviceToHost);
-        double phsp_factor = (double)phr;
-        cudaFree(d_pr); cudaFree(d_pi);
-
-        // std::cout << "phsp_factor: " << phsp_factor << std::endl;
-
-        // 分配扩展Hessian (2·n_ext × 2·n_ext, GPU 0)
-        const int n_ext = extended_vector.numel();  // = n_amplitudes_
-        torch::Tensor hessian = torch::zeros({ 2 * n_ext, 2 * n_ext }, torch::kDouble).to(dev);
-        double* d_hessian = hessian.data_ptr<double>();
-
-        // 多GPU: 累加data和bkg的Hessian贡献（每GPU独立分配，P2P累加到GPU 0）
-        int hess_sz = (2 * n_ext) * (2 * n_ext);
-        int totalDataEvents = 0;
-        for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-            cudaSetDevice(gpu);
-            torch::Tensor vec_gpu = extended_vector.to(ctpwa_dev(gpu));
-            const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(vec_gpu.data_ptr());
-
-            // 在当前GPU上分配临时hessian并清零
-            double* d_hess_gpu;
-            ctpwaCheckedMalloc((void**)&d_hess_gpu, (size_t)hess_sz * sizeof(double), "d_hess_gpu");
-            cudaMemset(d_hess_gpu, 0, hess_sz * sizeof(double));
-
-            // --- data ---
-            if (events_[gpu][1] > 0) {
-                totalDataEvents += events_[gpu][1];
-                hessianSegmentContrib((int)gpu, 1, d_v_gpu, d_hess_gpu, n_ext,
-                                      hessianFastPathEnabled());
-            }
-
-            // --- bkg ---
-            hessianSegmentContrib((int)gpu, 2, d_v_gpu, d_hess_gpu, n_ext,
-                                  hessianFastPathEnabled());
-
-            // P2P累加到GPU 0的主hessian
-            if (gpu == dev.index()) {
-                double one = 1.0;
-                cublasHandle_t h; cublasCreate(&h);
-                cublasDaxpy(h, hess_sz, &one, d_hess_gpu, 1, d_hessian, 1);
-                cublasDestroy(h);
-            } else {
-                double* d_hess_buf;
-                cudaSetDevice(dev.index());
-                ctpwaCheckedMalloc((void**)&d_hess_buf, (size_t)hess_sz * sizeof(double), "d_hess_buf");
-                cudaMemcpyPeer(d_hess_buf, dev.index(), d_hess_gpu, gpu, hess_sz * sizeof(double));
-                double one = 1.0;
-                cublasHandle_t h; cublasCreate(&h);
-                cublasDaxpy(h, hess_sz, &one, d_hess_buf, 1, d_hessian, 1);
-                cublasDestroy(h);
-                cudaFree(d_hess_buf);
-                // d_hess_gpu 在副卡分配；P2P 后当前设备是主卡，
-                // 必须先切回其所属设备再释放。
-                cudaSetDevice(gpu);
-            }
-            cudaFree(d_hess_gpu);
-        }
-        cudaSetDevice(dev.index());
-
-        // phsp Hessian贡献
-        double phsp_weight = data_total_weight_ - bkg_integral_;
-        cudaSetDevice(dev.index());
-        computePhspHessian(d_phsp_matrix_, d_vec, phsp_factor, phsp_weight, d_hessian, n_ext);
-
-        // std::cout << "n_ext: " << n_ext << ", n: " << n << ", totalDataEvents: " << totalDataEvents << std::endl;
-
-        // 按约束Jacobian投影: H_orig (2n×2n) = J^T * H_ext (2·n_ext×2·n_ext) * J
-        // J是diagonal blocks: J[2*eid][2*oid]=real_ratio, J[2*eid+1][2*oid+1]=imag_ratio
-        if (n_ext > n) {
-            std::vector<int> h_oids, h_eids;
-            std::vector<double> h_re, h_im;
-            for (const auto& g : params_.constraintGroups()) {
-                for (size_t j = 0; j < g.ext_indices.size(); ++j) {
-                    if (static_cast<int>(j) == g.origin_idx_in_group) continue;
-                    h_oids.push_back(g.origin_id);
-                    h_eids.push_back(g.ext_indices[j]);
-                    h_re.push_back(static_cast<double>(g.real_ratios[j]));
-                    h_im.push_back(static_cast<double>(g.imag_ratios[j]));
-                }
-            }
-            int ncons = h_oids.size();
-            int* d_oids, * d_eids;
-            double* d_re, * d_im;
-            cudaMalloc(&d_oids, ncons * sizeof(int));
-            cudaMalloc(&d_eids, ncons * sizeof(int));
-            cudaMalloc(&d_re, ncons * sizeof(double));
-            cudaMalloc(&d_im, ncons * sizeof(double));
-            cudaMemcpy(d_oids, h_oids.data(), ncons * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_eids, h_eids.data(), ncons * sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_re, h_re.data(), ncons * sizeof(double), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_im, h_im.data(), ncons * sizeof(double), cudaMemcpyHostToDevice);
-
-            // 分配输出Hessian (2n × 2n)，避免就地修改导致读写冲突
-            torch::Tensor hessian_reduced = torch::zeros({ 2 * n, 2 * n }, torch::kDouble).to(dev);
-            double* d_hessian_reduced = hessian_reduced.data_ptr<double>();
-
-            reduceHessianWithConstraints(d_hessian, d_hessian_reduced, d_oids, d_eids, d_re, d_im, ncons, n, n_ext);
-
-            cudaFree(d_oids); cudaFree(d_eids); cudaFree(d_re); cudaFree(d_im);
-            cudaFree(d_P_vec);
-            return hessian_reduced;
-        }
-
-        // 无约束：直接截取
-        torch::Tensor hessian_reduced = hessian.slice(0, 0, 2 * n).slice(1, 0, 2 * n).clone();
-        cudaFree(d_P_vec);
-        return hessian_reduced;
+        // P4：实现已搬到 ctpwa::computeCouplingHessian（include/CouplingHessian.h）
+        ctpwa::CouplingHessianCtx ctx;
+        ctx.d_all_amplitudes = &d_all_amplitudes_;
+        ctx.events = &events_;
+        ctx.amp_offsets = &amp_offsets_;
+        ctx.data_weights = &data_weights_;
+        ctx.bkg_weights = &bkg_weights_;
+        ctx.d_phsp_matrix = d_phsp_matrix_;
+        ctx.params = &params_;
+        ctx.n_amplitudes = n_amplitudes_;
+        ctx.n_polar = n_polar_;
+        ctx.float_amps = float_amps_;
+        ctx.primary_dev = primary_dev_;
+        ctx.data_total_weight = data_total_weight_;
+        ctx.bkg_integral = bkg_integral_;
+        ctx.free_params_to_amplitudes =
+            [this](const torch::Tensor& v) { return freeParamsToAmplitudes(v); };
+        return ctpwa::computeCouplingHessian(ctx, vector);
     }
 
     // ========== 统一 params 接口 ==========
@@ -3513,7 +3382,7 @@ public:
                     totalDataEvents += nData;
                     auto vvt0 = std::chrono::high_resolution_clock::now();
                     hessianSegmentContrib((int)gpu, 1, d_v_gpu, d_hess_gpu, n_ext,
-                                          hessianFastPathEnabled());
+                                          ctpwa::hessianFastPathEnabled());
                     if (hprof) {
                         auto vvt1 = std::chrono::high_resolution_clock::now();
                         printf("[PROF] H.vv-data(gpu%zu): %.2f ms (nData=%d)\n", gpu,
@@ -3526,7 +3395,7 @@ public:
                 {
                     auto vvt0 = std::chrono::high_resolution_clock::now();
                     hessianSegmentContrib((int)gpu, 2, d_v_gpu, d_hess_gpu, n_ext,
-                                          hessianFastPathEnabled());
+                                          ctpwa::hessianFastPathEnabled());
                     if (hprof) {
                         auto vvt1 = std::chrono::high_resolution_clock::now();
                         printf("[PROF] H.vv-bkg(gpu%zu): %.2f ms\n", gpu,
@@ -4143,6 +4012,8 @@ public:
         ctx.amp_offsets = &amp_offsets_;
         ctx.n_slvectors = &nSLvectors_;
         ctx.n_amplitudes = n_amplitudes_;
+        ctx.n_polar = n_polar_;
+        ctx.float_amps = float_amps_;
         ctx.n_polar = n_polar_;
         ctx.n_gpus = n_gpus_;
         ctx.primary_dev = primary_dev_;

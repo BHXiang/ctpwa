@@ -178,6 +178,7 @@ SOURCES_CORE = [
     "src/FitFractions.cu",   # P4：份额/效率/按样本矩阵
     "src/Polarization.cu",   # P4：初态极化索引映射（纯 host）
     "src/HessianContrib.cu", # P4：单段 Hessian 贡献
+    "src/CouplingHessian.cu", # P4：耦合方向 Hessian
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 

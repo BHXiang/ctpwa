@@ -10,9 +10,30 @@
 
 #include "ComplexType.h"
 
+#include <cstdlib>
+#include <iostream>
 #include <vector>
 
 namespace ctpwa {
+
+// fast / legacy Hessian 路径选择（P4：从 Analysis.h 上移，供抽出的模块共用）
+inline bool hessianFastPathEnabled()
+{
+#if defined(CTPWA_BACKEND_CPU)
+    // CPU 后端只移植了 fast 路径（gnBlockReduce + 加权 Gram）。legacy 路径
+    // （perEventHessian + reduceHessian 的 chunk 循环）在 CPU 上尚未验证，
+    // 会读到未初始化的 chunk 缓冲（实测 NaN）→ 这里强制走 fast 并明确告知。
+    const char* e = getenv("CTPWA_HESS_FAST");
+    if (e != nullptr && atoi(e) == 0) {
+        std::cerr << "[ctpwa] CPU 后端不支持 CTPWA_HESS_FAST=0（legacy Hessian 路径"
+                     "尚未移植），已改用 fast 路径\n";
+    }
+    return true;
+#else
+    const char* e = getenv("CTPWA_HESS_FAST");
+    return e == nullptr || atoi(e) != 0;
+#endif
+}
 
 void hessianSegmentContrib(
     const std::vector<ctComplex*>& d_all_amplitudes,
