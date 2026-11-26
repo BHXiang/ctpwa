@@ -35,6 +35,7 @@
 | P4 第十二步（`CouplingHessian` 137 行） | ✅ | `bb95a4b` |
 | **P4 第十三步（`FullHessian` 685 行，最大单体）** | ✅ | `4641bff` |
 | **P4 第十四步（写入器搬出 header，−1830 行）** | ✅ | `5a58c7c` |
+| **P4 第十五步（`initialize` 三件套，−1101 行）** | ✅ | `c4dcb3c` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -712,6 +713,18 @@ CUDA 只编译 0 错误。
 
 **这条路径对剩下的方法同样适用**：`initialize`（770）、`computePhspHessian` 等都可以
 先"无脑搬出 header"，再决定要不要变成模块接口。
+
+---
+
+## P4（第十五步）：初始化三件套搬出 header（−1101 行）
+
+同一路径第二批：`initialize`（770）、`initializeDecayChains`（159）、`getIntensity`（172）
+→ `src/Initialize.cu`（1119 行）。方法体一字未改。
+
+`Analysis.h` 3738 → **2637 行**。门禁 258/0/63；A/B 逐位一致；CUDA 编译 0 错误。
+
+**累计**：`Analysis.h` 从重构前的 **7624 行**（Analysis.cu）降到 **2637 行**，
+其中类定义部分已从 ~6300 行降到约 1600 行——剩下的主要是成员声明和小方法。
 
 ---
 
