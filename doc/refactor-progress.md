@@ -29,6 +29,7 @@
 | P4 第七步（`BatchIntegrals` 247 行） | ✅ | `b94ebbc` |
 | P4 第八步（`FitFractions` 约 330 行） | ✅ | `f73483a` |
 | P4 第九步（`rebuildPhspGram` + helper 上移） | ✅ | `9021595` |
+| P4 第十步（`Polarization` 纯函数） | ✅ | `8353f4d` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -553,6 +554,24 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 
 **流程改进生效**：这轮两次 prefix 替换（`n_polar_` / `primary_dev_`）都先 `assert` 检查
 再落盘，没有再出现"改到局部变量名"的事故。
+
+---
+
+## P4（第十步）：初态极化索引映射 → `Polarization`（纯函数）
+
+`initializePolarization`（73 行）只依赖 `particles_`——张量维数、mask 后的有效极化数、
+output→tensor 索引映射，全是组合数学。抽成 `ctpwa::initializePolarization(particles)`
+后是纯 host 函数，可脱离 GPU 单测。
+
+`Analysis.h` 6471 → **6408 行**。门禁 254/7/56/4；A/B 指纹逐位一致。
+
+**踩坑（两个都值得记）**：
+
+1. 结构体变量叫 `out`，撞上函数体里的 `for (int out = 0; ...)` → 编译错。搬代码时
+   给汇总结构体起名要避开原函数里的局部名（`res` 比 `out` 安全）。
+2. 前缀替换把 `n_polar_total_` 变成了 `res.n_polar` + `total`——**又**是前缀冲突，
+   即使我先替换长的。根因是替换进去的新文本 `res.n_polar_total` 里又含
+   `n_polar_`…… 现在的做法是：**用正则 `\b…\b` 并且一次生成、不从半成品再替换**。
 
 ---
 
