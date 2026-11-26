@@ -24,6 +24,7 @@
 | P4 第四步（`MatrixErrors` + 共享 helper 头） | ✅ | `8c0e86a` |
 | P4 第五步（`SLAmpsIO`） | ✅ | `cd05b49` |
 | P4 第六步（helper 上移 + `TruthIntegrals`） | ✅ | `fa8f7fd` |
+| G3 CI 门禁（CPU + CUDA 只编译） | ✅ | `f383d62` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -386,6 +387,34 @@ errors；CUDA 只编译 EXIT=0、0 错误。
 
 **方法论沉淀**：搬函数前先问三件事——它读哪些成员（→ 参数/字段）、它调哪些算法
 （→ 回调）、它用到哪些 static helper / kernel（→ 先上移，kernel 只能进 .cu）。
+
+---
+
+## G3：CI 门禁落地（补齐发布流程里缺的那一环）
+
+`doc/refactor-release-workflow.md` 里 G3 一直是空的：仓库只有 tag 触发的
+`build-wheel.yml`，push/PR 什么都不跑。本轮补上 `.github/workflows/ci.yml`：
+
+| job | 内容 |
+|---|---|
+| `gate-cpu` | conda-forge ROOT + torch(cpu) → CPU 构建 → **import 预检** → **设备棘轮** → 全量 pytest（无卡机器上 GPU 用例自动 skip） |
+| `compile-cuda` | 只在 PR 动到 `src/` 时跑：nvcc 单架构**只编译**（不需要卡）+ 检查 `_cuda.so` **无未解析 `ctpwa::` 符号** |
+
+两个细节来自踩过的坑：
+
+1. **import 预检**：`.so` 缺符号时 pytest 给出 41 个 "usage error"，噪音完全盖住真因
+   （第 6 轮实测）；预检失败直接把真实 import 错误打出来。
+2. **未解析符号检查**：shared library 允许未定义符号，"链接成功"不等于"能 import"。
+   `nm -C --undefined-only | grep ctpwa::` 把这条检查搬进 CI。
+
+**设备门禁改成棘轮**：`scripts/check_device_calls.sh` 默认读
+`scripts/device_call_budget.txt`（当前 **120**），违规数超过预算才失败。理由：P0-B 需要
+真双卡才能验证，在完成前把门槛设成 0 只会让门禁长期红灯、然后被人绕过；棘轮的意思是
+**只许下降**，每完成一批就手动调小预算（P0-A 的 208 → 133 → 125 → 120 就是这么走的）。
+
+本轮顺手把自己新抽出模块里的 5 处裸 `cudaSetDevice` 改成 `ctpwa::DeviceGuard`
+（PhspGram/TruthIntegrals/MatrixErrors/SLAmpsIO），它们本来就在每 GPU 循环体内，
+guard 的作用域正好是循环体 —— 这也是"新模块应该一步到位用 DeviceGuard"的示范。
 
 ---
 
