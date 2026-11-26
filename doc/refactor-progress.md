@@ -33,6 +33,7 @@
 | **门禁全绿（258/0/63）** | ✅ | `9409335` |
 | P4 第十一步（`HessianContrib`） | ✅ | `1b503b1` |
 | P4 第十二步（`CouplingHessian` 137 行） | ✅ | `bb95a4b` |
+| **P4 第十三步（`FullHessian` 685 行，最大单体）** | ✅ | `4641bff` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -659,6 +660,29 @@ CUDA 只编译 0 错误。
 （`MatrixErrorCtx` 里也有 `ctx.events = &events_;`），把不存在的字段塞了进去。
 教训：一个文件里同时存在多个 `ctx` 装配块时，**必须先按块定位（用各自的
 `ctpwa::XxxCtx ctx;` 起止），再做行级修改**，不能全局 replace。
+
+---
+
+## P4（第十三步）：`getHessian` 685 行 → `FullHessian`（P4 最大单体）
+
+这是"先搬底层"策略的收口。十二轮前它的 12 个依赖全是成员函数；现在
+`computePhspHessian` / `computeQuadraticForm` / `reduceHessianWithConstraints` /
+`computeFactorNLL(F)` / `hessianSegmentContrib` / `computeCouplingHessian` 全是对外
+自由函数，**只剩 `freeParamsToAmplitudes` 一个回调**。接口：17 个字段 + 1 个回调。
+
+`Analysis.h` 6223 → **5568 行**（单轮 −655）。
+
+**过程中抓出两个真问题**（都靠门禁/测试抓的，不是靠 review）：
+
+1. 委派里漏了 `ctx.amp_calc = &amp_calc_` → 空指针，整层 segfault。
+2. 我图省事给 `rebuildPhspGram` 传了空 `phsp_weights` → 加权 NLL 的 Hessian 错了
+   （`test_cpu_numerics::test_phsp_weights_nll_grad_hessian` 抓到，max_rel 0.85）。
+   这个用例的注释写得很明白："phsp_weights 必须同时进入 NLL 归一化、梯度和 Hessian"
+   ——正是为这类错误写的回归。
+
+**门禁补洞**：段错误时 pytest 不打印 `N failed`，只看 failed/errors 会把整层信号错误
+当成全绿（本轮实测：segfault 后 passed 258→122 却报"通过"）。现在
+`rc ∉ {0,1,5}` 一律算失败并列出文件名。这是"门禁自己也可能骗人"的一次实例。
 
 ---
 
