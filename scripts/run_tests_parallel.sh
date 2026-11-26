@@ -65,8 +65,13 @@ echo "逐文件表: ${TABLE}"
 # 门禁判据：failed 与 errors 必须为 0（skipped 允许——GPU-only 用例在 CPU 构建上就是跳过）。
 # 2026-11 起 CPU 构建是全绿的（258 passed / 0 failed / 63 skipped），所以"红即回归"。
 read -r P F E < "${OUTDIR}/totals"
-if (( F > 0 || E > 0 )); then
-    echo "❌ 门禁失败: failed=$F errors=$E（passed=$P）"
+# 崩溃/超时也必须算失败：段错误时 pytest 不打印 "N failed"，
+# 只看 failed/errors 会把整层信号错误当成"全绿"（本轮实测踩过：segfault 后 passed 从 258 掉到 122 却报绿）。
+CRASH=$(awk 'NR>1 && $7 != 0 && $7 != 1 && $7 != 5 {n++} END {print n+0}' "$TABLE")
+TIMEOUT=$(awk 'NR>1 && $7 == 124 {n++} END {print n+0}' "$TABLE")
+if (( F > 0 || E > 0 || CRASH > 0 )); then
+    echo "❌ 门禁失败: failed=$F errors=$E 异常退出(含段错误/超时)=$CRASH（passed=$P）"
+    awk 'NR>1 && $7 != 0 && $7 != 1 && $7 != 5 {printf "   !! %-40s rc=%s\n", $1, $7}' "$TABLE"
     exit 1
 fi
 echo "✅ 门禁通过: passed=$P failed=0 errors=0"

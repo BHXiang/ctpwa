@@ -179,6 +179,7 @@ SOURCES_CORE = [
     "src/Polarization.cu",   # P4：初态极化索引映射（纯 host）
     "src/HessianContrib.cu", # P4：单段 Hessian 贡献
     "src/CouplingHessian.cu", # P4：耦合方向 Hessian
+    "src/FullHessian.cu",    # P4：统一 Hessian（685 行）
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
