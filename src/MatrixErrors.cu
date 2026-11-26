@@ -194,7 +194,7 @@ std::vector<torch::Tensor> computeMatrixErrors(const MatrixErrorCtx& ctx,
                 int nP = (*ctx.events)[g][0];
                 if (nP == 0) continue;
                 if (g < (*ctx.phsp_weights).size() && (*ctx.phsp_weights)[g] != nullptr) {
-                    cudaSetDevice((int)g);
+                    ctpwa::DeviceGuard dev_guard((int)g);
                     std::vector<double> hw(nP);
                     cudaMemcpy(hw.data(), (*ctx.phsp_weights)[g], nP * sizeof(double),
                                cudaMemcpyDeviceToHost);

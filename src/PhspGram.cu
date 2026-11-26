@@ -32,7 +32,7 @@ torch::Tensor phspMatrixFromGram(const PhspGramInputs& in,
             int nP = (*in.events)[g][0];
             if (nP == 0) continue;
             if (g < (*in.phsp_weights).size() && (*in.phsp_weights)[g] != nullptr) {
-                cudaSetDevice((int)g);
+                ctpwa::DeviceGuard dev_guard((int)g);
                 std::vector<double> hw(nP);
                 cudaMemcpy(hw.data(), (*in.phsp_weights)[g], nP * sizeof(double),
                            cudaMemcpyDeviceToHost);

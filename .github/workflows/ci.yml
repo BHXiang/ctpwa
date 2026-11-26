@@ -1,0 +1,141 @@
+# GitHub Actions: 重构/开发的 CPU 门禁（与 build-wheel.yml 的发布链路分开）
+#
+# 背景（doc/refactor-release-workflow.md §9）：仓库此前**只有** tag 触发的
+# build-wheel，push/PR 没有任何自动检查——"测完再发"完全依赖人记性。
+# 这个 workflow 把 doc/refactor-progress.md 里那套门禁自动化：
+#
+#   1. ctpwa 可加载（预检；.so 缺符号时 pytest 会给出 41 个 usage error，噪音盖住真因）
+#   2. 设备切换出口检查（scripts/check_device_calls.sh）——P0 的机械门禁
+#   3. 全量 pytest（CPU 后端；无卡机器上 GPU 用例自动 skip）
+#
+# 为什么是 CPU 后端：GitHub 托管 runner 没有 GPU；而 CPU 构建 + double 精度已经能
+# 覆盖数值回归（golden NLL / 梯度 vs FD / Hessian 对称性，P1 之后这些用例真的在跑）。
+# GPU 相关的门禁（多卡设备归属、性能）仍在集群上跑，见 doc/refactor-release-workflow.md。
+#
+# 成本：conda 环境（ROOT 依赖链）+ CPU 全量编译 ≈ 30–60 min，所以只在 PR 与 main 上跑，
+# 且带缓存。真 CUDA 编译另外用一个 job（不需要卡，只要 nvcc）。
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, "refactor/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-cpu:
+    name: CPU 门禁（构建 + 设备检查 + 全量 pytest）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- conda-forge 的 root 提供 root-config（与 build-wheel.yml 同一 recipe）----
+      # 注意: defaults 源与 conda-forge 的 root 依赖链（libxml2/icu）solve 冲突，
+      # 所以 --override-channels 只留 conda-forge。ninja 是 torch cpp_extension
+      # 在 dlink=True 时强制要求的。
+      - name: Install miniconda + ROOT
+        run: |
+          curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+            -o /tmp/miniconda.sh
+          bash /tmp/miniconda.sh -b -p /opt/conda
+          /opt/conda/bin/conda create -y -q -p /opt/conda/envs/ci \
+            --override-channels -c conda-forge python=3.12 root ninja
+          /opt/conda/envs/ci/bin/root-config --version
+
+      - name: Install torch (CPU)
+        run: |
+          /opt/conda/envs/ci/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          /opt/conda/envs/ci/bin/python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Build (CPU backend)
+        run: |
+          export PATH=/opt/conda/envs/ci/bin:$PATH
+          export ROOTSYS=/opt/conda/envs/ci
+          CTPWA_BACKEND=cpu MAX_JOBS=4 python3 setup.py build_ext --inplace
+
+      # 预检：能 import 才继续（缺符号时 pytest 只会给出成片 usage error）
+      - name: Smoke import
+        run: |
+          export PATH=/opt/conda/envs/ci/bin:$PATH
+          export ROOTSYS=/opt/conda/envs/ci
+          python3 -c "import ctpwa; print('backend =', ctpwa.backend(), ctpwa.build_info())"
+
+      # P0 的机械门禁：裸 cudaSetDevice 只允许出现在 device 模块（清单见脚本）
+      - name: Device-call gate
+        run: bash scripts/check_device_calls.sh
+
+      - name: Full pytest (CPU)
+        run: |
+          export PATH=/opt/conda/envs/ci/bin:$PATH
+          export ROOTSYS=/opt/conda/envs/ci
+          bash scripts/run_tests_parallel.sh | tee /tmp/gate.log
+
+      - name: Upload gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-cpu-log
+          path: /tmp/gate.log
+          if-no-files-found: ignore
+
+  compile-cuda:
+    name: CUDA 只编译（不跑 GPU）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    # 只在动到 src/include 时跑：CUDA 编译很贵，但它恰好能抓住"改了头文件把 CUDA 侧
+    # 编坏"这类问题（与 CPU 构建是两套编译路径）。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(toJSON(github.event.pull_request.changed_files), 'src/'))
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+          sudo mv cuda-rhel9.repo /etc/yum.repos.d/ 2>/dev/null || true
+          # ubuntu runner 上没有 dnf；用 NVIDIA 的 ubuntu2204 源
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-12-4
+          /usr/local/cuda-12.4/bin/nvcc --version | tail -1
+
+      - name: Install miniconda + ROOT
+        run: |
+          curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+            -o /tmp/miniconda.sh
+          bash /tmp/miniconda.sh -b -p /opt/conda
+          /opt/conda/bin/conda create -y -q -p /opt/conda/envs/ci \
+            --override-channels -c conda-forge python=3.12 root ninja
+          /opt/conda/envs/ci/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build (CUDA backend, compile only)
+        run: |
+          export PATH=/usr/local/cuda-12.4/bin:/opt/conda/envs/ci/bin:$PATH
+          export ROOTSYS=/opt/conda/envs/ci
+          export CUDA_HOME=/usr/local/cuda-12.4
+          # 单架构即可验证"能编过"；8 架构会让这一步变慢 8 倍
+          CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 \
+            python3 setup.py build_ext --inplace
+          ls -l ctpwa/_cuda.so
+
+      - name: No undefined ctpwa symbols
+        run: |
+          # shared library 允许未定义符号，所以"链接成功"不等于"能用"——
+          # 实测过一次：头文件签名写错，编译链接全过，import 时才炸。
+          if nm -C --undefined-only ctpwa/_cuda.so | grep -q "ctpwa::"; then
+            echo "❌ _cuda.so 存在未解析的 ctpwa:: 符号："
+            nm -C --undefined-only ctpwa/_cuda.so | grep "ctpwa::" | head -20
+            exit 1
+          fi
+          echo "✅ 无未解析的 ctpwa:: 符号"

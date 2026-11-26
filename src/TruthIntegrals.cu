@@ -36,7 +36,7 @@ void computeTruthIntegrals(
             if (nt <= 0 || d_amps[gpu] == nullptr) continue;
 
             int* d_nsl = nullptr;
-            cudaSetDevice(gpu);
+            ctpwa::DeviceGuard dev_guard(gpu);   // 循环体结束即还原
             TORCH_CHECK(cudaMalloc(&d_nsl, npartials * sizeof(int)) == cudaSuccess,
                         "computeTruthIntegrals: cudaMalloc(d_nsl) 失败");
             cudaMemcpy(d_nsl, n_slvectors.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);

@@ -8,13 +8,23 @@
 #   with_device(dev, fn)    多卡循环
 #
 # 用法:
-#   bash scripts/check_device_calls.sh          # 检查，有违规 → exit 1
-#   bash scripts/check_device_calls.sh --stats  # 只打印计数（用于跟踪改造进度）
+#   bash scripts/check_device_calls.sh              # 棘轮门禁：违规数 > 预算 → exit 1
+#   bash scripts/check_device_calls.sh --stats      # 只打印计数（跟踪进度）
+#   bash scripts/check_device_calls.sh --strict     # 必须为 0（P0-B 完成后切到这里）
+#
+# 为什么默认是"棘轮"而不是"必须为 0"：P0-B（多卡循环内的 set）需要真双卡才能验证，
+# 在完成之前把门槛设成 0 只会让门禁长期红灯、然后被人绕过。棘轮的做法是：
+# **违规数只许下降**——预算写在 scripts/device_call_budget.txt，改造推进时手动调小。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 STATS_ONLY=false
-[[ "${1:-}" == "--stats" ]] && STATS_ONLY=true
+STRICT=false
+case "${1:-}" in
+    --stats)  STATS_ONLY=true ;;
+    --strict) STRICT=true ;;
+esac
+BUDGET_FILE="$(dirname "$0")/device_call_budget.txt"
 
 # 允许清单（每行一个前缀）
 ALLOW_FILES=(
@@ -78,8 +88,26 @@ if $STATS_ONLY; then
     exit 0
 fi
 
-if (( viol > 0 )); then
-    echo "失败: 请改用 include/DeviceGuard.h 的 ensure_device / DeviceGuard / with_device。"
+if $STRICT; then
+    if (( viol > 0 )); then
+        echo "失败(--strict): 请改用 include/DeviceGuard.h 的 ensure_device / DeviceGuard / with_device。"
+        exit 1
+    fi
+    echo "通过(--strict): 设备切换只有单一出口。"
+    exit 0
+fi
+
+# 棘轮：违规数不得高于预算
+budget=0
+[[ -f "$BUDGET_FILE" ]] && budget=$(tr -dc '0-9' < "$BUDGET_FILE")
+budget=${budget:-0}
+echo "棘轮预算: $budget 处（$BUDGET_FILE）"
+if (( viol > budget )); then
+    echo "失败: 违规数 $viol > 预算 $budget —— 新增了裸 cudaSetDevice。"
+    echo "      请改用 DeviceGuard / ensure_device / with_device。"
     exit 1
 fi
-echo "通过: 设备切换只有单一出口。"
+if (( viol < budget )); then
+    echo "提示: 违规数 $viol 已低于预算 $budget，请把 $BUDGET_FILE 改成 $viol 锁住进度。"
+fi
+echo "通过: 违规数未超过预算。"

@@ -2,6 +2,7 @@
 #include <SLAmpsIO.h>
 
 #include "BackendHelpers.h"
+#include "DeviceGuard.h"
 #include "MixedPrecision.h"
 
 #include <cuda_runtime.h>
@@ -76,10 +77,7 @@ void saveSLAmpsToFile(const AmpCalc& amp_calc, const std::string& filename, bool
 torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el, int64_t nEl,
                                  int gpu, bool float_amps)
 {
-    int saved_dev = 0;
-    cudaGetDevice(&saved_dev);
-    auto device_guard = makeScopeExit([saved_dev]() { cudaSetDevice(saved_dev); });
-    cudaSetDevice(gpu);
+    ctpwa::DeviceGuard dev_guard(gpu);   // 退出即还原调用方的设备
     auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(gpu));
     if (nEl == 0) return torch::empty({0}, opts);
     if (!float_amps || ctIsFloatComplex) {
