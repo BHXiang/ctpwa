@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# 并行逐文件测试门禁（与 scripts/run_tests.sh 判据相同，只是把 41 个文件并行跑）
+#
+# 为什么需要：拆成真 TU 之后，数值用例第一次真正在 CPU 上跑，全量串行要约 30 分钟；
+# 逐文件并行（-P 5）约 6-8 分钟，适合重构期间每轮自检。
+#
+# 用法:
+#   bash scripts/run_tests_parallel.sh            # 跑全部 test_*.py
+#   JOBS=3 bash scripts/run_tests_parallel.sh     # 控制并发
+#
+# 输出：每个文件一行（PASS/FAIL/SKIP/ERR/TIME/RC），末尾打印总计与失败清单。
+# 判据：PASS 数不得低于基线、FAIL 集合不得新增（基线见 doc/baseline-cpu-v0.3.27.md）。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+JOBS="${JOBS:-5}"
+OUTDIR="$(mktemp -d)"
+TABLE="${OUTDIR}/table.txt"
+
+cd "${ROOT}/tests"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:$PYTHONPATH}"
+export CTPWA_QUIET=1
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export OUTDIR
+
+run_one() {
+    f="$1"
+    local t0=$(date +%s)
+    timeout 900 python3 -m pytest "$f" -q --no-header -p no:cacheprovider --tb=no \
+        > "$OUTDIR/$f.log" 2>&1
+    local rc=$?
+    local t1=$(date +%s)
+    local line=$(grep -E "passed|failed|error|skipped" "$OUTDIR/$f.log" | tail -1)
+    local p fl s e
+    p=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+'); p=${p:-0}
+    fl=$(echo "$line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+'); fl=${fl:-0}
+    s=$(echo "$line" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+'); s=${s:-0}
+    e=$(echo "$line" | grep -oE '[0-9]+ error' | grep -oE '[0-9]+'); e=${e:-0}
+    printf '%-42s %4s %4s %4s %4s %4ss %s\n' "$f" "$p" "$fl" "$s" "$e" "$((t1-t0))" "$rc" \
+        > "$OUTDIR/$f.line"
+    rm -f "$OUTDIR/$f.log"
+}
+export -f run_one
+
+ls test_*.py | xargs -P "${JOBS}" -I{} bash -c 'run_one "$@"' _ {}
+
+{ printf '%-42s %4s %4s %4s %4s %6s %s\n' FILE PASS FAIL SKIP ERR TIME RC
+  cat "$OUTDIR"/*.line | sort; } > "$TABLE"
+
+cat "$TABLE"
+awk 'NR>1 && $2+$3+$4+$5>0 {p+=$2; f+=$3; s+=$4; e+=$5}
+     END {printf "\n合计: passed=%d failed=%d skipped=%d errors=%d\n", p, f, s, e}' "$TABLE"
+awk 'NR>1 && $3+$5>0 {printf "  !! %-40s fail=%s err=%s\n", $1, $3, $5}' "$TABLE"
+echo "逐文件表: ${TABLE}"
