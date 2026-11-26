@@ -36,6 +36,7 @@
 | **P4 第十三步（`FullHessian` 685 行，最大单体）** | ✅ | `4641bff` |
 | **P4 第十四步（写入器搬出 header，−1830 行）** | ✅ | `5a58c7c` |
 | **P4 第十五步（`initialize` 三件套，−1101 行）** | ✅ | `c4dcb3c` |
+| **P4 第十六步（剩余成员搬出 + 删 `Analysis.cu` 中转）** | ✅ | `73bb08b` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -725,6 +726,32 @@ CUDA 只编译 0 错误。
 
 **累计**：`Analysis.h` 从重构前的 **7624 行**（Analysis.cu）降到 **2637 行**，
 其中类定义部分已从 ~6300 行降到约 1600 行——剩下的主要是成员声明和小方法。
+
+---
+
+## P4（第十六步）：god class 拆解收尾
+
+- `src/AnalysisMethods.cu`（新 TU）：`release` / `computeFileBatchIntegrals` /
+  `computeMatrixErrors` / `initializeMultiGPUs` / `getHessian` / `getNLL` /
+  `computeCouplingHessian` / `reCalcAmp` 的实现（266 行）。
+- `src/main.cu` 改成 `#include <Analysis.h>`，**删掉 `src/Analysis.cu`**（最后的文本内联中转）。
+  `analysis` 现在是"头文件声明 + 各 TU 定义"，与普通 C++ 类没有区别。
+
+`include/Analysis.h` 2637 → **2423 行**。
+
+### 这一阶段的账（P4 全程）
+
+| 时点 | 形态 | 行数 |
+|---|---|---|
+| 重构前 | `src/Analysis.cu`，6300 行类 + 内联定义，无头文件 | 7624 |
+| 第 8 轮 | 类搬进 `Analysis.h`，仍是内联定义 | 7594 |
+| 第 23 轮 | 写入器搬出（`ResultWriter.cu`） | 3738 |
+| 第 24 轮 | 初始化三件套搬出（`Initialize.cu`） | 2637 |
+| **第 25 轮** | 剩余成员搬出 + 删中转（`AnalysisMethods.cu`） | **2423** |
+
+2423 行里已几乎没有方法体：剩下的是 **成员声明 + 物理/格式约定注释**。要再降就得把
+数据成员分组进子结构（如 `SampleState` / `PhspState`），那是另一种（更有值的）重构，
+不属于"拆 god class"这一步。
 
 ---
 
