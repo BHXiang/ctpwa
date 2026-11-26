@@ -32,6 +32,7 @@
 | P4 第十步（`Polarization` 纯函数） | ✅ | `8353f4d` |
 | **门禁全绿（258/0/63）** | ✅ | `9409335` |
 | P4 第十一步（`HessianContrib`） | ✅ | `1b503b1` |
+| P4 第十二步（`CouplingHessian` 137 行） | ✅ | `bb95a4b` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -642,6 +643,22 @@ skipped 不计（GPU-only 用例在 CPU 构建上就该跳过）。CI 直接吃�
 
 `Analysis.h` 6408 → **6359 行**。门禁 258/0/63（全绿）；A/B 指纹逐位一致；
 CUDA 只编译 0 错误。
+
+---
+
+## P4（第十二步）：`computeCouplingHessian` → `CouplingHessian`
+
+这轮验证了"底层自由化"的复利：它的 6 个依赖里
+`computeQuadraticForm` / `computePhspHessian` / `reduceHessianWithConstraints` /
+`hessianSegmentContrib` **都已经是自由函数**，`hessianFastPathEnabled` 本轮顺手
+上移到 `HessianContrib.h`，于是只剩 `freeParamsToAmplitudes` 一个回调。
+
+`Analysis.h` 6343 → **6223 行**。门禁 258/0/63；A/B 逐位一致；CUDA 编译 0 错误。
+
+**踩坑（重要）**：给 ctx 补字段时用全文 replace，命中了**另一个** delegate
+（`MatrixErrorCtx` 里也有 `ctx.events = &events_;`），把不存在的字段塞了进去。
+教训：一个文件里同时存在多个 `ctx` 装配块时，**必须先按块定位（用各自的
+`ctpwa::XxxCtx ctx;` 起止），再做行级修改**，不能全局 replace。
 
 ---
 
