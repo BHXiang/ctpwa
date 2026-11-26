@@ -147,16 +147,16 @@ inline std::vector<double*> readWeightsFromFile(const std::vector<std::string>& 
         }
 
         // 设置当前GPU设备
-        cudaError_t cudaStatus = cudaSetDevice(i);
-        if (cudaStatus != cudaSuccess)
+        // 用带检查的入口：失败时 device_set 内部会打印设备号与原因
+        if (!ctpwa::device_set((int)i))
         {
-            std::cerr << "Error: cudaSetDevice failed for GPU " << i << ": " << cudaGetErrorString(cudaStatus) << std::endl;
+            std::cerr << "Error: 切到 GPU " << i << " 失败" << std::endl;
             // 清理已分配的内存
             for (size_t j = 0; j < i; ++j)
             {
                 if (d_weights_ptrs[j] != nullptr)
                 {
-                    cudaSetDevice(j);
+                    ctpwa::ensure_device(j);
                     cudaFree(d_weights_ptrs[j]);
                 }
             }
@@ -165,7 +165,7 @@ inline std::vector<double*> readWeightsFromFile(const std::vector<std::string>& 
 
         // 分配设备内存
         double* d_weights_i = nullptr;
-        cudaStatus = cudaMalloc(&d_weights_i, n_weights * sizeof(double));
+        cudaError_t cudaStatus = cudaMalloc(&d_weights_i, n_weights * sizeof(double));
         if (cudaStatus != cudaSuccess)
         {
             std::cerr << "Error: cudaMalloc failed for GPU " << i << ": " << cudaGetErrorString(cudaStatus) << std::endl;
@@ -174,7 +174,7 @@ inline std::vector<double*> readWeightsFromFile(const std::vector<std::string>& 
             {
                 if (d_weights_ptrs[j] != nullptr)
                 {
-                    cudaSetDevice(j);
+                    ctpwa::ensure_device(j);
                     cudaFree(d_weights_ptrs[j]);
                 }
             }
@@ -193,7 +193,7 @@ inline std::vector<double*> readWeightsFromFile(const std::vector<std::string>& 
             {
                 if (d_weights_ptrs[j] != nullptr)
                 {
-                    cudaSetDevice(j);
+                    ctpwa::ensure_device(j);
                     cudaFree(d_weights_ptrs[j]);
                 }
             }
@@ -222,7 +222,7 @@ inline std::vector<LorentzVector*> convertToLorentzVectors(
 
     for (size_t i = 0; i < finalMomenta.size(); ++i)
     {
-        cudaSetDevice(i);
+        ctpwa::ensure_device(i);
 
         // 获取事件数量和粒子数量
         int n_events = finalMomenta[i].begin()->second.size();
@@ -544,7 +544,7 @@ public:
             int nP = events_list[gpu][0];
             if (nP == 0) continue;
             if (gpu < (int)d_phsp_weights_list.size() && d_phsp_weights_list[gpu] != nullptr) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 thrust::device_ptr<double> dp(d_phsp_weights_list[gpu]);
                 W_total += thrust::reduce(dp, dp + nP);
             } else {
@@ -593,7 +593,7 @@ public:
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nP = events_list[gpu][0];
                 if (nP == 0) continue;
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 if ((int)s_phsp_handle.size() < num_gpus) s_phsp_handle.resize(num_gpus, nullptr);
                 if (!s_phsp_handle[gpu]) cublasCreate(&s_phsp_handle[gpu]);   // θ 段 S CGEMV 共用
                 if (s_d_P_part_sz[gpu] < n_amplitudes_) {
@@ -655,7 +655,7 @@ public:
             for (int gpu = 0; gpu < num_gpus; ++gpu) {
                 int nP = events_list[gpu][0];
                 if (nP == 0) continue;
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(
                     extended_vec_per_gpu[gpu].data_ptr());
                 const double* d_w = (gpu < (int)d_phsp_weights_list.size())
@@ -725,7 +725,7 @@ public:
             s_w_buf_sizes.assign(num_gpus, 0);
             s_w_bkg_buf_sizes.assign(num_gpus, 0);
             for (int g = 0; g < num_gpus; ++g) {
-                cudaSetDevice(g);
+                ctpwa::ensure_device(g);
                 cudaMalloc(&s_d_grad_per_gpu[g], extended_n_gls * sizeof(ctComplex));
             }
             s_alloc_n = extended_n_gls;
@@ -737,7 +737,7 @@ public:
         cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(ctComplex));
 
         for (int gpu = 0; gpu < num_gpus; ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             const ctComplex* d_vec_gpu = reinterpret_cast<const ctComplex*>(
                 extended_vec_per_gpu[gpu].data_ptr());
             ctComplex* d_grad = s_d_grad_per_gpu[gpu];
@@ -802,7 +802,7 @@ public:
                 totalDataEvents += nData_gpu;
                 // data 总权重（phsp 归一化 N_eff 用；无权重时 = 事件数）
                 if (d_w_data != nullptr) {
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     thrust::device_ptr<const double> dp(d_w_data);
                     totalDataWeight += thrust::reduce(dp, dp + nData_gpu);
                 }
@@ -826,7 +826,7 @@ public:
             // --- bkg ---
             int nBkg_gpu = (events_list[gpu].size() > 2) ? events_list[gpu][2] : 0;
             if (nBkg_gpu > 0) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 ctComplex* d_amp = d_all_amplitudes_list[gpu] + amp_offsets_list[gpu][2];
                 const double* d_w = d_bkg_weights_list[gpu];
 
@@ -960,7 +960,7 @@ public:
                         s_dS_alloc_sz.assign(num_gpus, 0);
                     }
                     for (int g = 0; g < num_gpus; ++g) {
-                        cudaSetDevice(g);
+                        ctpwa::ensure_device(g);
                         int nP = events_list[g][0];
                         n_phsp_evts[g] = nP;
                         if (nP == 0) continue;
@@ -2067,11 +2067,11 @@ private:
         size_t amp_elem_bytes = float_amps_ ? sizeof(float2) : sizeof(ctComplex);
         for (int gpu = 0; gpu < n_gpu_eff; ++gpu) {
             if (amp_offsets_[gpu].back() > 0) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 cudaMalloc(&d_all_amplitudes_vec[gpu], amp_offsets_[gpu].back() * amp_elem_bytes);
             }
         }
-        // cudaSetDevice(0);
+        // ctpwa::ensure_device(0);
 
         // std::cout << "Calculating amplitudes for " << num_gpus << " GPUs..." << std::endl;
 

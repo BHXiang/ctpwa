@@ -82,7 +82,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
         int hmem_n = 0;
         auto hmem_snap = [&]() {
             if (!hprof || hmem_n >= 5) return;
-            cudaSetDevice(dev.index());
+            ctpwa::ensure_device(dev.index());
             size_t free_b = 0, tot_b = 0;
             cudaMemGetInfo(&free_b, &tot_b);
             hmem[hmem_n++] = (tot_b - free_b) / 1048576ULL;
@@ -112,7 +112,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
             const int n_ext = extended_vector.numel();
 
             // phsp factor
-            cudaSetDevice(dev.index());
+            ctpwa::ensure_device(dev.index());
             ctComplex* d_P_vec;
             cudaMalloc(&d_P_vec, ctx.n_amplitudes * sizeof(ctComplex));
             ctPhspReal *d_pr, *d_pi;
@@ -134,7 +134,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
 
             // Multi-GPU: data + bkg Hessian contributions
             for (size_t gpu = 0; gpu < (*ctx.d_all_amplitudes).size(); ++gpu) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 torch::Tensor vec_gpu = extended_vector.to(ctpwa_dev(gpu));
                 const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(vec_gpu.data_ptr());
 
@@ -182,7 +182,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                     cublasDestroy(h);
                 } else {
                     double* d_hess_buf;
-                    cudaSetDevice(dev.index());
+                    ctpwa::ensure_device(dev.index());
                     ctpwaCheckedMalloc((void**)&d_hess_buf, (size_t)hess_sz * sizeof(double), "d_hess_buf");
                     cudaMemcpyPeer(d_hess_buf, dev.index(), d_hess_gpu, gpu, hess_sz * sizeof(double));
                     double one = 1.0;
@@ -193,7 +193,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                 }
                 cudaFree(d_hess_gpu);
             }
-            cudaSetDevice(dev.index());
+            ctpwa::ensure_device(dev.index());
 
             // phsp Hessian contribution
             {
@@ -268,7 +268,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
             std::vector<torch::Tensor> v_il_tensors;  // keep tensors alive
             std::vector<ctComplex*> d_v_per_gpu(n_gpu, nullptr);
             for (int gpu = 0; gpu < n_gpu; ++gpu) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 torch::Tensor v_gpu = extended_v.to(ctpwa_dev(gpu));
                 // computeEffectiveCoupling 已停用（d_T 无消费者，见 forward 处注释）
                 // ctx.amp_calc->computeEffectiveCoupling(
@@ -326,7 +326,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                 for (int g = 0; g < n_gpu; ++g) {
                     double* d_neg = nullptr;
                     if (g < (int)(*ctx.bkg_weights).size() && (*ctx.bkg_weights)[g] != nullptr && n_bkg_ev[g] > 0) {
-                        cudaSetDevice(g); cudaMalloc(&d_neg, n_bkg_ev[g] * sizeof(double));
+                        ctpwa::ensure_device(g); cudaMalloc(&d_neg, n_bkg_ev[g] * sizeof(double));
                         int grid = (n_bkg_ev[g] + 255) / 256;
                         CTPWA_LAUNCH(negateWeightsKernel, grid, 256, 0, d_neg, (*ctx.bkg_weights)[g], n_bkg_ev[g]);
                     }
@@ -343,7 +343,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                         std::chrono::duration<double, std::milli>(uT1 - uT0).count());
                     fflush(stdout);
                 }
-                for (int g = 0; g < n_gpu; ++g) { if (neg_bkg_weights[g]) { cudaSetDevice(g); cudaFree(neg_bkg_weights[g]); } }
+                for (int g = 0; g < n_gpu; ++g) { if (neg_bkg_weights[g]) { ctpwa::ensure_device(g); cudaFree(neg_bkg_weights[g]); } }
                 ctpwa::ensure_device(primary_dev);
             }
 
@@ -482,7 +482,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                 for (int gpu = 0; gpu < n_gpu; ++gpu) {
                     int nEv = (*ctx.events)[gpu][1];
                     if (nEv == 0) continue;
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     ctComplex* d_g_gpu;
                     cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
                     // d_v_ext 在主 GPU，需每 GPU 副本——跨设备传入 computeFactorNLL
@@ -515,7 +515,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                     CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, 1.0, 2 * na);
                     cudaFree(d_tmp);
                     // d_g_gpu 在副卡分配，切回所属设备后释放。
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     cudaFree(d_g_gpu);
                 }
 
@@ -525,7 +525,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                 for (int gpu = 0; gpu < n_gpu; ++gpu) {
                     if ((*ctx.events)[gpu].size() <= 2 || (*ctx.events)[gpu][2] == 0) continue;
                     int nEv = (*ctx.events)[gpu][2];
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     ctComplex* d_g_gpu;
                     cudaMalloc(&d_g_gpu, na * sizeof(ctComplex));
                     // Negate bkg weights (same as in NLL forward)
@@ -574,7 +574,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
                     CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_g_v, d_tmp, bkg_axpy, 2 * na);
                     cudaFree(d_tmp);
                     // d_g_gpu 在副卡分配，切回所属设备后释放。
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     cudaFree(d_g_gpu);
                 }
 

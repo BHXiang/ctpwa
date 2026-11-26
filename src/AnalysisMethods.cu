@@ -16,7 +16,7 @@ void analysis::release()
         }
 
         for (size_t g = 0; g < d_all_amplitudes_.size(); ++g) {
-            cudaSetDevice(static_cast<int>(g));
+            ctpwa::ensure_device(static_cast<int>(g));
             if (d_all_amplitudes_[g]) {
                 cudaFree(d_all_amplitudes_[g]);
                 d_all_amplitudes_[g] = nullptr;
@@ -35,7 +35,7 @@ void analysis::release()
         }
         auto free_weights = [](std::vector<double*>& weights) {
             for (size_t g = 0; g < weights.size(); ++g) {
-                cudaSetDevice(static_cast<int>(g));
+                ctpwa::ensure_device(static_cast<int>(g));
                 if (weights[g]) cudaFree(weights[g]);
             }
             weights.clear();
@@ -51,7 +51,7 @@ void analysis::release()
         amp_calc_.release();
         initialized_ = false;
         // 析构/释放不能成为新的 current-device 污染源：恢复进入前的设备。
-        cudaSetDevice(saved_dev);
+        ctpwa::ensure_device(saved_dev);
     
 }
 

@@ -38,7 +38,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
                 int nP = events[gpu][0];
                 if (nP == 0) continue;
                 if (gpu < phsp_weights.size() && phsp_weights[gpu] != nullptr) {
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     thrust::device_ptr<double> dp(phsp_weights[gpu]);
                     W_total += thrust::reduce(dp, dp + nP);
                 } else {
@@ -54,7 +54,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
             for (size_t gpu = 0; gpu < d_all_amplitudes.size(); ++gpu) {
                 int nPhsp = events[gpu][0];
                 if (nPhsp == 0) continue;
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 const int kPhspBatch = batch_events();
                 const double* d_w = (gpu < phsp_weights.size()) ? phsp_weights[gpu] : nullptr;
                 cublasHandle_t h;
@@ -102,13 +102,13 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
                         cudaMalloc(&d_temp, n_amplitudes * n_amplitudes * sizeof(ctComplex));
                         cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
                             n_amplitudes * n_amplitudes * sizeof(ctComplex));
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                         cudaFree(d_phsp_gpu);
                         ctpwa::ensure_device(primary_dev);
                         ctComplex one = ctMake(1.0f, 0.0f);
                         axpyComplex((*d_matrix_io), d_temp, one, n_amplitudes * n_amplitudes);
                         cudaFree(d_temp);
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                     }
                 }
                 cublasDestroy(h);

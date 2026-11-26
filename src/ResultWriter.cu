@@ -85,7 +85,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
         std::vector<double*> d_final_result_vec;
         std::vector<double*> d_partial_result_vec;
         for (int i = 0; i < d_all_amplitudes_.size(); ++i) {
-            cudaSetDevice(i);
+            ctpwa::ensure_device(i);
             double* d_final_result;
             cudaMalloc(&d_final_result, events_[i][0] * sizeof(double));
             d_final_result_vec.push_back(d_final_result);
@@ -97,7 +97,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                 events_[i][0] * npartials * sizeof(double));
             d_partial_result_vec.push_back(d_partial_result);
         }
-        cudaSetDevice(target_dev);
+        ctpwa::ensure_device(target_dev);
 
         // 分配nSLvectors_的设备内存
         // int* d_nSLvectors;
@@ -112,7 +112,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
         int N_data = 0;
         int N_bkg = 0;
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             int phsp_events = events_[gpu][0];
             N_phsp += static_cast<int>(phsp_events);
             int data_events = events_[gpu][1];
@@ -132,7 +132,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
         });
         int ev_cumulative = 0;  // 多GPU累加偏移
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             int* d_nSLvectors;
             cudaMalloc(&d_nSLvectors, nSLvectors_.size() * sizeof(int));
             cudaMemcpy(d_nSLvectors, nSLvectors_.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);
@@ -262,7 +262,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                             }
                         }
                         std::vector<ctComplex*> d_chunk = calculateAmplitudes(Vp4_chunk);
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                         double* d_ct;
                         cudaMalloc(&d_ct, nch * sizeof(double));
                         double* d_cp;
@@ -296,8 +296,8 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                         cudaFree(d_ct);
                         cudaFree(d_cp);
                         for (int g = 0; g < n_gpus_; ++g)
-                            if (d_chunk[g]) { cudaSetDevice(g); cudaFree(d_chunk[g]); }
-                        cudaSetDevice(gpu);
+                            if (d_chunk[g]) { ctpwa::ensure_device(g); cudaFree(d_chunk[g]); }
+                        ctpwa::ensure_device(gpu);
                     }
                     events_offsets_ = saved_ev;
                     amp_offsets_ = saved_amp;
@@ -343,7 +343,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             // // h_bkg_integral = thrust::reduce(d_ptr, d_ptr + bkg_length /
             // // n_polar_, 0.0, thrust::plus<double>());
             // for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-            //     cudaSetDevice(gpu);
+            //     ctpwa::ensure_device(gpu);
             //     if (events_[gpu][2] > 0) {
             //         // double* d_bkg_weights_gpu;
             //         // cudaMalloc(&d_bkg_weights_gpu, events_[gpu][2] * sizeof(double));
@@ -592,7 +592,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH1F*>> temp_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_hists[i];
                 for (const auto& histConfig : masshist)
@@ -628,7 +628,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH1F*>> temp_angle_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_angle_hists[i];
                 for (const auto& histConfig : anglehist)
@@ -666,7 +666,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH2F*>> temp_dalitz_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH2F*>& temp = temp_dalitz_hists[i];
                 for (const auto& histConfig : dalitzhist)
@@ -714,7 +714,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH1F*>> temp_mass_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_mass_hists[i];
                 for (const auto& histConfig : masshist)
@@ -758,7 +758,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH1F*>> temp_angle_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_angle_hists[i];
                 for (const auto& histConfig : anglehist)
@@ -802,7 +802,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             std::vector<std::vector<TH2F*>> temp_dalitz_hists(device_momenta_list.size());
             for (size_t i = 0; i < device_momenta_list.size(); ++i)
             {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH2F*>& temp = temp_dalitz_hists[i];
                 for (const auto& histConfig : dalitzhist)
@@ -855,7 +855,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             {
                 if (events_[i][2] == 0) continue;  // 该GPU无bkg事件
 
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_mass_hists[i];
                 for (const auto& histConfig : masshist)
@@ -902,7 +902,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             {
                 if (events_[i][2] == 0) continue;
 
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH1F*>& temp = temp_angle_hists[i];
                 for (const auto& histConfig : anglehist)
@@ -950,7 +950,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             {
                 if (events_[i][2] == 0) continue;
 
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 // 为当前GPU创建临时直方图
                 std::vector<TH2F*>& temp = temp_dalitz_hists[i];
                 for (const auto& histConfig : dalitzhist)
@@ -1007,7 +1007,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                 {
                     if (events_[gpu][0] == 0) continue;  // 该GPU无phsp事件
 
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     // 为当前GPU创建临时直方图
                     std::vector<TH1F*>& temp = temp_mass_hists[gpu];
                     for (const auto& histConfig : masshist)
@@ -1060,7 +1060,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                 {
                     if (events_[gpu][0] == 0) continue;
 
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     std::vector<TH1F*>& temp = temp_angle_hists[gpu];
                     for (const auto& histConfig : anglehist)
                     {
@@ -1151,7 +1151,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                 }
                 for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
                     if (events_[gpu][1] == 0) continue;
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     std::vector<TH1F*> t1(obshists.size(), nullptr);
                     std::vector<TH2F*> t2(obshists.size(), nullptr);
                     for (size_t j = 0; j < obshists.size(); ++j) {
@@ -1204,7 +1204,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                     }
                     for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
                         if (events_[gpu][2] == 0) continue;
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                         std::vector<TH1F*> t1(obshists.size(), nullptr);
                         std::vector<TH2F*> t2(obshists.size(), nullptr);
                         for (size_t j = 0; j < obshists.size(); ++j) {
@@ -1257,7 +1257,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                 }
                 for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
                     if (events_[gpu][0] == 0) continue;
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     std::vector<TH1F*> t1(obshists.size(), nullptr);
                     std::vector<TH2F*> t2(obshists.size(), nullptr);
                     for (size_t j = 0; j < obshists.size(); ++j) {
@@ -1314,7 +1314,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                     }
                     for (size_t gpu = 0; gpu < device_momenta_list.size(); ++gpu) {
                         if (events_[gpu][0] == 0) continue;
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                         for (int p = 0; p < npartials; ++p) {
                             std::vector<PlotConfig> one = {cfg};
                             std::vector<TH1F*> t1(is2 ? 0 : 1, nullptr);
@@ -1369,23 +1369,23 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
         // 不先放掉，后面每张矩阵/每个误差方向都要再分配批 workspace → 多卡 OOM。
         for (size_t i = 0; i < d_final_result_vec.size(); ++i)
             if (d_final_result_vec[i]) {
-                cudaSetDevice((int)i);
+                ctpwa::ensure_device((int)i);
                 cudaFree(d_final_result_vec[i]);
                 d_final_result_vec[i] = nullptr;
             }
         for (size_t i = 0; i < d_partial_result_vec.size(); ++i)
             if (d_partial_result_vec[i]) {
-                cudaSetDevice((int)i);
+                ctpwa::ensure_device((int)i);
                 cudaFree(d_partial_result_vec[i]);
                 d_partial_result_vec[i] = nullptr;
             }
         for (size_t i = 0; i < device_momenta_list.size(); ++i)
             if (device_momenta_list[i]) {
-                cudaSetDevice((int)i);
+                ctpwa::ensure_device((int)i);
                 cudaFree(device_momenta_list[i]);
                 device_momenta_list[i] = nullptr;
             }
-        cudaSetDevice(target_dev);
+        ctpwa::ensure_device(target_dev);
 
 
         // =====================================================================
@@ -1542,24 +1542,24 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
         // 释放每个GPU的final_result和partial_result
         for (size_t i = 0; i < d_final_result_vec.size(); ++i) {
             if (d_final_result_vec[i] != nullptr) {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 cudaFree(d_final_result_vec[i]);
             }
         }
         for (size_t i = 0; i < d_partial_result_vec.size(); ++i) {
             if (d_partial_result_vec[i] != nullptr) {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 cudaFree(d_partial_result_vec[i]);
             }
         }
         // 释放四动量内存
         for (size_t i = 0; i < device_momenta_list.size(); ++i) {
             if (device_momenta_list[i] != nullptr) {
-                cudaSetDevice(i);
+                ctpwa::ensure_device(i);
                 cudaFree(device_momenta_list[i]);
             }
         }
-        cudaSetDevice(target_dev);
+        ctpwa::ensure_device(target_dev);
         // h_total_results / h_partial_results 由 h_guard 统一释放（含异常路径）。
     
 }
@@ -1641,7 +1641,7 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
         for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
             int ne = events_[gpu][0];
             if (ne == 0) continue;
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             // 每 GPU 自己的归约/索引缓冲：跨设备指针传给 computeResults 会非法访问。
             double* d_total_integral = nullptr;
             cudaMalloc(&d_total_integral, sizeof(double));
@@ -1709,7 +1709,7 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
                         }
                     }
                     std::vector<ctComplex*> d_chunk = calculateAmplitudes(Vp4_chunk);
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     double* d_ct;
                     cudaMalloc(&d_ct, nch * sizeof(double));
                     double* d_cp;
@@ -1745,8 +1745,8 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
                             cudaMemcpyDeviceToHost);
                     cudaFree(d_ct); cudaFree(d_cp); cudaFree(d_cintf);
                     for (int g = 0; g < n_gpus_; ++g)
-                        if (d_chunk[g]) { cudaSetDevice(g); cudaFree(d_chunk[g]); }
-                    cudaSetDevice(gpu);
+                        if (d_chunk[g]) { ctpwa::ensure_device(g); cudaFree(d_chunk[g]); }
+                    ctpwa::ensure_device(gpu);
                 }
                 events_offsets_ = saved_ev;
                 amp_offsets_ = saved_amp;
@@ -1774,7 +1774,7 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
             if (d_partial) cudaFree(d_partial);
             if (d_intf) cudaFree(d_intf);
         }
-        cudaSetDevice(dev.index());
+        ctpwa::ensure_device(dev.index());
 
         double h_phsp_integral = 0.0;
         for (int i = 0; i < N_phsp; ++i) h_phsp_integral += h_total[i];

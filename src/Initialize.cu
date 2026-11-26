@@ -425,7 +425,7 @@ void analysis::initialize(std::string config_file)
             // Σ data 权重（phsp 归一化 N_eff 用；无权重 GPU 按事件数计）
             for (size_t gpu = 0; gpu < data_weights_.size(); ++gpu) {
                 if (data_weights_[gpu] != nullptr && events_[gpu].size() > 1 && events_[gpu][1] > 0) {
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     thrust::device_ptr<double> dp(data_weights_[gpu]);
                     data_total_weight_ += thrust::reduce(dp, dp + events_[gpu][1]);
                 }
@@ -468,7 +468,7 @@ void analysis::initialize(std::string config_file)
             // bkg_weigths_求和
             double h_bkg_integral = 0.0;
             for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 if (events_[gpu][2] > 0) {
                     thrust::device_ptr<double> d_ptr_gpu(bkg_weights_[gpu]);
                     h_bkg_integral += thrust::reduce(d_ptr_gpu, d_ptr_gpu + events_[gpu][2]);
@@ -503,7 +503,7 @@ void analysis::initialize(std::string config_file)
             int nP = events_[gpu][0];
             if (nP == 0) continue;
             if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 thrust::device_ptr<double> dp(phsp_weights_[gpu]);
                 W_total += thrust::reduce(dp, dp + nP);
             } else {
@@ -538,7 +538,7 @@ void analysis::initialize(std::string config_file)
             for (int gpu = 0; gpu < n_gpus_; ++gpu) {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
                 cublasHandle_t h;
                 cublasCreate(&h);
                 for (int c0 = 0; c0 < nPhsp; c0 += batch_cap) {
@@ -559,7 +559,7 @@ void analysis::initialize(std::string config_file)
                         }
                     }
                     std::vector<ctComplex*> d_batch = calculateAmplitudes(Vp4_batch);
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                     int nTot = nch * n_polar_ * n_amplitudes_;
 
                     // float 模式（double .so 混合精度）: 批振幅为 float2（8B/元素），
@@ -604,7 +604,7 @@ void analysis::initialize(std::string config_file)
                             axpyComplex(d_phsp_matrix_, d_temp, ctMake(1.0f, 0.0f),
                                         n_amplitudes_ * n_amplitudes_);
                             cudaFree(d_temp);
-                            cudaSetDevice(gpu);
+                            ctpwa::ensure_device(gpu);
                         }
                         cudaFree(d_scaled);
                         cudaFree(d_m);
@@ -654,7 +654,7 @@ void analysis::initialize(std::string config_file)
                             axpyZComplex(d_phsp_matrix_double_, d_temp,
                                          n_amplitudes_ * n_amplitudes_);
                             cudaFree(d_temp);
-                            cudaSetDevice(gpu);
+                            ctpwa::ensure_device(gpu);
                         }
                         cudaFree(d_batch_d);
                         cudaFree(d_md);
@@ -663,9 +663,9 @@ void analysis::initialize(std::string config_file)
                     // 释放上转段（本 GPU）与批振幅（含占位 GPU 的 1 事件缓冲）
                     if (d_batch_up != nullptr) cudaFree(d_batch_up);
                     for (int g = 0; g < n_gpus_; ++g) {
-                        if (d_batch[g]) { cudaSetDevice(g); cudaFree(d_batch[g]); }
+                        if (d_batch[g]) { ctpwa::ensure_device(g); cudaFree(d_batch[g]); }
                     }
-                    cudaSetDevice(gpu);
+                    ctpwa::ensure_device(gpu);
                 }
                 cublasDestroy(h);
             }
@@ -679,7 +679,7 @@ void analysis::initialize(std::string config_file)
             {
                 int nPhsp = events_[gpu][0];
                 if (nPhsp == 0) continue;
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
 
                 // resident 模式构造期 B̄ 构建。float 模式下 A 为 float2（8B/元素），
                 // B̄ 保持 double（phsp_factor 恒走 double 轨道）→ 按块上转 double 再
@@ -732,13 +732,13 @@ void analysis::initialize(std::string config_file)
                         cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                         cudaMemcpyPeer(d_temp, primary_dev_, d_phsp_gpu, gpu,
                             n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                         cudaFree(d_phsp_gpu);
                         ctpwa::ensure_device(primary_dev_);
                         ctComplex one = ctMake(1.0f, 0.0f);
                         axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_temp);
-                        cudaSetDevice(gpu);
+                        ctpwa::ensure_device(gpu);
                     }
                 }
             }
@@ -1014,13 +1014,13 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
 
         auto cleanup = [&]() {
             for (int g = 0; g < static_cast<int>(upcast.size()); ++g)
-                if (upcast[g]) { cudaSetDevice(g); cudaFree(upcast[g]); }
+                if (upcast[g]) { ctpwa::ensure_device(g); cudaFree(upcast[g]); }
             upcast.clear();
             for (int g = 0; g < static_cast<int>(amps.size()); ++g)
-                if (amps[g]) { cudaSetDevice(g); cudaFree(amps[g]); }
+                if (amps[g]) { ctpwa::ensure_device(g); cudaFree(amps[g]); }
             amps.clear();
             for (int g = 0; g < static_cast<int>(d_out.size()); ++g)
-                if (d_out[g]) { cudaSetDevice(g); cudaFree(d_out[g]); }
+                if (d_out[g]) { ctpwa::ensure_device(g); cudaFree(d_out[g]); }
             d_out.clear();
             d_vec.clear();
             if (!released) {
@@ -1076,7 +1076,7 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
             }
 
             for (int g = 0; g < n_gpu; ++g) {
-                cudaSetDevice(g);
+                ctpwa::ensure_device(g);
                 ctComplex* a = amps[g];
                 if (float_amps_ && !ctIsFloatComplex && a) {
                     const size_t n_el = static_cast<size_t>(counts[g]) *
@@ -1099,7 +1099,7 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
             double* host = out.data_ptr<double>();
             int off = 0;
             for (int g = 0; g < n_gpu; ++g) {
-                cudaSetDevice(g);
+                ctpwa::ensure_device(g);
                 cudaError_t e = cudaMemcpy(host + off, d_out[g],
                     static_cast<size_t>(counts[g]) * sizeof(double),
                     cudaMemcpyDeviceToHost);

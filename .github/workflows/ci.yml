@@ -68,8 +68,9 @@ jobs:
           python3 -c "import ctpwa; print('backend =', ctpwa.backend(), ctpwa.build_info())"
 
       # P0 的机械门禁：裸 cudaSetDevice 只允许出现在 device 模块（清单见脚本）
-      - name: Device-call gate
-        run: bash scripts/check_device_calls.sh
+      # P0 的机械门禁：现在违规数已归零，用 --strict —— 任何新的裸 cudaSetDevice 直接红
+      - name: Device-call gate (strict)
+        run: bash scripts/check_device_calls.sh --strict
 
       - name: Full pytest (CPU)
         run: |

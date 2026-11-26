@@ -36,7 +36,7 @@ torch::Tensor computeCouplingHessian(const CouplingHessianCtx& ctx,
         const ctComplex* d_vec_conj = reinterpret_cast<const ctComplex*>(extended_vector_conj.data_ptr());
 
         // 计算phsp量 (与forward pass一致)
-        cudaSetDevice(dev.index());
+        ctpwa::ensure_device(dev.index());
         ctComplex* d_P_vec;
         cudaMalloc(&d_P_vec, ctx.n_amplitudes * sizeof(ctComplex));
         ctPhspReal* d_pr, * d_pi;
@@ -61,7 +61,7 @@ torch::Tensor computeCouplingHessian(const CouplingHessianCtx& ctx,
         int hess_sz = (2 * n_ext) * (2 * n_ext);
         int totalDataEvents = 0;
         for (size_t gpu = 0; gpu < (*ctx.d_all_amplitudes).size(); ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             torch::Tensor vec_gpu = extended_vector.to(ctpwa_dev(gpu));
             const ctComplex* d_v_gpu = reinterpret_cast<const ctComplex*>(vec_gpu.data_ptr());
 
@@ -95,7 +95,7 @@ torch::Tensor computeCouplingHessian(const CouplingHessianCtx& ctx,
                 cublasDestroy(h);
             } else {
                 double* d_hess_buf;
-                cudaSetDevice(dev.index());
+                ctpwa::ensure_device(dev.index());
                 ctpwaCheckedMalloc((void**)&d_hess_buf, (size_t)hess_sz * sizeof(double), "d_hess_buf");
                 cudaMemcpyPeer(d_hess_buf, dev.index(), d_hess_gpu, gpu, hess_sz * sizeof(double));
                 double one = 1.0;
@@ -105,15 +105,15 @@ torch::Tensor computeCouplingHessian(const CouplingHessianCtx& ctx,
                 cudaFree(d_hess_buf);
                 // d_hess_gpu 在副卡分配；P2P 后当前设备是主卡，
                 // 必须先切回其所属设备再释放。
-                cudaSetDevice(gpu);
+                ctpwa::ensure_device(gpu);
             }
             cudaFree(d_hess_gpu);
         }
-        cudaSetDevice(dev.index());
+        ctpwa::ensure_device(dev.index());
 
         // phsp Hessian贡献
         double phsp_weight = ctx.data_total_weight - ctx.bkg_integral;
-        cudaSetDevice(dev.index());
+        ctpwa::ensure_device(dev.index());
         computePhspHessian(ctx.d_phsp_matrix, d_vec, phsp_factor, phsp_weight, d_hessian, n_ext);
 
         // std::cout << "n_ext: " << n_ext << ", n: " << n << ", totalDataEvents: " << totalDataEvents << std::endl;

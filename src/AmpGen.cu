@@ -305,7 +305,7 @@ std::vector<DeviceMomenta*> AmpCasDecay::convertToDeviceMomenta(
 
     for (size_t i = 0; i < finalMomenta.size(); ++i)
     {
-        cudaSetDevice(i);
+        ctpwa::ensure_device(i);
 
         // 获取事件数量和粒子数量
         int n_events = finalMomenta[i].begin()->second.size();
@@ -477,7 +477,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
 
     for (size_t i = 0; i < finalMomenta.size(); ++i)
     {
-        cudaSetDevice(i);
+        ctpwa::ensure_device(i);
 
         // 计算事件数和极化态数
         nEvents_.push_back(finalMomenta[i].begin()->second.size());
@@ -1028,7 +1028,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
 {
     for (size_t i = 0; i < d_amplitudes.size(); ++i)
     {
-        cudaSetDevice(i);
+        ctpwa::ensure_device(i);
 
         // 分配设备内存用于共振态数组
         size_t resonance_count = resonances.size();
@@ -2252,7 +2252,7 @@ void AmpCalc::release()
         bump(ng, b.jit.res_off_dev.size());
 
         for (int g = 0; g < ng; ++g) {
-            cudaSetDevice(g);
+            ctpwa::ensure_device(g);
             auto free_at = [g](auto& vec) {
                 if (g < static_cast<int>(vec.size()) && vec[g]) {
                     cudaFree(vec[g]);
@@ -2277,19 +2277,19 @@ void AmpCalc::release()
 
     auto free_double_vec = [](std::vector<double*>& v) {
         for (size_t g = 0; g < v.size(); ++g) {
-            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+            if (v[g]) { ctpwa::ensure_device(static_cast<int>(g)); cudaFree(v[g]); }
         }
         v.clear();
     };
     auto free_int_vec = [](std::vector<int*>& v) {
         for (size_t g = 0; g < v.size(); ++g) {
-            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+            if (v[g]) { ctpwa::ensure_device(static_cast<int>(g)); cudaFree(v[g]); }
         }
         v.clear();
     };
     auto free_ad_vec = [](std::vector<ADBlockDesc*>& v) {
         for (size_t g = 0; g < v.size(); ++g) {
-            if (v[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(v[g]); }
+            if (v[g]) { ctpwa::ensure_device(static_cast<int>(g)); cudaFree(v[g]); }
         }
         v.clear();
     };
@@ -2314,7 +2314,7 @@ void AmpCalc::release()
     // cas_list_ 由 shared_ptr 自动释放（AmpCasDecay 析构会 free SL/momenta 表）
     cas_list_.clear();
 
-    cudaSetDevice(saved_dev);
+    ctpwa::ensure_device(saved_dev);
 }
 
 // 辅助：根据 free_indices 将自由参数的 params[] 下标展开
@@ -2524,7 +2524,7 @@ void AmpCalc::addBlock(std::shared_ptr<AmpCasDecay> cas,
     h_channel_templates_.push_back(h_all_channels);
 
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
+        ctpwa::ensure_device(gpu);
         // DeviceResonance 数组
         cudaMalloc(&block.d_resonances[gpu],
                    resonances.size() * sizeof(DeviceResonance));
@@ -2850,7 +2850,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
     if (d_params_per_gpu_.size() != (size_t)n_gpu) {
         d_params_per_gpu_.assign(n_gpu, nullptr);
         for (int gpu = 0; gpu < n_gpu; ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             cudaMalloc(&d_params_per_gpu_[gpu], n_free * sizeof(double));
         }
         // 恢复 primary，保持函数内后续逻辑的当前设备语义一致
@@ -2877,7 +2877,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
     }
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (cached_ev_off_[gpu] != event_offsets[gpu]) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             if (!d_ev_off_cache_[gpu])
                 cudaMalloc(&d_ev_off_cache_[gpu],
                            std::max((size_t)1, event_offsets[gpu].size()) * sizeof(int));
@@ -2886,7 +2886,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cached_ev_off_[gpu] = event_offsets[gpu];
         }
         if (cached_amp_off_[gpu] != amp_offsets[gpu]) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             if (!d_amp_off_cache_[gpu])
                 cudaMalloc(&d_amp_off_cache_[gpu],
                            std::max((size_t)1, amp_offsets[gpu].size()) * sizeof(int));
@@ -2898,7 +2898,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
 
     // 3. 每个 GPU: 更新 DeviceResonance 参数 + 重跑 computeAmpsKernel
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
+        ctpwa::ensure_device(gpu);
         int blockSize = 256;
 
         // 为每个 block 更新 DeviceResonance 中的自由参数
@@ -3178,14 +3178,14 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
         if (d_ad_desc_.size() != (size_t)n_gpu) d_ad_desc_.assign(n_gpu, nullptr);
         if (n_custom > d_ad_desc_cap_) {
             for (int g = 0; g < n_gpu; ++g) {
-                cudaSetDevice(g);
+                ctpwa::ensure_device(g);
                 if (d_ad_desc_[g]) cudaFree(d_ad_desc_[g]);
                 cudaMalloc(&d_ad_desc_[g], n_custom * sizeof(ADBlockDesc));
             }
             // 恢复外层循环的当前设备！否则嵌套循环后 current device 停在最后一个
             // 设备上，gpu=0 的 cudaMemcpy / kernel 启动都会在错误上下文执行，
             // 跨设备读 desc → cudaErrorIllegalAddress（实测 2×A100 首次 getNLL 必现）
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             d_ad_desc_cap_ = n_custom;
         }
 
@@ -3612,12 +3612,12 @@ void AmpCalc::computeResonanceGradient(
     if (d_grad_per_gpu_.size() != (size_t)n_gpu) {
         d_grad_per_gpu_.assign(n_gpu, nullptr);
         for (int gpu = 0; gpu < n_gpu; ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             cudaMalloc(&d_grad_per_gpu_[gpu], n_free * sizeof(double));
         }
     }
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
+        ctpwa::ensure_device(gpu);
         cudaMemset(d_grad_per_gpu_[gpu], 0, n_free * sizeof(double));
     }
 
@@ -3629,7 +3629,7 @@ void AmpCalc::computeResonanceGradient(
         int nSL = static_cast<int>(cas->getNSLCombs());
 
         for (int gpu = 0; gpu < n_gpu; ++gpu) {
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             int nEv = n_events[gpu];
             if (nEv == 0) continue;
             int nPol = static_cast<int>(cas->getNPolarizations());
@@ -3708,7 +3708,7 @@ void AmpCalc::computeResonanceGradient(
             cudaDeviceSynchronize();
         } else {
             std::vector<double> h_temp(n_free);
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
             cudaMemcpy(h_temp.data(), d_grad_per_gpu_[gpu],
                        n_free * sizeof(double), cudaMemcpyDeviceToHost);
             ctpwa::ensure_device(primary_dev);
@@ -3771,7 +3771,7 @@ void AmpCalc::computeUnifiedHessian(
 
     // ===== Stage 1-4: per-GPU, with local output buffers for remote GPUs =====
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
-        cudaSetDevice(gpu);
+        ctpwa::ensure_device(gpu);
         int nEv = n_events[gpu];
         if (nEv <= 0) continue;
         int evt_off = has_offset ? t_offset[gpu] : 0;
@@ -4285,7 +4285,7 @@ void AmpCalc::computeUnifiedHessian(
                 cublasDestroy(h); cudaFree(d_tmp);
                 // d_phsp_I: copy single value
                 double h_pI;
-                cudaSetDevice(gpu); cudaMemcpy(&h_pI, d_pI_g, sizeof(double), cudaMemcpyDeviceToHost);
+                ctpwa::ensure_device(gpu); cudaMemcpy(&h_pI, d_pI_g, sizeof(double), cudaMemcpyDeviceToHost);
                 ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, sizeof(double));
                 cudaMemcpy(d_tmp, &h_pI, sizeof(double), cudaMemcpyHostToDevice);
                 cublasCreate(&h); cublasDaxpy(h, 1, &one, d_tmp, 1, d_phsp_I, 1);
@@ -4317,7 +4317,7 @@ void AmpCalc::computeUnifiedHessian(
                 cublasCreate(&h); cublasDaxpy(h, t3_sz, &one, d_tmp, 1, d_phsp_mixed_t3, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
             }
-            cudaSetDevice(gpu);
+            ctpwa::ensure_device(gpu);
         }
 
         // Free remote GPU local buffers

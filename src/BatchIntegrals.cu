@@ -157,7 +157,7 @@ double computeFileBatchIntegrals(
         // 分配到一半失败（OOM）时也要释放已分配的部分；正常路径在末尾置空。
         auto ws_guard = makeScopeExit([&]() {
             for (int g = 0; g < ctx.n_gpus; ++g) {
-                cudaSetDevice(g);
+                ctpwa::ensure_device(g);
                 if (ws_complex[g]) cudaFree(ws_complex[g]);
                 if (ws_matrix[g])  cudaFree(ws_matrix[g]);
                 if (ws_upcast[g])  cudaFree(ws_upcast[g]);
@@ -170,13 +170,13 @@ double computeFileBatchIntegrals(
         auto batch_guard = makeScopeExit([&]() {
             for (size_t g = 0; g < d_batch_amps.size(); ++g)
                 if (d_batch_amps[g]) {
-                    cudaSetDevice((int)g);
+                    ctpwa::ensure_device((int)g);
                     cudaFree(d_batch_amps[g]);
                 }
             ctpwa::ensure_device(ctx.primary_dev);
         });
         for (int g = 0; g < ctx.n_gpus; ++g) {
-            cudaSetDevice(g);
+            ctpwa::ensure_device(g);
             TORCH_CHECK(cudaMalloc(&ws_complex[g], ws_cplx * sizeof(ctComplex)) == cudaSuccess,
                 "[", file_key, "] workspace cudaMalloc 失败 (",
                 ws_cplx * sizeof(ctComplex), " B)");
@@ -230,7 +230,7 @@ double computeFileBatchIntegrals(
                 int ev_off_w = 0;
                 for (int g = 0; g < active_gpus; ++g) {
                     int nev = batch_ev_per_gpu[g];
-                    cudaSetDevice(g);
+                    ctpwa::ensure_device(g);
                     TORCH_CHECK(cudaMemcpy(ws_weights[g],
                             h_weights.data() + start + ev_off_w,
                             nev * sizeof(double), cudaMemcpyHostToDevice) == cudaSuccess,
@@ -272,13 +272,13 @@ double computeFileBatchIntegrals(
             memprobe("after-integrals", start);
             // Free batch amplitudes
             for (size_t g = 0; g < d_batch_amps.size(); ++g)
-                if (d_batch_amps[g]) { cudaSetDevice(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
+                if (d_batch_amps[g]) { ctpwa::ensure_device(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
             d_batch_amps.clear();
             memprobe("after-amp-free", start);
         }
         // 统一释放 workspace（单次分配 → 单次释放，不再有上千次 alloc/free）
         for (int g = 0; g < ctx.n_gpus; ++g) {
-            cudaSetDevice(g);
+            ctpwa::ensure_device(g);
             if (ws_complex[g]) { cudaFree(ws_complex[g]); ws_complex[g] = nullptr; }
             if (ws_matrix[g])  { cudaFree(ws_matrix[g]);  ws_matrix[g] = nullptr; }
             if (ws_upcast[g])  { cudaFree(ws_upcast[g]);  ws_upcast[g] = nullptr; }
