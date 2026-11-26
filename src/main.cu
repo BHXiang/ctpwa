@@ -24,8 +24,7 @@
 #include <Config.cuh>
 #include <PhaseSpace.cuh>
 #include <Figure.cuh>
-// Analysis inline (no header for analysis class)
-#include "Analysis.cu"
+#include <Analysis.h>
 #include <Info.cuh>
 #include <Parameters.cuh>
 #include <SymbolicDiff.cuh>  // Node/deriv for modelDeriv+buildModelAST

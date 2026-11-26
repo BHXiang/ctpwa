@@ -182,6 +182,7 @@ SOURCES_CORE = [
     "src/FullHessian.cu",    # P4：统一 Hessian（685 行）
     "src/ResultWriter.cu",   # P4：writeResult / writeInterfResult（1836 行）
     "src/Initialize.cu",     # P4：initialize / initializeDecayChains / getIntensity
+    "src/AnalysisMethods.cu", # P4：剩余成员实现（装配层）
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
