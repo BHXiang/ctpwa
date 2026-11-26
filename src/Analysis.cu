@@ -10,7 +10,8 @@
 #include <omp.h>
 #include <random>
 #include <torch/extension.h>
-#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH / ctpwa:: 原语
+#include "Backend.h"  // CTPWA_KERNEL / CTPWA_LAUNCH / ctpwa:: 原语
+#include "DeviceGuard.h"  // ctpwa::ensure_device / DeviceGuard
 
 // ---------------------------------------------------------------------------
 // 后端无关的设备 helper：CPU 后端下所有张量都在 CPU 上，CUDA 后端保持原语义。
@@ -896,7 +897,7 @@ public:
         //            phsp_factor 与 d_P_vec 由一次融合扫描直接给出
         //            d_P_vec = Σ_ev,p (w/W)·A·conj(S) ≡ B̄·v̄
         bool free_theta = (amp_calc && n_free_res > 0 && theta.numel() > 0);
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
         ctComplex* d_P_vec;
         cudaMalloc(&d_P_vec, n_amplitudes_ * sizeof(ctComplex));
         double phsp_sum = 0.0;
@@ -922,7 +923,7 @@ public:
             // phsp 流式模式: 原始 phsp 振幅不驻留，phsp_sum = Re(v^H M_double v)（主 GPU）
             TORCH_CHECK(n_free_res == 0,
                 "phsp 流式模式（free_phsp_amplitudes）要求无自由共振态参数");
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             const ctComplex* d_v_primary = reinterpret_cast<const ctComplex*>(
                 extended_vector.data_ptr());
             phsp_sum = computeDoublePhspSum(d_phsp_matrix_double_, d_v_primary,
@@ -943,7 +944,7 @@ public:
         } else if (free_theta) {
             // free-θ 常驻: phsp_factor 与 d_P_vec 一次融合扫描（免 B̄ 重建）
             //（phsp_factor 语义与 computePhspMeanSum 一致: Σ w|S|²，下面除 W_total）
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             if ((int)s_d_P_part.size() < num_gpus) {
                 s_d_P_part.resize(num_gpus, nullptr);
                 s_d_P_part_sz.assign(num_gpus, 0);
@@ -979,7 +980,7 @@ public:
                 }
             }
             // 跨 GPU 规约局部 d_P_vec → 主 GPU d_P_vec
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             cudaMemset(d_P_vec, 0, n_amplitudes_ * sizeof(ctComplex));
             {
                 ctComplex one = ctMake(1.0f, 0.0f);
@@ -991,7 +992,7 @@ public:
                     } else {
                         cudaMemcpyPeer(s_d_P_peer, primary_dev, s_d_P_part[gpu], gpu,
                             n_amplitudes_ * sizeof(ctComplex));
-                        cudaSetDevice(primary_dev);
+                        ctpwa::ensure_device(primary_dev);
                         axpyComplex(d_P_vec, s_d_P_peer, one, n_amplitudes_);
                     }
                 }
@@ -1001,7 +1002,7 @@ public:
             // W_total 的逐 GPU 权重归约把 current device 留在最后一张卡。
             // d_phsp_matrix_ 与 d_P_vec 都在主卡，必须先切回主卡再做二次型；
             // 否则副卡 kernel 会直接读主卡指针（compute-sanitizer 已定位）。
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             ctPhspReal* d_phsp_r, * d_phsp_i;
             cudaMalloc(&d_phsp_r, sizeof(ctPhspReal));
             cudaMalloc(&d_phsp_i, sizeof(ctPhspReal));
@@ -1038,7 +1039,7 @@ public:
         // sqrt(w/W_total)，所以 phsp_sum 已经是归一化值（denom=1）。
         double phsp_denom = phsp_stream_normalized ? 1.0 : W_total;
         double phsp_factor = (phsp_denom > 0.0) ? phsp_sum / phsp_denom : 0.0;
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
         tF3 = std::chrono::high_resolution_clock::now();  // phsp_factor/d_P_vec（free-θ 融合扫描）完成
         tF4 = tF3;  // （原 B̄ CGEMM 段已删；D2H 计入 tF3 段）
 
@@ -1079,7 +1080,7 @@ public:
             for (auto& p : s_d_w_bufs) if (p) { cudaFree(p); p = nullptr; }
             for (auto& p : s_d_w_bkg_bufs) if (p) { cudaFree(p); p = nullptr; }
 
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             cudaMalloc(&s_d_grad_global, extended_n_gls * sizeof(ctComplex));
             cudaMalloc(&s_d_grad_buf, extended_n_gls * sizeof(ctComplex));
             s_d_grad_per_gpu.resize(num_gpus, nullptr);
@@ -1096,7 +1097,7 @@ public:
 
         ctComplex* d_grad_global = s_d_grad_global;
         ctComplex* d_grad_buf = s_d_grad_buf;
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
         cudaMemset(d_grad_global, 0, extended_n_gls * sizeof(ctComplex));
 
         for (int gpu = 0; gpu < num_gpus; ++gpu) {
@@ -1181,7 +1182,7 @@ public:
                 }
                 else {
                     cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(ctComplex));
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
                     axpyComplex(d_grad_global, d_grad_buf, ctMake(1.0f, 0.0f), extended_n_gls);
                 }
             }
@@ -1243,7 +1244,7 @@ public:
                 }
                 else {
                     cudaMemcpyPeer(d_grad_buf, primary_dev, d_grad, gpu, extended_n_gls * sizeof(ctComplex));
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
                     axpyComplex(d_grad_global, d_grad_buf, ctMake(-1.0f, 0.0f), extended_n_gls);
                 }
             }
@@ -1254,18 +1255,18 @@ public:
         // === 新增：计算共振态参数梯度 ===
         torch::Tensor grad_theta;
         if (amp_calc && n_free_res > 0 && theta.numel() > 0) {
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             // 持久化懒分配（n_free_res 固定，避免每次 forward 的 malloc/free）
             static double* s_d_grad_res = nullptr;
             static int s_grad_res_sz = 0;
             if (s_grad_res_sz < n_free_res) {
                 if (s_d_grad_res) cudaFree(s_d_grad_res);
-                cudaSetDevice(primary_dev);
+                ctpwa::ensure_device(primary_dev);
                 cudaMalloc(&s_d_grad_res, n_free_res * sizeof(double));
                 s_grad_res_sz = n_free_res;
             }
             double* d_grad_res = s_d_grad_res;
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             cudaMemset(d_grad_res, 0, n_free_res * sizeof(double));
 
             // data 贡献 (sign=+1, d_T/d_momenta 需加 phsp 偏移)
@@ -1357,7 +1358,7 @@ public:
                             d_S_bufs[g], d_w, nP, n_polar_, 1.0 / W_total);
                     }
 
-                    cudaSetDevice(primary_dev);  // d_grad_res is on primary_dev
+                    ctpwa::ensure_device(primary_dev);  // d_grad_res is on primary_dev
                     std::vector<ctComplex*> d_v_ptrs(num_gpus);
                     for (int g = 0; g < num_gpus; ++g)
                         d_v_ptrs[g] = const_cast<ctComplex*>(
@@ -1369,12 +1370,12 @@ public:
                     if (getenv("CTPWA_PROF")) printf("[PROF] resonanceGradient(phsp): %.2f ms\n",
                         std::chrono::duration<double, std::milli>(t1_rgp - t0_rgp).count());
 
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
                 }
             }
             t7_rg = std::chrono::high_resolution_clock::now();  // resonanceGradient 各段完成
 
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             grad_theta = torch::empty({ n_free_res },
                 torch::TensorOptions().dtype(torch::kFloat64).device(ctpwa_dev(primary_dev)));
             cudaMemcpy(grad_theta.data_ptr(), d_grad_res,
@@ -1445,7 +1446,7 @@ public:
         }
 
         // 6. 保存梯度和loss到ctx
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
         torch::Tensor global_extended_grad = torch::empty({ extended_n_gls },
             TORCH_COMPLEX).to(vector.device());
         cudaMemcpy(global_extended_grad.data_ptr(), d_grad_global,
@@ -1468,7 +1469,7 @@ public:
         // 恢复主设备再返回：forward 尾部各 per-GPU 段可能把 raw current device
         // 留在非主卡，torch 缓存又只随 torch 自身调用更新——保持 raw 与 torch
         // 主设备一致，避免后续 python/torch 的裸/张量操作落到错误物理卡。
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
         return torch::tensor(loss, torch::kDouble).to(vector.device());
     }
 
@@ -1610,7 +1611,7 @@ public:
         }
         d_all_amplitudes_.clear();
 
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         if (d_phsp_matrix_) {
             cudaFree(d_phsp_matrix_);
             d_phsp_matrix_ = nullptr;
@@ -1734,7 +1735,7 @@ public:
                      const std::vector<int>& waves = {},
                      torch::Tensor hessian_in = torch::Tensor())
     {
-        cudaSetDevice(primary_dev_);   // 入口恢复主设备
+        ctpwa::ensure_device(primary_dev_);   // 入口恢复主设备
         TORCH_CHECK(ctpwa_is_cuda_like(params), "params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
 
         // 流式 phsp 分支会临时改写 offsets；异常时也要还原。
@@ -1742,7 +1743,7 @@ public:
         auto wr_guard = makeScopeExit([this, wr_ev0, wr_amp0]() {
             events_offsets_ = wr_ev0;
             amp_offsets_ = wr_amp0;
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         });
 
         int npartials_all = (int)nSLvectors_.size();
@@ -3301,12 +3302,12 @@ public:
     {
         TORCH_CHECK(ctpwa_is_cuda_like(params), "params 必须位于当前后端的设备上（CPU 构建用 CPU 张量）");
         TORCH_CHECK(!pairs.empty(), "pairs 不能为空");
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         auto wi_ev0 = events_offsets_, wi_amp0 = amp_offsets_;
         auto wi_guard = makeScopeExit([this, wi_ev0, wi_amp0]() {
             events_offsets_ = wi_ev0;
             amp_offsets_ = wi_amp0;
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         });
         int npartials = (int)nSLvectors_.size();
         std::vector<int> pair_list;
@@ -4060,7 +4061,7 @@ public:
                 d_v_per_gpu[gpu] = const_cast<ctComplex*>(reinterpret_cast<const ctComplex*>(vil.data_ptr()));
                 v_il_tensors.push_back(vil);
             }
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
 
             double* d_hess;
             ctpwaCheckedMalloc((void**)&d_hess, (size_t)P * P * sizeof(double), "d_hess(2n+P 全 Hessian)");
@@ -4109,7 +4110,7 @@ public:
                     }
                     neg_bkg_weights.push_back(d_neg);
                 }
-                cudaSetDevice(primary_dev);
+                ctpwa::ensure_device(primary_dev);
                 auto uT0 = std::chrono::high_resolution_clock::now();
                 amp_calc_.computeUnifiedHessian(n_bkg_ev, d_hess, P, bkg_off, -1.0,
                     d_v_per_gpu, d_all_amplitudes_, n_amplitudes_, neg_bkg_weights,
@@ -4121,7 +4122,7 @@ public:
                     fflush(stdout);
                 }
                 for (int g = 0; g < n_gpu; ++g) { if (neg_bkg_weights[g]) { cudaSetDevice(g); cudaFree(neg_bkg_weights[g]); } }
-                cudaSetDevice(primary_dev);
+                ctpwa::ensure_device(primary_dev);
             }
 
             // Phsp
@@ -4284,7 +4285,7 @@ public:
                         h_g[a]      = (double)h_g_tmp[a].x;
                         h_g[na + a] = (double)h_g_tmp[a].y;
                     }
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
                     double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
                     cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
                     int grid = (2 * na + 255) / 256;
@@ -4335,7 +4336,7 @@ public:
                         h_g[a]      = (double)h_g_tmp[a].x;
                         h_g[na + a] = (double)h_g_tmp[a].y;
                     }
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
                     double* d_tmp; cudaMalloc(&d_tmp, 2 * na * sizeof(double));
                     cudaMemcpy(d_tmp, h_g.data(), 2 * na * sizeof(double), cudaMemcpyHostToDevice);
                     int grid = (2 * na + 255) / 256;
@@ -4357,7 +4358,7 @@ public:
                 // --- Phsp gradient: g_phsp = N_eff / phsp_factor * (M × v) ---
                 {
                     double N_eff = data_total_weight_ - bkg_integral_;
-                    cudaSetDevice(primary_dev);
+                    ctpwa::ensure_device(primary_dev);
 
                     // Compute phsp_factor and P_vec = M × v
                     ctComplex* d_P_vec; cudaMalloc(&d_P_vec, na * sizeof(ctComplex));
@@ -4482,7 +4483,7 @@ public:
         // 恢复主 GPU 为当前设备：内部 per-GPU 循环会把它留在最后一个设备，
         // 导致后续 torch.device('cuda')（index=None → 当前设备）的 tensor 落在
         // 非主 GPU，触发 getNLL/getHessian 的 params 位置检查（测试套件实测）。
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
 
         if (hprof) {
             auto hTend = std::chrono::high_resolution_clock::now();
@@ -4591,7 +4592,7 @@ public:
             // 临时缓冲由 tmp_guard 在本次 GPU 迭代结束时释放（含异常路径）。
         }
         // 多 GPU 循环后恢复主设备（FF/EFF/writeResult 等随后会做 torch/耦合运算）
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
     }
 
     // =====================================================================
@@ -4720,7 +4721,7 @@ public:
         auto offset_guard = makeScopeExit([&]() {
             events_offsets_ = saved_ev;
             amp_offsets_ = saved_amp;
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         });
         // 旧实现在 computeBranchingFractions 内每次调用都 cudaMalloc/cudaFree
         // 两个大缓冲（ngls×1e5×npolar×16B ≈ 139 MB）：15M 事件的 truth = 150 batch
@@ -4748,7 +4749,7 @@ public:
                 if (ws_upcast[g])  cudaFree(ws_upcast[g]);
                 if (ws_weights[g]) cudaFree(ws_weights[g]);
             }
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         });
         // 当前批的 A 表；异常（kernel 报错等）时也要释放。
         std::vector<ctComplex*> d_batch_amps;
@@ -4758,7 +4759,7 @@ public:
                     cudaSetDevice((int)g);
                     cudaFree(d_batch_amps[g]);
                 }
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         });
         for (int g = 0; g < n_gpus_; ++g) {
             cudaSetDevice(g);
@@ -4866,7 +4867,7 @@ public:
         }
         memprobe("exit(after ws free)", -1);
         events_offsets_ = saved_ev; amp_offsets_ = saved_amp;
-        cudaSetDevice(primary_dev_);   // 恢复主设备（内部多 GPU 循环后 raw 停在最后卡）
+        ctpwa::ensure_device(primary_dev_);   // 恢复主设备（内部多 GPU 循环后 raw 停在最后卡）
         return weight_sum;
     }
 
@@ -4966,7 +4967,7 @@ public:
     torch::Tensor getFitFractions(torch::Tensor vector,
         torch::Tensor hessian_in)
     {
-        cudaSetDevice(primary_dev_);   // 入口恢复主设备（调用方可能刚从多 GPU 段返回）
+        ctpwa::ensure_device(primary_dev_);   // 入口恢复主设备（调用方可能刚从多 GPU 段返回）
 
         // 未配置 phsp_truth(无效率相空间 MC)时天然返回空张量 [0,2]:
         // 早期拟合不带 mctruth, fit.py 据此自然跳过, 不抛异常、不触碰任何相关 kernel。
@@ -5126,7 +5127,7 @@ public:
     torch::Tensor phspMatrixFromGram(const torch::Tensor& vector, double* W_out = nullptr,
                                      double* Wtotal_out = nullptr)
     {
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         const int np = n_amplitudes_;      // B̄ 是 n_amplitudes_ × n_amplitudes_
         auto opts2d = torch::TensorOptions().dtype(torch::kFloat64);
         TORCH_CHECK((int)vector.numel() == np,
@@ -5207,7 +5208,7 @@ public:
     // 内部用：给定耦合向量算某样本的原始积分矩阵（rec 走常驻 B̄，truth 走一趟扫描）。
     torch::Tensor matrixForSample(torch::Tensor vector, std::string sample)
     {
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         if (sample == "truth") sample = "phsp_truth";
         if (sample == "phsp") {
             // 重建侧不再读文件：常驻 B̄ 收缩（B̄ 在构造 / reCalcAmp / writeResult 时刷新）
@@ -5268,7 +5269,7 @@ public:
     std::vector<torch::Tensor> computeMatrixErrors(
         torch::Tensor params, torch::Tensor hessian_in)
     {
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         TORCH_CHECK(ctpwa_is_cuda_like(params) && params.dtype() == torch::kFloat64,
             "params 必须是当前后端设备上的 float64 统一参数 [Re p, Im p, θ]");
         const int n = getNVector();
@@ -5290,7 +5291,7 @@ public:
         // 异常路径也必须还原 θ：runMatrices/逐方向扫描会改 theta_cur_。
         auto theta_guard = makeScopeExit([&]() { theta_cur_ = theta_saved; });
         // 读 B̄ 权重时按 GPU 循环会把 current device 留在最后一张卡。
-        auto dev_guard = makeScopeExit([&]() { cudaSetDevice(primary_dev_); });
+        auto dev_guard = makeScopeExit([&]() { ctpwa::ensure_device(primary_dev_); });
 
         // ---- 统一 Hessian → Cov（耦合自由方向的边际协方差）----
         torch::Tensor H = hessian_in;
@@ -5427,7 +5428,7 @@ public:
         std::vector<double> Br, Bi;
         double W_total_rec = 0.0;
         {
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
             Br.resize((size_t)namp * namp);
             Bi.resize((size_t)namp * namp);
             if (d_phsp_matrix_double_ != nullptr) {
@@ -5588,7 +5589,7 @@ public:
     torch::Tensor getEfficiency(torch::Tensor vector,
         torch::Tensor hessian_in)
     {
-        cudaSetDevice(primary_dev_);   // 入口恢复主设备
+        ctpwa::ensure_device(primary_dev_);   // 入口恢复主设备
 
         // 需要 phsp（带效率 MC）与 phsp_truth（无效率 MC）两个数据键;
         // 缺任一 → 天然返回空张量 [0,2]（同 getFitFractions 的缺数据行为）。
@@ -5941,7 +5942,7 @@ public:
             // 每次调用只恢复一次（不是逐批/逐事件操作），避免 reCalcAmp 后
             // raw current device 停在最后一张卡；异常路径也同样恢复。
             auto device_guard = makeScopeExit([this]() {
-                cudaSetDevice(primary_dev_);
+                ctpwa::ensure_device(primary_dev_);
             });
             int primary_dev = primary_dev_;
             // Pre-compute total phsp weight for correct global normalization
@@ -5959,7 +5960,7 @@ public:
             }
             if (W_total <= 0.0) W_total = 1.0;
 
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
             // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
             // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
@@ -6009,14 +6010,14 @@ public:
                         axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_phsp_gpu);
                     } else {
-                        cudaSetDevice(primary_dev);
+                        ctpwa::ensure_device(primary_dev);
                         ctComplex* d_temp;
                         cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                         cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
                             n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                         cudaSetDevice(gpu);
                         cudaFree(d_phsp_gpu);
-                        cudaSetDevice(primary_dev);
+                        ctpwa::ensure_device(primary_dev);
                         ctComplex one = ctMake(1.0f, 0.0f);
                         axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_temp);
@@ -6027,7 +6028,7 @@ public:
             }
             // 多卡循环会把 current device 留在最后一张卡；调用方（reCalcAmp/
             // writeResult/getHessian）随后用 torch 默认 device 建张量，必须回来。
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
     }
 
     void reCalcAmp(torch::Tensor params)
@@ -6145,7 +6146,7 @@ public:
             }
             events_offsets_ = saved_ev;
             amp_offsets_ = saved_amp;
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
         };
 
         try {
@@ -6521,7 +6522,7 @@ private:
         // 先放在主卡，再显式复制到其他卡；不能继承前一个多卡调用残留的
         // current device=1，否则后续 make_params(cuda:0) 与主卡定义冲突。
         primary_dev_ = 0;
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
         params_.setPrimaryDevice(primary_dev_);
 
         // 初始化粒子信息
@@ -7009,7 +7010,7 @@ private:
         }
         if (W_total <= 0.0) W_total = 1.0;
 
-        cudaSetDevice(primary_dev_);  // ensure d_phsp_matrix_ is allocated on primary GPU
+        ctpwa::ensure_device(primary_dev_);  // ensure d_phsp_matrix_ is allocated on primary GPU
         cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
         cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
 
@@ -7093,7 +7094,7 @@ private:
                             axpyComplex(d_phsp_matrix_, d_m, ctMake(1.0f, 0.0f),
                                         n_amplitudes_ * n_amplitudes_);
                         } else {
-                            cudaSetDevice(primary_dev_);
+                            ctpwa::ensure_device(primary_dev_);
                             ctComplex* d_temp;
                             cudaMalloc(&d_temp, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                             cudaMemcpyPeer(d_temp, primary_dev_, d_m, gpu,
@@ -7143,7 +7144,7 @@ private:
                             axpyZComplex(d_phsp_matrix_double_, d_md,
                                          n_amplitudes_ * n_amplitudes_);
                         } else {
-                            cudaSetDevice(primary_dev_);
+                            ctpwa::ensure_device(primary_dev_);
                             cuDoubleComplex* d_temp;
                             cudaMalloc(&d_temp, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
                             cudaMemcpyPeer(d_temp, primary_dev_, d_md, gpu,
@@ -7168,7 +7169,7 @@ private:
             }
             events_offsets_ = saved_ev;
             amp_offsets_ = saved_amp;
-            cudaSetDevice(primary_dev_);
+            ctpwa::ensure_device(primary_dev_);
             std::cout << "[ctpwa] phsp 矩阵（float32+double）构建完成，phsp 振幅不驻留。"
                       << std::endl;
         } else {
@@ -7224,14 +7225,14 @@ private:
                         axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_phsp_gpu);
                     } else {
-                        cudaSetDevice(primary_dev_);
+                        ctpwa::ensure_device(primary_dev_);
                         ctComplex* d_temp;
                         cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                         cudaMemcpyPeer(d_temp, primary_dev_, d_phsp_gpu, gpu,
                             n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                         cudaSetDevice(gpu);
                         cudaFree(d_phsp_gpu);
-                        cudaSetDevice(primary_dev_);
+                        ctpwa::ensure_device(primary_dev_);
                         ctComplex one = ctMake(1.0f, 0.0f);
                         axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_temp);
@@ -7271,7 +7272,7 @@ private:
         // current-device 缓存在其首次 CUDA 调用时从 raw device 懒初始化——
         // 漏掉此恢复会让随后的 torch.device('cuda')/tensor 落到非主 GPU
         // （getNLL/getHessian 的 params 位置检查触发，测试套件双卡实测必现）。
-        cudaSetDevice(primary_dev_);
+        ctpwa::ensure_device(primary_dev_);
     }
 
     void initializeMultiGPUs(std::vector<int> init_events)

@@ -1,5 +1,6 @@
 #include <Parameters.cuh>
-#include "Backend.h"     // CTPWA_KERNEL / CTPWA_TID / CTPWA_LAUNCH / 双后端
+#include "Backend.h"  // CTPWA_KERNEL / CTPWA_TID / CTPWA_LAUNCH / 双后端
+#include "DeviceGuard.h"  // ctpwa::ensure_device / DeviceGuard
 #include <cuda_runtime.h>  // CPU 后端由 include/cpu_shims 接手
 #include <AmpGen.cuh>
 
@@ -228,7 +229,7 @@ void Parameters::freeCouplingData()
 void Parameters::uploadCouplingData()
 {
     if (!has_coupling_matrix_) return;
-    if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);   // 表固定上传到主设备
+    if (primary_dev_ >= 0) ctpwa::ensure_device(primary_dev_);   // 表固定上传到主设备
     freeCouplingData();
     const auto& r = coupling_matrix_;
 
@@ -309,7 +310,7 @@ void Parameters::extendCouplingParams(
     const auto& cm = coupling_matrix_;
     int total_threads = cm.n_amps + nt;
     int grid = (total_threads + 255) / 256;
-    if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);
+    if (primary_dev_ >= 0) ctpwa::ensure_device(primary_dev_);
     CTPWA_LAUNCH(extendCouplingParamsKernel, grid, 256, 0, 
         d_out, d_in,
         d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
@@ -322,7 +323,7 @@ void Parameters::applyCouplingMatrix(const double* d_params, ctComplex* d_v_out)
     if (!has_coupling_matrix_) return;
     const auto& cm = coupling_matrix_;
     int grid = (cm.n_amps + 255) / 256;
-    if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);   // 耦合 kernel 固定主设备（防多卡错卡）
+    if (primary_dev_ >= 0) ctpwa::ensure_device(primary_dev_);   // 耦合 kernel 固定主设备（防多卡错卡）
     CTPWA_LAUNCH(multiplicativeCouplingKernel, grid, 256, 0, 
         d_v_out, d_params,
         d_amp_chain_, d_step_offsets_, d_step_data_, d_amp_chain_ratio_,
@@ -337,7 +338,7 @@ void Parameters::transformCouplingGradient(
     if (!has_coupling_matrix_) return;
     const auto& cm = coupling_matrix_;
     int grid = (cm.n_free + 255) / 256;
-    if (primary_dev_ >= 0) cudaSetDevice(primary_dev_);
+    if (primary_dev_ >= 0) ctpwa::ensure_device(primary_dev_);
     CTPWA_LAUNCH(multiplicativeGradientKernel, grid, 256, 0, 
         d_grad_p, d_grad_v, d_v, d_params,
         d_amp_chain_, d_step_offsets_, d_step_data_,

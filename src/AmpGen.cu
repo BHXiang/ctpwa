@@ -1,5 +1,6 @@
 #include <AmpGen.cuh>
-#include "Backend.h"     // CTPWA_KERNEL / CTPWA_LAUNCH(_P) / 双后端
+#include "Backend.h"  // CTPWA_KERNEL / CTPWA_LAUNCH(_P) / 双后端
+#include "DeviceGuard.h"  // ctpwa::ensure_device / DeviceGuard
 #include "PrecCpx.h"
 #include <ComputeHessian.cuh>
 #include <CustomExpr.cuh>
@@ -3189,11 +3190,11 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
             cudaMalloc(&d_params_per_gpu_[gpu], n_free * sizeof(double));
         }
         // 恢复 primary，保持函数内后续逻辑的当前设备语义一致
-        cudaSetDevice(primary_dev);
+        ctpwa::ensure_device(primary_dev);
     }
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == primary_dev) {
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             cudaMemcpy(d_params_per_gpu_[primary_dev], d_params,
                        n_free * sizeof(double), cudaMemcpyDeviceToDevice);
         } else {
@@ -3714,7 +3715,7 @@ void AmpCalc::reComputeAmps(std::vector<ctComplex*>& d_amplitudes,
 
     prof_tick("tail");
     // 恢复 primary device
-    cudaSetDevice(primary_dev);
+    ctpwa::ensure_device(primary_dev);
 }
 
 // ============================================================
@@ -4035,7 +4036,7 @@ void AmpCalc::computeResonanceGradient(
     // 将各 GPU 结果通过 daxpy 累加到 d_grad_res（在 primary_dev 上）
     for (int gpu = 0; gpu < n_gpu; ++gpu) {
         if (gpu == primary_dev) {
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             int grid = (n_free + 255) / 256;
             CTPWA_LAUNCH(daxpy_kernel, grid, 256, 0, d_grad_res, d_grad_per_gpu_[primary_dev], 1.0, n_free);
             cudaDeviceSynchronize();
@@ -4044,7 +4045,7 @@ void AmpCalc::computeResonanceGradient(
             cudaSetDevice(gpu);
             cudaMemcpy(h_temp.data(), d_grad_per_gpu_[gpu],
                        n_free * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             double* d_temp;
             cudaMalloc(&d_temp, n_free * sizeof(double));
             cudaMemcpy(d_temp, h_temp.data(), n_free * sizeof(double), cudaMemcpyHostToDevice);
@@ -4055,7 +4056,7 @@ void AmpCalc::computeResonanceGradient(
         }
     }
 
-    cudaSetDevice(primary_dev);
+    ctpwa::ensure_device(primary_dev);
 }
 
 void AmpCalc::computeUnifiedHessian(
@@ -4603,7 +4604,7 @@ void AmpCalc::computeUnifiedHessian(
         if (is_remote) {
             double one = 1.0;
             // d_hess: copy peer → daxpy on primary_dev
-            cudaSetDevice(primary_dev);
+            ctpwa::ensure_device(primary_dev);
             double* d_tmp; cudaMalloc(&d_tmp, hess_sz * sizeof(double));
             cudaMemcpyPeer(d_tmp, primary_dev, d_hess_g, gpu, hess_sz * sizeof(double));
             cublasHandle_t h; cublasCreate(&h);
@@ -4611,19 +4612,19 @@ void AmpCalc::computeUnifiedHessian(
             cublasDestroy(h); cudaFree(d_tmp);
             // d_phsp_hessA
             if (d_phsp_hessA) {
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, hess_sz * sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, hess_sz * sizeof(double));
                 cudaMemcpyPeer(d_tmp, primary_dev, d_phA_g, gpu, hess_sz * sizeof(double));
                 cublasCreate(&h); cublasDaxpy(h, hess_sz, &one, d_tmp, 1, d_phsp_hessA, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
                 // d_phsp_I: copy single value
                 double h_pI;
                 cudaSetDevice(gpu); cudaMemcpy(&h_pI, d_pI_g, sizeof(double), cudaMemcpyDeviceToHost);
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, sizeof(double));
                 cudaMemcpy(d_tmp, &h_pI, sizeof(double), cudaMemcpyHostToDevice);
                 cublasCreate(&h); cublasDaxpy(h, 1, &one, d_tmp, 1, d_phsp_I, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
                 // d_phsp_grad
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, n_free * sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, n_free * sizeof(double));
                 cudaMemcpyPeer(d_tmp, primary_dev, d_pg_g, gpu, n_free * sizeof(double));
                 cublasCreate(&h); cublasDaxpy(h, n_free, &one, d_tmp, 1, d_phsp_grad, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
@@ -4631,20 +4632,20 @@ void AmpCalc::computeUnifiedHessian(
             // d_mixed_out, d_phsp_mixed_sum
             int mix_sz = 2 * n_amp_total * n_free;
             if (d_mixed_out) {
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
                 cudaMemcpyPeer(d_tmp, primary_dev, d_mix_g, gpu, mix_sz * sizeof(double));
                 cublasCreate(&h); cublasDaxpy(h, mix_sz, &one, d_tmp, 1, d_mixed_out, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
             }
             if (d_phsp_mixed_sum) {
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, mix_sz * sizeof(double));
                 cudaMemcpyPeer(d_tmp, primary_dev, d_msum_g, gpu, mix_sz * sizeof(double));
                 cublasCreate(&h); cublasDaxpy(h, mix_sz, &one, d_tmp, 1, d_phsp_mixed_sum, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
             }
             if (d_phsp_mixed_t3) {
                 int t3_sz = 2 * n_amp_total;
-                cudaSetDevice(primary_dev); cudaMalloc(&d_tmp, t3_sz * sizeof(double));
+                ctpwa::ensure_device(primary_dev); cudaMalloc(&d_tmp, t3_sz * sizeof(double));
                 cudaMemcpyPeer(d_tmp, primary_dev, d_t3_g, gpu, t3_sz * sizeof(double));
                 cublasCreate(&h); cublasDaxpy(h, t3_sz, &one, d_tmp, 1, d_phsp_mixed_t3, 1);
                 cublasDestroy(h); cudaFree(d_tmp);
@@ -4663,7 +4664,7 @@ void AmpCalc::computeUnifiedHessian(
             if (d_t3_g) cudaFree(d_t3_g);
         }
     }
-    cudaSetDevice(primary_dev);
+    ctpwa::ensure_device(primary_dev);
 }
 
 
