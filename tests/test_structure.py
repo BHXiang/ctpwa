@@ -226,10 +226,15 @@ def test_device_info_fields():
 
     dm = ctpwa.DeviceManager()
     dm.detect()
+    is_cpu = ctpwa.backend() == "cpu"
     for i in range(dm.numDevices()):
         assert len(dm.deviceName(i)) > 0, f"GPU {i} 名称为空"
         cc_major, cc_minor = dm.deviceComputeCapability(i)
-        assert cc_major >= 1, f"GPU {i} 算力异常"
+        # CPU 后端的伪设备没有"算力"概念（cc = 0/0），跳过该项而不是判失败。
+        if not is_cpu:
+            assert cc_major >= 1, f"GPU {i} 算力异常"
+        else:
+            assert cc_major == 0 and cc_minor == 0, f"CPU 伪设备算力应为 0/0"
         total = dm.deviceMemoryTotal(i)
         free = dm.deviceMemoryFree(i)
         assert total > 0, f"GPU {i} 总显存为 0"

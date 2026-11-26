@@ -183,7 +183,23 @@ void memset(void* p, int value, std::size_t bytes)
 
 void sync() {}
 
-bool set_device(int index) { return index == 0; }
+// CPU 后端只有一个伪设备（index 0）。越界 index 以前是静默 return false，于是
+// 「多卡代码在 CPU 上跑」会无声退化到 0 号设备——这正是设备类 bug 在无卡机器上
+// 不可见的原因。现在明确报到 stderr（每进程只报一次，避免循环刷屏）；严格模式
+// （CTPWA_STRICT_DEVICE=1）下由 DeviceGuard.h 的 device_set 负责 abort。
+bool set_device(int index)
+{
+    if (index == 0) return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr,
+                     "[ctpwa] CPU 后端只有设备 0，收到 set_device(%d)；"
+                     "多卡路径在 CPU 构建上不生效（CTPWA_STRICT_DEVICE=1 可直接中止）\n",
+                     index);
+    }
+    return false;
+}
 
 int device_count() { return 1; }
 

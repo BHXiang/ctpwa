@@ -20,7 +20,7 @@
 
 | passed | failed | skipped | 文件数 |
 |---|---|---|---|
-| **183** | **8** | 26（另有 7 个文件整文件 skip，解析器未计入） | 41 |
+| **183** | **8** → 修 P0-D 后 **7** | 26（另有 7 个文件整文件 skip，解析器未计入） | 41 |
 
 耗时：全套约 6 分钟（逐文件串行，OMP_NUM_THREADS=4）。
 
@@ -31,7 +31,7 @@
 | `test_float_mode.py` | 4 failed | `precision: float` 相关 | 预期：float 档是 GPU/混合精度路径，CPU 构建（double）不具备 |
 | `test_hessian_bwr_spec.py` | 2 failed | BWR 解析特化 vs 字节码对照 | 预期：`bwrSpecEval` 闭式特化只接了 CUDA 路径，CPU 走 `not_implemented` 或退化解 |
 | `test_memory_monitor.py` | 1 failed | 显存监控 | 预期：CPU 构建无显存概念 |
-| `test_structure.py` | 1 failed | 结构/设备探测 | 待查（与 `DeviceManager` 的 CPU 伪设备有关） |
+| ~~`test_structure.py`~~ | ~~1 failed~~ | ~~结构/设备探测~~ | ✅ 已修（见 P0-D：CPU 伪设备 cc=0 不该判失败），现 24 passed |
 | `test_reparam.py` | 4 **errors** | `ModuleNotFoundError: ctpwa.diagnostics; 'ctpwa' is not a package` | **测试自身的 bug**：fixture 用 `types.ModuleType("ctpwa")` 打桩后加载 `example/fit.py`，但 `example/fit.py:28` 新增了 `from ctpwa.diagnostics import ...`，桩没跟上 |
 
 ## 4. 关键发现：CPU 门禁目前**不验证数值**
