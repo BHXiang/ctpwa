@@ -174,6 +174,7 @@ SOURCES_CORE = [
     "src/MatrixErrors.cu",   # P4：干涉矩阵统计误差
     "src/SLAmpsIO.cu",       # P4：SL 振幅表导出
     "src/TruthIntegrals.cu", # P4：产生侧分波积分
+    "src/BatchIntegrals.cu", # P4：分批全样本积分
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
