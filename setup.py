@@ -170,6 +170,7 @@ SOURCES_CORE = [
     "src/DecayDesc.cu",      # P3：Amp2BD 实现（纯 host）
     "src/DataReader.cu",     # P4：数据文件读取（纯 host）
     "src/MatrixStats.cu",    # P4：矩阵统计（纯张量数学）
+    "src/PhspGram.cu",       # P4：phsp Gram → 干涉矩阵
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 
