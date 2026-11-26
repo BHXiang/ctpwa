@@ -23,6 +23,7 @@
 | P4 第三步（`PhspGram` 显式输入模块） | ✅ | `b5b7975` |
 | P4 第四步（`MatrixErrors` + 共享 helper 头） | ✅ | `8c0e86a` |
 | P4 第五步（`SLAmpsIO`） | ✅ | `cd05b49` |
+| P4 第六步（helper 上移 + `TruthIntegrals`） | ✅ | `fa8f7fd` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -362,6 +363,29 @@ computeBranchingFractions（别处的自由函数）→ 还要把头也搬
 
 所以下一轮的第一个任务不是搬函数，而是**把这批 helper 归位**——之后
 `computeTruthIntegrals`、`ampSegmentToTensor` 这类函数才能干净搬走。
+
+---
+
+## P4（第六步）：先做 helper 上移，再搬函数
+
+上一轮发现"搬函数会牵出 static helper 与 kernel"。这轮先把它们归位：
+
+| 上移的东西 | 去处 | 结果 |
+|---|---|---|
+| `upcastAmpSegToDouble`（原 `static`） | `include/MixedPrecision.h`（inline） | 它依赖的 `castF2ToDouble2Kernel` 定义在 `ComputeHessian.cu`、声明在 `.cuh`，所以放头安全 |
+| `ctpwa_dev` / `ctpwa_is_cuda_like` / `ctpwa_on_primary` / `ScopeExit` / `makeScopeExit` / `CUDA_CHECK` | `BackendHelpers.h`（已存在，本轮把 Analysis.h 里的重复定义删掉） | 上轮为 MatrixErrors 新建时，Analysis.h 还留着自己的那份 → 重定义 |
+
+归位之后，两个函数一次就搬干净了：
+
+- `computeTruthIntegrals`（77 行）→ `include/TruthIntegrals.h` + `src/TruthIntegrals.cu`，
+  新增 5 个显式参数（`n_slvectors` / `float_amps` / `n_polar` / `n_amplitudes` / `primary_dev`）；
+- `ampSegmentToTensor`（15 行）→ 并入 `SLAmpsIO`，直接复用上移后的上转工具。
+
+`Analysis.h` 7220 → **7079 行**。门禁 254 passed / 7 failed / 56 skipped / 4 known
+errors；CUDA 只编译 EXIT=0、0 错误。
+
+**方法论沉淀**：搬函数前先问三件事——它读哪些成员（→ 参数/字段）、它调哪些算法
+（→ 回调）、它用到哪些 static helper / kernel（→ 先上移，kernel 只能进 .cu）。
 
 ---
 
