@@ -34,14 +34,22 @@ def reparam():
 
     stub = types.ModuleType("ctpwa")
     stub.analysis = lambda *a, **k: _Ana()
+    # example/fit.py 现在还会 `from ctpwa.diagnostics import ...`；桩必须带上子模块，
+    # 否则会出现 "No module named 'ctpwa.diagnostics'; 'ctpwa' is not a package"。
+    diag = types.ModuleType("ctpwa.diagnostics")
+    diag.analyze_hessian = lambda *a, **k: {}
+    diag.map_errors_to_params = lambda *a, **k: []
+    stub.diagnostics = diag
 
     old = sys.modules.get("ctpwa")
     sys.modules["ctpwa"] = stub
+    sys.modules["ctpwa.diagnostics"] = diag
     try:
         spec = importlib.util.spec_from_file_location("ctpwa_example_fit", FIT_PY)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     finally:
+        sys.modules.pop("ctpwa.diagnostics", None)
         if old is not None:
             sys.modules["ctpwa"] = old
         else:

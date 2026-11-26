@@ -57,6 +57,16 @@ ls test_*.py | xargs -P "${JOBS}" -I{} bash -c 'run_one "$@"' _ {}
 
 cat "$TABLE"
 awk 'NR>1 && $2+$3+$4+$5>0 {p+=$2; f+=$3; s+=$4; e+=$5}
-     END {printf "\n合计: passed=%d failed=%d skipped=%d errors=%d\n", p, f, s, e}' "$TABLE"
+     END {printf "\n合计: passed=%d failed=%d skipped=%d errors=%d\n", p, f, s, e;
+          printf "%d %d %d\n", p, f, e > "/dev/stderr"}' "$TABLE" 2> "${OUTDIR}/totals"
 awk 'NR>1 && $3+$5>0 {printf "  !! %-40s fail=%s err=%s\n", $1, $3, $5}' "$TABLE"
 echo "逐文件表: ${TABLE}"
+
+# 门禁判据：failed 与 errors 必须为 0（skipped 允许——GPU-only 用例在 CPU 构建上就是跳过）。
+# 2026-11 起 CPU 构建是全绿的（258 passed / 0 failed / 63 skipped），所以"红即回归"。
+read -r P F E < "${OUTDIR}/totals"
+if (( F > 0 || E > 0 )); then
+    echo "❌ 门禁失败: failed=$F errors=$E（passed=$P）"
+    exit 1
+fi
+echo "✅ 门禁通过: passed=$P failed=0 errors=0"

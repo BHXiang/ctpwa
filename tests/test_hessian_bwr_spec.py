@@ -13,8 +13,13 @@ import numpy as np
 import pytest
 import torch
 
-from conftest import make_params
+from conftest import CPU_BUILD, make_params
 
+
+
+# 仅 CUDA 构建覆盖：BWR 解析特化只接了 CUDA kernel；CPU 走字节码路径。跳过不是"不测"，而是这些路径在 CPU 构建里
+# 没有对应实现；由 CUDA 侧（CI 的 compile job + 集群 GPU 回归）覆盖。
+pytestmark = pytest.mark.skipif(CPU_BUILD, reason="仅 CUDA 构建（见文件内说明）")
 
 def _hess(ana_key, use_bytecode: bool):
     import ctpwa

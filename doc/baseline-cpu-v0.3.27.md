@@ -21,11 +21,21 @@
 | 阶段 | passed | failed | skipped | 说明 |
 |---|---|---|---|---|
 | 重构前（v0.3.27） | 183 | 8 | 26（另有 7 个文件整文件 skip，解析器未计入） | 数值用例全 skip |
-| **P2 后（新基线）** | **251 + 3**（`test_ownership`） | **7** | 30 | 数值/物理用例已能在 CPU 上跑 |
+| P2 后 | 254 | 7 | 56 | 数值/物理用例已能在 CPU 上跑 |
+| **现在（门禁全绿）** | **258** | **0** | **63** | failed/errors 归零，门禁"红即回归" |
 
-新基线 = `tmp/baseline2_table.txt`（逐文件表）+ `tests/test_ownership.py`（3 个）。
-七项失败：`test_float_mode` 4、`test_hessian_bwr_spec` 2、`test_memory_monitor` 1。
-`test_structure` 已修（24 passed）。
+归零的路径（都不是"删测试"）：
+
+| 原问题 | 处理 |
+|---|---|
+| `test_reparam` 4 errors | 测试桩 bug：`example/fit.py` 新增了 `from ctpwa.diagnostics import …`，桩没跟上。补上子模块桩 → 4 passed |
+| `test_float_mode` 4 failed | `precision:float` 是 GPU 混合精度档（A 存 float2 + 窗口上转），CPU 构建固定 double → 标记为"仅 CUDA 构建覆盖"并写明理由 |
+| `test_hessian_bwr_spec` 2 failed | BWR 解析特化只接了 CUDA kernel，CPU 走字节码路径 → 同上 |
+| `test_memory_monitor` 1 failed | `cudaMemGetInfo` 显存监控，CPU 用可用 RAM 替代，语义不同 → 同上 |
+| `test_structure` 1 failed | CPU 伪设备算力 0/0 不该按 GPU 判 → 已改为分后端断言 |
+
+`bash scripts/run_tests_parallel.sh` 现在**以退出码表达判据**：failed>0 或 errors>0 即 exit 1，
+skipped 不计（GPU-only 用例在 CPU 构建上就该跳过）。CI 直接吃这个退出码。
 
 耗时：全套约 6 分钟（逐文件串行，OMP_NUM_THREADS=4）。
 

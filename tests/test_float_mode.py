@@ -19,8 +19,13 @@ GEN_DIR = TESTS_DIR / "_gen_float_mode"
 GEN_DIR.mkdir(exist_ok=True)
 
 import ctpwa  # noqa: E402
-from conftest import make_params  # noqa: E402
+from conftest import CPU_BUILD, make_params  # noqa: E402
 
+
+
+# 仅 CUDA 构建覆盖：precision:float 是 GPU 混合精度档，CPU 构建固定 double。跳过不是"不测"，而是这些路径在 CPU 构建里
+# 没有对应实现；由 CUDA 侧（CI 的 compile job + 集群 GPU 回归）覆盖。
+pytestmark = pytest.mark.skipif(CPU_BUILD, reason="仅 CUDA 构建（见文件内说明）")
 
 def _analysis(name: str, precision: str):
     base = (TESTS_DIR / "configs" / f"{name}.yml").read_text()

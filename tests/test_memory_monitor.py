@@ -24,6 +24,12 @@ from pathlib import Path
 import pytest
 import torch
 
+from conftest import CPU_BUILD
+
+# 仅 CUDA 构建覆盖：cudaMemGetInfo 显存监控；CPU 构建语义不同。跳过不是"不测"，而是这些路径在 CPU 构建里
+# 没有对应实现；由 CUDA 侧（CI 的 compile job + 集群 GPU 回归）覆盖。
+pytestmark = pytest.mark.skipif(CPU_BUILD, reason="仅 CUDA 构建（见文件内说明）")
+
 TESTS_DIR = Path(__file__).resolve().parent
 OUT_DIR = TESTS_DIR / "outputs"
 GEN_DIR = TESTS_DIR / "outputs" / "gen"
@@ -153,7 +159,7 @@ def memmon_env():
 
 def test_memory_monitor(memmon_env):
     import ctpwa
-    from conftest import make_params
+    from conftest import CPU_BUILD, make_params
 
     print(f"\n  [MEM] 规模: phsp={N_PHSP} 事件 (x{PHSP_MULT}), 6 波, pol=3", flush=True)
 
