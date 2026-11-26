@@ -414,19 +414,6 @@ static void axpyZComplex(cuDoubleComplex* y, const cuDoubleComplex* x, std::ptrd
 // 带诊断的 cudaMalloc：OOM 时直接报"哪个缓冲/多大/哪张卡/还剩多少"，
 // 而不是把 cudaMalloc 的失败结果（nullptr/未定义指针）喂进 kernel，最后报成
 // 一句无从下手的 "illegal memory access"。
-static void ctpwaCheckedMalloc(void** ptr, size_t bytes, const char* what)
-{
-    cudaError_t e = cudaMalloc(ptr, bytes);
-    if (e != cudaSuccess) {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        size_t mf = 0, mt = 0;
-        cudaMemGetInfo(&mf, &mt);
-        TORCH_CHECK(false, "[ctpwa] cudaMalloc(", what, ") 失败: 需要 ", bytes >> 20,
-            " MiB, gpu=", dev, " 可用 ", mf >> 20, " / ", mt >> 20, " MiB (",
-            cudaGetErrorString(e), ")");
-    }
-}
 
 //////////////////////////////////////////////////////////////
 /// NLLFunction 类定义
@@ -4558,96 +4545,11 @@ public:
     // 抽出来是为了让 reCalcAmp(θ) 之后 B̄ 也新鲜（此前只在 getHessian 里更新）。
     void rebuildPhspGram()
     {
-            // 每次调用只恢复一次（不是逐批/逐事件操作），避免 reCalcAmp 后
-            // raw current device 停在最后一张卡；异常路径也同样恢复。
-            auto device_guard = makeScopeExit([this]() {
-                ctpwa::ensure_device(primary_dev_);
-            });
-            int primary_dev = primary_dev_;
-            // Pre-compute total phsp weight for correct global normalization
-            double W_total = 0.0;
-            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                int nP = events_[gpu][0];
-                if (nP == 0) continue;
-                if (gpu < phsp_weights_.size() && phsp_weights_[gpu] != nullptr) {
-                    cudaSetDevice(gpu);
-                    thrust::device_ptr<double> dp(phsp_weights_[gpu]);
-                    W_total += thrust::reduce(dp, dp + nP);
-                } else {
-                    W_total += (double)nP;
-                }
-            }
-            if (W_total <= 0.0) W_total = 1.0;
-
-            ctpwa::ensure_device(primary_dev);
-            cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-            // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
-            // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
-            for (size_t gpu = 0; gpu < d_all_amplitudes_.size(); ++gpu) {
-                int nPhsp = events_[gpu][0];
-                if (nPhsp == 0) continue;
-                cudaSetDevice(gpu);
-                const int kPhspBatch = phspGramBatchEvents();
-                const double* d_w = (gpu < phsp_weights_.size()) ? phsp_weights_[gpu] : nullptr;
-                cublasHandle_t h;
-                cublasCreate(&h);
-                ctComplex alpha = ctMake(1.0f, 0.0f);
-                for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
-                    int nch = std::min(kPhspBatch, nPhsp - c0);
-                    int nTot = nch * n_polar_ * n_amplitudes_;
-                    ctComplex* d_phsp_scaled;
-                    ctpwaCheckedMalloc((void**)&d_phsp_scaled,
-                        (size_t)nTot * sizeof(ctComplex), "phsp Gram scaled batch");
-                    // phsp 段在 d_all_amplitudes_[gpu] 基址，块起点 = c0 事件 × nPolar×nA
-                    if (float_amps_ && !ctIsFloatComplex) {
-                        const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes_[gpu])
-                            + (size_t)c0 * n_polar_ * n_amplitudes_;
-                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nTot + 255) / 256, 256, 0, 
-                            srcF, reinterpret_cast<cuDoubleComplex*>(d_phsp_scaled), nTot);
-                    } else {
-                        cudaMemcpy(d_phsp_scaled,
-                            d_all_amplitudes_[gpu] + (size_t)c0 * n_polar_ * n_amplitudes_,
-                            nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
-                    }
-                    int grid = (nTot + 255) / 256;
-                    CTPWA_LAUNCH(scalePhspAmpsKernel, grid, 256, 0, d_phsp_scaled,
-                        d_w ? d_w + c0 : nullptr, nch, n_polar_, n_amplitudes_,
-                        1.0 / W_total, 0);
-
-                    ctComplex* d_phsp_gpu;
-                    ctpwaCheckedMalloc((void**)&d_phsp_gpu,
-                        (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex),
-                        "phsp Gram batch matrix");
-                    ctComplex beta = ctMake(0.0f, 0.0f);
-                    CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes_, n_amplitudes_, nch * n_polar_,
-                        &alpha, d_phsp_scaled, n_amplitudes_, d_phsp_scaled, n_amplitudes_,
-                        &beta, d_phsp_gpu, n_amplitudes_);
-                    cudaFree(d_phsp_scaled);
-
-                    if (gpu == (size_t)primary_dev) {
-                        ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
-                        cudaFree(d_phsp_gpu);
-                    } else {
-                        ctpwa::ensure_device(primary_dev);
-                        ctComplex* d_temp;
-                        cudaMalloc(&d_temp, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                        cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
-                            n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                        cudaSetDevice(gpu);
-                        cudaFree(d_phsp_gpu);
-                        ctpwa::ensure_device(primary_dev);
-                        ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
-                        cudaFree(d_temp);
-                        cudaSetDevice(gpu);
-                    }
-                }
-                cublasDestroy(h);
-            }
-            // 多卡循环会把 current device 留在最后一张卡；调用方（reCalcAmp/
-            // writeResult/getHessian）随后用 torch 默认 device 建张量，必须回来。
-            ctpwa::ensure_device(primary_dev_);
+        // P4：实现已搬到 ctpwa::rebuildPhspGram（include/PhspGram.h）
+        ctpwa::rebuildPhspGram(d_all_amplitudes_, events_, phsp_weights_,
+                               float_amps_, n_amplitudes_, n_polar_, primary_dev_,
+                               &d_phsp_matrix_,
+                               [this]() { return phspGramBatchEvents(); });
     }
 
     void reCalcAmp(torch::Tensor params)

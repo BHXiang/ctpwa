@@ -6,6 +6,8 @@
 
 #include <torch/extension.h>
 
+#include <cuda_runtime.h>
+
 #include <utility>
 
 // ---------------------------------------------------------------------------
@@ -42,3 +44,18 @@ ScopeExit<F> makeScopeExit(F f) { return ScopeExit<F>{std::move(f)}; }
             exit(EXIT_FAILURE); \
         } \
     } while (0)
+
+// CUDA 分配包装：失败时打印设备与前后的显存信息（比裸 TORCH_CHECK 好定位 OOM）
+inline void ctpwaCheckedMalloc(void** ptr, size_t bytes, const char* what)
+{
+    cudaError_t e = cudaMalloc(ptr, bytes);
+    if (e != cudaSuccess) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        size_t mf = 0, mt = 0;
+        cudaMemGetInfo(&mf, &mt);
+        TORCH_CHECK(false, "[ctpwa] cudaMalloc(", what, ") 失败: 需要 ", bytes >> 20,
+                    " MiB, GPU ", dev, " 空闲 ", mf >> 20, " / ", mt >> 20, " MiB: ",
+                    cudaGetErrorString(e));
+    }
+}

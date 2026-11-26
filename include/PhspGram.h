@@ -8,8 +8,11 @@
 // 逐个字段告诉调用方漏了什么。
 #pragma once
 
+#include "ComplexType.h"
+
 #include <torch/extension.h>
 
+#include <functional>
 #include <vector>
 
 namespace ctpwa {
@@ -24,6 +27,16 @@ struct PhspGramInputs {
     int n_amplitudes = 0;                   // B̄ 维度
     int primary_dev = 0;                    // B̄ 所在设备
 };
+
+// 重新构建常驻 B̄（phsp Gram）：Σ_ev,p (w/W)·A·A^H，分块构建以压峰值显存。
+//   d_matrix_io : 读写 —— 既被 memset，也被逐块 axpy 累加
+//   batch_events: 每块事件数（依赖当前空闲显存，故用回调而不是常量）
+void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
+                     const std::vector<std::vector<int>>& events,
+                     const std::vector<double*>& phsp_weights,
+                     bool float_amps, int n_amplitudes, int n_polar, int primary_dev,
+                     ctComplex** d_matrix_io,
+                     std::function<int()> batch_events);
 
 // B̄ 收缩成 npartials×npartials 归一化干涉矩阵 M[p][q]。
 //   vector  : 扩展后的振幅向量 [n_amplitudes]（与 .so 复数精度一致）

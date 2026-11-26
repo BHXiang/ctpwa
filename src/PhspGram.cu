@@ -4,15 +4,120 @@
 #include "ComplexType.h"
 #include "PrecCpx.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include "BackendHelpers.h"
 #include "DeviceGuard.h"
+#include "MixedPrecision.h"
+
+#include <ComputeNLL.cuh>   // axpyComplex
 
 #include <cmath>
 #include <complex>
 #include <vector>
 
 namespace ctpwa {
+
+void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
+                     const std::vector<std::vector<int>>& events,
+                     const std::vector<double*>& phsp_weights,
+                     bool float_amps, int n_amplitudes, int n_polar, int primary_dev,
+                     ctComplex** d_matrix_io,
+                     std::function<int()> batch_events)
+{
+            // 每次调用只恢复一次（不是逐批/逐事件操作），避免 reCalcAmp 后
+            // raw current device 停在最后一张卡；异常路径也同样恢复。
+            // 入口设备固定为 primary_dev；退出时还原（等价于原来的 makeScopeExit）
+            auto device_guard = makeScopeExit([primary_dev]() {
+                ctpwa::ensure_device(primary_dev);
+            });
+            // Pre-compute total phsp weight for correct global normalization
+            double W_total = 0.0;
+            for (size_t gpu = 0; gpu < d_all_amplitudes.size(); ++gpu) {
+                int nP = events[gpu][0];
+                if (nP == 0) continue;
+                if (gpu < phsp_weights.size() && phsp_weights[gpu] != nullptr) {
+                    cudaSetDevice(gpu);
+                    thrust::device_ptr<double> dp(phsp_weights[gpu]);
+                    W_total += thrust::reduce(dp, dp + nP);
+                } else {
+                    W_total += (double)nP;
+                }
+            }
+            if (W_total <= 0.0) W_total = 1.0;
+
+            ctpwa::ensure_device(primary_dev);
+            cudaMemset((*d_matrix_io), 0, n_amplitudes * n_amplitudes * sizeof(ctComplex));
+            // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
+            // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
+            for (size_t gpu = 0; gpu < d_all_amplitudes.size(); ++gpu) {
+                int nPhsp = events[gpu][0];
+                if (nPhsp == 0) continue;
+                cudaSetDevice(gpu);
+                const int kPhspBatch = batch_events();
+                const double* d_w = (gpu < phsp_weights.size()) ? phsp_weights[gpu] : nullptr;
+                cublasHandle_t h;
+                cublasCreate(&h);
+                ctComplex alpha = ctMake(1.0f, 0.0f);
+                for (int c0 = 0; c0 < nPhsp; c0 += kPhspBatch) {
+                    int nch = std::min(kPhspBatch, nPhsp - c0);
+                    int nTot = nch * n_polar * n_amplitudes;
+                    ctComplex* d_phsp_scaled;
+                    ctpwaCheckedMalloc((void**)&d_phsp_scaled,
+                        (size_t)nTot * sizeof(ctComplex), "phsp Gram scaled batch");
+                    // phsp 段在 d_all_amplitudes[gpu] 基址，块起点 = c0 事件 × nPolar×nA
+                    if (float_amps && !ctIsFloatComplex) {
+                        const float2* srcF = reinterpret_cast<const float2*>(d_all_amplitudes[gpu])
+                            + (size_t)c0 * n_polar * n_amplitudes;
+                        CTPWA_LAUNCH(castF2ToDouble2Kernel, (nTot + 255) / 256, 256, 0, 
+                            srcF, reinterpret_cast<cuDoubleComplex*>(d_phsp_scaled), nTot);
+                    } else {
+                        cudaMemcpy(d_phsp_scaled,
+                            d_all_amplitudes[gpu] + (size_t)c0 * n_polar * n_amplitudes,
+                            nTot * sizeof(ctComplex), cudaMemcpyDeviceToDevice);
+                    }
+                    int grid = (nTot + 255) / 256;
+                    CTPWA_LAUNCH(scalePhspAmpsKernel, grid, 256, 0, d_phsp_scaled,
+                        d_w ? d_w + c0 : nullptr, nch, n_polar, n_amplitudes,
+                        1.0 / W_total, 0);
+
+                    ctComplex* d_phsp_gpu;
+                    ctpwaCheckedMalloc((void**)&d_phsp_gpu,
+                        (size_t)n_amplitudes * n_amplitudes * sizeof(ctComplex),
+                        "phsp Gram batch matrix");
+                    ctComplex beta = ctMake(0.0f, 0.0f);
+                    CUBLAS_CGEMM(h, CUBLAS_OP_N, CUBLAS_OP_C, n_amplitudes, n_amplitudes, nch * n_polar,
+                        &alpha, d_phsp_scaled, n_amplitudes, d_phsp_scaled, n_amplitudes,
+                        &beta, d_phsp_gpu, n_amplitudes);
+                    cudaFree(d_phsp_scaled);
+
+                    if (gpu == (size_t)primary_dev) {
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex((*d_matrix_io), d_phsp_gpu, one, n_amplitudes * n_amplitudes);
+                        cudaFree(d_phsp_gpu);
+                    } else {
+                        ctpwa::ensure_device(primary_dev);
+                        ctComplex* d_temp;
+                        cudaMalloc(&d_temp, n_amplitudes * n_amplitudes * sizeof(ctComplex));
+                        cudaMemcpyPeer(d_temp, primary_dev, d_phsp_gpu, gpu,
+                            n_amplitudes * n_amplitudes * sizeof(ctComplex));
+                        cudaSetDevice(gpu);
+                        cudaFree(d_phsp_gpu);
+                        ctpwa::ensure_device(primary_dev);
+                        ctComplex one = ctMake(1.0f, 0.0f);
+                        axpyComplex((*d_matrix_io), d_temp, one, n_amplitudes * n_amplitudes);
+                        cudaFree(d_temp);
+                        cudaSetDevice(gpu);
+                    }
+                }
+                cublasDestroy(h);
+            }
+            // 多卡循环会把 current device 留在最后一张卡；调用方（reCalcAmp/
+            // writeResult/getHessian）随后用 torch 默认 device 建张量，必须回来。
+            ctpwa::ensure_device(primary_dev);
+    
+}
 
 torch::Tensor phspMatrixFromGram(const PhspGramInputs& in,
                                  const torch::Tensor& vector,
