@@ -1,4 +1,11 @@
 // main.cu — 编译入口 & pybind11 绑定
+//
+// P1（真 TU）：DeviceManager / Config / PhaseSpace / Info / ResModel / Resonance
+// 已经是独立翻译单元，这里只包含头文件。唯一仍以文本方式内联的是 Analysis.cu
+// —— 它没有头文件（analysis 只供本 TU 的 pybind 绑定使用）。
+//
+// 收益：改 Config.cu 只重编 Config.cu + 链接（此前会重编 12.8k 行的整个 TU）；
+// 并且编译器第一次能告诉你"谁越界用了谁"。
 
 #include <pybind11/pybind11.h>
 
@@ -7,37 +14,24 @@
 #include <Amplitude.cuh>
 
 #include <DeviceManager.cuh>
-// DeviceManager.cu inline (no device code)
-#include "DeviceManager.cu"
 
 #include <ComputeHessian.cuh>
 
 #include <AmpGen.cuh>
-// #include "ComputeGrad.cu"
 #include <ComputeNLL.cuh>
 #include <ComputeResults.cuh>
 #include <ComputeBF.cuh>
 #include <Config.cuh>
-// Config inline (host-only, no device code)
-#include "Config.cu"
 #include <PhaseSpace.cuh>
-// PhaseSpace inline (host-only; needs ConfigParser definitions above)
-#include "PhaseSpace.cu"
 #include <Figure.cuh>
 // Analysis inline (no header for analysis class)
 #include "Analysis.cu"
 #include <Info.cuh>
-// Info inline (host-only)
-#include "Info.cu"
 #include <Parameters.cuh>
 #include <SymbolicDiff.cuh>  // Node/deriv for modelDeriv+buildModelAST
 #include <ResModel.cuh>
-// ResModel inline (templates in header, only host code left)
-#include "ResModel.cu"
 #include <CustomExpr.cuh>
 #include <Resonance.cuh>
-// Resonance inline (host-only, no device code)
-#include "Resonance.cu"
 
 
 // ---------------------------------------------------------------------------
