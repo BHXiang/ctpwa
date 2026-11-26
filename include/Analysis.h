@@ -34,31 +34,14 @@
 #include <PhspGram.h>   // ctpwa::phspMatrixFromGram（P4 抽出）
 #include <MatrixErrors.h> // ctpwa::computeMatrixErrors（P4 抽出）
 #include <SLAmpsIO.h>   // ctpwa::slAmpsTensor / saveSLAmpsToFile（P4 抽出）
+#include <MixedPrecision.h> // upcastAmpSegToDouble（P4：从本头上移）
+#include <TruthIntegrals.h> // ctpwa::computeTruthIntegrals（P4 抽出）
 
 // ---------------------------------------------------------------------------
 // 后端无关的设备 helper：CPU 后端下所有张量都在 CPU 上，CUDA 后端保持原语义。
 // 目的是让 7000 行的编排代码只有这一处知道"当前是哪个后端"。
 // ---------------------------------------------------------------------------
-#if defined(CTPWA_BACKEND_CPU)
-static inline torch::Device ctpwa_dev(int) { return torch::Device(torch::kCPU); }
-// 后端设备检查：CPU 构建必须拿到 CPU 张量。喂 CUDA 张量会让内核解引用
-// 主机不可访问的指针 → 这里挡在入口，而不是让它在 kernel 里崩。
-static inline bool ctpwa_is_cuda_like(const torch::Tensor& t)
-{
-    return t.device().is_cpu();
-}
-static inline bool ctpwa_on_primary(const torch::Tensor& t, int)
-{
-    return t.device().is_cpu();
-}
-#else
-static inline torch::Device ctpwa_dev(int i) { return torch::Device(torch::kCUDA, i); }
-static inline bool ctpwa_is_cuda_like(const torch::Tensor& t) { return t.is_cuda(); }
-static inline bool ctpwa_on_primary(const torch::Tensor& t, int primary)
-{
-    return t.device().is_cuda() && t.device().index() == primary;
-}
-#endif
+#include <BackendHelpers.h>   // ctpwa_dev / ctpwa_is_cuda_like / makeScopeExit / CUDA_CHECK
 
 #include <unordered_set>
 #include <vector>
@@ -84,25 +67,6 @@ static inline bool ctpwa_on_primary(const torch::Tensor& t, int primary)
 
 #include <utility>
 
-// RAII：函数中途抛异常时也要还原 analysis 的内部状态/关闭 ROOT 文件。
-template <class F>
-struct ScopeExit {
-    F f;
-    ~ScopeExit() { f(); }
-};
-template <class F>
-ScopeExit<F> makeScopeExit(F f) { return ScopeExit<F>{std::move(f)}; }
-
-//////////////////////////////////////////////
-// 错误检查宏
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
 
 //////////////////////////////////////////////
 ////////////////////////////////////////
@@ -1244,26 +1208,6 @@ public:
 // 调用方负责 cudaFree 返回值。返回 nullptr 表示非 float 模式）
 // 只允许 double .so 的混合精度模式，原生 float .so 下 A 已经是 ctComplex，
 // 再"上转"会按 16B/元素写进 8B/元素缓冲区（越界）并让下游按 float 错读。
-static ctComplex* upcastAmpSegToDouble(const ctComplex* baseF /*实际为 float2 存储*/,
-                                       size_t nElem,
-                                       ctComplex* buf = nullptr /*可选: 复用缓冲*/)
-{
-    if (nElem == 0) return nullptr;
-    TORCH_CHECK(!ctIsFloatComplex,
-        "upcastAmpSegToDouble 只适用于 double .so 的混合精度模式；"
-        "原生 float .so 的 ctComplex 已是 float2，不应再上转");
-    ctComplex* dbl = buf;
-    if (dbl == nullptr) {
-        // 返回缓冲按 cuDoubleComplex 语义使用，必须按 16B/元素分配。
-        cudaError_t e = cudaMalloc(&dbl, nElem * sizeof(cuDoubleComplex));
-        TORCH_CHECK(e == cudaSuccess, "upcastAmpSegToDouble: cudaMalloc 失败: ",
-                    cudaGetErrorString(e));
-    }
-    int g = (int)((nElem + 255) / 256);
-    CTPWA_LAUNCH(castF2ToDouble2Kernel, g, 256, 0, reinterpret_cast<const float2*>(baseF),
-        reinterpret_cast<cuDoubleComplex*>(dbl), (int)nElem);
-    return dbl;
-}
 
 class analysis
 {
@@ -4211,83 +4155,11 @@ public:
         const std::vector<ctComplex*>& ws_upcast,
         const std::vector<double*>& d_weights_per_gpu) const
     {
-        for (size_t gpu = 0; gpu < d_amps.size(); ++gpu) {
-            int nt = ev_per_gpu[gpu];
-            if (nt <= 0 || d_amps[gpu] == nullptr) continue;
-
-            int* d_nsl = nullptr;
-            cudaSetDevice(gpu);
-            TORCH_CHECK(cudaMalloc(&d_nsl, npartials * sizeof(int)) == cudaSuccess,
-                        "computeTruthIntegrals: cudaMalloc(d_nsl) 失败");
-            cudaMemcpy(d_nsl, nSLvectors_.data(), npartials * sizeof(int), cudaMemcpyHostToDevice);
-
-            double* d_p = nullptr;
-            TORCH_CHECK(cudaMalloc(&d_p, npartials * sizeof(double)) == cudaSuccess,
-                        "computeTruthIntegrals: cudaMalloc(d_p) 失败");
-            cudaMemset(d_p, 0, npartials * sizeof(double));
-            double* d_s = nullptr;
-            TORCH_CHECK(cudaMalloc(&d_s, npartials * npartials * sizeof(double)) == cudaSuccess,
-                        "computeTruthIntegrals: cudaMalloc(d_s) 失败");
-            cudaMemset(d_s, 0, npartials * npartials * sizeof(double));
-            double* d_t = nullptr;
-            TORCH_CHECK(cudaMalloc(&d_t, sizeof(double)) == cudaSuccess,
-                        "computeTruthIntegrals: cudaMalloc(d_t) 失败");
-            cudaMemset(d_t, 0, sizeof(double));
-            double* d_sq = nullptr;
-            if (out_square != nullptr) {
-                TORCH_CHECK(cudaMalloc(&d_sq, npartials * sizeof(double)) == cudaSuccess,
-                            "computeTruthIntegrals: cudaMalloc(d_sq) 失败");
-                cudaMemset(d_sq, 0, npartials * sizeof(double));
-            }
-            // computeBranchingFractions 可能抛异常；每卡的临时归约缓冲必须释放。
-            auto tmp_guard = makeScopeExit([&]() {
-                if (d_sq) cudaFree(d_sq);
-                cudaFree(d_p);
-                cudaFree(d_s);
-                cudaFree(d_t);
-                cudaFree(d_nsl);
-            });
-
-            auto vg = extended_vector.to(ctpwa_dev(gpu));
-            // float 模式: 该批振幅缓冲为 float2 → 上转 double 段后再进双精度
-            // computeBranchingFractions（批 ≤ 100k 事件, 临时翻倍有界, 与驻留 A 无关）
-            const ctComplex* d_mat = d_amps[gpu];
-            ctComplex* d_amp_dbl = nullptr;
-            if (float_amps_ && !ctIsFloatComplex) {
-                // 复用调用方的 upcast workspace（旧实现每次都 cudaMalloc/cudaFree）
-                d_amp_dbl = upcastAmpSegToDouble(d_amps[gpu],
-                    (size_t)nt * n_polar_ * n_amplitudes_,
-                    (gpu < ws_upcast.size()) ? ws_upcast[gpu] : nullptr);
-                d_mat = d_amp_dbl;
-            }
-            const double* d_w = (gpu < d_weights_per_gpu.size())
-                ? d_weights_per_gpu[gpu] : nullptr;
-            computeBranchingFractions(d_mat,
-                reinterpret_cast<const ctComplex*>(vg.data_ptr()),
-                d_p, d_s, d_t, d_sq, d_nsl, npartials, nt, n_amplitudes_, n_polar_,
-                ws_complex[gpu], ws_matrix[gpu], d_w);
-            if (d_amp_dbl != nullptr
-                && (gpu >= ws_upcast.size() || d_amp_dbl != ws_upcast[gpu]))
-                cudaFree(d_amp_dbl);
-
-            std::vector<double> hp(npartials), hs(npartials * npartials); double ht;
-            cudaMemcpy(hp.data(), d_p, npartials * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(hs.data(), d_s, npartials * npartials * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(&ht, d_t, sizeof(double), cudaMemcpyDeviceToHost);
-            for (int i = 0; i < npartials; ++i) {
-                out_partial[i] += hp[i];
-                for (int j = 0; j < npartials; ++j)
-                    out_scattering[i * npartials + j] += hs[i * npartials + j];
-            }
-            if (d_sq != nullptr) {
-                std::vector<double> hsq(npartials);
-                cudaMemcpy(hsq.data(), d_sq, npartials * sizeof(double), cudaMemcpyDeviceToHost);
-                for (int i = 0; i < npartials; ++i) out_square[i] += hsq[i];
-            }
-            // 临时缓冲由 tmp_guard 在本次 GPU 迭代结束时释放（含异常路径）。
-        }
-        // 多 GPU 循环后恢复主设备（FF/EFF/writeResult 等随后会做 torch/耦合运算）
-        ctpwa::ensure_device(primary_dev_);
+        // P4：实现已搬到 ctpwa::computeTruthIntegrals（include/TruthIntegrals.h）
+        ctpwa::computeTruthIntegrals(extended_vector, d_amps, ev_per_gpu,
+                                     out_partial, out_scattering, out_square, npartials,
+                                     ws_complex, ws_matrix, ws_upcast, d_weights_per_gpu,
+                                     nSLvectors_, float_amps_, n_polar_, n_amplitudes_, primary_dev_);
     }
 
     // =====================================================================
@@ -5062,21 +4934,8 @@ public:
     torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el,
         int64_t nEl, int gpu = 0) const
     {
-        int saved_dev = 0;
-        cudaGetDevice(&saved_dev);
-        auto device_guard = makeScopeExit([saved_dev]() { cudaSetDevice(saved_dev); });
-        cudaSetDevice(gpu);
-        auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(gpu));
-        if (nEl == 0) return torch::empty({0}, opts);
-        if (!float_amps_ || ctIsFloatComplex) {
-            return torch::from_blob(base + offset_el, {nEl}, opts).clone();
-        }
-        const float2* fbase = reinterpret_cast<const float2*>(base) + offset_el;
-        ctComplex* dbl = upcastAmpSegToDouble(
-            reinterpret_cast<const ctComplex*>(fbase), (size_t)nEl);
-        torch::Tensor t = torch::from_blob(dbl, {nEl}, opts).clone();
-        cudaFree(dbl);
-        return t;
+        // P4：实现已搬到 ctpwa::ampSegmentToTensor（include/SLAmpsIO.h）
+        return ctpwa::ampSegmentToTensor(base, offset_el, nEl, gpu, float_amps_);
     }
 
     // ---------------------------------------------------------------------

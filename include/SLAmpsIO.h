@@ -20,4 +20,9 @@ torch::Tensor slAmpsTensor(const AmpCalc& amp_calc, bool phsp_freed);
 // 把第一条链组合的 SL 振幅按裸 complex<double> 顺序写文件。
 void saveSLAmpsToFile(const AmpCalc& amp_calc, const std::string& filename, bool phsp_freed);
 
+// 取驻留振幅矩阵的一段 [offset_el, offset_el+nEl) 转成该设备上的 torch 张量
+// （float 存储档位会先上转成 double）。float_amps = 驻留 A 是否为 float2。
+torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el, int64_t nEl,
+                                 int gpu, bool float_amps);
+
 }  // namespace ctpwa

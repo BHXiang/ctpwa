@@ -1,6 +1,9 @@
 // src/SLAmpsIO.cu — 见 include/SLAmpsIO.h
 #include <SLAmpsIO.h>
 
+#include "BackendHelpers.h"
+#include "MixedPrecision.h"
+
 #include <cuda_runtime.h>
 #include <thrust/complex.h>
 
@@ -68,6 +71,26 @@ void saveSLAmpsToFile(const AmpCalc& amp_calc, const std::string& filename, bool
     delete[] h_buf;
     printf("saveSLAmps: saved %d complex numbers to %s (nEv=%d nPol=%d nSL=%d)\n",
            total, filename.c_str(), nEv, nPol, nSL);
+}
+
+torch::Tensor ampSegmentToTensor(ctComplex* base, int64_t offset_el, int64_t nEl,
+                                 int gpu, bool float_amps)
+{
+    int saved_dev = 0;
+    cudaGetDevice(&saved_dev);
+    auto device_guard = makeScopeExit([saved_dev]() { cudaSetDevice(saved_dev); });
+    cudaSetDevice(gpu);
+    auto opts = torch::TensorOptions().dtype(TORCH_COMPLEX).device(ctpwa_dev(gpu));
+    if (nEl == 0) return torch::empty({0}, opts);
+    if (!float_amps || ctIsFloatComplex) {
+        return torch::from_blob(base + offset_el, {nEl}, opts).clone();
+    }
+    const float2* fbase = reinterpret_cast<const float2*>(base) + offset_el;
+    ctComplex* dbl = upcastAmpSegToDouble(reinterpret_cast<const ctComplex*>(fbase),
+                                          (size_t)nEl);
+    torch::Tensor t = torch::from_blob(dbl, {nEl}, opts).clone();
+    cudaFree(dbl);
+    return t;
 }
 
 }  // namespace ctpwa
