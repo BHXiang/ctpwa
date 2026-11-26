@@ -17,6 +17,7 @@
 | P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | `7c808a8` |
 | P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | `d42f203` |
 | P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | `ee9178b` |
+| P4 第一步（数据读取模块） | ✅ | `7cab902` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -187,6 +188,37 @@ bash tests/cpu_backend/build_and_run.sh
 
 全量 pytest 门禁：254 passed / 7 failed / 56 skipped / 4 known errors
 （`test_reparam` 桩 bug），与 baseline3 逐文件 PASS/FAIL 一致；CUDA 只编译 EXIT=0。
+
+---
+
+## P4（第一步）：数据读取从 `analysis` 抽出
+
+`Analysis.cu` 7624 行（原 7878）里，最先能独立的是**输入读取**：两个自由函数
+（`readMomentaFromDat` 支持 .dat/ROOT、`readWeightValuesFromFile`），共 331 行，
+逻辑上早就与设备无关，只是住在 god class 的 TU 里。
+
+| 新增 | 内容 |
+|---|---|
+| `include/DataReader.h` | 两个纯 host 读取函数声明（返回 STL 容器） |
+| `src/DataReader.cu` | 实现（ROOT `TFile`/`TTree` + 文本解析），新 TU |
+
+留在原处：`readWeightsFromFile` 返回 `std::vector<double*>`（设备指针，需要
+cudaMalloc），属 loader/device 层，不是纯 io——这条边界写进了 `DataReader.h` 的注释。
+
+**这轮踩到的坑（已变成门禁的一部分）**：头文件里把参数写成 `int`、实现是 `long`，
+编译照过、链接照过（shared library 允许未定义符号），到 `import ctpwa` 才炸：
+
+```
+RuntimeError: 没有可用的 ctpwa 后端 ... ImportError: _cpu.so: undefined symbol:
+  readWeightValuesFromFile(... int)
+```
+
+而 pytest 对这种加载失败会给 **41 个 "usage error"**，噪音完全盖住真因。
+`scripts/run_tests_parallel.sh` 现在先跑一次 `python3 -c "import ctpwa"` 预检，
+失败就直接把真实 import 错误打出来并退出（exit 2），不再让 41 行噪音淹没它。
+
+**验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors（与 baseline3 一致）；
+CUDA 只编译 EXIT=0、0 错误。
 
 ---
 
