@@ -843,6 +843,28 @@ CPU 与 GPU 的 A/B 指纹对比出现分叉：
 
 ---
 
+## 一键验收（本轮新增）
+
+```bash
+bash scripts/verify_all.sh              # CPU：构建 + 设备纪律(--strict) + 门禁 + A/B + host 单测
+bash scripts/verify_all.sh --with-gpu   # 再加 GPU 门禁与 GPU A/B
+bash scripts/run_tests_gpu.sh           # 只跑 GPU 门禁（自动探测 arch，6 批，~10 分钟）
+```
+
+实测：
+
+| 脚本 | 结果 |
+|---|---|
+| `verify_all.sh`（CPU） | 258 passed / 0 failed / 63 skipped；A/B 全部一致；host 单测通过 |
+| `run_tests_gpu.sh` | **263 passed / 9 skipped / 1 xfail**（6 批，RTX 5060） |
+
+**顺带修了 A/B 比较器的判据**：原来用"整条向量的最大相对差"，`interp` 的梯度里
+有个 ≈0 的分量（被约束固定的方向），绝对差 9e-13 在它身上显示成 7.9e-8 的"相对差"，
+于是被判不一致——但物理上毫无意义。改成逐元素 `|Δ| <= atol + rtol·max(|a|,|b|)`
+（atol=1e-12, rtol=1e-11），同一份数据 0 个坏点。这是**判据本身的错**，不是数值变了。
+
+---
+
 ## 当前门禁口径
 
 ```bash
