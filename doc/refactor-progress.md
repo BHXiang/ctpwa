@@ -16,7 +16,7 @@
 | P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | `9e91283` |
 | P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | `7c808a8` |
 | P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | `d42f203` |
-| P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | 见下 |
+| P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | `ee9178b` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -184,6 +184,9 @@ bash tests/cpu_backend/build_and_run.sh
 `src/DecayDesc.cu + 测试文件 + 标准库`——**不链接 `Backend.cpp`、不需要 torch/ROOT**。
 它检查：粒子去重与顺序、节点追加与波数乘积、`setNSLCombs` 覆盖、
 `Amp2BD` 的 (S,L) 结构不变量（`|J2-J3| ≤ S ≤ J2+J3`、`L ≤ maxL`）。
+
+全量 pytest 门禁：254 passed / 7 failed / 56 skipped / 4 known errors
+（`test_reparam` 桩 bug），与 baseline3 逐文件 PASS/FAIL 一致；CUDA 只编译 EXIT=0。
 
 ---
 
