@@ -27,6 +27,7 @@
 | G3 CI 门禁（CPU + CUDA 只编译） | ✅ | `f383d62` |
 | **A/B 数值对照（vs v0.3.27 基线）** | ✅ | `c95eddb` |
 | P4 第七步（`BatchIntegrals` 247 行） | ✅ | `b94ebbc` |
+| P4 第八步（`FitFractions` 约 330 行） | ✅ | `f73483a` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -511,6 +512,25 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 **同一个坑第二次踩**：`particles_` → `(*ctx.particles)` 的前缀替换把局部变量
 `particles_names` 也改了（`(*ctx.particles)names`）。第 10 轮记过这条，这次仍中招。
 现在把检查固化进流程：批量替换后立刻 `grep` 局部变量名是否被污染。
+
+---
+
+## P4（第八步）：份额/效率/按样本矩阵 → `FitFractions`
+
+这三个函数（137+151+43 行）依赖形态完全一致，且它们调的底层
+（`computeFileBatchIntegrals` / `phspMatrixFromGram` / `computeTruthIntegrals`）
+**在前两轮已经变成自由函数**——所以这轮能一次搬走约 330 行，而不是又踩一轮级联。
+这就是"先搬底层"的回报。
+
+编译期仍牵出两个漏网的依赖，正好补上：
+
+| 依赖 | 处理 |
+|---|---|
+| `computeCouplingHessian`（成员） | 回调接入（它自身还很耦合） |
+| `couplingCovariance` | 直接换成**自由函数** `ctpwa::couplingCovariance`（第 8 轮抽出的） |
+| `computeBFErrors` | `ComputeBF.cuh` 里本来就有声明，include 即可 |
+
+`Analysis.h` 6859 → **6567 行**。门禁 254/7/56/4；A/B 指纹逐位一致；CUDA 编译 0 错误。
 
 ---
 
