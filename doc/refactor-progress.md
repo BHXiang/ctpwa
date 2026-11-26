@@ -20,6 +20,7 @@
 | P4 第一步（数据读取模块） | ✅ | `7cab902` |
 | P2 第三批（`AmpCalc` 四个大缓冲） | ✅ | `a9dc6db` |
 | P4 第二步（`analysis` 变成可包含的头 + 首个方法迁出） | ✅ | `0cbad61` |
+| P4 第三步（`PhspGram` 显式输入模块） | ✅ | `b5b7975` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -275,6 +276,50 @@ torch::Tensor couplingCovariance(const torch::Tensor& H, int n,
 **验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors（与基线一致）；
 CUDA 只编译 EXIT=0、0 错误。
 
+---
+
+## P4（第三步）：`PhspGram` —— "先显式化输入，再搬函数" 的可复用模板
+
+`analysis::phspMatrixFromGram` 只读 7 个成员（`events_` / `phsp_weights_` / 两个 B̄
+指针 / `n_amplitudes_` / `nSLvectors_` / `primary_dev_`），但因为住在 god class 里，
+既不能单测也不能复用。
+
+| 新增 | 内容 |
+|---|---|
+| `include/PhspGram.h` | `PhspGramInputs`（只读结构体，7 个字段）+ 自由函数声明 |
+| `src/PhspGram.cu` | 76 行实现（B̄ 收缩成 npartials×npartials 干涉矩阵 + 权重归一） |
+| 成员 | 8 行委派：显式填 `in` 后调用 |
+
+**这轮定下的模板**（后续每次搬家都照这个走）：
+
+1. 先写一个**只读输入结构体**，字段就是函数真正读的那些成员；
+2. 成员函数改成委派，把 `in` 一个个填上——**编译器会逐个字段告诉你漏了什么**；
+3. 通过门禁后，函数体搬到新 TU。
+
+比"直接搬函数、再补参数"安全：直接搬的话，漏一个字段往往编译能过（默认值/隐式转换），
+错要到运行时才现。`Analysis.h` 7594 → 7529 行。
+
+**验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors；CUDA 只编译
+EXIT=0、0 错误。
+
+---
+
+## P4 的进度评估（诚实版）
+
+`Analysis.h` 仍有 **7529 行**，其中类定义约 6300 行。已迁出：io（331 行）、
+矩阵统计（`couplingCovariance`）、`PhspGram`（76 行）。
+
+按目前每轮 60~300 行的速度，把类压到计划里写的"<800 行"还需要 **十几轮**，
+而且必须靠更大的切片：
+
+| 切片 | 规模 | 依赖 |
+|---|---|---|
+| 写入器 `writeResult`/`writeInterfResult`/`writeMC` | ~1900 行 | 需要 `FitResult` POD |
+| 误差矩阵 `computeMatrixErrors` + `runMatrices` | ~400 行 | 需要 θ 重算回调 |
+| 份额/效率 `getFitFractions`/`getEfficiency`/`computeFileBatchIntegrals` | ~860 行 | 需要振幅/偏移上下文 |
+| 初始化 `initialize`/`initializeDecayChains` | ~930 行 | 与设备分配强耦合 |
+
+结论：**P4 的"启动"已完成**（类可包含 + 3 个模块边界 + 模板），"完成"仍是多轮工程。
 ---
 
 ## P0-B 为什么停在这里（128 处多卡循环内的 set）
