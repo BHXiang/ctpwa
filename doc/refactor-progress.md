@@ -21,6 +21,7 @@
 | P2 第三批（`AmpCalc` 四个大缓冲） | ✅ | `a9dc6db` |
 | P4 第二步（`analysis` 变成可包含的头 + 首个方法迁出） | ✅ | `0cbad61` |
 | P4 第三步（`PhspGram` 显式输入模块） | ✅ | `b5b7975` |
+| P4 第四步（`MatrixErrors` + 共享 helper 头） | ✅ | `8c0e86a` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -301,6 +302,33 @@ CUDA 只编译 EXIT=0、0 错误。
 
 **验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors；CUDA 只编译
 EXIT=0、0 错误。
+
+---
+
+## P4（第四步）：`MatrixErrors` —— 第一个"状态 + 回调"混合切片
+
+`analysis::computeMatrixErrors` 292 行，读 9 个成员、调 4 个成员函数、还会临时改写
+`theta_cur_` 做中心差分。它是 P4 里第一个**不能只靠只读结构体**搬走的函数：θ 扫描
+要改状态，积分要调算法。所以模板升级成两段式：
+
+| 依赖类型 | 处理 |
+|---|---|
+| 它**读**的状态（events/phsp_weights/B̄ 指针/n_amplitudes/n_theta/…) | `MatrixErrorCtx` 的只读字段（9 个） |
+| 它**调用**的算法（`freeParamsToAmplitudes` / `getHessian` / `computeFileBatchIntegrals` / θ 读写） | `std::function` 回调（6 个） |
+
+回调签名直接照抄 `computeFileBatchIntegrals` 的 12 个参数，成员装配时原样转发 ——
+**不包一层自定义协议**，避免"抽出来之后行为悄悄变了"。
+
+顺带抽出 `include/BackendHelpers.h`（`ctpwa_dev` / `ctpwa_is_cuda_like` /
+`makeScopeExit` / `CUDA_CHECK` 等）：它们原来只存在于 `Analysis.h` 内部，任何搬出去的
+模块都得复制一遍，这正是"god class 的隐性成本"。
+
+**踩到的坑**：`d_phsp_matrix_double_` → `ctx.d_phsp_matrix_double` 替换后，随后的
+`d_phsp_matrix_` 规则又把它当子串匹配了一次，产生 `ctx.ctx.d_phsp_matrixdouble`。
+**按前缀替换必须先长后短**，且替换完用 `grep -c 'ctx.ctx'` 验一遍。
+
+`Analysis.h` 7529 → **7266 行**。门禁 254 passed / 7 failed / 56 skipped / 4 known
+errors（`test_matrix_errors` 7 个用例正好覆盖这条路径）。
 
 ---
 
