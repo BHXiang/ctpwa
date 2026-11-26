@@ -25,15 +25,18 @@ IDENT_CONFIGS = ["ident2", "ident3"]
 
 
 def _make_params(ana):
+    """参数必须在**后端设备**上：CUDA 构建里 analysis 会检查 params 落在主设备
+    （本用例最初写死 CPU 张量，在 GPU 上直接报 "params 必须位于主设备"）。"""
+    dev = torch.device("cuda:0") if ctpwa.backend() == "cuda" else torch.device("cpu")
     n_vec = ana.getNVector()
     n_theta = ana.getNFreeTheta()
-    p = torch.zeros(2 * n_vec + n_theta, dtype=torch.float64)
+    p = torch.zeros(2 * n_vec + n_theta, dtype=torch.float64, device=dev)
     p[0] = 1.0
     for k in range(1, n_vec):
         p[k] = 0.1 * k
         p[n_vec + k] = 0.05 * k
     if n_theta:
-        p[2 * n_vec:] = ana.getFreeResParams()[0]
+        p[2 * n_vec:] = ana.getFreeResParams()[0].to(p.device)
     return p
 
 
@@ -53,8 +56,13 @@ def test_release_and_destroy_repeatedly(name):
         gc.collect()
 
     assert all(n == n for n in nlls), f"NLL 出现 NaN: {nlls}"
-    # 同一配置、同一参数 → 必须完全可复现（顺带守住释放顺序没污染状态）
-    assert nlls[0] == nlls[1] == nlls[2], f"{name}: NLL 不可复现 {nlls}"
+    # 同一配置、同一参数 → 数值必须一致（顺带守住释放顺序没污染状态）。
+    # 判据用相对容差而不是逐位：GPU 上的归约顺序不确定，重复构造会差最后几位
+    # （实测 ident3: ...41626 vs ...416259，相对差 ~5e-16）；CPU 是逐位相同的。
+    ref = nlls[0]
+    for k, n in enumerate(nlls[1:], 1):
+        assert abs(n - ref) <= 1e-12 * max(1.0, abs(ref)), \
+            f"{name}: NLL 不可复现 round{k}: {nlls}"
 
 
 def test_destructor_without_explicit_release():
