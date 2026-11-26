@@ -26,6 +26,7 @@
 | P4 第六步（helper 上移 + `TruthIntegrals`） | ✅ | `fa8f7fd` |
 | G3 CI 门禁（CPU + CUDA 只编译） | ✅ | `f383d62` |
 | **A/B 数值对照（vs v0.3.27 基线）** | ✅ | `c95eddb` |
+| P4 第七步（`BatchIntegrals` 247 行） | ✅ | `b94ebbc` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -489,6 +490,27 @@ CTPWA_BACKEND=cuda TORCH_CUDA_ARCH_LIST="8.6" MAX_JOBS=4 python3 setup.py build_
 | 其中数值用例 | 0（全 skip） | **37**（含 golden NLL / golden 梯度 / 梯度 vs FD） |
 | failed | 8 | 7（均已定位为 CPU 构建固有） |
 | 裸 `cudaSetDevice` 违规 | 208 | **127** |
+
+---
+
+## P4（第七步）：`computeFileBatchIntegrals` → `BatchIntegrals` 模块
+
+份额/效率/误差矩阵/写结果共同的底层（247 行）。依赖形态最复杂的一类：9 个成员 +
+2 个成员函数 + **会临时改写** `events_offsets_`/`amp_offsets_`。按 P4 模板拆成三类：
+
+| 依赖 | 形态 |
+|---|---|
+| 读的状态（data_files / data_order / particles / n_slvectors / n_amplitudes / …） | 只读字段 |
+| 要改的状态（`events_offsets` / `amp_offsets`） | **指针**（函数内保存-改写-还原） |
+| 算法（`currentThetaHost` / `calculateAmplitudes`） | 2 个 `std::function` 回调 |
+
+顺带把 `computeTruthIntegrals` 的 3 个调用点补上它上轮新增的 5 个显式参数。
+
+`Analysis.h` 7079 → **6859 行**；门禁 254/7/56/4；A/B 指纹与 v0.3.27 基线**逐位一致**。
+
+**同一个坑第二次踩**：`particles_` → `(*ctx.particles)` 的前缀替换把局部变量
+`particles_names` 也改了（`(*ctx.particles)names`）。第 10 轮记过这条，这次仍中招。
+现在把检查固化进流程：批量替换后立刻 `grep` 局部变量名是否被污染。
 
 ---
 
