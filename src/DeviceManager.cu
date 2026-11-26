@@ -247,7 +247,7 @@ DeviceManager::MemEstimate DeviceManager::estimate(
         m.breakdown.emplace_back(name, bytes);
     };
 
-    // ---- 事件相关（per GPU，用最大样本的事件数估算峰值）----
+    // ---- 事件相关（per GPU）：A 用本卡全部常驻事件，其他临时缓冲以此作保守上界 ----
     double amp = ne * n_amplitudes * n_polar * amp_cs;   // d_all_amplitudes（运行时档位）
     double slamp = ne * n_polar * n_slcombs * sl;        // d_slamps
     double mom = ne * n_particles * 32.0;                // d_momenta (LorentzVector = 4×double)

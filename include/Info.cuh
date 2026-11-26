@@ -14,6 +14,9 @@ struct ChainInfo {
     std::map<std::pair<std::string, std::vector<int>>, std::vector<Resonance>>
         intermediate_resonance_map;
     std::vector<std::vector<Particle>> intermediate_combs;
+    // 每个 JP 组合对应一张由全部共振态组合共享的 SL 表；逐项为 nSLCombs。
+    // 显存预检应累计这里的值，不能用包含共振态重复展开的总振幅数。
+    std::vector<int> slcombs_per_jp;
     std::vector<std::string> amplitude_names;  // 该链的振幅名(_LS 格式)
 };
 

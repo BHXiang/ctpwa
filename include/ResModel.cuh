@@ -244,8 +244,12 @@ template <typename T>
 __host__ __device__ auto BWR(T& m, T& m0, T& gamma0, int L, T& q, T& q0, double d)
     -> typename ResResult<T>::type
 {
+    // 与 TF-PWA Gamma 一致：q0=0 时不执行 q/q0，幂项取 1。
+    // 仅改变阈值奇点行为；q0>0 的 BWR 公式保持逐字不变。
+    T ratio = T(1.0);
+    if (q0 > T(1e-9)) ratio = pow(q / q0, 2 * L + 1);
     const T gamma =
-        gamma0 * pow(q / q0, 2 * L + 1) * (m0 / m) * pow(Bf<T>(L, q, q0, d), 2);
+        gamma0 * ratio * (m0 / m) * pow(Bf<T>(L, q, q0, d), 2);
     T x = m0 * m0 - m * m;
     T y = m0 * gamma;
     T s = x * x + y * y;
@@ -564,7 +568,9 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
     double q0, q0p, q0pp;
     bwrQ0Derivs(m0, q0m1, q0m2, q0, q0p, q0pp);
     double m02 = m0 * m0;
-    double u = q0p / q0;                       // d(ln q0)/dm0
+    const bool q0_singular = (q0 <= 1e-9);
+    // q0=0 时参考动量项取 1，不再执行 1/q0；其余 Bf 项仍按原公式计算。
+    double u = q0_singular ? 0.0 : q0p / q0;   // d(ln q0)/dm0
 
     // ---- 内部 Bf² = N(q0·di)/N(q·di); di = has_bf? dd : 0（di=0 → Bf≡1）----
     double di = has_bf ? dd : 0.0;
@@ -583,10 +589,11 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
 
     // ---- P = (q/q0)^n, n = 2Lmin+1（q 与 m0 无关）----
     int nP = 2 * Lmin + 1;
-    double lP = -nP * u;                       // P'/P
-    double lPp = nP * (u * u - q0pp / q0);     // (P'/P)'
+    double lP = q0_singular ? 0.0 : -nP * u;   // P'/P
+    double lPp = q0_singular ? 0.0 : nP * (u * u - q0pp / q0); // (P'/P)'
     double pP = 1.0;
-    for (int k = 0; k < nP; ++k) pP *= (q / q0);
+    if (!q0_singular)
+        for (int k = 0; k < nP; ++k) pP *= (q / q0);
 
     // ---- γ 组: γ = g0·P·(m0/m)·Bf² ----
     double Lg = lP + 1.0 / m0 + lI;
@@ -651,8 +658,10 @@ static __device__ void bwrSpecEval(double m0, double g0, double m, double q,
         const double nP_d = (double)nP;
         const double dlBi_q  = dlnBf_dq0(Lmin, q,  di);   // 同一个函数（对自身动量求导）
         const double dlBi_q0 = dlnBf_dq0(Lmin, q0, di);
-        const double dgam_q  = gamma * ( nP_d / q  - 2.0 * dlBi_q);   // Bf 在分母 → 负号
-        const double dgam_q0 = gamma * (-nP_d / q0 + 2.0 * dlBi_q0);
+        const double dgam_q = (q <= 1e-9)
+            ? 0.0 : gamma * ( nP_d / q  - 2.0 * dlBi_q);   // Bf 在分母 → 负号
+        const double dgam_q0 = q0_singular
+            ? 0.0 : gamma * (-nP_d / q0 + 2.0 * dlBi_q0);
         // ∂ln prop/∂q(0) = K · dγ/dq(0)
         double dq_re  = K_re * dgam_q,  dq_im  = K_im * dgam_q;
         double dq0_re = K_re * dgam_q0, dq0_im = K_im * dgam_q0;
