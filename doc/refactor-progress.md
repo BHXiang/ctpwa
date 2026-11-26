@@ -781,8 +781,19 @@ CPU 与 GPU 的 A/B 指纹对比出现分叉：
 | `with_trans` | hess[80] | −290.0 vs −287.4（**0.5%**） | 超出"两后端 1e-12"的预期，需要归因 |
 | `interp` | grad[0] | 1.15e-5 vs 1.34e-4 | 两者都≈0，相对差无意义 |
 
-**归因方法已就绪**：`baseline_wt`（v0.3.27 原版）正在编译 sm_120 的 CUDA 后端，
-下一轮用"GPU 基线 vs GPU 重构"对比即可判断这是**固有跨后端差异**还是**重构引入**。
+**已归因（同轮完成）**：`baseline_wt`（v0.3.27 原版）编了 sm_120 的 CUDA 后端，
+用「GPU 基线 vs GPU 重构」对比：
+
+| config | nll | grad | hess |
+|---|---|---|---|
+| 全部 7 个 | **0（逐位相同）** | ≤1.3e-13 | ≤1.7e-10 |
+
+结论：**重构在 CUDA 上与重构前逐位一致**；上面那个 CPU↔GPU 的 0.5% Hessian 差异
+是**固有的跨后端差异（重构前就存在）**，与本次改造无关。
+
+产物：`doc/parity/fingerprint-baseline-gpu-sm120.json`、
+`doc/parity/fingerprint-refactor-gpu-sm120.json`、
+`doc/parity/compare-gpu-baseline-vs-refactor.txt`。
 
 ---
 

@@ -1,0 +1,25 @@
+config       field            max|Δ|      max rel  状态
+flatte       nll           2.274e-13    3.530e-16  ok
+flatte       grad          3.411e-13    1.254e-16  ok
+flatte       hess          6.057e-10    6.357e-14  ok
+gs           nll           0.000e+00    0.000e+00  ok
+gs           grad          3.638e-12    8.091e-16  ok
+gs           hess          5.821e-11    1.464e-15  ok
+ident2       nll           0.000e+00    0.000e+00  ok
+ident2       grad          1.819e-12    7.041e-16  ok
+ident2       hess          6.548e-11    3.674e-15  ok
+ident3       nll           0.000e+00    0.000e+00  ok
+ident3       grad          2.274e-12    9.295e-16  ok
+ident3       hess          5.093e-10    2.718e-14  ok
+interp       nll           2.274e-13    2.457e-16  ok
+interp       grad          0.000e+00    0.000e+00  ok
+interp       hess          0.000e+00    0.000e+00  ok
+simple       nll           0.000e+00    0.000e+00  ok
+simple       grad          3.638e-12    6.176e-16  ok
+simple       hess          2.692e-10    4.737e-15  ok
+with_trans   nll           0.000e+00    0.000e+00  ok
+with_trans   grad          1.279e-13    5.611e-17  ok
+with_trans   hess          1.728e-10    1.420e-14  ok
+
+判据: 相对差 <= 1e-11（重构不改变物理时应当逐位或近乎逐位相等）
+结论: 全部一致
