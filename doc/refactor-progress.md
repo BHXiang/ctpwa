@@ -15,7 +15,8 @@
 | P0-B 多卡循环内的 set（128 处） | ⏸ **等 GPU** | — |
 | P2 DevBuffer 所有权 | ✅ 第一批（AmpCasDecay 四动量） | `9e91283` |
 | P2 第二批（`AmpCasDecay` 六张设备表） | ✅ | `7c808a8` |
-| P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | 见下 |
+| P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | `d42f203` |
+| P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | 见下 |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -154,6 +155,35 @@ grep -c 'h_perm_maps_\|h_signs_' src/PermTopology.cu
 **验证**：全量逐文件扫描 **254 passed / 7 failed / 30 skipped**，与 baseline3
 **逐行相同**（置换拓扑的敏感用例 `test_identical` 11 passed、`test_barrier` 7
 passed 都在其中）；CUDA 侧只编译 EXIT=0、0 错误。
+
+---
+
+## P3（第二步）：`DecayChainDesc` —— 衰变链成为可脱离 GPU 的值类型
+
+第一步把"描述类型"搬出了 `AmpGen.cuh`，但它们仍散在 `AmpCasDecay` 的四个容器里
+（`decayChain_`/`particleMap_`/`particleNames_`/`nSLCombs_`），想构造一条链依然
+要先 new 一个持有 6 张设备表 + JIT 状态的对象。
+
+**改动**：
+
+| 新增/移动 | 内容 |
+|---|---|
+| `include/DecayChainDesc.h` | `ParticleDesc` + `DecayChainDesc`（header-only）：`addParticle` / `addNode` / `setNSLCombs` + 只读访问器 |
+| `src/DecayDesc.cu`（新 TU） | `Amp2BD` 的构造与 `ComSL`（~110 行）从 `AmpGen.cu` 搬出 |
+| `AmpCasDecay` | 四个容器 → 一个 `ctpwa::DecayChainDesc desc_;`（has-a），52 处引用改为 `desc_.nodes()` / `desc_.particles()` / … |
+
+**验收（第一次有真正脱离 GPU 的单测）**：
+
+```bash
+bash tests/cpu_backend/build_and_run.sh
+# [test_decay_desc] 纯 host，无 GPU/torch/ROOT 依赖
+# [test_decay_desc] all checks passed
+```
+
+新增 `tests/cpu_backend/test_decay_desc.cpp`，编译链只有
+`src/DecayDesc.cu + 测试文件 + 标准库`——**不链接 `Backend.cpp`、不需要 torch/ROOT**。
+它检查：粒子去重与顺序、节点追加与波数乘积、`setNSLCombs` 覆盖、
+`Amp2BD` 的 (S,L) 结构不变量（`|J2-J3| ≤ S ≤ J2+J3`、`L ≤ maxL`）。
 
 ---
 

@@ -167,6 +167,7 @@ SOURCES_CORE = [
     "src/ResModel.cu",
     "src/Resonance.cu",
     "src/PermTopology.cu",   # P3：置换拓扑（纯 host）
+    "src/DecayDesc.cu",      # P3：Amp2BD 实现（纯 host）
 ]
 SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
 

@@ -8,6 +8,7 @@
 #include <Resonance.cuh>
 #include <SymbolicDiff.cuh>  // Q0MassDep（getDaughterMassDep 签名）
 #include <DevBuffer.h>       // AmpCasDecay 四动量缓冲的唯一所有者
+#include <DecayChainDesc.h>  // 衰变链描述（P3：从本类抽出）
 
 #include <array>
 #include "ComplexType.h"
@@ -72,11 +73,11 @@ private:
     // 衰变描述类型已上移到 DecayDesc.h（P3）；保留类内别名使既有代码不用改
     using DecayNodeHost = ::DecayNodeHost;
 
-    struct ParticleInfo {
-        int spin;
-        int parity;
-        double mass;
-    };
+
+    // 衰变链描述（P3 抽出：纯 host 值类型，可脱离 GPU 构造/检查）
+    ctpwa::DecayChainDesc desc_;
+    std::map<std::string, int> particleToIndex_;   // 名字 → 末态索引（由描述派生）
+    std::string chain_name_;  // 所属衰变链名（config.yml 顶层 key，如 decay1）
 
     // 全同粒子置换拓扑（coset）：
     // d_slamp_tab_[gpu] = [nSigma × nEv×nSL×nPol]，σ=0 行 = 恒等 SL 振幅
@@ -107,14 +108,8 @@ private:
     // // 每批数据大小
     // int* batchSizes_;
 
-    std::map<std::string, int> particleToIndex_;
-    std::vector<DecayNodeHost> decayChain_;
-    std::string chain_name_;  // 所属衰变链名（config.yml 顶层 key，如 decay1）
-    std::map<std::string, ParticleInfo> particleMap_;
-    std::vector<std::string> particleNames_;
 
     std::vector<size_t> nEvents_;
-    size_t nSLCombs_;
     size_t nPolarizations_;
 
     void addParticleIfNotExists(const std::string& name, int spin, int parity, double mass);
@@ -167,10 +162,10 @@ public:
     bool hasSLAmps() const { return !slamp_released_; }
 
     // Getter函数
-    size_t getNSLCombs() const { return nSLCombs_; }
+    size_t getNSLCombs() const { return desc_.nSLCombs(); }
     size_t getNPolarizations() const { return nPolarizations_; }
     size_t getNPolarizationsTotal() const { return nPolarizations_total_; }
-    int getDecayChainSize() const { return static_cast<int>(decayChain_.size()); }
+    int getDecayChainSize() const { return static_cast<int>(desc_.size()); }
     const std::vector<size_t>& getNEventsVec() const { return nEvents_; }
     // σ=0 行（恒等 SL 振幅）——tab 的起始指针
     thrust::complex<double>* getSLAmps(int gpu) const { return (gpu >= 0 && gpu < static_cast<int>(d_slamp_tab_.size())) ? d_slamp_tab_[gpu].data() : nullptr; }

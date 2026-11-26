@@ -35,103 +35,6 @@ static int polMode()
 }
 
 // Amp2BD 类实现
-Amp2BD::Amp2BD(std::array<int, 3> jvalues, std::array<int, 3> parities,
-    bool identical_daughters, bool is_boson, int maxL, bool p_break, bool has_bf,
-    double bf_d, std::set<std::pair<int, int>> sl_filter)
-    : jvalues_(jvalues), parities_(parities),
-    identical_daughters_(identical_daughters), is_boson_(is_boson),
-    maxL_(maxL), p_break_(p_break), has_bf_(has_bf), bf_d_(bf_d),
-    sl_filter_(std::move(sl_filter))
-{
-    spinOrbitCombinations_ = ComSL(jvalues, parities);
-}
-
-// std::vector<SL> Amp2BD::ComSL(const std::array<int, 3> &spins, const
-// std::array<int, 3> &parities)
-// {
-//     std::vector<SL> combinations;
-//     auto [s1, s2, s3] = spins;
-//     auto [p1, p2, p3] = parities;
-
-//     const int S_min = std::abs(s2 - s3);
-//     const int S_max = s2 + s3;
-//     for (int S = S_min; S <= S_max; ++S)
-//     {
-//         const int L_min = std::abs(s1 - S);
-//         const int L_max = s1 + S;
-//         for (int L = L_min; L <= L_max; ++L)
-//         {
-//             const int sign = (L % 2 == 0) ? 1 : -1;
-//             if (p1 == p2 * p3 * sign)
-//             {
-//                 combinations.emplace_back(S, L);
-//             }
-//         }
-//     }
-//     return combinations;
-// }
-
-std::vector<SL> Amp2BD::ComSL(const std::array<int, 3>& spins, const std::array<int, 3>& parities)
-{
-    std::vector<SL> combinations;
-
-    // 将 2J+1 转换回 J*2 的形式（避免浮点数）
-    // spins[i] = 2*J_i + 1 => 2*J_i = spins[i] - 1
-    auto [s1_2j, s2_2j, s3_2j] = spins;
-
-    // 转换为两倍的自旋值，以便整数运算
-    int two_j1 = s1_2j - 1; // 2 * J1
-    int two_j2 = s2_2j - 1; // 2 * J2
-    int two_j3 = s3_2j - 1; // 2 * J3
-
-    auto [p1, p2, p3] = parities;
-
-    // S（总自旋）的范围：|J2 - J3| ≤ S ≤ J2 + J3
-    // 使用两倍的值进行计算
-    const int two_S_min = std::abs(two_j2 - two_j3);
-    const int two_S_max = two_j2 + two_j3;
-
-    for (int two_S = two_S_min; two_S <= two_S_max; two_S += 2)
-    {
-        // L（轨道角动量）的范围：|J1 - S| ≤ L ≤ J1 + S
-        const int two_L_min = std::abs(two_j1 - two_S);
-        const int two_L_max = two_j1 + two_S;
-
-        for (int two_L = two_L_min; two_L <= two_L_max; two_L += 2)
-        {
-            // 宇称条件：P1 = P2 * P3 * (-1)^L
-            // 注意：L 是轨道角动量，不是两倍值
-            int L = two_L / 2; // 实际的轨道角动量量子数
-            const int sign = (L % 2 == 0) ? 1 : -1;
-
-            // 宇称条件（若宇称破缺则跳过该条件，如弱衰变）
-            if (p_break_ || p1 == p2 * p3 * sign)
-            {
-                // 全同粒子选择定则: (-1)^{L+S} = +1 (Bose) 或 -1 (Fermi)
-                if (identical_daughters_) {
-                    int S = two_S / 2; // 实际的总自旋量子数
-                    int parity_LS = ((L + S) % 2 == 0) ? 1 : -1;
-                    int required = is_boson_ ? 1 : -1;
-                    if (parity_LS != required) continue;
-                }
-
-                // 轨道角动量上限截断
-                if (maxL_ > 0 && L > maxL_) continue;
-
-                // 分波白名单: 仅保留用户指定的 (S, L)（S 为 2S+1 记号）
-                if (!sl_filter_.empty()) {
-                    int S_multi = two_S + 1;
-                    if (sl_filter_.find({S_multi, L}) == sl_filter_.end()) continue;
-                }
-
-                // 存储实际的自旋量子数（不是两倍值）
-                // int S = two_S / 2; // 实际的总自旋量子数
-                combinations.emplace_back(two_S + 1, L);
-            }
-        }
-    }
-    return combinations;
-}
 
 // DeviceMomenta 成员函数实现
 __device__ LorentzVector DeviceMomenta::getMomentum(int event_idx, int particle_idx) const
@@ -149,10 +52,9 @@ AmpCasDecay::AmpCasDecay(const std::vector<Particle>& particles)
 {
     for (const auto& p : particles)
     {
-        particleMap_[p.name] = { p.spin, p.parity, p.mass };
-        particleNames_.push_back(p.name);
+        desc_.addParticle(p.name, p.spin, p.parity, p.mass);
     }
-    nSLCombs_ = 1;
+    desc_.setNSLCombs(1);
     nPolarizations_total_ = 0;
 }
 
@@ -193,7 +95,7 @@ AmpCasDecay::~AmpCasDecay()
 
 void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const std::string& daug1, const std::string& daug2)
 {
-    decayChain_.push_back({ amp, mother, daug1, daug2 });
+    desc_.addNode(DecayNodeHost{amp, mother, daug1, daug2}, amp.getSL().size());
 
     auto jvals = amp.getJValues();
     auto pars = amp.getParities();
@@ -201,7 +103,6 @@ void AmpCasDecay::addDecay(const Amp2BD& amp, const std::string& mother, const s
     addParticleIfNotExists(daug1, jvals[1], pars[1], -1.0);
     addParticleIfNotExists(daug2, jvals[2], pars[2], -1.0);
 
-    nSLCombs_ *= amp.getSL().size();
 }
 
 void AmpCasDecay::setPolarizationMap(const std::vector<int>& map)
@@ -229,7 +130,7 @@ void AmpCasDecay::buildPermTopologies()
     // P3：置换拓扑是**衰变描述**的性质，算法已移到 ctpwa::buildPermTopology
     // （include/PermTopology.h，纯 host、可脱离 GPU 单测）。这里只做接线。
     ctpwa::PermTopology topo = ctpwa::buildPermTopology(
-        {decayChain_, particleToIndex_, identical_groups_, chain_name_});
+        {desc_.nodes(), particleToIndex_, identical_groups_, chain_name_});
     h_perm_maps_ = std::move(topo.maps);
     h_signs_ = std::move(topo.signs);
 }
@@ -237,11 +138,7 @@ void AmpCasDecay::buildPermTopologies()
 // AmpCasDecay 私有方法实现
 void AmpCasDecay::addParticleIfNotExists(const std::string& name, int spin, int parity, double mass)
 {
-    if (particleMap_.find(name) == particleMap_.end())
-    {
-        particleMap_[name] = { spin, parity, mass };
-        particleNames_.push_back(name);
-    }
+    desc_.addParticle(name, spin, parity, mass);
 }
 
 // host 侧衰变节点（索引/质量/势垒因子已决议）—— 与 computeSLAmps 中
@@ -249,16 +146,16 @@ void AmpCasDecay::addParticleIfNotExists(const std::string& name, int spin, int 
 std::vector<DecayNode> AmpCasDecay::getHostDecayNodes() const
 {
     std::vector<DecayNode> host_decayNodes;
-    for (const auto& node : decayChain_)
+    for (const auto& node : desc_.nodes())
     {
         DecayNode indexed_node;
         indexed_node.mother_idx = particleToIndex_.at(node.mother);
         indexed_node.daug1_idx = particleToIndex_.at(node.daug1);
         indexed_node.daug2_idx = particleToIndex_.at(node.daug2);
 
-        indexed_node.mass[0] = particleMap_.at(node.mother).mass;
-        indexed_node.mass[1] = particleMap_.at(node.daug1).mass;
-        indexed_node.mass[2] = particleMap_.at(node.daug2).mass;
+        indexed_node.mass[0] = desc_.particles().at(node.mother).mass;
+        indexed_node.mass[1] = desc_.particles().at(node.daug1).mass;
+        indexed_node.mass[2] = desc_.particles().at(node.daug2).mass;
 
         // 势垒因子（三级作用域决议后的最终值，随 DecayNode 进入内核）
         indexed_node.has_bf = node.amp.getHasBf();
@@ -274,7 +171,7 @@ std::vector<DecayNode> AmpCasDecay::getHostDecayNodes() const
 // 宽度约定: Lmin = decay 顶点 SL 列表的最小 L（K1_1400: (0,2)→0 等）
 int AmpCasDecay::getNodeLMin(const std::string& mother_name) const
 {
-    for (const auto& node : decayChain_) {
+    for (const auto& node : desc_.nodes()) {
         if (node.mother != mother_name) continue;
         int Lmin = -1;
         for (const auto& sl : node.amp.getSL()) {
@@ -290,9 +187,9 @@ bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
     Q0MassDep& md2_dep, double& md2_fixed) const
 {
     // mother_idx/target_idx 均为 particleToIndex_ 空间（字母序索引）——
-    // 不能用 particleNames_（config 顺序索引）按名反查，两个索引空间不一致。
+    // 不能用 desc_.particleNames()（config 顺序索引）按名反查，两个索引空间不一致。
     // 直接按 particleToIndex_ 匹配 decay 节点。
-    for (const auto& node : decayChain_) {
+    for (const auto& node : desc_.nodes()) {
         auto mit = particleToIndex_.find(node.mother);
         if (mit == particleToIndex_.end() || mit->second != mother_idx) continue;
         auto d1it = particleToIndex_.find(node.daug1);
@@ -303,8 +200,8 @@ bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
         //   子粒子 = target（共振态，无固定质量）→ M0Param（= m0 参数）
         //   否则（事件质量）→ EventMass
         auto dep = [&](const std::string& dname, int d_idx) {
-            auto it = particleMap_.find(dname);
-            double mass = (it != particleMap_.end()) ? it->second.mass : -1.0;
+            auto it = desc_.particles().find(dname);
+            double mass = (it != desc_.particles().end()) ? it->second.mass : -1.0;
             if (mass > 0) return std::make_pair(Q0MassDep::FixedMass, mass);
             if (d_idx == target_idx) return std::make_pair(Q0MassDep::M0Param, 0.0);
             return std::make_pair(Q0MassDep::EventMass, 0.0);
@@ -321,7 +218,7 @@ bool AmpCasDecay::getDaughterMassDep(int mother_idx, int target_idx,
 std::vector<std::vector<SL>> AmpCasDecay::getSLCombinations() const
 {
     std::vector<std::vector<SL>> result = { {} };
-    for (const auto& chain : decayChain_)
+    for (const auto& chain : desc_.nodes())
     {
         const auto& sls = chain.amp.getSL();
         std::vector<std::vector<SL>> temp;
@@ -343,16 +240,16 @@ std::vector<std::vector<SL>> AmpCasDecay::getSLCombinations() const
 // {
 //     int nPolar = 1;
 //     // 母粒子极化态数
-//     // if (!decayChain_.empty())
+//     // if (!desc_.nodes().empty())
 //     // {
-//     //     const std::string &motherName = decayChain_[0].mother;
-//     //     int motherSpin = particleMap_.at(motherName).spin;
+//     //     const std::string &motherName = desc_.nodes()[0].mother;
+//     //     int motherSpin = desc_.particles().at(motherName).spin;
 //     //     nPolar *= (2 * motherSpin + 1);
 //     // }
 //     // 末态粒子极化态数
 //     for (const auto& [name, _] : finalMomenta)
 //     {
-//         int particleSpin = particleMap_.at(name).spin;
+//         int particleSpin = desc_.particles().at(name).spin;
 //         // nPolar *= (2 * particleSpin + 1);
 //         nPolar *= particleSpin;
 //     }
@@ -541,7 +438,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
 
     // 所有粒子及其索引
     std::set<std::string> allParticles;
-    for (const auto& node : decayChain_)
+    for (const auto& node : desc_.nodes())
     {
         allParticles.insert(node.mother);
         allParticles.insert(node.daug1);
@@ -569,14 +466,14 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
     // 本批开始：释放上一批遗留的每-σ 四动量缓冲（见 releaseMomentaBuffers 注释）
     releaseMomentaBuffers();
     // 所有四动量都入设备端
-    d_momenta_ = convertToDeviceMomenta(finalMomenta, particleToIndex_, decayChain_);
+    d_momenta_ = convertToDeviceMomenta(finalMomenta, particleToIndex_, desc_.nodes());
     // 每 σ 拓扑的重建四动量（σ=0 复用 d_momenta_；σ≥1 用交换映射重建——
     // 中间态动量随末态交换重新求和，这是置换正确性的关键）
     d_mom_sigma_.clear();
     d_mom_sigma_.push_back(d_momenta_);
     for (size_t m = 0; m < h_perm_maps_.size(); ++m)
         d_mom_sigma_.push_back(
-            convertToDeviceMomenta(finalMomenta, h_perm_maps_[m], decayChain_));
+            convertToDeviceMomenta(finalMomenta, h_perm_maps_[m], desc_.nodes()));
 
     for (size_t i = 0; i < finalMomenta.size(); ++i)
     {
@@ -586,16 +483,16 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         nEvents_.push_back(finalMomenta[i].begin()->second.size());
 
         const auto slCombinations = getSLCombinations();
-        nSLCombs_ = slCombinations.size();
+        desc_.setNSLCombs(slCombinations.size());
 
         // 准备使用索引的衰变节点
         std::vector<DecayNode> host_decayNodes = getHostDecayNodes();
 
         // 准备衰变链信息
         std::vector<int> host_dj, host_dj1, host_dj2;
-        for (size_t i = 0; i < decayChain_.size(); ++i)
+        for (size_t i = 0; i < desc_.nodes().size(); ++i)
         {
-            const auto& node = decayChain_[i];
+            const auto& node = desc_.nodes()[i];
             auto jvals = node.amp.getJValues();
             host_dj.push_back(std::get<0>(jvals));  // dj
             host_dj1.push_back(std::get<1>(jvals)); // dj1
@@ -606,7 +503,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         // 显存硬检查（初始化时执行，per-GPU 按分摊后事件数）：
         // nPolar/链长大时 slamp 表是最易爆的 buffer，提前明确报错
         // （Analysis::checkCapacity 的预检拿不到 nSigma，这里是精确值）
-        size_t slamp_row = (size_t)nEvents_[i] * nPolarizations_ * nSLCombs_;
+        size_t slamp_row = (size_t)nEvents_[i] * nPolarizations_ * desc_.nSLCombs();
         size_t slamp_bytes = (size_t)nSigma * slamp_row * sizeof(thrust::complex<double>);
         {
             size_t free_b = 0, total_b = 0;
@@ -625,7 +522,7 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
             if (slamp_bytes > free_b) {
                 std::cerr << "ERROR: 显存不足——GPU " << i << " 的 slamp 表需要 "
                           << slamp_bytes / 1e6 << " MiB，仅剩 " << free_b / 1e6
-                          << " MiB（nSL=" << nSLCombs_ << " nEv=" << nEvents_[i]
+                          << " MiB（nSL=" << desc_.nSLCombs() << " nEv=" << nEvents_[i]
                           << " nPol=" << nPolarizations_ << " nSigma=" << nSigma
                           << "）。请减少事件数、缩短衰变链或使用多 GPU 分摊。" << std::endl;
                 throw std::runtime_error("slamp table exceeds device memory");
@@ -655,16 +552,16 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
 
         // 准备设备端的衰变链信息
         int* d_dimj, * d_dimj1, * d_dimj2;
-        cudaMalloc(&d_dimj, decayChain_.size() * sizeof(int));
-        cudaMalloc(&d_dimj1, decayChain_.size() * sizeof(int));
-        cudaMalloc(&d_dimj2, decayChain_.size() * sizeof(int));
-        cudaMemcpy(d_dimj, host_dj.data(), decayChain_.size() * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_dimj1, host_dj1.data(), decayChain_.size() * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_dimj2, host_dj2.data(), decayChain_.size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMalloc(&d_dimj, desc_.nodes().size() * sizeof(int));
+        cudaMalloc(&d_dimj1, desc_.nodes().size() * sizeof(int));
+        cudaMalloc(&d_dimj2, desc_.nodes().size() * sizeof(int));
+        cudaMemcpy(d_dimj, host_dj.data(), desc_.nodes().size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_dimj1, host_dj1.data(), desc_.nodes().size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_dimj2, host_dj2.data(), desc_.nodes().size() * sizeof(int), cudaMemcpyHostToDevice);
 
         // 将衰变节点复制到设备
-        d_decayNodes_[i].allocate(static_cast<int>(i), decayChain_.size());
-        cudaMemcpy(d_decayNodes_[i].data(), host_decayNodes.data(), decayChain_.size() * sizeof(DecayNode), cudaMemcpyHostToDevice);
+        d_decayNodes_[i].allocate(static_cast<int>(i), desc_.nodes().size());
+        cudaMemcpy(d_decayNodes_[i].data(), host_decayNodes.data(), desc_.nodes().size() * sizeof(DecayNode), cudaMemcpyHostToDevice);
 
         // 准备设备端的SL组合
         std::vector<SL> host_slCombinations;
@@ -690,11 +587,11 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
         // 精确模拟 computeSLAmpKernel 设备端 buffer_used 记账，得到每 sl scratch 用量。
         // 每节点: node_amp(dj*dj1*dj2) + pwa_amp 暂存(2*total + trans1 + trans2 + massive_shared)；
         // 每节点(ni>0): 缩并输出 Π(outputShape)，outputShape = 现形状去掉母粒子维 + [dj1, dj2]。
-        // buffer_used 在 kernel 内每 sl 重置，故每事件只需一份每 sl 用量（不乘 nSLCombs_）。
+        // buffer_used 在 kernel 内每 sl 重置，故每事件只需一份每 sl 用量（不乘 desc_.nSLCombs()）。
         std::vector<int> h_labels;
         std::vector<int> h_shapes;
         size_t scratch_per_sl = 0;
-        for (size_t ni = 0; ni < decayChain_.size(); ++ni)
+        for (size_t ni = 0; ni < desc_.nodes().size(); ++ni)
         {
             const DecayNode& node = host_decayNodes[ni];
             int dim_j = host_dj[ni];
@@ -779,8 +676,8 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 cudaMalloc(&d_amp_buffer, n_events * scratch_per_sl * sizeof(thrust::complex<double>));
                 CTPWA_LAUNCH(computeSLAmpKernel, numBlocks, blockSize, 0, 
                     target, d_amp_buffer, dm, d_decayNodes_[i].data(), d_dimj, d_dimj1,
-                    d_dimj2, d_slCombination_[i].data(), nSLCombs_, nEvents_[i], nPolarizations_,
-                    decayChain_.size(), (int)scratch_per_sl, n_events, start,
+                    d_dimj2, d_slCombination_[i].data(), desc_.nSLCombs(), nEvents_[i], nPolarizations_,
+                    desc_.nodes().size(), (int)scratch_per_sl, n_events, start,
                     d_polarization_map_.empty() ? nullptr : d_polarization_map_[i].data(),
                     nPolarizations_total_);
 
@@ -1208,11 +1105,11 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
         // 设置核函数配置
         dim3 blockDim(256);
         // 一维化：工作项数 = SL 组合数 × 事件数（kernel 内用 tid/nEvents 还原二维下标）
-        dim3 gridDim((static_cast<size_t>(nSLCombs_) * nEvents_[i] + blockDim.x - 1) /
+        dim3 gridDim((static_cast<size_t>(desc_.nSLCombs()) * nEvents_[i] + blockDim.x - 1) /
                      blockDim.x);
 
         // skip empty calls (no SL combos or no resonances for this combination)
-        if (nEvents_[i] == 0 || nSLCombs_ == 0 || resonance_count == 0) {
+        if (nEvents_[i] == 0 || desc_.nSLCombs() == 0 || resonance_count == 0) {
             cudaFree(d_resonances);
             if (d_all_params) cudaFree(d_all_params);
             if (d_all_channels) cudaFree(d_all_channels);
@@ -1240,7 +1137,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                     out_amp, d_momenta_[i], d_slCombination_[i].data(),
                     d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), desc_.nodes().size(), nEvents_[i], desc_.nSLCombs(),
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
@@ -1249,7 +1146,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                     out_amp, d_momenta_[i], d_slCombination_[i].data(),
                     d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), desc_.nodes().size(), nEvents_[i], desc_.nSLCombs(),
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
@@ -1259,7 +1156,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                         out_amp, d_momenta_[i], d_slCombination_[i].data(),
                         d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                         d_resonances, resonance_count, d_all_params, d_all_channels,
-                        d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
+                        d_decayNodes_[i].data(), desc_.nodes().size(), nEvents_[i], desc_.nSLCombs(),
                         nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                         n_amplitudes, site, k0);
                 break;
@@ -1269,7 +1166,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                         out_amp, d_momenta_[i], d_slCombination_[i].data(),
                         d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                         d_resonances, resonance_count, d_all_params, d_all_channels,
-                        d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
+                        d_decayNodes_[i].data(), desc_.nodes().size(), nEvents_[i], desc_.nSLCombs(),
                         nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                         n_amplitudes, site, 0);
                 break;
@@ -1278,7 +1175,7 @@ void AmpCasDecay::getAmps(std::vector<ctComplex*>& d_amplitudes,
                     out_amp, d_momenta_[i], d_slCombination_[i].data(),
                     d_slamp_tab_[i].data(), getNSigma(), d_mom_tab_[i].data(), d_sign_tab_[i].data(),
                     d_resonances, resonance_count, d_all_params, d_all_channels,
-                    d_decayNodes_[i].data(), decayChain_.size(), nEvents_[i], nSLCombs_,
+                    d_decayNodes_[i].data(), desc_.nodes().size(), nEvents_[i], desc_.nSLCombs(),
                     nPolarizations_, d_amp_offsets, d_event_offsets, num_offsets,
                     n_amplitudes, site, 0);
                 break;
