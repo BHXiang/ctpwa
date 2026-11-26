@@ -85,12 +85,15 @@ def run(out_path, configs):
     print(f"[ab] wrote {out_path}", file=sys.stderr)
 
 
-def compare(a_path, b_path, rel_tol, atol):
-    """逐元素判定：|a-b| <= atol + rel_tol*max(|a|,|b|)。
+def compare(a_path, b_path, rel_tol, atol_scale):
+    """逐元素判定：|a-b| <= atol_eff + rel_tol·max(|a|,|b|)，atol_eff = atol_scale·‖v‖∞。
 
-    为什么不用"整条向量的最大相对差"：梯度里常有 ≈0 的分量（例如被约束固定的方向），
-    绝对差 1e-12 在小分量上会变成很大的"相对差"，但物理上毫无意义。逐元素
-    atol + rtol 是数值比较的标准做法。
+    判据的两次修正都来自实测（见 doc/refactor-progress.md）：
+      1. 不能用"整条向量的最大相对差"——`interp` 有个 ≈0 的梯度分量，绝对差 9e-13
+         会被算成 7.9e-8 的"相对差"；
+      2. 也不能用固定的绝对 atol——`grad[0]`（被固定的参考振幅方向）解析上应为 0，
+         实际是 ~1e-4 的抵消噪声，且**逐次运行会抖动 ~1e-12**（同一二进制两次跑就不同）。
+         对这种"零方向"，有意义的判据是"相对向量尺度的绝对误差"。
     """
     a = json.loads(Path(a_path).read_text())
     b = json.loads(Path(b_path).read_text())
@@ -112,17 +115,19 @@ def compare(a_path, b_path, rel_tol, atol):
             bad = 0
             max_abs = 0.0
             max_rel = 0.0
+            vscale = max((abs(v) for v in va), default=0.0)
+            atol_eff = atol_scale * vscale
             for p, q in zip(va, vb):
                 d = abs(p - q)
                 scale = max(abs(p), abs(q))
                 max_abs = max(max_abs, d)
                 if scale > 0:
                     max_rel = max(max_rel, d / scale)
-                if d > atol + rel_tol * scale:
+                if d > atol_eff + rel_tol * scale:
                     bad += 1
             bad_total += bad
             print(f"{name:12s} {field:6s} {max_abs:11.3e} {max_rel:11.3e} {bad:7d}  {'ok' if bad==0 else 'MISMATCH'}")
-    print(f"\n判据: 逐元素 |Δ| <= atol({atol:g}) + rtol({rel_tol:g})·max(|a|,|b|)")
+    print(f"\n判据: 逐元素 |Δ| <= {atol_scale:g}·‖v‖∞ + {rel_tol:g}·max(|a|,|b|)")
     print("结论:", "全部一致" if bad_total == 0 else f"{bad_total} 个元素不一致")
     return 1 if bad_total else 0
 
@@ -132,11 +137,14 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--configs", nargs="*", default=DEFAULT_CONFIGS)
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
-    ap.add_argument("--rel-tol", type=float, default=1e-11)
-    ap.add_argument("--atol", type=float, default=1e-12)
+    # 默认 1e-7：实测 CPU 梯度路径本身有 ~8e-8 的逐次运行抖动（interp 模型，
+    # 同一二进制两次跑就不同），属于查找表/归约的舍入，与代码改动无关。
+    # 真·物理变化远大于此（份额/参数差通常在 1e-2 量级）。
+    ap.add_argument("--rel-tol", type=float, default=1e-7)
+    ap.add_argument("--atol-scale", type=float, default=1e-8, dest="atol_scale")
     args = ap.parse_args()
     if args.compare:
-        return compare(args.compare[0], args.compare[1], args.rel_tol, args.atol)
+        return compare(args.compare[0], args.compare[1], args.rel_tol, args.atol_scale)
     if not args.out:
         ap.error("需要 --out 或 --compare")
     run(args.out, args.configs)

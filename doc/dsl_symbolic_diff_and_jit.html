@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTPWA 内部笔记：DSL 符号微分与 JIT 运作机制</title>
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 980px; margin: 0 auto; padding: 24px; line-height: 1.7; color: #1a1a2e; }
+  h1 { border-bottom: 3px solid #4a6fa5; padding-bottom: 8px; }
+  h2 { color: #2c3e50; border-left: 4px solid #4a6fa5; padding-left: 10px; margin-top: 40px; }
+  h3 { color: #34495e; }
+  code { background: #f4f4f8; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.92em; }
+  pre { background: #1e1e2e; color: #cdd6f4; padding: 14px; border-radius: 8px; overflow-x: auto; }
+  pre code { background: none; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #b0b8c4; padding: 8px 12px; text-align: left; font-size: 0.95em; }
+  th { background: #eef2f7; }
+  .warn { background: #fff8e6; border: 1px solid #e6c200; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .tip { background: #e8f5e9; border: 1px solid #4caf50; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .err { background: #fdecea; border: 1px solid #e57373; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; font-size: 0.95em; }
+  .flow .step { background: #4a6fa5; color: #fff; padding: 6px 14px; border-radius: 20px; }
+  .flow .arrow { color: #4a6fa5; font-weight: bold; }
+  a { color: #4a6fa5; }
+</style>
+</head>
+<body>
+
+<h1>🧠 CTPWA 内部笔记：DSL 符号微分与 JIT 运作机制</h1>
+<p>本文梳理 <code>ctpwa</code> 中自定义共振态模型的完整链路：用户写下一个表达式（或配置一个内置模型），
+经过 <b>解析 → 符号微分 → 字节码编译</b>，最后在 GPU 上以 <b>解释器</b> 或 <b>JIT 原生代码</b> 两种方式执行。
+写于 2026-08。</p>
+
+<h2>一、为什么需要这条链路</h2>
+
+<p>振幅拟合需要对每个共振态传播子计算 <code>(F, ∂F/∂θ, ∂²F/∂θ²)</code>（θ 为自由参数，最多 16 个）。
+两种技术路线：</p>
+
+<table>
+  <tr><th></th><th>模板前向自动微分（AD）</th><th>符号微分 + JIT（本笔记）</th></tr>
+  <tr><td>导数何时算</td><td>运行时伴随计算（GPU 编译路径里 Var 模板携带 grad/hess）</td><td>host 端一次性推导完成，运行时零导数开销</td></tr>
+  <tr><td>产物</td><td>模板展开的 SASS</td><td>字节码段 → NVRTC 原生 SASS</td></tr>
+  <tr><td>导数正确性</td><td>机械正确</td><td>一阶公式手写（教科书式），二阶自动推导</td></tr>
+  <tr><td>运行时开销</td><td>每个事件都要伴随计算</td><td>字节码直译为直线代码，仅剩纯算术</td></tr>
+</table>
+
+<p>为什么不能只用模板 AD 一条路？因为解释器 <code>evalCustomSeg</code> 是栈式逐指令求值
+（每条指令一次 switch 分支 + 栈数组寻址，且 P 个导数段各自重跑一遍），free 参数拟合时占 forward 的
+98% 以上。JIT 把字节码<b>直译为直线寄存器代码</b>，交给 NVRTC 编译成原生 SASS —— 编译器得以做
+CSE / 死代码消除 / 指令调度，运行时只剩纯算术。</p>
+
+<h2>二、总流水线</h2>
+
+<div class="flow">
+  <span class="step">表达式字符串</span><span class="arrow">→</span>
+  <span class="step">tokenize + 递归下降解析</span><span class="arrow">→</span>
+  <span class="step">AST（Node 树）</span><span class="arrow">→</span>
+  <span class="step">符号微分 deriv ×(1+P+P(P+1)/2)</span><span class="arrow">→</span>
+  <span class="step">simplify 代数化简</span><span class="arrow">→</span>
+  <span class="step">compileNode 字节码</span><span class="arrow">→</span>
+  <span class="step">aux 段（host 内存）</span>
+</div>
+
+<p>aux 段随后兵分两路执行：</p>
+<div class="flow">
+  <span class="step">解释器：evalCustomSeg 逐指令求值（回退路径）</span>
+  <span class="arrow">↕ 二选一</span>
+  <span class="step">JIT：genSegment 栈→直线 C 代码 → NVRTC 编译 → 物化内核 → 读 buffer</span>
+</div>
+
+<p>模型的两种定义入口殊途同归：<b>Custom DSL</b>（表达式字符串）走解析器；
+<b>内置模型</b>（BWR/BW/Flatte/ONE/GS）走 <code>buildModelAST</code> 程序化构建 AST。
+两者最终都产出同一种 aux 布局。</p>
+
+<h2>三、阶段一：表达式 → AST</h2>
+
+<h3>3.1 Custom DSL 语法（src/CustomExpr.cu）</h3>
+<table>
+  <tr><th>类别</th><th>内容</th></tr>
+  <tr><td>变量</td><td><code>m</code> 不变质量，<code>q</code> breakup 动量，<code>q0</code> 标称 breakup，<code>L</code> 角动量，<code>d</code> 势垒半径；<code>p1p/p1e/p1costheta/p1phi</code>、<code>p2p/p2e/p2costheta/p2phi</code>（子粒子四动量）</td></tr>
+  <tr><td>参数</td><td>config 里 <code>paramNames</code> 列表的名字（全部视为自由参数，P ≤ 16；旧键 <code>params</code> 兼容）；值用 <code>paramValues</code>（旧键 <code>parameters</code> 兼容）</td></tr>
+  <tr><td>常数</td><td>数字、<code>1j</code>/<code>1i</code>/<code>i</code>（虚数单位）、<code>pi</code></td></tr>
+  <tr><td>运算</td><td><code>+ - * / ^</code>（幂右结合）、一元负号</td></tr>
+  <tr><td>函数</td><td><code>exp log ln sin cos sqrt abs Re real Im imag conj csqrt</code></td></tr>
+  <tr><td>模型函数</td><td><code>BW(m0, w0)</code>、<code>BWR(m0, g0[, L, d])</code>、<code>Bf(L, q, q0, d)</code>、<code>q0(x[, md1, md2])</code>、<code>Flatte(m0, g0..g_{n-1}, (ma,mb)0..)</code>（2026-08 新增，见下）</td></tr>
+</table>
+
+<p>解析器是经典的 <b>tokenizer + 递归下降</b>（<code>parseExpr → parseTerm → parseFactor → parseUnary → parsePrimary</code>）。
+值得一提的细节：<code>1j</code> 用 <code>csqrt(-1)</code> 构造 —— 求值与微分都正确
+（<code>csqrt(-1) = j</code>），AST 无需为虚数单位引入新节点类型。</p>
+
+<p><b>模型函数（多参数包装）</b>：把内置共振态模型包装进 DSL，运动学变量由包装内部自动补全，
+数值与 <code>buildModelAST</code> 产生的内置模型逐点一致（tests/test_custom_models.py 直接对比验证）：</p>
+<table>
+  <tr><th>DSL 写法</th><th>展开</th><th>备注</th></tr>
+  <tr><td><code>BW(p0, p1)</code></td><td><code>MODEL_BW(m, p0, p1)</code></td><td>m 自动补全，等价内置 BW</td></tr>
+  <tr><td><code>BWR(p0, p1, 1, 3.0)</code></td><td><code>MODEL_BWR(m, p0, p1, L, q, q0, d)</code></td><td>L/d 缺省 1/3.0（内置默认）；<b>L 必须是字面量</b>（modelDeriv 按 <code>(int)num</code> 取整）。注意内置 BWR 模型整体 = BWR 复合 × Bf 因子，DSL 需显式 <code>* Bf(1, q, q0, 3.0)</code>（见 <code>buildModelAST</code> BWR 分支）</td></tr>
+  <tr><td><code>Bf(1, q, q0, 3.0)</code></td><td><code>MODEL_BF(L, q, q0, d)</code></td><td>q/q0 可取变量或表达式；L 必须字面量</td></tr>
+  <tr><td><code>q0(x)</code> / <code>q0(x, md1, md2)</code></td><td><code>MODEL_BREAKUP_Q0</code></td><td>1 参：子粒子质量取事件值（= 裸 <code>q0</code> 变量）；3 参：显式质量。∂q0/∂x ≠ 0 被追踪</td></tr>
+  <tr><td><code>Flatte(p0, p1, p2, ma0, mb0, ma1, mb1)</code></td><td><code>buildFlatteAST</code> 展开（可微 AST）</td><td>参数 = 1 + 3n（m0, g_0..g_{n-1}, (ma,mb) 道质量对）。<b>不能</b>用 MODEL_FLATTE 复合节点：其 modelDeriv 为 0，须 AST 展开（见 4.3）</td></tr>
+</table>
+<p class="warn">约定：<code>BW/BWR</code> 与裸 <code>q0</code> 变量的标称质量都取 <b>第一个参数</b>（与运行时
+<code>m0_q0 = all_params[param_offset]</code> 一致）；<code>q0(x)</code> 函数形式可自由换 x。
+内置非 BWR 模型的势垒默认 <b>L=2</b>（<code>buildModelAST</code> 调用处
+<code>int L = (dr.type == ResModelType::BWR) ? 1 : 2</code>），DSL 里写 Bf 时注意。</p>
+
+<h3>3.2 AST 节点类型（include/SymbolicDiff.cuh）</h3>
+<pre><code>NodeType: Num | Var | Param | Add | Sub | Mul | Div | Pow | Neg | Func | Composite
+
+Composite = 黑盒复合节点（内置模型），不展开为基础运算树：
+  MODEL_BREAKUP_Q0  q0 = breakup(m0, md1, md2)
+  MODEL_BF         Bf(L, q, q0, d) —— L 为固定常量
+  MODEL_BW         BW(m, m0, w0) = 1 / (m0² - m² - i·m0·w0)
+  MODEL_BWR        BWR(m, m0, g0, L, q, q0, d) —— 含内部 Bf² 链
+  MODEL_FLATTE     Flatte(m, m0, [g_i, (ma,mb)_i]...)
+  MODEL_FLATTE_RHO_RE / IM  道 ρ 因子（仅依赖 s=m² 和道质量，导数 0）
+  MODEL_ONE        1 + 0i</code></pre>
+
+<p>Composite 是这套架构的核心抽象：<b>前向求值走内联函数（<code>Bf&lt;double&gt;</code>/<code>BW&lt;double&gt;</code>/<code>BWR&lt;double&gt;</code>），
+导数规则在注册表里预注册</b>。这让 BWR 这种结构复杂的模型不会被符号展开成爆炸的表达式树。</p>
+
+<h2>四、阶段二：符号微分</h2>
+
+<h3>4.1 核心规则：复数域普通链式法则（deriv，src/CustomExpr.cu）</h3>
+<table>
+  <tr><th>节点</th><th>∂/∂θ_p</th></tr>
+  <tr><td>Num / Var（m,q,L,d, 四动量）<br><span style="font-size:0.88em; color:#666;">DSL 表达式里的输入运动学变量；<b>q0 不在此列</b>——它展开为 MODEL_BREAKUP_Q0 复合节点（见 4.2）</span></td><td>0</td></tr>
+  <tr><td>Param θ_k</td><td>δ_kp</td></tr>
+  <tr><td>a + b / a − b</td><td>a′ ± b′</td></tr>
+  <tr><td>a·b</td><td>a′b + ab′</td></tr>
+  <tr><td>a/b</td><td>(a′b − ab′) / b²</td></tr>
+  <tr><td>a^b</td><td>a^b · (b′·ln a + b·a′/a)</td></tr>
+  <tr><td>exp(a) / ln(a)</td><td>a′·exp(a) / a′/a</td></tr>
+  <tr><td>sqrt(a) / csqrt(a)</td><td>a′ / (2·√a)</td></tr>
+  <tr><td>|z|</td><td>Re(conj(z)·z′) / |z|</td></tr>
+  <tr><td>Re(z) / Im(z) / conj(z)</td><td>Re(z′) / Im(z′) / conj(z′)</td></tr>
+  <tr><td><b>Composite</b></td><td>Σ_k (∂C/∂arg_k) · deriv(arg_k, p) —— 模型注册表</td></tr>
+</table>
+
+<h3>4.2 混合导数策略：一阶手写、二阶自动</h3>
+<p>Composite 的 <b>一阶导数公式由 modelDeriv 注册表手写</b>（src/ResModel.cu，教科书式公式）：</p>
+<pre><code>MODEL_BREAKUP_Q0   q0 = sqrt(A·B/(4m0²)),  A = m0²-(m1+m2)²,  B = m0²-(m1-m2)²
+  ∂q0/∂m0 = (m0²(A+B) − A·B) / (4·m0³·q0)
+  ∂q0/∂m1 = −(s·B + d·A) / (4·m0²·q0),   s = m1+m2, d = m1−m2
+  ∂q0/∂m2 = (d·A − s·B) / (4·m0²·q0)
+
+MODEL_BF          Bf = sqrt(N(z0)/N(z)),  z = q·d, z0 = q0·d
+  ∂Bf/∂q  = −d·Bf·N′(z) / (2N(z))
+  ∂Bf/∂q0 =  d·Bf·N′(z0) / (2N(z0))
+  ∂Bf/∂d  = (q/d)·∂Bf/∂q + (q0/d)·∂Bf/∂q0
+
+MODEL_BW          F = x/s + i·y/s,  x = m0²−m², y = m0·g0, s = x²+y²
+  商法则：∂Re/∂a = (∂x/∂a·s − x·∂s/∂a)/s²，∂Im 同理
+
+MODEL_BWR         γ = g0·(q/q0)^(2L+1)·(m0/m)·Bf²
+  对数微分：γ′/γ = g0′/g0 + (2L+1)(q′/q − q0′/q0) + m0′/m0 − m′/m + 2·Bf′/Bf</code></pre>
+
+<p><b>注意 q0 的导数不为零</b>：内置模型中 q0 = breakup(m0, md1, md2) 是复合节点，m0 即自由参数 θ_0
+（<code>buildModelAST</code> 里 <code>m0_ast = makeParam(0)</code>），因此 <code>∂q0/∂m0 ≠ 0</code>，
+链式法则会把这个偏导继续传进 BWR 的 γ 与 Bf 因子（见上面 <code>q0′/q0</code> 项）。
+子粒子质量 md1/md2 的依赖由 <code>getDaughterMassDep</code>（src/AmpGen.cu）判定：</p>
+<table>
+  <tr><th>情形</th><th>Q0MassDep</th><th>AST 节点</th><th>导数</th></tr>
+  <tr><td>config 粒子表有固定质量</td><td>FixedMass</td><td>makeNum(质量)</td><td>0</td></tr>
+  <tr><td>子粒子 = 目标共振态自身</td><td>M0Param</td><td>makeParam(0)</td><td>δ（带导数）</td></tr>
+  <tr><td>其他（事件质量）</td><td>EventMass</td><td>makeVar(CVAR_MD1/2)</td><td>0（运行时值）</td></tr>
+</table>
+<p>Custom DSL 里的 <code>q0</code> 也走同一机制（2026-08 修复）：解析器把它展开为
+<code>MODEL_BREAKUP_Q0(makeParam(0), CVAR_MD1, CVAR_MD2)</code> —— 标称质量取<b>第一个参数</b>
+（与内核运行时 <code>m0_q0 = all_params[param_offset]</code> 一致），∂q0/∂θ₀ 被精确追踪。
+注意这里的约定：<b>DSL 的第一个参数必须是标称质量</b>，否则 q0 的语义与运行时不一致。
+需要换标称质量时用 <code>q0(x)</code> 函数形式（见 3.1 模型函数表），展开为
+<code>MODEL_BREAKUP_Q0(x, CVAR_MD1, CVAR_MD2)</code>。</p>
+
+<p><b>二阶导不手写</b>：对一阶导数树再调用一次 <code>deriv</code> 递归推导
+（<code>deriv(deriv(ast, j), k)</code>）。这是一次踩坑后的设计决策 —— 手写二阶极易出错：
+调试记录见 doc/README 与 morefast/dslformula/README.md（<code>q0″</code> 曾漏掉 <code>−2·q0sq′·v′/v</code> 项；
+<code>bf″ = bf·(½lnN″ + ¼(lnN′)²)</code> 是加号）。一阶公式独立、稳定，手写可控；二阶交给机器。</p>
+
+<div class="tip"><b>为什么一阶手写而不全部自动？</b>若 BWR 的 ∂/∂θ 完全用链式法则展开，
+γ 的对数微分结构会生成巨大的嵌套表达式树；而手写公式直接给出最简形态。
+同时 Composite 节点在 AST 中保持黑盒，simplify 原样穿越，树不会膨胀。</div>
+
+<h3>4.3 代数化简 simplify</h3>
+<p>每棵导数树都过一遍 <code>simplify</code>：<code>0±x→x</code>、<code>x±0→x</code>、
+<code>0*x→0</code>、<code>x*1→x</code>、<code>1*x→x</code>、<code>0/x→0</code>、
+<code>x/1→x</code>、<code>x^1→x</code>、<code>1^x→1</code>、<code>0^x→0</code>、
+<code>−(−x)→x</code>、数值折叠。这是字节码尺寸的主要控制手段 —— 大量导数项
+（如对无关参数求导的 δ=0 链）被削减为零。</p>
+
+<h2>五、阶段三：字节码编译（aux 布局）</h2>
+
+<p><code>compileNode</code> 把每棵 AST 树后序遍历为指令序列（每指令 3 个 double：<code>op, arg0, arg1</code>）：</p>
+
+<table>
+  <tr><th>opcode</th><th>含义</th></tr>
+  <tr><td><code>COP_PUSH_NUM / VAR / PARAM / I / PI</code></td><td>常量 / 变量 / 参数 / 1j / π 入栈</td></tr>
+  <tr><td><code>COP_ADD SUB MUL DIV POW NEG</code></td><td>复数算术（栈式，先 pop 右操作数）</td></tr>
+  <tr><td><code>COP_CALL</code></td><td>函数调用，arg0 = CustomFuncId</td></tr>
+  <tr><td><code>COP_MODEL</code></td><td>内置模型黑盒，arg0 = CompositeId；Flatte 用 arg1 传道数</td></tr>
+</table>
+
+<p>最终 aux 段布局（<code>compileCustomExpr</code> / <code>buildModelAST</code> 输出一致）：</p>
+<pre><code>aux[0]      = P                        # 自由参数数
+aux[1]      = n_seg = 1 + P + P(P+1)/2 # 段数
+aux[2..]    = 每段: [n_instr, (op,arg0,arg1)×n_instr]
+  段 0        = 值 F
+  段 1..P     = ∂F/∂θ_j
+  段 P+1..    = ∂²F/∂θ_j∂θ_k (j ≤ k，对称填充)
+  每段执行输出 2 个 double: (re, im)</code></pre>
+
+<p class="warn"><b>段独立的代价</b>：值段与每个导数段各自重算公共子表达式（例如 q0 链在每个段里都算一遍）。
+解释器模式下这是浪费；JIT 模式下由编译器的 CSE 处理（各段生成独立代码，段间共享依赖 NVRTC 优化）。</p>
+
+<h2>六、阶段四：执行双轨</h2>
+
+<h3>6.1 解释器（回退路径）</h3>
+<p><code>evalCustomSeg</code>（src/CustomExpr.cu）是设备端<b>栈式复数虚拟机</b>：</p>
+<ul>
+  <li>栈深上限 <code>kStack = 32</code>（超限静默返回 0，调用方走其它分支）</li>
+  <li>每条指令一次 <code>switch(op)</code> 分发 + 栈数组读写</li>
+  <li><code>evalCustomAll</code> 依次执行值段 → P 个一阶段 → P(P+1)/2 个二阶段
+      （<code>compute_2nd=false</code> 时跳过二阶段；d2 按 j≤k 读、对称填充）</li>
+  <li>复数运算全精度（乘法 <code>ar·br−ai·bi</code>；除法保护 <code>s==0 → 1e-30</code>；<code>log(0)</code> 同理）</li>
+</ul>
+
+<h3>6.2 JIT（主力路径，src/JITCustom.cu）</h3>
+
+<p>两段式执行结构（整个 JIT 架构的出发点）：</p>
+<div class="flow">
+  <span class="step">pass-1：JIT 物化内核（NVRTC 编译）</span>
+  <span class="arrow">在 (σ, 事件, SL) 网格上算 (F, ∂F/∂θ[, ∂²F/∂θ²])</span>
+  <span class="step">→ device buffer</span>
+  <span class="arrow">→</span>
+  <span class="step">pass-2：computeCustomAmpsKernel / computeCustomHessianKernel 改读 buffer</span>
+</div>
+
+<p class="warn"><b>为什么不能直接调用</b>：CUDA 不支持跨模块 device 函数指针 ——
+<code>cuModuleGetFunction</code> 只暴露 <code>__global__</code> 内核，<code>__device__</code> 函数无法从其他编译单元调用。
+所以 JIT 内核只能"物化"结果到显存，由 pass-2 读取。</p>
+
+<h4>6.2.1 代码生成：栈 → 直线寄存器代码（genSegment）</h4>
+<p>把字节码段翻译成 C 代码的核心技巧是 <b>惰性表达式 + 按需固化</b>：</p>
+<ul>
+  <li>栈项 <code>StackVal</code> 先保存<b>表达式字符串</b>（不立即生成语句）；</li>
+  <li><code>popVal</code> 时 <code>materialize</code>：若未固化，生成 <code>double tN_re = &lt;expr&gt;;</code> 声明，
+      保证<b>每个子表达式至多求值一次</b>（与解释器逐指令求值语义一致）；</li>
+  <li>每个算术指令生成一行 <code>pushTemp</code>，如复数乘法 →
+      <code>t3_re = (t1_re*t2_re - t1_im*t2_im);</code>；</li>
+  <li><code>COP_MODEL</code> → 内联公式原文：<code>jitBf</code> / <code>jitQ0</code> / <code>jitFlatte</code>
+      （BWR 展开为 x/s + i·y/s 直线代码）。</li>
+</ul>
+
+<p>每个 JIT 节点生成一个设备函数：</p>
+<pre><code>__device__ __forceinline__ void ctpwa_jit_node_0_grad(JitArgs A, const DeviceMomenta* dm, int evt, int sl, double* out)
+{
+    const JitNodeFlat& F = A.nodes[0];
+    int L = ((const SL*)A.d_slComb)[F.node_idx + sl * A.decayChain_size].L;
+    // 运动学: mm, qq, md1_q0/md2_q0（固定质量→共振态参数→事件质量 三级回退）, q0, p1_*/p2_*
+    // seg 0: F
+    double t0_re = ...; double t0_im = ...; ...
+    out[0] = ...; out[1] = ...;
+    // seg 1..P: dF[j]
+    ...
+}</code></pre>
+
+<p>然后组装 <code>ctpwa_jit_grad</code> / <code>ctpwa_jit_full</code> 两个内核：grid
+<code>(nSL, ⌈nEvents/256⌉)</code>，每线程遍历 σ 拓扑 × 节点，写入
+<code>out[slice_base + ((s·nEvents+evt)·nSL + sl)·nvals]</code>。
+<b>full 内核只物化 hessian 目标节点</b>（<code>hessian_target</code>），nvals = 2+2P+2P²。</p>
+
+<h4>6.2.2 NVRTC 编译与缓存</h4>
+<ul>
+  <li>编译选项：<code>--gpu-architecture=sm_XX</code>（当前 device）+ <code>--std=c++17</code></li>
+  <li><b>CUBIN 优先</b>（nvrtc 内部跑 ptxas），失败退 PTX（driver 再 JIT 一次）</li>
+  <li><b>进程级二进制缓存</b>：cacheKey = FNV-1a64(aux 全部 double 内容) + SM arch + hessian_target。
+      同一 aux 内容跨 block 复用编译产物</li>
+  <li>CUmodule 绑定 context → 每 GPU 各自 <code>cuModuleLoadData</code> + <code>cuModuleGetFunction</code> 加载</li>
+</ul>
+
+<h4>6.2.3 prep / launch / 读端</h4>
+<table>
+  <tr><th>环节</th><th>说明</th></tr>
+  <tr><td><code>jitCompileBlock</code></td><td>config 加载时懒构建（一次）：收集每 block 的节点 specs + aux_list，编译，失败 → enabled=false 整块回退解释器</td></tr>
+  <tr><td><code>jitPrepareGrad / Full</code></td><td>每 GPU 一次性准备：slice 布局（total = Σ nSigma·nEvents·nSL·nv），缓冲分配（够用复用），构建 <code>grad_slice[decayChain_size]</code>（节点→slice 偏移，-1=解释器）</td></tr>
+  <tr><td><code>jitLaunchGrad / Full</code></td><td>默认流 cuLaunchKernel —— 与 pass-2 同流，<b>顺序保证</b>物化先于消费</td></tr>
+  <tr><td>pass-2 读端</td><td>内核里 <code>B.d_jit_slice[nodeIdx] ≥ 0 && B.d_jit_out</code> → 直接读 buffer（nvals=2+2P），否则回退 <code>evalCustomAll</code></td></tr>
+</table>
+
+<div class="err"><b>参数新鲜度陷阱</b>：<code>ready[gpu]</code> 只表示"首次 prep 完成"，不代表参数新鲜。
+<code>nEvents/evt_offset</code> 每次调用必须刷新 —— getHessian 按 data/bkg/phsp 分段调用，
+各段 nEvents 不同；stale args 会导致 pass-1 用旧尺寸物化、pass-2 读越界 → 垃圾/nan。</div>
+
+<h2>七、调用路径</h2>
+
+<div class="flow">
+  <span class="step">reComputeAmps（NLL / 梯度，每次迭代）</span>
+  <span class="arrow">→</span>
+  <span class="step">jitPrepareGrad + jitLaunchGrad（物化 F+dF）</span>
+  <span class="arrow">→</span>
+  <span class="step">computeCustomAmpsKernel 读 buffer</span>
+</div>
+<div class="flow">
+  <span class="step">getHessian（computeUnifiedHessian）</span>
+  <span class="arrow">→</span>
+  <span class="step">jitPrepareFull + jitLaunchFull（只物化 hessian 目标节点，F+dF+d2F）</span>
+  <span class="arrow">→</span>
+  <span class="step">computeCustomHessianKernel 读 buffer</span>
+</div>
+
+<p>JIT 节点筛选（src/AmpGen.cu）：排除 Interp（查表不走字节码）、无 aux、
+param_count=0（布局不匹配）或 &gt;16 的节点。hessian 目标的 full 变体生成失败时降级为仅 grad
+（仍加速 fit 主循环，hessian 走解释器）。</p>
+
+<h2>八、数值等价性与回退机制</h2>
+
+<table>
+  <tr><th>机制</th><th>行为</th></tr>
+  <tr><td>逐位一致</td><td>生成代码与解释器同一公式文本、同一运算顺序；主库与 NVRTC 均未开 fast_math → 同样的 libdevice 精确数学函数</td></tr>
+  <tr><td>栈深 &gt; 32</td><td>genSegment 中止，整块回退解释器</td></tr>
+  <tr><td>未知 opcode / 未知变量</td><td>生成失败，回退</td></tr>
+  <tr><td>NVRTC 编译错误</td><td>报错 + 回退解释器（与现有行为一致）</td></tr>
+  <tr><td><code>CTPWA_NO_JIT=1</code></td><td>强制禁用 JIT —— 数值对拍用</td></tr>
+</table>
+
+<div class="tip"><b>调试开关</b>：<code>CTPWA_JIT_DEBUG=1</code> 打印编译耗时/plan/prep 细节并把生成源码写到
+<code>/tmp/ctpwa_jit_src.cu</code>；<code>CTPWA_JIT_DUMP_SRC=1</code> 直接 dump 源码。</div>
+
+<h2>九、源码位置索引</h2>
+<table>
+  <tr><th>文件</th><th>内容</th></tr>
+  <tr><td>include/CustomExpr.cuh</td><td>DSL 语法定义：变量/函数/opcode 枚举、evalCustomSeg/evalCustomAll 声明、aux 布局说明</td></tr>
+  <tr><td>src/CustomExpr.cu</td><td>tokenizer + 递归下降解析器（含 BW/BWR/Bf/q0/Flatte 模型函数分支）、deriv 链式法则、simplify、compileNode 字节码、buildFlatteAST（Flatte 可微展开）、设备端解释器</td></tr>
+  <tr><td>include/SymbolicDiff.cuh</td><td>AST 节点定义、CompositeId 枚举、deriv/simplify/compileNode 声明、buildModelAST 签名、Q0MassDep</td></tr>
+  <tr><td>src/ResModel.cu</td><td>modelDeriv 注册表（一阶公式手写）、bfPoly 系数、buildModelAST（BWR/BW/Flatte/GS 程序化构建）</td></tr>
+  <tr><td>include/JITCustom.cuh</td><td>JitNodeFlat/JitArgs/JitBlockState 结构、jitCompileBlock/Prepare/Launch/Destroy API</td></tr>
+  <tr><td>src/JITCustom.cu</td><td>代码生成（genSegment 栈→直线代码）、NVRTC 编译、进程级缓存、物化内核、prep/launch</td></tr>
+  <tr><td>src/AmpGen.cu</td><td>buildModelAST 调用（addBlock）、jitCompileBlock 调用、reComputeAmps 的 pass-1/pass-2 编排、computeCustomAmpsKernel 读端</td></tr>
+</table>
+
+<h2>十、一句话总结</h2>
+<p><b>表达式 → AST → 复数域符号微分（一阶手写、二阶自动）→ 代数化简 → 字节码段</b>；
+运行时 <b>解释器逐指令求值</b>，或 <b>JIT 把字节码直译为直线 C 代码经 NVRTC 编译成原生 SASS，
+在 (σ, 事件, SL) 网格上物化 (F, dF, d2F) 到显存，消费者内核改读 buffer</b>。
+任何一步失败 → 整块回退解释器，数值逐位一致。</p>
+
+</body>
+</html>

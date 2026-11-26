@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTPWA 设计笔记：nllSimulate —— 分波迭代的“加态 ΔNLL 模拟器”</title>
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['\\(','\\)'], ['$','$']], displayMath: [['\\[','\\]']] },
+  options: { renderActions: { addMenu: [] } }
+};
+</script>
+<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 980px; margin: 0 auto; padding: 24px; line-height: 1.7; color: #1a1a2e; }
+  h1 { border-bottom: 3px solid #4a6fa5; padding-bottom: 8px; }
+  h2 { color: #2c3e50; border-left: 4px solid #4a6fa5; padding-left: 10px; margin-top: 40px; }
+  h3 { color: #34495e; margin-top: 26px; }
+  h4 { color: #4a6fa5; }
+  code { background: #f4f4f8; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.92em; }
+  pre { background: #1e1e2e; color: #cdd6f4; padding: 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #b0b8c4; padding: 8px 12px; text-align: left; font-size: 0.95em; vertical-align: top; }
+  th { background: #eef2f7; }
+  .warn { background: #fff8e6; border: 1px solid #e6c200; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .tip  { background: #e8f5e9; border: 1px solid #4caf50; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .err  { background: #fdecea; border: 1px solid #e57373; border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+  .flow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; font-size: 0.95em; }
+  .flow .step { background: #4a6fa5; color: #fff; padding: 6px 14px; border-radius: 20px; }
+  .flow .arrow { color: #4a6fa5; font-weight: bold; }
+  a { color: #4a6fa5; }
+  .kbd { background: #eef2f7; border: 1px solid #b0b8c4; border-radius: 4px; padding: 1px 6px; font-family: Consolas, monospace; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>⚛️ CTPWA 设计笔记：nllSimulate —— 分波迭代的“加态 ΔNLL 模拟器”</h1>
+
+<p>本文是 <code>auto-pwa</code> 分波迭代闭环中“<b>决定下一步该测试哪个共振态</b>”这一环的设计笔记。
+目标：在<b>当前 best-fit</b> 的基础上，用一次<b>少量参数优化</b>（而非完整冷启动拟合），
+快速估算“<b>再加入一个共振态</b>”能给负对数似然（NLL）带来的改变 \(\Delta\mathcal{L}\)，
+从而对 PDG / 阈值附近的候选共振态做<b>显著性排序</b>，把重活（真拟合确认）留给最有希望的那几个。
+写于 2026-08。</p>
+
+<div class="flow">
+  <span class="step">best-fit</span><span class="arrow">→</span>
+  <span class="step">nllSimulate（快速 ΔNLL 排序）</span><span class="arrow">→</span>
+  <span class="step">top-k 候选</span><span class="arrow">→</span>
+  <span class="step">试拟合确认</span><span class="arrow">→</span>
+  <span class="step">加态进下一轮</span>
+</div>
+
+<div class="tip">
+<b>一句话结论：可行。</b> 因为“加入单共振态”让强度对耦合是<b>精确二次型</b>，加上 CTPWA 已有解析梯度/解析 Hessian，
+“0 步得分检验 + 少步 warm-start profile”可以做到既有速度又有精度。唯一要立项修正的认知是：
+<b>在 \(\alpha=0\)（新态耦合为零）处，NLL 对 \((m,\Gamma)\) 的梯度恒为 0</b>，所以 \((m,\Gamma)\) 必须显式扫描，
+梯度公式只用于“\(\alpha\) 已铺开之后”的峰值细化。
+</div>
+
+<h2>一、NLL 的数学结构（这是整套方案便宜的根源）</h2>
+
+<p>CTPWA 把每个极化组态的通道振幅拼成复向量，逐事件强度成为耦合参数上的<b>二次型</b>：</p>
+
+\[
+I(x;\boldsymbol{\theta}) = \sum_{\boldsymbol{\lambda}}\bigl|\boldsymbol{\theta}_a\boldsymbol{\mathcal{A}}_{\boldsymbol{\lambda}}\bigr|^2
+= \boldsymbol{\theta}_a^\dagger \mathbf{B}\,\boldsymbol{\theta}_a,
+\qquad
+\mathbf{B} \equiv \sum_{\boldsymbol{\lambda}}\boldsymbol{\mathcal{A}}_{\boldsymbol{\lambda}}^*\,\boldsymbol{\mathcal{A}}_{\boldsymbol{\lambda}}^{\mathsf{T}}
+\tag{1}
+\]
+
+<p>\(\mathbf{B}\) 是每事件 \(N_{\rm ch}\times N_{\rm ch}\) 的 Hermitian 半正定矩阵，把该事件所有运动学/极化信息吸收进去。
+于是整批数据的强度更新退化为<b>批处理矩阵-向量积</b>，负对数似然由结果强度的逐元素对数得到。相空间归一化矩阵<b>预平均一次</b>：</p>
+
+\[
+\bar{\mathbf{B}} = \frac{1}{N_{\rm phsp}}\sum_{j=1}^{N_{\rm phsp}}\mathbf{B}_j,
+\tag{2}
+\]
+
+<p>这样相空间项及其导数每次迭代仅需一次 \(\mathcal{O}(N_{\rm ch}^2)\)，与 \(N_{\rm phsp}\) 无关。这是“便宜”的根源。</p>
+
+<p>CTPWA 的 loss 组装（见 <code>Analysis.cu</code>）：</p>
+
+<pre><code>loss = data_nll − bkg_nll + (Σw_data − bkg_integral) · log(phsp_factor)
+data_nll = −Σ_{data} w_e log I_e ，   I_e = Σ_polar |S_{e,p}|² ，  S = A·v</code></pre>
+
+<h3>1.1 关键性质：加一条波，强度对“单个复耦合”是精确二次</h3>
+
+<p>在 best-fit 存在已固定的 \(S_0=A_0 v_0\)。加一条新共振态振幅列 \(A_{\rm new}\)（复耦合 \(\alpha\)）后：</p>
+
+\[
+I_e(\alpha) = \sum_{p}\bigl|S_{0,p}+\alpha\,A_{{\rm new},p}\bigr|^2
+= a_e + 2\,\mathrm{Re}[b_e\,\alpha] + c_e|\alpha|^2,
+\tag{3}
+\]
+
+<p>其中逐事件标量</p>
+
+\[
+a_e=\sum_p|S_{0,p}|^2,\quad b_e=\sum_p\overline{S_{0,p}}A_{{\rm new},p},\quad c_e=\sum_p|A_{{\rm new},p}|^2.
+\tag{4}
+\]
+
+<p>因为只有一条新耦合，强度对 \(\alpha\) <b>没有更高阶项</b>；phsp 项 \(\Phi(\alpha)\) 同样由 \(\bar{\mathbf{B}}\) 变成二次型。
+这是“固定 \((m,\Gamma)\)、只优化 \(\alpha\)”时，NLL 成为 2 实参光滑函数、可闭式剖面（profile）的原因。</p>
+
+<h2>二、必须立项修正的物理事实：\(\alpha=0\) 处 \((m,\Gamma)\) 梯度恒为零</h2>
+
+<p>共振态参数梯度公式为（数据部分）：</p>
+
+\[
+\frac{\partial\mathcal{L}_{\rm data}}{\partial\theta_r}
+= -2\sum_{\boldsymbol{\lambda}}\frac{1}{I_{\boldsymbol{\lambda}}}
+\,\mathrm{Re}\!\Big[\mathcal{P}_{r,\boldsymbol{\lambda}}\,\overline{S_{\boldsymbol{\lambda}}}\,\frac{\partial F(m;\boldsymbol{\theta}_r)}{\partial\theta_r}\Big],
+\qquad \mathcal{P}_{r,\boldsymbol{\lambda}}\equiv\sum_{a\in r}\theta_a[\mathcal{A}_{L,S}]_{a,\boldsymbol{\lambda}}.
+\tag{5}
+\]
+
+<p>对<b>新加的</b>共振态（此刻耦合 \(\alpha=0\)），\(\mathcal{P}_{\rm new}=\alpha\,A_{\rm new}=0\)，于是</p>
+
+\[
+\left.\frac{\partial\mathcal{L}}{\partial m}\right|_{\alpha=0}
+=\left.\frac{\partial\mathcal{L}}{\partial\Gamma}\right|_{\alpha=0}=0 .
+\tag{6}
+\]
+
+<div class="warn">
+<b>含义</b>：新态耦合还没铺开，质量/宽度取什么值都不影响似然。因此<b>不能</b>从 best-fit 出发直接用 \((m,\Gamma)\) 梯度做“加态后对 \((m,\Gamma)\) 的检验”。
+\((m,\Gamma)\) 必须<b>显式网格扫描</b>；梯度公式 Eq.(5) 用于“\(\alpha\) profile 之后、\(\alpha^*\neq0\)”的<b>峰值细化</b>（由包络定理，\(\partial(\min_\alpha\mathcal{L})/\partial m = \partial\mathcal{L}/\partial m|_{\alpha=\alpha^*}\neq0\)）。
+</div>
+
+<h2>三、加一个共振态 = 一组新参数（不是单个耦合）</h2>
+
+<p>加入一个共振态通常引入的不止一个复耦合，而是一个<b>参数集合</b>：</p>
+
+<table>
+  <tr><th>来源</th><th>参数</th><th>数量</th></tr>
+  <tr><td>每条允许的 (L,S) 分波白名单</td><td>各自对应一个复耦合（Re/Im）</td><td>≥1 组，视 <code>sl</code> 白名单而定</td></tr>
+  <tr><td>共振态质量 / 宽度参与拟合</td><td><code>(m, Γ)</code>，共享 slot</td><td>0 或 2</td></tr>
+</table>
+
+<p>因此单个“\(\alpha\) 精确二次 + 闭式 Schur”只是<b>最小情形</b>（一条波、一个复耦合、固定 \((m,\Gamma)\)），适合当 <b>0 步快筛</b>，
+不是通用答案。通用做法是<b>从 best-fit 出发做“有界少步参数优化”</b>，由优化器统一处理任意多个新参数。</p>
+
+<h2>四、方案设计：nllSimulate = warm-start + 有界少步 profile</h2>
+
+<h3>4.1 接口</h3>
+
+<pre><code>analysis::simulateAddResonance(
+  cand,            // 候选共振态 {name, J^P, chain/intermediate, model, params}
+  m_grid, g_grid,  // (m, Γ) 网格（或自动从 PDG / 阈值余量取区间）
+  P_mode,          // NEW_ONLY（冻住已有参数）| FULL（已有参数也允许小幅重排）
+  K,               // 少步优化迭代预算（如 8–15）
+  init = warm,     // 新耦合初始化为 0（或小随机）；新 (m,Γ) 初始化为网格点 / PDG
+) -&gt; { dNLL_map[m,Γ], dNLL*, (m,Γ)^, W~χ²(2), diagnostics }</code></pre>
+
+<h3>4.2 算法（每个候选 × 每个 (m,Γ) 网格点）</h3>
+
+<pre><code>1. 缓存 best-fit 固定量（一次）: S0 = A0·v0、phsp_matrix(M) / phsp 权重、
+   data&bkg 权重、N_eff = Σw_data − bkg_integral。
+2. 注入候选 R → 新增振幅列 {A_new} + 新参数集 S_new；
+   初始化: 已有参数 = θ_best（warm start），新耦合 = 0，新 (m,Γ) = 网格点。
+   —— 因 Eq.(6)，优化器会先长耦合、再让 (m,Γ) 动。
+3. 跑 K 步优化，只对自由参数集 P 求导:
+     P = S_new             → 下界（冻住已有参数）
+     P = S_new ∪ θ_existing→ 完整 profile（已有参数允许小幅重排）
+   每步: 解析梯度 Eq.(grad-matrix)/(grad-r) + 可选 Hessian (H_aa/H_ar/H_rr) 做阻尼牛顿;
+   每步 reComputeAmps 刷新 A（主要开销，但 K 小）。
+4. 记录 NLL_final 与 dNLL = NLL_final − NLL_best。</code></pre>
+
+<h3>4.3 两种 ΔNLL 语义（建议都暴露）</h3>
+
+<table>
+  <tr><th>模式</th><th>自由参数</th><th>ΔNLL 含义</th><th>用途</th></tr>
+  <tr><td><code>NEW_ONLY</code></td><td>仅 S_new</td><td>下界（已有参数冻在 MLE）</td><td>快、排序候选 / 网格</td></tr>
+  <tr><td><code>FULL</code></td><td>S_new ∪ 已有</td><td>完整 profile（加态+重拟合）</td><td>与真拟合同口径，确认前用</td></tr>
+</table>
+
+<h3>4.4 (m,Γ) 网格扫描</h3>
+
+<div class="flow">
+  <span class="step">粗网格</span><span class="arrow">→</span>
+  <span class="step">每点: 少步优化(仅新参, 固定本点)</span><span class="arrow">→</span>
+  <span class="step">dNLL(m,Γ) 曲面</span><span class="arrow">→</span>
+  <span class="step">峰值区: 放开 (m,Γ) 少步优化</span><span class="arrow">→</span>
+  <span class="step">记录 (m,Γ)^ 与 ΔNLL^*</span>
+</div>
+
+<p>可选 0 步快筛：用“单 α 闭式 Schur 得分检验 \(W\sim\chi^2(2)\)”先粗排，只对少数点跑少步优化，进一步压缩成本。</p>
+
+<h3>4.5 CTPWA 挂钩点</h3>
+
+<table>
+  <tr><th>能力</th><th>现有入口</th><th>对应的剖析公式</th></tr>
+  <tr><td>每事件每极化振幅 A_new</td><td><code>AmpCalc::reComputeAmps</code> + <code>buildModelAST</code>/<code>evalCustomAll</code></td><td>—</td></tr>
+  <tr><td>−Σw·log|S|² 与梯度</td><td><code>computeFactorNLL</code></td><td>Eq.(grad-matrix)</td></tr>
+  <tr><td>phsp 均值/二次型</td><td><code>computePhspMeanSum</code>, <code>computeQuadraticForm</code></td><td>Eq.(2)</td></tr>
+  <tr><td>耦合/共振态梯度</td><td><code>computeResonanceGradient</code></td><td>Eq.(5)</td></tr>
+  <tr><td>Hessian（Schur 补 / 牛顿用）</td><td><code>computeHessian</code> + 闭式 H_aa/H_ar/H_rr</td><td>Eq.(hess-cc/cr/rr)</td></tr>
+  <tr><td>复耦合=2 实参、gauge 固定</td><td>耦合矩阵 <code>Parameters::extendCouplingParams</code>/<code>transformCouplingGradient</code></td><td>—</td></tr>
+  <tr><td>固定 m,Γ / 只 free S_new</td><td>复用“波内 free 参数”机制</td><td>—</td></tr>
+</table>
+
+<h2>五、与现有 auto-pwa 迭代链的衔接</h2>
+
+<div class="flow">
+  <span class="step">当前 best-fit</span><span class="arrow">→</span>
+  <span class="step">nllSimulate（候选 × 网格排序）</span><span class="arrow">→</span>
+  <span class="step">top-1..3</span><span class="arrow">→</span>
+  <span class="step">试拟合确认（真拟合）</span><span class="arrow">→</span>
+  <span class="step">compare ≥ 阈值</span><span class="arrow">→</span>
+  <span class="step">add → 下一轮</span>
+</div>
+
+<p>放在 <code>auto_pwa_suggest</code>（候选发现）与 <code>auto_pwa_try_candidates</code>（试拟合）<b>之间</b>，
+把“PDG / 阈值候选”先按 ΔNLL 预估快速排序，只对最有希望的几个跑真拟合。这与 <code>try_candidates</code> 的区别在于<b> warm-start + 少步</b>（冷启需几百步），这是能做到“每候选/每网格点秒级”的关键。</p>
+
+<h2>六、参考：这条路线在领域里不是新东西</h2>
+
+<p>方案里每一块都是成熟标准做法，没有一个是新发明；<b>新的只在“串成给 AI 用的闭环 + 用 CTPWA 二次型结构做便宜”这一层</b>。</p>
+
+<table>
+  <tr><th>本方案步骤</th><th>领域标准技术</th><th>出处</th></tr>
+  <tr><td>ΔNLL 判显著</td><td>似然比检验 (LRT) + <b>Wilks 定理</b>：嵌套模型 2ΔlogL ~ χ²(k)，k=新增自由参数</td><td><a href="https://ar5iv.labs.arxiv.org/html/1903.07185#3">Wilks 定理 / POI χ² 综述</a></td></tr>
+  <tr><td>“加态前先估 ΔNLL”</td><td><b>Rao 得分检验</b> = <b>Lagrange multiplier (LM) 检验</b>：只用在 H₀ 处的 score + 信息阵，无需重拟合，是 LRT 的局部近似</td><td><a href="https://search.r-project.org/CRAN/refmans/VGAM/html/score.stat.html">Rao score (score.stat)</a> · <a href="https://www.stat.umn.edu/geyer/8112/notes/tests.pdf">Stat 8112 检验讲义</a></td></tr>
+  <tr><td>“已有参数可重排的部分”</td><td><b>Profile / 框定参数</b>：Schur 补 \(J_{\rm eff}=J_{\alpha\alpha}-J_{\alpha\beta}J_{\beta\beta}^{-1}J_{\beta\alpha}\) 压缩有效信息</td><td><a href="https://theses.hal.science/tel-05372766v1/file/151359_CARABADJAC_2025_archivage.pdf#61#28">边际似然 λ_marg（框定说明）</a></td></tr>
+  <tr><td>“少量步 warm-start 收敛”</td><td>从 MLE 续算 / 高斯-牛顿一步近似；<code>MINUIT</code> 从收敛点重启、<code>iminuit</code> 的 MINOS 误差</td><td>标准优化器实践</td></tr>
+  <tr><td>(m,Γ) 网格扫描 + 显著性</td><td><b>共振搜索 / bump hunting</b>：扫质量取局部显著性，HEP 分波分析“逐个加态 + 扫描”的标准流程</td><td><a href="https://ar5iv.labs.arxiv.org/html/1304.1973#3">ψ(2S)→pp̄η PWA</a> · <a href="https://ar5iv.labs.arxiv.org/html/hep-ex/0508050#5">χ_c0→π⁺π⁻K⁺K⁻ PWA</a></td></tr>
+  <tr><td>振幅分析工具</td><td>ComPWA / ComPWA2、AmpTools++、TF-PWA、PAWIAN：加共振模型 + 拟合器给显著性</td><td><a href="https://compwa.github.io/legacy-doxygen/classComPWA_1_1Physics_1_1EvtGen_1_1EvtGenIF.html">ComPWA 文档</a></td></tr>
+  <tr><td>扫描峰值的 trials 修正</td><td><b>look-elsewhere / trials factor</b>：扫描 N 点后取峰不服从 χ²(k)</td><td><a href="https://ar5iv.labs.arxiv.org/html/1005.1891#1">Gross &amp; Vitells 2010</a> · <a href="https://epjc.epj.org/articles/epjc/abs/2010/11/10052_2010_Article_1470/10052_2010_Article_1470.html">EPJC</a></td></tr>
+</table>
+
+<div class="tip">
+<b>结论</b>：“没人做过”不是问题——恰恰相反，每块都有经典出处，说明路线是验证过、稳的。值得投入的是
+<b>① 标准统计内核之上的 CTPWA 二次型向量化（便宜）</b>、<b>② AI 自动迭代闭环（suggest→filter→confirm→add）</b>、
+<b>③ 把多重耦合 / gauge 简并 / 阈值边界这些 Wilks 正则性失效的坑有意识地兜住</b>。
+</div>
+
+<h2>七、坑与工程规避</h2>
+
+<p>下表的前两行已在 <b>§8 数值验证</b>中<b>被实测确认</b>（✓/✗ 标注为实测结论）。</p>
+
+<table>
+  <tr><th>坑</th><th>风险</th><th>规避</th><th>实测</th></tr>
+  <tr><td>扫描峰值的 <b>look-elsewhere</b></td><td>扫描点越多，峰值“名义显著性”越虚</td><td>显著度用 Gross–Vitells/空注入 trials 修正；⭐<b>ΔNLL=3 只适用单个固定 (m,Γ) 候选，网格扫描需更大修正阈值</b>；模拟只做排序</td><td>✓（空注入均值 −4.3、尾 −12.5；修正后(−5.3)拒 vs 信号(−1066)留）</td></tr>
+  <tr><td><b>得分检验的局部性 / 0步不稳</b></td><td>单步牛顿在近奇异 Hessian 处爆掉/反向（简单模型 −13553/+4706）</td><td>⭐<b>主用 β 钉住 profile（保守下界）；Schur 0 步作"含重拟合"快筛；裸 0 步勿单独用</b></td><td>✓（增强模型 ±10% 散布；Schur −1238≈全拟合 −1192）</td></tr>
+  <tr><td><b>只用 J_αα（忽略干涉/混叠）</b></td><td>同 J^P 态与既有波 aliasing，高估显著性</td><td>必须用 Schur 补 \(J_{\rm eff}\)（H_aa/ar/rr 组装），并输出正定性诊断</td><td>—（理论；与上工序联用）</td></tr>
+  <tr><td><b>Warm-start 基准不一致</b></td><td>注入候选后相位/归一化基准与 best-fit 不同，ΔNLL 有系统偏差</td><td>先重算 phsp 归一化（\(\bar{\mathbf{B}}\)）与振幅缓冲，再启动少步优化</td><td>—</td></tr>
+  <tr><td>loss 复现不一致</td><td>bkg 符号/权重、\(N_{\rm eff}\)、phsp 项与真拟合不同偏</td><td>必须复用 <code>NLLFunction::forward</code> 的 loss 组装，不重新推导（⚠️ 原型曾因「未对极化求和」把 [N,2] 当 2N 事件，导致归一化错乱、拟合发散）</td><td>—（实现须核对）</td></tr>
+  <tr><td>float 累加漂移</td><td>~1e-4 相对偏差 → NLL ~2</td><td>(a,b,c) 与 phsp 全部 double 累加</td><td>—</td></tr>
+  <tr><td>gauge / 简并（新波与既有波近似线性相关）</td><td>\(J_{\alpha\alpha}/J_{\rm eff}\) 可能奇异；裸 0 步随之爆掉</td><td>Schur + 小正则；输出正定性诊断；回退到 β 钉住 profile</td><td>✓（爆掉即此因）</td></tr>
+  <tr><td>新自由参数计数</td><td>单条共振不止 2 个自由度（多耦合 ±(m,Γ)）</td><td>χ² 自由度按实际 S_new 规模取，勿固定为 2</td><td>—</td></tr>
+</table>
+
+<h2>八、数值验证（合成数据原型，2026-08）</h2>
+
+<p>在 CTPWA 沙箱里用 numpy/scipy（无需 GPU）写了一个<b>合成数据</b>原型，直接复现上面第 2 节的 NLL 结构来检验结论。
+先跑<b>简单</b>模型（1 维事件、单极化、3 波），再用一个<b>更接近真实 PWA</b>的模型复核：
+<b>2 维事件（子系不变质量 M + 产生角 cosθ）、2 极化（每波独立极化向量）、相对论 Breit–Wigner + Blatt–Weisskopf 势垒（含 q 依赖共振质量）、J=0/1/2 三种角型（真实干涉）、相干本底波</b>。
+原型源码：<code>tmp/nll_predict_toy.py</code>（有信号）、<code>tmp/nll_predict_null.py</code>（空）、<code>tmp/nll_predict_avoidance.py</code>、<code>tmp/nll_predict_complex.py</code>（增强复核）。</p>
+
+<h3>8.1 结果（增强模型）</h3>
+
+<table>
+  <tr><th>检验项</th><th>结果</th><th>判读</th></tr>
+  <tr><td>有信号扫描峰 (m,Γ)</td><td>(<b>1.7</b>, 0.15)，真值 (1.7, 0.12)</td><td>✅ <b>质量精确命中</b>；Γ 在网格分辨率内（Γ 面很平）</td></tr>
+  <tr><td>真值点各估计 ΔNLL</td><td>裸0步 −1157 ｜ <b>Schur0步 −1238</b> ｜ <b>profile(β钉住) −1072</b> ｜ <b>全拟合 −1192</b></td><td>✅ 理论顺序成立：<b>β钉住 profile=保守下界</b>（−1072 &lt; 全拟合 −1192），<b>Schur=“含重拟合”快筛</b>（−1238 ≈ 全拟合）</td></tr>
+  <tr><td>空注入扫描峰分布</td><td>min −10.8 ｜ max −1.07 ｜ <b>均值 −4.28</b></td><td>✅ 显著高于单候选阈值 −3 → 扫描放大空噪声</td></tr>
+  <tr><td>trials 修正阈值</td><td>T5% = <b>−9.16</b></td><td>负尾分位作修正阈值</td></tr>
+  <tr><td>空注入单次扫描峰</td><td>−5.28 &gt; T5%</td><td>✅ <b>正确不误报</b></td></tr>
+  <tr><td>有信号扫描峰</td><td>−1066 &lt; T5%</td><td>✅ <b>正确判为发现</b></td></tr>
+</table>
+
+<h3>8.2 两个坑被数值实锤</h3>
+
+<div class="warn">
+<b>坑1 · 0 步得分检验</b>：在<b>简单模型</b>里裸 0 步在共振处 <b>爆掉（ΔNLL 到 −13553）甚至反向（+4706）</b>；在<b>增强模型</b>里虽未爆、但也仅 +4% 精度，且仍围绕真值 ±10% 散布。
+<b>规避</b>：主用 <b>β 钉住的少步 profile</b>（任何时候都是保守下界、绝不虚报），Schur 0 步当"含重拟合"的快筛；<b>裸 0 步不要单独用</b>（近奇异 Hessian 时会崩）。</div>
+
+<div class="warn">
+<b>坑2 · look-elsewhere / trials 因子</b>：空注入扫描峰<b>均值就有 −4.3 ~ −4.8，尾巴到 −12.5</b>，远超 χ²(2) 的单候选阈值 −3。
+<b>规避</b>：<b>「ΔNLL=3」的阈值只适用于「单个固定 (m,Γ) 候选」</b>；对 <b>(m,Γ) 网格扫描</b>，显著度必须用 <b>trials 修正</b>（空注入伪实验的扫描峰分布负尾分位，或 Gross–Vitells 解析公式）把阈值抬高，否则几乎每个空扫描都会误报成发现。该修正已在原型里验证：<b>空注入(−5.3)被拒、真信号(−1066)被留住</b>，分层清晰。</div>
+
+<h2>九、结论与下一步</h2>
+
+<p><b>可行。</b> 设计为“从 θ_best warm-start、对新增参数集做 K 步解析优化的有界 profile”，单条 α 闭式只作为 0 步快筛和 (m,Γ) 排序加速；它与 <code>try_candidates</code> 的区别就在于 <b>warm-start + 少步</b>。
+落地顺序建议：</p>
+
+<table>
+  <tr><th>阶段</th><th>内容</th><th>验证点</th></tr>
+  <tr><td><b>P0</b></td><td>固定 β、固定 (m,Γ)：用 (a,b,c) 归约 + 2D 牛顿 profile，逐网格出 ΔNLL_map</td><td>跑通“扫描-排序”闭环</td></tr>
+  <tr><td><b>P1</b></td><td>Schur 分数检验：加 best-fit Hessian + 交叉项，输出 \(W\sim\chi^2(2)\)、\(J_{\rm eff}\) 正定诊断、\(\Delta\mathcal{L}\approx-W/2\)</td><td>对齐“显著性”语义</td></tr>
+  <tr><td><b>P2</b></td><td>粗到细网格 + look-elsewhere 修正</td><td>避免把扫描峰值当真实显著性</td></tr>
+  <tr><td><b>P3</b></td><td>与 auto_pwa 串起来：<code>simulateAddResonance</code> → <code>try_candidates</code> 闭环</td><td>AI 迭代链路自洽</td></tr>
+</table>
+
+<hr>
+<p style="color:#888;font-size:0.9em;">配套参考文献：Wilks 定理、Rao/LM 得分检验、profile likelihood（Schur）、Gross–Vitells look-elsewhere、
+BESIII/LHCb 分波分析、ComPWA/AmpTools 框架。本文为设计讨论记录，具体数值校准以 CTPWA 源码与实测为准。</p>
+
+</body>
+</html>
