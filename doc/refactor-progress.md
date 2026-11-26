@@ -817,6 +817,32 @@ CPU 与 GPU 的 A/B 指纹对比出现分叉：
 
 ---
 
+## P0（本轮）：裸 `cudaSetDevice` 归零（120 → 0）
+
+把 9 个文件里剩下的 **120 处**裸调用统一换成 `include/DeviceGuard.h` 的入口：
+
+| 原形态 | 新形态 | 语义 |
+|---|---|---|
+| `cudaSetDevice(x);` | `ctpwa::ensure_device(x);` | **完全一致**（粘性、不还原），多了失败检查 |
+| `cudaError_t st = cudaSetDevice(i);` | `if (!ctpwa::device_set((int)i))` | 失败分支保留，错误信息更直接 |
+
+**这不是"完成 P0-B"**：P0-B 要把粘性 set 改成**作用域还原**（`DeviceGuard`），
+那会改变"循环结束后 current 停在哪张卡"的语义——只有双卡能验证。本步只做两件事：
+
+1. 消除裸 API 面（原来漏检查的地方不再静默失败）；
+2. 让棘轮预算归零并切到 `--strict`：任何新的裸调用直接红。
+
+验证（语义不变，双后端都过）：
+
+| 项 | 结果 |
+|---|---|
+| CPU 门禁 | 258 / 0 / 63 全绿 |
+| GPU `test_numerical` + `hessian_diagnostics` | 46 passed + 1 xfail |
+| GPU A/B vs v0.3.27 | **NLL 逐位相同** |
+| `check_device_calls.sh --stats` | 违规 **0**（只剩 Backend.cpp / DeviceManager.cu / cpu_shims） |
+
+---
+
 ## 当前门禁口径
 
 ```bash

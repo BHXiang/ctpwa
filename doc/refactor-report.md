@@ -10,7 +10,7 @@
 
 | 阶段 | 目标 | 状态 |
 |---|---|---|
-| **P0** 设备纪律 | `DeviceGuard` + 显式 `primary_dev` + 单一出口 | 🟡 **A/C/D 完成，B 待双卡** |
+| **P0** 设备纪律 | `DeviceGuard` + 显式 `primary_dev` + 单一出口 | 🟡 **裸调用已归零；作用域还原（P0-B）待双卡** |
 | **P1** 真翻译单元 | 拆掉文本内联的 12.8k 行单 TU | ✅ 17 TU，改一个文件 9.3 s（原 15 min） |
 | **P2** DevBuffer 所有权 | 一个设备指针只有一处 free 路径 | ✅ `AmpCasDecay` 全部 + `AmpCalc` 四大缓冲 |
 | **P3** DecayInfo 与 SL 表解耦 | 衰变描述可脱离 GPU 构造/检查 | ✅ `DecayChainDesc` + host 单测 |
@@ -138,7 +138,9 @@ analysis: 移除 0, 新增 0
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| **P0-B：120 处多卡循环内的 `cudaSetDevice`** | ⏸ **待双卡** | 改动语义（循环结束是否还依赖 current 停在最后一张卡），**只有双卡能验证**。已就绪：`scripts/check_device_calls.sh` 棘轮（预算 120，只许降）+ 每个新模块已改用 `DeviceGuard` |
+| **P0-B：把粘性 set 改成作用域还原（`DeviceGuard`）** | ⏸ **待双卡** | 改动语义（循环结束是否还依赖 current 停在最后一张卡），**只有双卡能验证**。裸 `cudaSetDevice` 已全部消除（120 → 0，棘轮预算 0 + CI `--strict`），
+每处都走 `ctpwa::ensure_device`/`device_set`；剩下的是**语义**改动（循环体改成 guard），
+必须双卡验证 |
 | `Analysis.h` 里 4 个 `static CTPWA_KERNEL` | 未挪 | 已改成 `static`（内部链接）保证多 TU 安全；彻底做法是挪进 `.cu` + 头里留声明 |
 | `analysis` 的 40+ 数据成员 | 未分组 | P4 的自然延伸：分成 `SampleState` / `PhspState` 等子结构，头文件可再降一档 |
 | `test_reparam` 的桩 | 已修 | 顺手修掉的一个真 bug（`example/fit.py` 新增 `ctpwa.diagnostics` 导入后桩没跟上） |
