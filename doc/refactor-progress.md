@@ -18,6 +18,7 @@
 | P3 第一步（衰变描述类型 + 置换拓扑抽出） | ✅ | `d42f203` |
 | P3 第二步（`DecayChainDesc` 组合进 `AmpCasDecay`） | ✅ | `ee9178b` |
 | P4 第一步（数据读取模块） | ✅ | `7cab902` |
+| P2 第三批（`AmpCalc` 四个大缓冲） | ✅ | `a9dc6db` |
 | 门禁补强：数值用例上 CPU | ✅ | `d1b27b0` |
 | P3 DecayInfo / SL 表解耦 | ⬜ | — |
 | P4 god class 拆分 | ⬜ | — |
@@ -188,6 +189,24 @@ bash tests/cpu_backend/build_and_run.sh
 
 全量 pytest 门禁：254 passed / 7 failed / 56 skipped / 4 known errors
 （`test_reparam` 桩 bug），与 baseline3 逐文件 PASS/FAIL 一致；CUDA 只编译 EXIT=0。
+
+---
+
+## P2（第三批）：`AmpCalc::ResBlock` 的四个大缓冲
+
+`d_T`（有效耦合 `nEvents×nPolar`）、`d_dF`（导数 `nEv×nSL×Nfree`）、`d_prop6`
+（BWR 传播子复用表）、`d_static`（固定节点预算表）——全是每 GPU 一份、在 fit 循环里
+懒分配的大块，原来只在 `release()` 里靠 `free_at` + `cudaSetDevice(g)` 释放。
+
+| 改动 | 说明 |
+|---|---|
+| `DevBuffer::allocate_bytes(bytes)` + `bytes()` | `d_dF` 的元素宽度随 precision 档位变（float2 / double2），只能按字节算；`size()` 取整会错 |
+| 四个成员 `vector<T*>` → `vector<DevBuffer<T>>` | 单一所有者 |
+| `release()` | 这四个从 `free_at` 名单移除，改为 `clear()`（DevBuffer 在各自设备上释放） |
+| 分配/使用点 | `allocate`/`allocate_bytes`；取 `.data()` |
+
+**验证**：门禁 254 passed / 7 failed / 56 skipped / 4 known errors（与基线一致）；
+CUDA 只编译 EXIT=0、0 错误。
 
 ---
 
