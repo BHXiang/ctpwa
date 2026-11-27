@@ -198,7 +198,12 @@ bash scripts/check_device_calls.sh                   # 棘轮必须下降
 bash scripts/verify_all.sh              # CPU：构建 + 设备纪律 + 门禁 + A/B + host 单测
 bash scripts/verify_all.sh --with-gpu   # 再加 GPU 门禁与 GPU A/B（需要真卡）
 bash scripts/run_tests_gpu.sh           # 只跑 GPU 门禁（自动探测架构、分批、~10 分钟）
+bash scripts/smoke_all_configs.sh       # 深检查：64 个 config 全构造（~10 分钟，不进主门禁）
 ```
+
+> `smoke_all_configs.sh` 是补漏用的：第 33 轮那个 `deep_4pi0` 回归就是"没有测试用这个
+> config"，门禁全绿却构造不出来。遍历全部 config 太慢（9.5 分钟），所以留在主门禁之外，
+> 但发版前应该跑一次。
 
 手工分解：
 
