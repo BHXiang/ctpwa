@@ -927,6 +927,21 @@ objective 里"保持 config 契约不变"这条，此前只验证到 Python API 
 
 ---
 
+## 零基构建验证（本轮）
+
+拆成 36 个 TU 之后，一直用的是增量构建——那会掩盖"缺 include / 依赖顺序"的问题
+（某个头只是恰好被别的头带进来）。本轮把 `build/` 整个删掉重来：
+
+| 项 | 结果 |
+|---|---|
+| `rm -rf build && CTPWA_BACKEND=cpu MAX_JOBS=4 python3 setup.py build_ext --inplace` | **EXIT=0，0 error**，编译 34 个影子 TU |
+| 全量门禁 | **259 passed / 0 failed / 63 skipped** |
+| 设备纪律（`--strict`） | 通过，违规 0 |
+
+结论：36 TU 的拆分**自洽**，每个 TU 的 include 都完整，不依赖增量构建的运气。
+
+---
+
 ## 一键验收（上一轮新增）
 
 ```bash
