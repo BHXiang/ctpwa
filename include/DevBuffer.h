@@ -64,20 +64,24 @@ public:
     DevBuffer& operator=(const DevBuffer&) = delete;
 
     // 按字节分配（元素宽度随精度档位变化时用，例如 dF 存 float2 或 double2）
+    //
+    // ⚠ 0 字节也要分配 1 个元素：`cudaMalloc(0)` 在 CUDA 上返回成功且指针非空，
+    // 旧代码依赖这个行为（调用方随后用 `if (!ptr) throw` 判失败）。若这里直接返回
+    // 空指针，零长度表（如 deep_4pi0 的 nSL 组合数为 0）会被误判成"分配失败"。
     void allocate_bytes(int dev, std::size_t bytes)
     {
         reset();
-        if (bytes == 0) return;
+        const std::size_t ask = bytes ? bytes : sizeof(T);
         void* p = nullptr;
         {
             DeviceGuard guard(dev);
-            p = alloc(bytes);
+            p = alloc(ask);
         }
         if (p) {
             ptr_ = static_cast<T*>(p);
             dev_ = dev;
             n_ = bytes / sizeof(T);
-            bytes_ = bytes;
+            bytes_ = ask;
         }
     }
 
@@ -87,11 +91,12 @@ public:
     void allocate(int dev, std::size_t n)
     {
         reset();
-        if (n == 0) return;
+        // n == 0 也分配 1 个元素（理由见 allocate_bytes 的注释：cudaMalloc(0) 非空）
+        const std::size_t ask = n ? n : 1;
         void* p = nullptr;
         {
             DeviceGuard guard(dev);   // 在目标设备上分配
-            p = alloc(n * sizeof(T));
+            p = alloc(ask * sizeof(T));
         }
         if (p) {
             ptr_ = static_cast<T*>(p);
