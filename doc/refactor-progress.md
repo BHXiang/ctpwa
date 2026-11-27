@@ -872,6 +872,31 @@ v3 的依据：**CPU 梯度路径本身有 ~8e-8 的逐次运行抖动**（同�
 
 ---
 
+## 第 32 轮：config 契约对比抓到一个真回归
+
+objective 里"保持 config 契约不变"这条，此前只验证到 Python API 层。这轮补上
+**配置语义层**：`scripts/config_contract.py` 对 64 个 `tests/configs/*.yml` 导出
+振幅名 / 参数名 / legends / n_vec / n_theta / n_params / 约束 / 极化数，与 v0.3.27
+的 dump 逐项对比。
+
+第一次跑就抓到 **`deep_4pi0` 构造失败**（新版本抛 `slamp 表分配失败`，基线正常）：
+
+| 环节 | 旧行为 | 新行为 |
+|---|---|---|
+| `nSL` 组合数为 0 → 表长 0 | `cudaMalloc(0)` 返回成功、指针非空 | `DevBuffer::allocate(n=0)` 直接返回，指针为空 |
+| 调用方判错 | `if (!ptr) throw` 不触发 | **触发，构造失败** |
+
+**为什么测试没抓到**：没有任何测试用 `deep_4pi0` 这个配置。修复方式是让
+`n==0` 也分配 1 个元素（与 `cudaMalloc(0)` 的语义对齐），并新增
+`tests/test_all_configs.py` 钉住这条路径。
+
+> 试过"遍历全部 64 个 config 做冒烟"，要 9.5 分钟——太重，会拖垮门禁节奏。
+> 最后只钉住出问题的那一个 config（秒级）。
+
+修复后 64 个 config 的契约**全部一致**（产物：`doc/parity/config-contract-*.json`）。
+
+---
+
 ## 一键验收（上一轮新增）
 
 ```bash
