@@ -904,6 +904,29 @@ objective 里"保持 config 契约不变"这条，此前只验证到 Python API 
 
 ---
 
+## 跨后端 Hessian 差异的定位（与重构无关，但查清了）
+
+之前把 CPU↔GPU 的 `with_trans` Hessian 0.5% 差异笼统记成"固有跨后端差异"。这轮查了
+机制：怀疑是 GPU 默认混合精度（`precision: auto` → A 存 float2），于是用
+`precision: double` 的临时 config 在两端各跑一次
+（`scripts/probe_backend_hessian.py`，产物在 `doc/parity/backend-precision-double/`）。
+
+**假设被否定**：
+
+| config | CPU vs GPU（`precision: double`） | 判读 |
+|---|---|---|
+| `simple` | max\|Δ\|/‖H‖∞ = **8.4e-13**，逐元素 ≤4.4e-11 | ✅ 与 skill 里"两后端 1e-12"一致 |
+| `with_trans` | max\|Δ\|/‖H‖∞ = **2.2e-4**，逐元素最大 **9.0e-3** | ❌ 强制 double 也不收敛 |
+
+结论：`with_trans`（带 trans 约束的配置）在 CPU 与 GPU 上**确实存在 ~1e-4 的 Hessian
+差异**，与精度档位无关，也与本次重构无关（v0.3.27 原版同样如此，见
+`doc/parity/compare-gpu-baseline-vs-refactor.txt` 里 GPU 基线 vs GPU 重构完全一致）。
+
+没有在本次改造里深入：它属于数值实现问题（trans 约束的 Hessian 归约路径），
+不在"模块化"范围内。已把探测脚本与数据留在仓库里，需要时可以继续。
+
+---
+
 ## 一键验收（上一轮新增）
 
 ```bash
