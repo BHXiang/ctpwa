@@ -28,9 +28,27 @@
 
 ## 1. 现在的模块图
 
+按 `doc/modularization-plan.md` §7.2 分区（第 37 轮，commit 见 `git log`）：
+
 ```
-src/
-  main.cu                 378   pybind 绑定 + 后端探针（只 include <Analysis.h>）
+src/config/      Config.cu  Info.cu  DecayDesc.cu                 纯 host
+src/model/       ResModel.cu  Resonance.cu  CustomExpr.cu  JITCustom.cu
+src/device/      DeviceManager.cu  Backend.cpp  JitStubs_cpu.cpp
+src/amplitude/   AmpGen.cu  Amplitude.cu  PermTopology.cu  Polarization.cu
+src/parameters/  Parameters.cu
+src/fit/         ComputeNLL/Hessian/Results/BF + 三个 Hessian 模块
+                 + FitFractions/BatchIntegrals/TruthIntegrals
+                 + MatrixStats/PhspGram/MatrixErrors
+src/io/          DataReader.cu  PhaseSpace.cu
+src/output/      ResultWriter.cu  Figure.cu  SLAmpsIO.cu
+src/app/         main.cu  Initialize.cu  AnalysisMethods.cu
+```
+
+头文件 `include/<分区>/` 一一对应，`setup.py` 为每个分区加一条 `-I`。
+分区不影响编译：include 写法一律不变。细节与"尚未满足的硬判据"见 `src/README.md`。
+
+```
+src/app/  main.cu        378   pybind 绑定 + 后端探针（只 include <Analysis.h>）
   NLLFunction.h（头）     776   torch autograd::Function 的 forward/backward
                                  （原本活在 Analysis.h 里的第二个类）
   AnalysisMethods.cu      266   analysis 的装配层成员（ctx 填充 + 调自由函数）

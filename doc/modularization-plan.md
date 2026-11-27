@@ -318,6 +318,12 @@ src/
 
 ### 7.2 目标目录
 
+> **状态（2026-11）：已按下面这张表实施。**`src/<分区>/*.cu` 与 `include/<分区>/*.h`
+> 都已就位，`setup.py` 为每个分区加了一条 `-I`，include 写法不变。文件归属与两条
+> "容易分错"的判据见 `src/README.md`；那里同时列出了**今天还没满足**的三条硬判据
+> （output/ 里仍有 `analysis`、device/ 只统一了 set-device、分区之间没有反向引用检查），
+> 不要把"目录建好了"当成"分层完成了"。
+
 ```
 src/
   config/       Config.cu + Info.cu(DecayInfo)        纯 host
