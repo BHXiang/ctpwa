@@ -123,15 +123,27 @@ double free"的整类问题。
 最后一行不是回归：**v0.3.27 原版在 CPU/GPU 之间就有同样的 0.5%**，属固有跨后端差异
 （见 `doc/parity/compare-gpu-baseline-vs-refactor.txt`）。
 
-### 3.2 契约冻结（`tmp/api_dump.py` 实测）
+### 3.2 契约冻结（两层，都实测）
 
-`dir(ctpwa)` 与 `dir(ctpwa.analysis)` 及全部方法签名，与 v0.3.27 **完全一致**：
+**（a）Python API**：`dir(ctpwa)`、`dir(ctpwa.analysis)` 与全部方法签名 vs v0.3.27：
 
 ```
 module:   移除 0, 新增 0
 analysis: 移除 0, 新增 0
 签名变化: 0
 ```
+
+**（b）config 语义**：`scripts/config_contract.py` 对 64 个 `tests/configs/*.yml`
+导出振幅名 / 参数名 / legends / n_vec / n_theta / n_params / 约束 / 极化数，逐项对比：
+
+```
+config 数: 64   差异: 0
+```
+
+> 这一层**抓到了一个真回归**：`deep_4pi0` 的 nSL 组合数为 0 → 表长 0，而
+> `DevBuffer::allocate(0)` 提前返回空指针，调用方据此抛"slamp 表分配失败"。
+> 旧代码依赖 `cudaMalloc(0)` 返回非空指针这一隐含约定，所以能过。
+> **API 签名一致不代表 config 语义一致**——这条验证是补出来的，而且第一次跑就中。
 
 ### 3.3 测试
 
