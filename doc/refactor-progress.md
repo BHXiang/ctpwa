@@ -895,6 +895,13 @@ objective 里"保持 config 契约不变"这条，此前只验证到 Python API 
 
 修复后 64 个 config 的契约**全部一致**（产物：`doc/parity/config-contract-*.json`）。
 
+**GPU 侧复验**（修复涉及分配路径，必须双后端都看）：
+
+| 项 | 结果 |
+|---|---|
+| `test_all_configs`（含 deep_4pi0）+ ownership / identical / free_phsp / static_budget | **22 passed** |
+| GPU A/B 指纹 vs v0.3.27 | **全部一致** |
+
 ---
 
 ## 一键验收（上一轮新增）
