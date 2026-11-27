@@ -80,6 +80,6 @@ def test_export_bucket_is_bounded():
 
 def test_pair_export_limit_documented():
     """超过 2048 对必须显式报错（而不是悄悄吃掉 ninterference 个槽位的显存）。"""
-    src = (REPO / "src" / "ComputeResults.cu").read_text()
+    src = (REPO / "src" / "fit" / "ComputeResults.cu").read_text()
     assert "2048" in src
     assert "一次最多导出" in src

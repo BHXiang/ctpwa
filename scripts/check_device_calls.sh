@@ -28,13 +28,13 @@ BUDGET_FILE="$(dirname "$0")/device_call_budget.txt"
 
 # 允许清单（每行一个前缀）
 ALLOW_FILES=(
-    "include/DeviceGuard.h"    # 唯一入口；注释里会提到 cudaSetDevice 这个名字
-    "include/CudaCompat.h"     # 非 CUDA 构建的类型替身
-    "src/Backend.cpp"          # 后端实现：cudaSetDevice 的唯一定义/调用处
-    "src/DeviceManager.cu"     # 设备模块（后续 P0b 也应迁移到 DeviceGuard）
+    "include/device/DeviceGuard.h"    # 唯一入口；注释里会提到 cudaSetDevice 这个名字
+    "include/device/CudaCompat.h"     # 非 CUDA 构建的类型替身
+    "src/device/Backend.cpp"          # 后端实现：cudaSetDevice 的唯一定义/调用处
+    "src/device/DeviceManager.cu"     # 设备模块（后续 P0b 也应迁移到 DeviceGuard）
 )
 ALLOW_PREFIX=(
-    "include/cpu_shims/"       # CPU 后端的假实现
+    "include/cpu_shims/"       # CPU 后端的假实现（仍在 include/ 顶层）
 )
 
 is_allowed() {

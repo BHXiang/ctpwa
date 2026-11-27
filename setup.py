@@ -148,43 +148,43 @@ else:
 # 由 main.cu 包含。**不要**把 Analysis.cu 列在这里（会重复符号）。
 # Backend.cpp 两种后端共用（内部按 CTPWA_HAS_CUDA 分流）。
 SOURCES_CORE = [
-    "src/main.cu",
-    "src/Amplitude.cu",
-    "src/ComputeHessian.cu",
-    "src/AmpGen.cu",
-    "src/ComputeNLL.cu",
-    "src/ComputeResults.cu",
-    "src/ComputeBF.cu",
-    "src/Figure.cu",
-    "src/Parameters.cu",
-    "src/CustomExpr.cu",
-    "src/JITCustom.cu",
+    "src/app/main.cu",
+    "src/amplitude/Amplitude.cu",
+    "src/fit/ComputeHessian.cu",
+    "src/amplitude/AmpGen.cu",
+    "src/fit/ComputeNLL.cu",
+    "src/fit/ComputeResults.cu",
+    "src/fit/ComputeBF.cu",
+    "src/output/Figure.cu",
+    "src/parameters/Parameters.cu",
+    "src/model/CustomExpr.cu",
+    "src/model/JITCustom.cu",
     # P1：原 main.cu 内联的 6 个 host 侧文件，现各自成 TU
-    "src/DeviceManager.cu",
-    "src/Config.cu",
-    "src/PhaseSpace.cu",
-    "src/Info.cu",
-    "src/ResModel.cu",
-    "src/Resonance.cu",
-    "src/PermTopology.cu",   # P3：置换拓扑（纯 host）
-    "src/DecayDesc.cu",      # P3：Amp2BD 实现（纯 host）
-    "src/DataReader.cu",     # P4：数据文件读取（纯 host）
-    "src/MatrixStats.cu",    # P4：矩阵统计（纯张量数学）
-    "src/PhspGram.cu",       # P4：phsp Gram → 干涉矩阵
-    "src/MatrixErrors.cu",   # P4：干涉矩阵统计误差
-    "src/SLAmpsIO.cu",       # P4：SL 振幅表导出
-    "src/TruthIntegrals.cu", # P4：产生侧分波积分
-    "src/BatchIntegrals.cu", # P4：分批全样本积分
-    "src/FitFractions.cu",   # P4：份额/效率/按样本矩阵
-    "src/Polarization.cu",   # P4：初态极化索引映射（纯 host）
-    "src/HessianContrib.cu", # P4：单段 Hessian 贡献
-    "src/CouplingHessian.cu", # P4：耦合方向 Hessian
-    "src/FullHessian.cu",    # P4：统一 Hessian（685 行）
-    "src/ResultWriter.cu",   # P4：writeResult / writeInterfResult（1836 行）
-    "src/Initialize.cu",     # P4：initialize / initializeDecayChains / getIntensity
-    "src/AnalysisMethods.cu", # P4：剩余成员实现（装配层）
+    "src/device/DeviceManager.cu",
+    "src/config/Config.cu",
+    "src/io/PhaseSpace.cu",
+    "src/config/Info.cu",
+    "src/model/ResModel.cu",
+    "src/model/Resonance.cu",
+    "src/amplitude/PermTopology.cu",   # P3：置换拓扑（纯 host）
+    "src/config/DecayDesc.cu",      # P3：Amp2BD 实现（纯 host）
+    "src/io/DataReader.cu",     # P4：数据文件读取（纯 host）
+    "src/fit/MatrixStats.cu",    # P4：矩阵统计（纯张量数学）
+    "src/fit/PhspGram.cu",       # P4：phsp Gram → 干涉矩阵
+    "src/fit/MatrixErrors.cu",   # P4：干涉矩阵统计误差
+    "src/output/SLAmpsIO.cu",       # P4：SL 振幅表导出
+    "src/fit/TruthIntegrals.cu", # P4：产生侧分波积分
+    "src/fit/BatchIntegrals.cu", # P4：分批全样本积分
+    "src/fit/FitFractions.cu",   # P4：份额/效率/按样本矩阵
+    "src/amplitude/Polarization.cu",   # P4：初态极化索引映射（纯 host）
+    "src/fit/HessianContrib.cu", # P4：单段 Hessian 贡献
+    "src/fit/CouplingHessian.cu", # P4：耦合方向 Hessian
+    "src/fit/FullHessian.cu",    # P4：统一 Hessian（685 行）
+    "src/output/ResultWriter.cu",   # P4：writeResult / writeInterfResult（1836 行）
+    "src/app/Initialize.cu",     # P4：initialize / initializeDecayChains / getIntensity
+    "src/app/AnalysisMethods.cu", # P4：剩余成员实现（装配层）
 ]
-SOURCES_BACKEND = ["src/Backend.cpp", "src/JitStubs_cpu.cpp"]
+SOURCES_BACKEND = ["src/device/Backend.cpp", "src/device/JitStubs_cpu.cpp"]
 
 # CPU 后端不编译 JITCustom.cu（NVRTC 运行时 JIT，无 CPU 对应物）。
 # ComputeHessian.cu 会编译，但其 T3 块归约 kernel 尚未移植（P3），
@@ -264,6 +264,15 @@ def make_cuda_extension():
         sources=SOURCES_CORE + SOURCES_BACKEND,
         include_dirs=[
             os.path.join(project_dir, "include"),
+            os.path.join(project_dir, "include", "config"),
+            os.path.join(project_dir, "include", "model"),
+            os.path.join(project_dir, "include", "device"),
+            os.path.join(project_dir, "include", "amplitude"),
+            os.path.join(project_dir, "include", "parameters"),
+            os.path.join(project_dir, "include", "fit"),
+            os.path.join(project_dir, "include", "io"),
+            os.path.join(project_dir, "include", "output"),
+            os.path.join(project_dir, "include", "app"),
             root_flags["include"],  # ROOT 头文件目录
             *cuda_inc,
             *([os.path.join(conda_prefix, "include")] if conda_prefix else []),
@@ -322,6 +331,15 @@ def make_cpu_extension():
             # CUDA Runtime / cuBLAS / thrust / cub 的 CPU 垫片。必须排在 include/ 之前。
             os.path.join(project_dir, "include", "cpu_shims"),
             os.path.join(project_dir, "include"),
+            os.path.join(project_dir, "include", "config"),
+            os.path.join(project_dir, "include", "model"),
+            os.path.join(project_dir, "include", "device"),
+            os.path.join(project_dir, "include", "amplitude"),
+            os.path.join(project_dir, "include", "parameters"),
+            os.path.join(project_dir, "include", "fit"),
+            os.path.join(project_dir, "include", "io"),
+            os.path.join(project_dir, "include", "output"),
+            os.path.join(project_dir, "include", "app"),
             root_flags["include"],
             *torch_inc,
             *([os.path.join(conda_prefix, "include")] if conda_prefix else []),

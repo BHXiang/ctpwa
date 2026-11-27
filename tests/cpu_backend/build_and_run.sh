@@ -35,7 +35,7 @@ echo "[run] OMP_NUM_THREADS=${OMP_NUM_THREADS:-<default>}"
 echo "[build] ${CXX} -> ${OUT}/test_decay_desc"
 "${CXX}" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
     -I"${ROOT}/include" \
-    -x c++ "${ROOT}/src/DecayDesc.cu" -x none \
+    -x c++ "${ROOT}/src/config/DecayDesc.cu" -x none \
     "${ROOT}/tests/cpu_backend/test_decay_desc.cpp" \
     -o "${OUT}/test_decay_desc"
 
