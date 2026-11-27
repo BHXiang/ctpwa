@@ -109,7 +109,7 @@ double free"的整类问题。
 |---|---|---|---|
 | CPU 重构版 **vs** CPU v0.3.27 | **0（逐位）** | 1e-12 级（见下） | **0（逐位）** |
 | GPU 重构版 **vs** GPU v0.3.27 | **0（逐位）** | ≤1.3e-13 | ≤1.7e-10 |
-| CPU vs GPU（同一份重构代码） | ≤1e-9 | 1e-8 | **0.5%**（`with_trans`） |
+| CPU vs GPU（同一份重构代码） | ≤1e-9 | 1e-8 | 见下方说明 |
 
 **判据是怎么定的**（三轮实测，见 `scripts/ab_fingerprint.py` 注释）：
 最终用 `|Δ| <= 1e-8·‖v‖∞ + 1e-7·max(|a|,|b|)`。原因不是"放宽到能过"，而是实测发现：
@@ -120,8 +120,15 @@ double free"的整类问题。
   逐次抖动 ~1e-12，只能用"相对向量尺度"的绝对容差衡量；
 * **GPU 上的 A/B 仍然逐位相同**（nll 的 Δ 恰好是 0）。
 
-最后一行不是回归：**v0.3.27 原版在 CPU/GPU 之间就有同样的 0.5%**，属固有跨后端差异
-（见 `doc/parity/compare-gpu-baseline-vs-refactor.txt`）。
+**CPU vs GPU 的 Hessian 差异**（已查清机制，与本次重构无关）：
+
+* `simple`：强制 `precision: double` 后两端一致到 **8.4e-13**（符合预期）；
+* `with_trans`：即使强制 double，仍有 **2.2e-4**（逐元素最大 9e-3）。
+
+所以不是"GPU 默认混合精度"造成的，而是 **trans 约束的 Hessian 归约路径在两端不同**。
+v0.3.27 原版表现完全相同，因此不是重构引入的；本报告把它列为**已知的既有差异**，
+未在本次改造中处理。探测脚本：`scripts/probe_backend_hessian.py`，
+数据：`doc/parity/backend-precision-double/`。
 
 ### 3.2 契约冻结（两层，都实测）
 
