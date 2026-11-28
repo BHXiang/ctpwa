@@ -33,7 +33,7 @@ CPU 后端也能跑但慢 20–60×）。config 的 `data`/`phsp`/`bkg` 文件�
 ----
     # 5 万信号 toy + Poisson + 真本底 → pseudo-data（并派生 config、写 stats）
     python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
-        -n 50000 --seed 42 --poisson --nobs-from-data --bkg \
+        -n 50000 --seed 42 --poisson --bkg \
         -o toy_data.dat --write-config config_toy.yml --stats-json toy.json
 
     # 纯信号、等权、10 万事件
@@ -205,6 +205,23 @@ def read_dat(path, nfinal):
     return a.reshape(-1, nfinal, 4)
 
 
+def read_dat_head(path, nfinal, n_events):
+    """只读 `.dat` 的前 n_events 个事例（不整文件 loadtxt，省内存/时间）。"""
+    need = int(n_events) * int(nfinal)
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for ln in f:
+            if len(rows) >= need:
+                break
+            rows.append(ln)
+    if len(rows) < need:
+        sys.exit(
+            f"[gen_toy_mc] {path} 只有 {len(rows) // nfinal} 个事例，不足 {n_events}"
+        )
+    a = np.loadtxt(rows, dtype=np.float64, ndmin=2)
+    return a.reshape(-1, nfinal, 4)
+
+
 def count_dat_events(path, nfinal):
     n = 0
     with open(path, encoding="utf-8") as f:
@@ -258,6 +275,261 @@ def as_torch(x):
     return torch.as_tensor(np.ascontiguousarray(x), dtype=torch.float64)
 
 
+def load_param_vector(path, nvec, ntheta):
+    """读 `--params-from` → 规范的 `[Re(nvec) | Im(nvec) | θ(ntheta)]` float64 一维张量。
+
+    兼容几种存法（返回 `(tensor, note)`，note 供日志说明换算了什么）：
+    * `fit.py` 的 `best_params.pt`：一维实数，长度 `2·nvec + ntheta`（标准，原样返回）；
+    * **复数**向量（长度 `nvec + ntheta`：前半复数耦合 + 后半实数 θ）→ 拆成 Re/Im/θ；
+    * `dict`（键 `params` / `best_params` / `vector` / `amp_params`）；
+    * `(2, nvec)` / `(nvec, 2)` 的 (Re, Im) 矩阵，尾部再拼 θ。
+
+    ⚠ ctpwa 的 `getParamNames()` 只有 `nvec + ntheta` 项（每个复振幅一个名字 + θ），
+    而参数向量是 `2·nvec + ntheta` 项；两者不能按 1:1 对齐（见 `verify_param_layout`）。
+
+    长度对不上时**立刻报错**并列出该 config 的期望值，绝不静默截断/补零——
+    静默补零会让参考振幅 Re_0/Im_0 变成 0，toy 与拟合模型完全脱节。
+    """
+    import torch
+
+    obj = torch.load(path, weights_only=True)
+    if isinstance(obj, dict):
+        key = next(
+            (
+                k
+                for k in ("params", "best_params", "vector", "amp_params")
+                if k in obj and torch.is_tensor(obj[k])
+            ),
+            None,
+        )
+        if key is None:
+            sys.exit(
+                f"[gen_toy_mc] {path} 是 dict，但里面没有张量参数"
+                f"（键: {list(obj)[:10]}）"
+            )
+        obj = obj[key]
+        print(f"[gen_toy_mc] 参数文件是 dict → 取 `{key}`")
+    if not torch.is_tensor(obj):
+        sys.exit(f"[gen_toy_mc] {path} 不是 tensor（{type(obj).__name__}）")
+
+    t = obj.detach()
+    expected = 2 * int(nvec) + int(ntheta)
+    note = ""
+
+    if t.is_complex():
+        cplx = t.reshape(-1)
+        if cplx.numel() == int(nvec) + int(ntheta):
+            re = cplx[:nvec].real.to(dtype=torch.float64).contiguous()
+            im = cplx[:nvec].imag.to(dtype=torch.float64).contiguous()
+            th = cplx[nvec:].real.to(dtype=torch.float64).contiguous()
+            note = (
+                f"复数向量 {cplx.numel()} 项（{nvec} 耦合 + {ntheta} 共振）"
+                f"→ 拆成 Re/Im/θ"
+            )
+            t = torch.cat([re, im, th])
+        else:
+            sys.exit(
+                f"[gen_toy_mc] {path} 是复数向量，长度 {cplx.numel()}，"
+                f"既不是 n_vec+θ={int(nvec) + int(ntheta)} 也不是 2·n_vec+θ={expected}；\n"
+                "  请存成实数一维 [Re(n_vec) | Im(n_vec) | θ]"
+                "（fit.py 的 best_params.pt 就是），或「复数耦合(n_vec) + 实数 θ」的拼接向量。"
+            )
+
+    t = t.to(dtype=torch.float64).reshape(-1)
+    if t.numel() == expected:
+        return t, note
+    # (2, nvec) / (nvec, 2) 的 (Re, Im) 矩阵 + 尾部 θ
+    if t.numel() == expected - int(ntheta):
+        mat = t.reshape(2, nvec) if t.numel() == 2 * int(nvec) else None
+        if mat is not None:
+            re, im = mat[0], mat[1]
+            if int(ntheta) == 0:
+                return torch.cat([re, im]).to(
+                    dtype=torch.float64
+                ), "矩阵 (2,n_vec) → Re/Im"
+            sys.exit(
+                f"[gen_toy_mc] {path} 是 (2, n_vec) 矩阵但缺少 θ（期望 {expected} 项），"
+                "请把 θ 拼在矩阵后面"
+            )
+    sys.exit(
+        f"[gen_toy_mc] 参数长度 {t.numel()} != 本 config 期望 {expected}"
+        f"（2×{nvec} 耦合 + {ntheta} 共振）\n"
+        "  → 是不是用了别的 config 的 best_params.pt？\n"
+        "  → 或者文件里存的是「复参数 + θ」（长度 n_vec+θ）？本脚本能自动拆复数，"
+        "但需要参数是 complex dtype。"
+    )
+
+
+def verify_param_layout(ana, params, nvec, ntheta, names):
+    """按 model 侧信息校验参数布局，并打印逐项 θ（含 bounds 越界检查）。
+
+    `params` 可以是 torch.Tensor 或 numpy 数组（两者都支持下标与 float()）。
+    """
+    n_elems = int(params.numel()) if hasattr(params, "numel") else int(np.size(params))
+    nparams = int(getattr(ana, "getNParams", lambda: 2 * nvec + ntheta)())
+    if nparams != n_elems:
+        sys.exit(f"[gen_toy_mc] model.getNParams()={nparams} != 参数长度 {n_elems}")
+    names = list(names or [])
+    coupling = names[:nvec]
+    # ⚠ θ 名从索引 nvec 开始（getParamNames() = [耦合名(nvec) | θ名(ntheta)]），
+    #   不是 2*nvec —— 参数向量才是 [Re(nvec) | Im(nvec) | θ(ntheta)]。
+    theta_names = names[nvec : nvec + ntheta]
+    if len(names) not in (0, nvec + ntheta):
+        print(
+            f"[gen_toy_mc] WARNING getParamNames() 有 {len(names)} 项，"
+            f"而 n_vec+n_res={nvec + ntheta}（布局解释可能不准）"
+        )
+    print(
+        f"[gen_toy_mc] 参数布局: [Re×{nvec} | Im×{nvec} | θ×{ntheta}] = {n_elems}"
+        f" = 2×{nvec} + {ntheta}"
+    )
+    re0, im0 = float(params[0]), float(params[nvec])
+    print(
+        f"[gen_toy_mc]   耦合[0] {coupling[0] if coupling else '(无名字)'}: "
+        f"Re={re0:g} Im={im0:g}（参考振幅，fit.py 固定 Re=1, Im=0）"
+    )
+    if abs(re0 - 1.0) > 1e-6 or abs(im0) > 1e-6:
+        print(
+            "[gen_toy_mc] WARNING 参考振幅不是 (1, 0)：若这不是你拟合时的约定，"
+            "请检查 best_params.pt 的布局（是不是按复参数存的？）"
+        )
+
+    fri = None
+    try:
+        fri = ana.getFreeResParams()
+    except Exception as e:  # noqa: BLE001
+        print(f"[gen_toy_mc] WARNING 取 getFreeResParams 失败({e})，跳过 θ 校验")
+    bad = []
+    for i in range(ntheta):
+        nm = theta_names[i] if i < len(theta_names) else f"θ[{i}]"
+        if nm is None:
+            nm = f"θ[{i}]"
+        v = float(params[2 * nvec + i])
+        if fri is not None and fri.shape[1] > i:
+            lo, hi = float(fri[1, i]), float(fri[2, i])
+            ok = lo <= v <= hi
+            flag = "" if ok else "   <-- 超出 bounds!"
+            if not ok:
+                bad.append(nm)
+            print(
+                f"[gen_toy_mc]   θ[{i}] {str(nm):<26s} = {v:12.6f}  "
+                f"bounds=[{lo:g}, {hi:g}]{flag}"
+            )
+        else:
+            print(f"[gen_toy_mc]   θ[{i}] {str(nm):<26s} = {v:12.6f}")
+    if bad:
+        sys.exit(
+            f"[gen_toy_mc] θ 超出拟合 bounds: {', '.join(map(str, bad))}"
+            "（参数布局或 config 不匹配）"
+        )
+    return {"n_vec": int(nvec), "n_theta": int(ntheta), "n_params": int(nparams)}
+
+
+def estimate_call_cost(ana, params, phsp_head):
+    """量出「单次调用固定开销」与「每事件开销」，并检查强度是否有限。
+
+    `generateMC` / `getIntensity` 每次调用都要重算一遍 phsp 归一化，固定开销与请求
+    事件数**无关**。斜率用**大 n 两点差分**（n=2000 / n=20000）：用 n=1 与 n=200 相减
+    会被两个大数相消的噪声压住（实测会把 0.15 ms 报成 1.5 ms）。
+    """
+    head_t = as_torch(np.ascontiguousarray(phsp_head))
+
+    # 固定开销：用两次 1 事例调用，取后者（首次调用还要付一次性初始化）。
+    t_first = t_fixed = None
+    for k in range(2):
+        t1 = time.time()
+        ana.getIntensity(head_t[:1], params)
+        dt = time.time() - t1
+        if k == 0:
+            t_first = dt
+        else:
+            t_fixed = dt
+
+    n_lo, n_hi = 2000, 20000
+    t_lo = t_hi = None
+    rate = None
+    slope_note = ""
+    if phsp_head.shape[0] >= n_hi:
+        t1 = time.time()
+        inten = ana.getIntensity(head_t[:n_hi], params)
+        t_hi = time.time() - t1
+        t1 = time.time()
+        ana.getIntensity(head_t[:n_lo], params)
+        t_lo = time.time() - t1
+        dt_diff = t_hi - t_lo
+        # 两点差必须明显大于计时噪声/节点负载波动，否则改用单点（扣掉固定开销）。
+        if dt_diff > max(0.05, 0.01 * t_hi):
+            rate = (n_hi - n_lo) / dt_diff  # 事件/秒
+            slope_note = f"n={n_lo}→{n_hi} 两点差分 {t_lo:.1f}s→{t_hi:.1f}s"
+        else:
+            denom = t_hi - t_fixed
+            if denom > max(0.05, 0.01 * t_hi):
+                rate = max(n_hi - 1, 1) / denom
+                slope_note = (
+                    f"n={n_hi} 单点（两点差分被负载噪声淹没："
+                    f"{t_lo:.1f}s→{t_hi:.1f}s，差 {dt_diff:.2f}s）"
+                )
+            else:
+                slope_note = (
+                    f"无法测准（固定开销占主导：{t_lo:.1f}s→{t_hi:.1f}s，"
+                    f"差 {dt_diff:.2f}s）"
+                )
+    else:
+        n_probe = int(phsp_head.shape[0])
+        t1 = time.time()
+        inten = ana.getIntensity(head_t[:n_probe], params)
+        t_hi = time.time() - t1
+        denom = t_hi - t_fixed
+        if denom > max(0.05, 0.01 * t_hi):
+            rate = max(n_probe - 1, 1) / denom
+            slope_note = f"n={n_probe} 单点（phsp 太小）"
+        else:
+            slope_note = f"无法测准（phsp 太小 + 固定开销占主导：n={n_probe}）"
+
+    x = np.asarray(inten.detach().cpu().numpy(), dtype=np.float64)
+    finite = bool(np.all(np.isfinite(x)))
+    pos = x[x > 0]
+    per_event_ms = None if rate is None else round(1e3 / rate, 3)
+    info = {
+        "t_first_call_s": round(t_first, 2),
+        "t_fixed_s": round(t_fixed, 2),
+        "per_event_ms": per_event_ms,
+        "intensity_finite": finite,
+        "intensity_min": float(np.min(x)) if x.size else None,
+        "intensity_max": float(np.max(x)) if x.size else None,
+        "intensity_median_pos": float(np.median(pos)) if pos.size else None,
+    }
+    print(
+        f"[gen_toy_mc] [estimate] 单次调用固定开销 ≈ {t_fixed:.1f}s"
+        f"（首次调用 {t_first:.1f}s，含一次性初始化；{slope_note}"
+        + (f" → 每事件 ≈ {per_event_ms:.3f} ms）" if per_event_ms is not None else "）")
+    )
+    if not finite:
+        print("[gen_toy_mc] [estimate] WARNING 强度含 NaN/Inf —— 参数或 config 有问题")
+    else:
+        print(
+            f"[gen_toy_mc] [estimate] 强度正常: min={info['intensity_min']:.4g}, "
+            f"max={info['intensity_max']:.4g}, "
+            f"median={info['intensity_median_pos']:.4g}"
+        )
+    return info, t_fixed, rate
+
+
+def auto_batch(n_gen, mode, batch_max):
+    """选 `batch`：让 `generateMC` 一次就把 n_gen 个事例收下来。
+
+    固定开销是**按批次数**收的（每批重算一遍 phsp 归一化），不是按调用次数；
+    `batch=100k` 时 1M 事件会被切成 10 批，白付 9 次归一化。unweighted（AR）还要
+    乘上 1/接受率（取 0.05 保守估计，上限 20 倍）。内存代价约与 batch 成正比，
+    用 `--batch-max` 兜底。
+    """
+    want = int(n_gen)
+    if mode == "unweighted":
+        want = int(min(want / 0.05, want * 20))
+    want = max(want, 1)
+    return int(min(want, int(batch_max)))
+
+
 # ============================================================================
 # 主流程
 # ============================================================================
@@ -286,7 +558,8 @@ def build_parser():
     p.add_argument(
         "--params-from",
         default="results/best_params.pt",
-        help="拟合参数（best_params.pt，[Re.., Im.., θ] float64）",
+        help="拟合参数（best_params.pt，[Re.., Im.., θ] float64；"
+        "也支持复数向量 n_vec+θ、dict、(2,n_vec) 矩阵）",
     )
     p.add_argument(
         "-n",
@@ -311,7 +584,37 @@ def build_parser():
         help="unweighted=AR 舍选等权；weighted=全收+权重（快）",
     )
     p.add_argument(
-        "--batch", type=int, default=100000, help="每批平坦事例数（传给 generateMC）"
+        "--batch",
+        type=int,
+        default=None,
+        help="每批平坦事例数（传给 generateMC）；默认自动 = 目标事例数（一次到位，最快）",
+    )
+    p.add_argument(
+        "--batch-max",
+        type=int,
+        default=2_000_000,
+        help="自动 batch 的上限（内存兜底）",
+    )
+    p.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="torch CPU 线程数（写入 OMP_NUM_THREADS；仅 CPU 后端有意义）",
+    )
+    p.add_argument(
+        "--auto-threads",
+        action="store_true",
+        help="CPU 后端且未指定 --threads 时，自动取 min(16, 核数)",
+    )
+    p.add_argument(
+        "--estimate",
+        action="store_true",
+        help="先用 getIntensity 量固定开销/每事件耗时并打印总耗时预估，再继续生成",
+    )
+    p.add_argument(
+        "--verify-output",
+        action="store_true",
+        help="写完后再校验输出文件（dat 重数行数，root/npy 检查存在且非空）",
     )
     p.add_argument(
         "--max-trials",
@@ -337,7 +640,8 @@ def build_parser():
         "--nobs-from-data",
         action="store_true",
         default=None,
-        help="--poisson 的目标事件数取 config 的 data 文件事件数（默认行为）",
+        help="兼容旧参数：--poisson 未给 --nobs/-n 时，目标事例数取 config 的 data 文件事件数"
+        "（现在 -n 优先）",
     )
     p.add_argument(
         "--allow-short",
@@ -405,7 +709,20 @@ def main():
         ext = os.path.splitext(args.output)[1].lower()
         fmt = ext.lstrip(".") if ext in (".dat", ".root", ".npy") else "dat"
 
+    # ---- torch 线程数（必须在 import torch / 初始化并行后端之前设置）----
+    if args.threads is not None or args.auto_threads:
+        nthreads = (
+            int(args.threads)
+            if args.threads is not None
+            else min(16, os.cpu_count() or 1)
+        )
+        os.environ["OMP_NUM_THREADS"] = str(nthreads)
+        print(f"[gen_toy_mc] torch CPU 线程数 = {nthreads}（OMP_NUM_THREADS）")
+
     import torch  # 延迟导入：--help 不需要
+
+    if args.threads is not None or args.auto_threads:
+        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
 
     order = load_data_order(args.config) or []
     nfinal_cfg = len(order) if order else None
@@ -416,14 +733,27 @@ def main():
     if data_path and os.path.isfile(data_path) and nfinal_cfg:
         data_events = count_dat_events(data_path, nfinal_cfg)
     nobs = args.nobs
+    nobs_src = "--nobs" if args.nobs is not None else None
     if args.poisson and nobs is None:
-        if data_events is None:
+        if args.nevents is not None:
+            # -n 优先于 data 推断：否则会先生成 -n 个、最后只抽 data 事件数，白跑
+            nobs = int(args.nevents)
+            nobs_src = "-n"
+            if data_events is not None and data_events != nobs:
+                print(
+                    f"[gen_toy_mc] NOTE 同时给了 -n {nobs} 和可读的 data"
+                    f"（{data_events} 事件）：按 -n {nobs} 生成"
+                    f"（要跟 data 对齐请去掉 -n 或显式 --nobs {data_events}）"
+                )
+        elif data_events is not None:
+            nobs = data_events
+            nobs_src = "data 文件"
+        else:
             sys.exit(
                 "[gen_toy_mc] --poisson 需要 --nobs，或 config 的 data 文件可读"
                 "（用于 --nobs-from-data）"
             )
-        nobs = data_events
-    if args.poisson and nobs is not None and args.nevents is None:
+    if args.poisson and args.nevents is None and nobs is not None:
         args.nevents = int(nobs)
     if args.nevents is None or args.nevents <= 0:
         sys.exit("[gen_toy_mc] 需要 -n（--poisson 未给 -n 时按 nobs 推断）")
@@ -433,10 +763,7 @@ def main():
             "请用 --format root/npy，或加 --poisson 转成等权 pseudo-data"
         )
 
-    params = torch.load(args.params_from, weights_only=True)
-    if not torch.is_tensor(params):
-        sys.exit(f"[gen_toy_mc] {args.params_from} 不是 tensor")
-    params = params.detach().to(dtype=torch.float64).reshape(-1)
+    # 参数在构造 analysis 后加载（需要 getNVector/getNFreeTheta 才能判断布局）
 
     # ---- 本底（读 dat，不需要后端）----
     bkg_ev = bkg_w = None
@@ -465,7 +792,7 @@ def main():
     ana = ctpwa.analysis(args.config)
     nvec = int(ana.getNVector())
     ntheta = int(ana.getNFreeTheta())
-    nparams = 2 * nvec + ntheta
+    nparams = int(getattr(ana, "getNParams", lambda: 2 * nvec + ntheta)())
     try:
         bi = ctpwa.build_info()
     except Exception:
@@ -477,11 +804,11 @@ def main():
         )
     print(f"[gen_toy_mc] 参数维度: 2×{nvec} + {ntheta} = {nparams}；Data.order={order}")
 
-    if params.numel() != nparams:
-        sys.exit(
-            f"[gen_toy_mc] 参数长度 {params.numel()} != 期望 {nparams}"
-            "（是不是用了别的 config 的 best_params.pt？）"
-        )
+    # ---- 参数：读入 + 布局自检 ----
+    params, pnote = load_param_vector(args.params_from, nvec, ntheta)
+    if pnote:
+        print(f"[gen_toy_mc] 参数换算: {pnote}")
+    layout = verify_param_layout(ana, params, nvec, ntheta, ana.getParamNames())
     # CUDA 后端要求 params 在 CUDA 上（best_params.pt 是 CPU 张量）
     dev = backend_device(bi)
     params = params.to(dev)
@@ -491,8 +818,7 @@ def main():
     )
     if nobs is not None:
         print(
-            f"[gen_toy_mc] --poisson: nobs={nobs}"
-            f"{' (来自 data 文件)' if args.nobs is None else ' (--nobs)'}, "
+            f"[gen_toy_mc] --poisson: nobs={nobs} (来自 {nobs_src}), "
             f"data 事件数={data_events}"
         )
     if use_bkg:
@@ -501,14 +827,67 @@ def main():
             f"scale={args.bkg_scale:g}"
         )
 
+    # ---- 可选：先量开销 ----
+    est = None
+    if args.estimate:
+        phsp_path = load_dat_path(args.config, "phsp")
+        if phsp_path and os.path.isfile(phsp_path) and nfinal_cfg:
+            head = read_dat_head(phsp_path, nfinal_cfg, 20000)
+            est, t_fixed, rate = estimate_call_cost(ana, params, head)
+            n_calls = 1 + (1 if args.check_distribution else 0)
+            if args.batch is None:
+                n_chunks = 1
+            else:
+                n_chunks = max(1, -(-int(args.nevents) // max(int(args.batch), 1)))
+            eff_events = (
+                args.nevents / 0.07 if args.mode == "unweighted" else args.nevents
+            )
+            est["n_calls"] = n_calls
+            est["n_chunks"] = n_chunks
+            if rate is not None:
+                projected = (
+                    n_calls * (t_fixed + (n_chunks - 1) * t_fixed)
+                    + n_calls * eff_events / rate
+                )
+                est["projected_s"] = round(projected, 1)
+                print(
+                    f"[gen_toy_mc] [estimate] 预估总耗时 ≈ {projected / 60:.1f} 分钟"
+                    f"（{n_calls} 次调用 × {n_chunks} 批 × {t_fixed:.1f}s 固定 + "
+                    f"{eff_events:.0f} 平坦事例 × {1e3 / rate:.2f} ms；不含构建/写盘）"
+                )
+                if n_chunks > 1:
+                    print(
+                        f"[gen_toy_mc] [estimate] 其中 {n_chunks} 批是 `--batch {args.batch}` "
+                        f"造成的 —— 去掉 --batch（默认一次到位）可省 "
+                        f"{(n_chunks - 1) * t_fixed / 60:.1f} 分钟"
+                    )
+            else:
+                print(
+                    "[gen_toy_mc] [estimate] 每事件耗时未测准（节点负载波动），"
+                    "只报固定开销；总时间无法预估"
+                )
+        else:
+            print("[gen_toy_mc] WARNING --estimate 但 config 的 phsp 不可用 → 跳过")
+
     # ---- 生成信号 ----
+    if args.batch is None:
+        batch = auto_batch(args.nevents, args.mode, args.batch_max)
+    else:
+        batch = int(args.batch)
+        n_chunks = max(1, -(-int(args.nevents) // max(batch, 1)))
+        if n_chunks > 1:
+            print(
+                f"[gen_toy_mc] NOTE --batch {batch} 会切成 {n_chunks} 批，"
+                "每批重算一次 phsp 归一化；去掉 --batch（默认一次到位）更快"
+            )
+    print(f"[gen_toy_mc] batch={batch}（mode={args.mode}）")
     t0 = time.time()
     res = ana.generateMC(
         int(args.nevents),
         params,
         seed=int(args.seed),
         mode=args.mode,
-        batch=int(args.batch),
+        batch=batch,
         max_trials=args.max_trials,
     )
     ev = np.asarray(res["events"].numpy(), dtype=np.float64)
@@ -615,6 +994,21 @@ def main():
         ana.writeMC(as_torch(sig), args.output, as_torch(sig_w))
         print(f"[gen_toy_mc] root 已写: {args.output}")
 
+    # ---- 可选：输出文件校验 ----
+    if args.verify_output:
+        main_out = (
+            args.output
+            if str(args.output).endswith(".npy") or fmt != "npy"
+            else str(args.output) + ".npy"
+        )
+        outs = [main_out]
+        if sig_w is not None:
+            outs.append(str(args.output) + ".weights.npy")
+        bad = [p for p in outs if not (os.path.isfile(p) and os.path.getsize(p) > 0)]
+        if bad:
+            sys.exit(f"[gen_toy_mc] --verify-output: 这些文件缺失或为空: {bad}")
+        print(f"[gen_toy_mc] --verify-output: OK ({', '.join(outs)})")
+
     # ---- 派生 config ----
     if args.write_config:
         derive_config_dat_path(
@@ -638,7 +1032,7 @@ def main():
             params,
             seed=int(args.seed) + 9999,
             mode="weighted",
-            batch=int(args.batch),
+            batch=batch,
         )
         ev_wt = np.asarray(wtres["events"].numpy(), dtype=np.float64)
         w_wt = np.asarray(wtres["weights"].numpy(), dtype=np.float64)
@@ -692,6 +1086,8 @@ def main():
         "format": fmt,
         "derived_config": args.write_config,
         "check_distribution": check,
+        "params_layout": layout,
+        "estimate": est,
         "elapsed_s": round(dt, 2),
         "backend": bi.get("backend"),
     }

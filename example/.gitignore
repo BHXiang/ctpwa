@@ -1,5 +1,5 @@
 # 本地私有文件（只保留在本机，不进版本库）
-AGENT.md
+AGENTS.md
 tests/
 CHANGELOG.md
 .pre-commit-config.yaml

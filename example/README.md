@@ -69,7 +69,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
 
 ## 1. 运行前提
 
-- 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求的 ctpwa 最低版本：
+- 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求 **ctpwa ≥ 0.3.26**，各功能对应的最低版本：
   - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
   - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
   - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）；
@@ -79,7 +79,8 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
   - `≥ 0.3.25`：多 LS 分波（`nSL > npart`）时 `interference_rec_err` 不再是 0；
   - `≥ 0.3.26`：Hessian 病态时 `writeResult` 不被 `eigvalsh` 异常中断；耦合误差按**完整自由
     Hessian** 的耦合块（θ 边际化）；流式 `phsp` 的 Gram 归一化修正。
-  本机当前：**0.3.24**（本地编译版；本次同步后需重编到 0.3.26）。
+  具体安装版本用 `python -c "import ctpwa; print(ctpwa.__version__)"` 查看；`≥ 0.3.27` 另附带
+  双卡内存预检、大 n Hessian、大模型 SL 峰值与 BWR `q0=0` 的稳定性修复，推荐使用。
 - **从源码编译**：`setup.py` 与上游一致（`-std=c++17` + 可选的 `CTPWA_GLIBCXX_ASSERTIONS=1`）。
   ⚠ 若用 torch ≥ 2.13 编译，其 C++ 头文件需要 C++20——此时需**在本机编译目录**临时把三处
   `-std=c++17` 改成 `-std=c++20`（不要提交）。
@@ -675,7 +676,7 @@ python gen_phsp_mc.py --config config.yml -n 200000 --format root -o phsp_flat.r
 ```bash
 # 5 万信号 toy + Poisson + 真本底 → pseudo-data（并派生 config、写 stats）
 python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
-    -n 50000 --seed 42 --poisson --nobs-from-data --bkg \
+    -n 50000 --seed 42 --poisson --bkg \
     -o toy_data.dat --write-config config_toy.yml --stats-json toy.json
 
 # 纯信号等权 / 带权（快）样本
@@ -691,17 +692,22 @@ python gen_toy_mc.py --config config.yml --params-from results/best_params.pt \
 | 参数 | 说明 | 默认 |
 |---|---|---|
 | `--config` | `config.yml` 路径 | `config.yml` |
-| `--params-from` | 拟合参数 `best_params.pt`（`[Re.., Im.., θ]` float64；长度按 config 校验；**会自动搬到当前后端设备**——CUDA 后端要求 CUDA 张量，而 `best_params.pt` 是 CPU 张量） | `results/best_params.pt` |
-| `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数；`--poisson` 且未给 `-n` 时默认 = `nobs`） | None |
+| `--params-from` | 拟合参数 `best_params.pt`。支持 4 种存法：实数一维 `[Re.., Im.., θ]`（标准）、**复数向量**（`n_vec+θ`，前 `n_vec` 个复数振幅 + 后 `θ` 的实部，自动拆成 Re/Im/θ）、dict（`params`/`best_params`/`vector`/`amp_params`）、`(2,n_vec)` 的 (Re,Im) 矩阵（`θ=0` 时）。长度不符会报出「本 config 期望多少 / 文件是什么形状」；**自动搬到当前后端设备** | `results/best_params.pt` |
+| `-n`, `--nevents` | 目标事例数（`unweighted` 时为输出事件数）；`--poisson` 时**优先于 data 推断**（同时给 `-n` 和可读 data 会打印 NOTE） | None |
 | `-o`, `--output` | 输出文件（dat/root/npy） | — |
 | `--seed` | 随机种子；**默认取当前 Unix 时间戳（每次运行不同）**。同时喂给 `generateMC`（平坦相空间 + 舍选）和本地 RNG（Poisson 抽样 / 重抽样 / 本底 / 打乱，内部用 `seed+20260101`）；`--check-distribution` 的参照样本用 `seed+9999`；复现请传回启动打印的 seed | 当前时间 |
 | `--mode {unweighted,weighted}` | `unweighted`=平坦相空间 + `\|M\|²` **舍选（AR）** → **等权**；`weighted`=**全收** + 每事件权重 `I` → **快**（详见下方要点） | `unweighted` |
-| `--batch` | 每批平坦事例数（传给 `generateMC`） | `100000` |
+| `--batch` | 每批平坦事例数（传给 `generateMC`）。默认**自动 = 目标事例数（一次到位）**——固定开销按批次数收取，切成多批会白付多次 phsp 归一化；显式给小值会打印提示 | 自动 |
+| `--batch-max` | 自动 `--batch` 的上限（内存兜底；batch 越大内存越高） | `2000000` |
+| `--threads N` | torch CPU 线程数（写入 `OMP_NUM_THREADS`；仅 CPU 后端有意义） | None |
+| `--auto-threads` | CPU 后端且未指定 `--threads` 时自动取 `min(16, 核数)` | False |
+| `--estimate` | 先用 `getIntensity` 量出单次调用固定开销与每事件耗时，打印总耗时预估，再继续生成 | False |
+| `--verify-output` | 写完后校验输出文件（dat 重数行数，root/npy 检查存在且非空） | False |
 | `--max-trials` | 平坦事例数上限（安全检查） | None（不限） |
 | `--format {dat,root,npy}` | 输出格式；默认按 `-o` 的扩展名 | 按扩展名 |
 | `--poisson` | 抽成等权 pseudo-data：`nobs ~ Poisson(目标事件数)`（等权无放回 / 带权按 w 有放回） | False |
 | `--nobs N` | `--poisson` 的目标事件数（信号部分） | None |
-| `--nobs-from-data` | `--poisson` 的目标事件数取 config 的 `data` 文件事件数 | 该行为默认 |
+| `--nobs-from-data` | 兼容旧参数：`--poisson` 未给 `--nobs`/`-n` 时，目标数取 config 的 `data` 事件数（**现在 `-n` 优先**） | 兼容 |
 | `--allow-short` | 可用信号 < nobs 时取 min 并警告（默认报错） | False |
 | `--bkg` / `--no-bkg` | 叠加 config 的 `bkg`（按 `bkg_weights` 加权抽样）；默认“有 bkg 就叠” | 有则叠 |
 | `--bkg-scale` | 本底产额缩放：`Poisson(scale·Σw)` | `1.0` |
