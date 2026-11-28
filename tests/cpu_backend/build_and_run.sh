@@ -22,19 +22,53 @@ echo "[build] ${CXX} -> ${OUT}/test_backend"
 "${CXX}" -std=c++17 -O2 -fopenmp -DCTPWA_BACKEND_CPU \
     -Wall -Wextra -Wno-unused-parameter \
     -DCTPWA_DOUBLE_COMPLEX \
-    -I"${ROOT}/include" ${TORCH_INC} \
-    "${ROOT}/src/Backend.cpp" \
+    -I"${ROOT}/include" \
+    -I"${ROOT}/include/config" \
+    -I"${ROOT}/include/model" \
+    -I"${ROOT}/include/device" \
+    -I"${ROOT}/include/amplitude" \
+    -I"${ROOT}/include/parameters" \
+    -I"${ROOT}/include/fit" \
+    -I"${ROOT}/include/io" \
+    -I"${ROOT}/include/output" \
+    -I"${ROOT}/include/app" \
+    -I"${ROOT}/include/cpu_shims" ${TORCH_INC} \
+    "${ROOT}/src/device/Backend.cpp" \
     "${ROOT}/tests/cpu_backend/test_backend.cpp" \
     -o "${OUT}/test_backend"
 
 echo "[run] OMP_NUM_THREADS=${OMP_NUM_THREADS:-<default>}"
 "${OUT}/test_backend"
 
+echo "[build] ${CXX} -> ${OUT}/test_dev_buffer"
+"${CXX}" -std=c++17 -O2 -fopenmp -DCTPWA_BACKEND_CPU \
+    -Wall -Wextra -Wno-unused-parameter \
+    -DCTPWA_DOUBLE_COMPLEX \
+    -I"${ROOT}/include" \
+    -I"${ROOT}/include/device" \
+    -I"${ROOT}/include/cpu_shims" ${TORCH_INC} \
+    "${ROOT}/src/device/Backend.cpp" \
+    "${ROOT}/tests/cpu_backend/test_dev_buffer.cpp" \
+    -o "${OUT}/test_dev_buffer"
+
+echo "[run] test_dev_buffer"
+"${OUT}/test_dev_buffer"
+
 # ---- 衰变描述类型（P3）：纯 host 单测，不链接 Backend.cpp、不需要 torch ----
 # 用 -x c++ 让 g++ 认 .cu 扩展名（与 setup.py 的 CPU 影子源文件同一手法）。
 echo "[build] ${CXX} -> ${OUT}/test_decay_desc"
 "${CXX}" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
     -I"${ROOT}/include" \
+    -I"${ROOT}/include/config" \
+    -I"${ROOT}/include/model" \
+    -I"${ROOT}/include/device" \
+    -I"${ROOT}/include/amplitude" \
+    -I"${ROOT}/include/parameters" \
+    -I"${ROOT}/include/fit" \
+    -I"${ROOT}/include/io" \
+    -I"${ROOT}/include/output" \
+    -I"${ROOT}/include/app" \
+    -I"${ROOT}/include/cpu_shims" \
     -x c++ "${ROOT}/src/config/DecayDesc.cu" -x none \
     "${ROOT}/tests/cpu_backend/test_decay_desc.cpp" \
     -o "${OUT}/test_decay_desc"

@@ -46,7 +46,8 @@ is_allowed() {
 
 # 收集所有含裸调用的文件（排除注释行里的提及：行首 // 或 * 的跳过）
 mapfile -t HITS < <(
-    grep -rn "cudaSetDevice" src include 2>/dev/null \
+    grep -rn --include='*.cu' --include='*.cpp' --include='*.cc' \
+        --include='*.cuh' --include='*.h' "cudaSetDevice" src include 2>/dev/null \
         | grep -v '^\s*$' \
         | awk -F: '
             {

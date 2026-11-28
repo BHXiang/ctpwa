@@ -512,17 +512,21 @@ void analysis::initialize(std::string config_file)
         }
         if (W_total <= 0.0) W_total = 1.0;
 
-        ctpwa::ensure_device(primary_dev_);  // ensure d_phsp_matrix_ is allocated on primary GPU
-        cudaMalloc(&d_phsp_matrix_, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-        cudaMemset(d_phsp_matrix_, 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+        d_phsp_matrix_.allocate_bytes(primary_dev_,
+            (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
+        TORCH_CHECK(d_phsp_matrix_, "phsp Gram 矩阵分配失败");
+        ctpwa::ensure_device(primary_dev_);  // allocate 的 guard 会把 current device 还原到前一张卡
+        cudaMemset(d_phsp_matrix_.data(), 0, n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
 
         if (phsp_freed_) {
             // ---- phsp 流式（不驻留）: 分块算 phsp 振幅 → 累加 float32 + double 矩阵 ----
             // 每批: calculateAmplitudes(单批 Vp4) → 批振幅临时缓冲 → 累加矩阵 → 释放。
             // 峰值 = 常驻 data/bkg 表 + 一批振幅，与 phsp 总量无关。
-            cudaMalloc(&d_phsp_matrix_double_,
+            d_phsp_matrix_double_.allocate_bytes(primary_dev_,
                 (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
-            cudaMemset(d_phsp_matrix_double_, 0,
+            TORCH_CHECK(d_phsp_matrix_double_, "double phsp Gram 矩阵分配失败");
+            ctpwa::ensure_device(primary_dev_);
+            cudaMemset(d_phsp_matrix_double_.data(), 0,
                 (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
             const int PHSP_BATCH = 100000;
             long long per_ev_bytes = (long long)n_polar_ * n_amplitudes_ * 8;
@@ -558,7 +562,7 @@ void analysis::initialize(std::string config_file)
                             amp_offsets_[g] = {0, n_polar_ * n_amplitudes_};
                         }
                     }
-                    std::vector<ctComplex*> d_batch = calculateAmplitudes(Vp4_batch);
+                    ctpwa::MultiGpuStorage<ctComplex> d_batch = calculateAmplitudes(Vp4_batch);
                     ctpwa::ensure_device(gpu);
                     int nTot = nch * n_polar_ * n_amplitudes_;
 
@@ -593,7 +597,7 @@ void analysis::initialize(std::string config_file)
                             &alpha, d_scaled, n_amplitudes_, d_scaled, n_amplitudes_,
                             &beta, d_m, n_amplitudes_);
                         if (gpu == primary_dev_) {
-                            axpyComplex(d_phsp_matrix_, d_m, ctMake(1.0f, 0.0f),
+                            axpyComplex(d_phsp_matrix_.data(), d_m, ctMake(1.0f, 0.0f),
                                         n_amplitudes_ * n_amplitudes_);
                         } else {
                             ctpwa::ensure_device(primary_dev_);
@@ -601,7 +605,7 @@ void analysis::initialize(std::string config_file)
                             cudaMalloc(&d_temp, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
                             cudaMemcpyPeer(d_temp, primary_dev_, d_m, gpu,
                                 (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(ctComplex));
-                            axpyComplex(d_phsp_matrix_, d_temp, ctMake(1.0f, 0.0f),
+                            axpyComplex(d_phsp_matrix_.data(), d_temp, ctMake(1.0f, 0.0f),
                                         n_amplitudes_ * n_amplitudes_);
                             cudaFree(d_temp);
                             ctpwa::ensure_device(gpu);
@@ -643,7 +647,7 @@ void analysis::initialize(std::string config_file)
                             &alpha, d_batch_d, n_amplitudes_, d_batch_d, n_amplitudes_,
                             &beta, d_md, n_amplitudes_);
                         if (gpu == primary_dev_) {
-                            axpyZComplex(d_phsp_matrix_double_, d_md,
+                            axpyZComplex(d_phsp_matrix_double_.data(), d_md,
                                          n_amplitudes_ * n_amplitudes_);
                         } else {
                             ctpwa::ensure_device(primary_dev_);
@@ -651,7 +655,7 @@ void analysis::initialize(std::string config_file)
                             cudaMalloc(&d_temp, (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
                             cudaMemcpyPeer(d_temp, primary_dev_, d_md, gpu,
                                 (size_t)n_amplitudes_ * n_amplitudes_ * sizeof(cuDoubleComplex));
-                            axpyZComplex(d_phsp_matrix_double_, d_temp,
+                            axpyZComplex(d_phsp_matrix_double_.data(), d_temp,
                                          n_amplitudes_ * n_amplitudes_);
                             cudaFree(d_temp);
                             ctpwa::ensure_device(gpu);
@@ -662,9 +666,7 @@ void analysis::initialize(std::string config_file)
 
                     // 释放上转段（本 GPU）与批振幅（含占位 GPU 的 1 事件缓冲）
                     if (d_batch_up != nullptr) cudaFree(d_batch_up);
-                    for (int g = 0; g < n_gpus_; ++g) {
-                        if (d_batch[g]) { ctpwa::ensure_device(g); cudaFree(d_batch[g]); }
-                    }
+                    d_batch.clear();
                     ctpwa::ensure_device(gpu);
                 }
                 cublasDestroy(h);
@@ -724,7 +726,7 @@ void analysis::initialize(std::string config_file)
 
                     if (gpu == (size_t)primary_dev_) {
                         ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
+                        axpyComplex(d_phsp_matrix_.data(), d_phsp_gpu, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_phsp_gpu);
                     } else {
                         ctpwa::ensure_device(primary_dev_);
@@ -736,7 +738,7 @@ void analysis::initialize(std::string config_file)
                         cudaFree(d_phsp_gpu);
                         ctpwa::ensure_device(primary_dev_);
                         ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex(d_phsp_matrix_, d_temp, one, n_amplitudes_ * n_amplitudes_);
+                        axpyComplex(d_phsp_matrix_.data(), d_temp, one, n_amplitudes_ * n_amplitudes_);
                         cudaFree(d_temp);
                         ctpwa::ensure_device(gpu);
                     }
@@ -1005,7 +1007,7 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
         auto saved_amp = amp_offsets_;
 
         AmpCalc tmp;
-        std::vector<ctComplex*> amps;
+        ctpwa::MultiGpuStorage<ctComplex> amps;
         std::vector<ctComplex*> upcast;
         std::vector<ctComplex*> d_vec(static_cast<size_t>(n_gpu), nullptr);
         std::vector<double*> d_out(static_cast<size_t>(n_gpu), nullptr);
@@ -1016,9 +1018,7 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
             for (int g = 0; g < static_cast<int>(upcast.size()); ++g)
                 if (upcast[g]) { ctpwa::ensure_device(g); cudaFree(upcast[g]); }
             upcast.clear();
-            for (int g = 0; g < static_cast<int>(amps.size()); ++g)
-                if (amps[g]) { ctpwa::ensure_device(g); cudaFree(amps[g]); }
-            amps.clear();
+            amps.clear();  // MultiGpuStorage 统一负责释放，不再手动 cudaFree
             for (int g = 0; g < static_cast<int>(d_out.size()); ++g)
                 if (d_out[g]) { ctpwa::ensure_device(g); cudaFree(d_out[g]); }
             d_out.clear();
@@ -1063,7 +1063,7 @@ torch::Tensor analysis::getIntensity(torch::Tensor momenta, torch::Tensor params
                 "getIntensity: theta size ", theta.numel(),
                 " != free resonance params ", tmp.nFreeResParams());
             if (tmp.nFreeResParams() > 0) {
-                tmp.reComputeAmps(amps, theta.data_ptr<double>(),
+                tmp.reComputeAmps(amps.data(), theta.data_ptr<double>(),
                     n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
                     primary_dev_);
             }

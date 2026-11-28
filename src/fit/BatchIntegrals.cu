@@ -166,13 +166,9 @@ double computeFileBatchIntegrals(
             ctpwa::ensure_device(ctx.primary_dev);
         });
         // 当前批的 A 表；异常（kernel 报错等）时也要释放。
-        std::vector<ctComplex*> d_batch_amps;
+        MultiGpuStorage<ctComplex> d_batch_amps;
         auto batch_guard = makeScopeExit([&]() {
-            for (size_t g = 0; g < d_batch_amps.size(); ++g)
-                if (d_batch_amps[g]) {
-                    ctpwa::ensure_device((int)g);
-                    cudaFree(d_batch_amps[g]);
-                }
+            d_batch_amps.clear();
             ctpwa::ensure_device(ctx.primary_dev);
         });
         for (int g = 0; g < ctx.n_gpus; ++g) {
@@ -245,7 +241,7 @@ double computeFileBatchIntegrals(
             memprobe("after-amps", start);
 
             // Center (+ square)
-            computeTruthIntegrals(ev_center, d_batch_amps, batch_ev_per_gpu,
+            computeTruthIntegrals(ev_center, d_batch_amps.data(), batch_ev_per_gpu,
                 out_partial, out_scattering, out_square, npartials,
                 ws_complex, ws_matrix, ws_upcast, ws_weights,
                 (*ctx.n_slvectors), ctx.float_amps, ctx.n_polar, ctx.n_amplitudes,
@@ -254,13 +250,13 @@ double computeFileBatchIntegrals(
             // Jacobian perturbations (reuse same batch amplitudes)
             if (out_p_partial != nullptr) {
                 for (int j = 0; j < (int)ev_perturbed_p.size(); ++j) {
-                    computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps, batch_ev_per_gpu,
+                    computeTruthIntegrals(ev_perturbed_p[j], d_batch_amps.data(), batch_ev_per_gpu,
                         out_p_partial + j * npartials,
                         out_p_scattering + j * npartials * npartials, nullptr, npartials,
                         ws_complex, ws_matrix, ws_upcast, ws_weights,
                 (*ctx.n_slvectors), ctx.float_amps, ctx.n_polar, ctx.n_amplitudes,
                 ctx.primary_dev);
-                    computeTruthIntegrals(ev_perturbed_m[j], d_batch_amps, batch_ev_per_gpu,
+                    computeTruthIntegrals(ev_perturbed_m[j], d_batch_amps.data(), batch_ev_per_gpu,
                         out_m_partial + j * npartials,
                         out_m_scattering + j * npartials * npartials, nullptr, npartials,
                         ws_complex, ws_matrix, ws_upcast, ws_weights,
@@ -271,8 +267,6 @@ double computeFileBatchIntegrals(
 
             memprobe("after-integrals", start);
             // Free batch amplitudes
-            for (size_t g = 0; g < d_batch_amps.size(); ++g)
-                if (d_batch_amps[g]) { ctpwa::ensure_device(static_cast<int>(g)); cudaFree(d_batch_amps[g]); }
             d_batch_amps.clear();
             memprobe("after-amp-free", start);
         }

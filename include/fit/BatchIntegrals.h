@@ -10,6 +10,7 @@
 
 #include <Amplitude.cuh>   // LorentzVector
 #include <Config.cuh>      // Particle
+#include <MultiGpuStorage.h>
 
 #include <torch/extension.h>
 
@@ -37,7 +38,7 @@ struct BatchIntegralCtx {
     // ---- 算法回调 ----
     std::function<std::vector<double>()> current_theta_host;
     // 用显式 θ 覆盖算振幅（Vp4 → 每 GPU 的振幅缓冲）
-    std::function<std::vector<ctComplex*>(
+    std::function<MultiGpuStorage<ctComplex>(
         const std::vector<std::map<std::string, std::vector<LorentzVector>>>&,
         int, const double*)> calculate_amplitudes;
 };

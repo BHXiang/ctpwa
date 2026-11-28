@@ -1,6 +1,7 @@
 #ifndef CONFIG_CUH
 #define CONFIG_CUH
 
+#include <complex>
 #include <map>
 #include <set>
 #include <string>

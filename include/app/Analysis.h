@@ -48,6 +48,8 @@
 // 目的是让 7000 行的编排代码只有这一处知道"当前是哪个后端"。
 // ---------------------------------------------------------------------------
 #include <BackendHelpers.h>   // ctpwa_dev / ctpwa_is_cuda_like / makeScopeExit / CUDA_CHECK
+#include <DevBuffer.h>        // phsp Gram 矩阵的设备所有权
+#include <MultiGpuStorage.h>  // 每卡一份的振幅表及裸指针视图
 
 #include <unordered_set>
 #include <vector>
@@ -542,7 +544,7 @@ public:
                                int n_amp, bool fast)
     {
         // P4：实现已搬到 ctpwa::hessianSegmentContrib（include/HessianContrib.h）
-        ctpwa::hessianSegmentContrib(d_all_amplitudes_, events_, amp_offsets_,
+        ctpwa::hessianSegmentContrib(d_all_amplitudes_.data(), events_, amp_offsets_,
                                      data_weights_, bkg_weights_,
                                      float_amps_, n_amplitudes_, n_polar_,
                                      gpu, seg, d_v, d_hess, n_amp, fast);
@@ -737,8 +739,8 @@ public:
         in.events = &events_;
         in.phsp_weights = &phsp_weights_;
         in.nSLvectors = &nSLvectors_;
-        in.d_matrix = d_phsp_matrix_;
-        in.d_matrix_double = d_phsp_matrix_double_;
+        in.d_matrix = d_phsp_matrix_.data();
+        in.d_matrix_double = d_phsp_matrix_double_.data();
         in.n_amplitudes = n_amplitudes_;
         in.primary_dev = primary_dev_;
         return ctpwa::phspMatrixFromGram(in, vector, W_out, Wtotal_out);
@@ -942,9 +944,9 @@ public:
     void rebuildPhspGram()
     {
         // P4：实现已搬到 ctpwa::rebuildPhspGram（include/PhspGram.h）
-        ctpwa::rebuildPhspGram(d_all_amplitudes_, events_, phsp_weights_,
+        ctpwa::rebuildPhspGram(d_all_amplitudes_.data(), events_, phsp_weights_,
                                float_amps_, n_amplitudes_, n_polar_, primary_dev_,
-                               &d_phsp_matrix_,
+                               d_phsp_matrix_.data(),
                                [this]() { return phspGramBatchEvents(); });
     }
 
@@ -1181,11 +1183,11 @@ private:
     torch::Tensor theta_cur_;
 
     // 振幅数据，设备端
-    std::vector<ctComplex*> d_all_amplitudes_;
-    ctComplex* d_phsp_matrix_ = nullptr;
+    ctpwa::MultiGpuStorage<ctComplex> d_all_amplitudes_;
+    ctpwa::DevBuffer<ctComplex> d_phsp_matrix_;
     // 双精度 phsp 矩阵（Constraints.free_phsp_amplitudes 流式模式用，主 GPU）：
     // phsp_sum = Re(v^H M_double v)，替代对原始 phsp 振幅的逐 forward 扫描
-    cuDoubleComplex* d_phsp_matrix_double_ = nullptr;
+    ctpwa::DevBuffer<cuDoubleComplex> d_phsp_matrix_double_;
     bool phsp_freed_ = false;   // true = phsp 振幅不驻留（流式模式）
     bool float_amps_ = false;   // true = 混合精度: 驻留振幅矩阵存 float（double .so 上 precision:float 或 auto 默认）
     PrecMode prec_mode_ = PrecMode::Double;  // 运行期档位（config precision）: Float=全 float;
@@ -1272,7 +1274,7 @@ private:
     // 那批对象里的 m0/Γ0 是配置初值；reComputeAmps 只改驻留振幅，管不到这里。
     // 映射靠 AmpCalc::slots_ 的 (block_idx, res_idx, param_idx) —— block_idx 与
     // 本函数里 addBlock 的调用顺序一致（每 chain×组合×共振组合一个 block）。
-    std::vector<ctComplex*> calculateAmplitudes(
+    ctpwa::MultiGpuStorage<ctComplex> calculateAmplitudes(
         const std::vector<std::map<std::string, std::vector<LorentzVector>>>& Vp4,
         AmpCalc* amp_calc = nullptr, int n_gpus_used = -1,
         const double* theta_override = nullptr) const
@@ -1283,9 +1285,9 @@ private:
         const int n_gpu_eff = (n_gpus_used > 0)
             ? std::min(n_gpus_used, n_gpus_) : n_gpus_;
 
-        // 多GPU支持：为每个GPU分配振幅内存
-        // int num_gpus = events_.size();
-        std::vector<ctComplex*> d_all_amplitudes_vec(n_gpu_eff, nullptr);
+        // 多GPU支持：每卡一份带所有权的振幅缓冲，裸指针视图只供 kernel 使用
+        ctpwa::MultiGpuStorage<ctComplex> d_all_amplitudes_vec;
+        d_all_amplitudes_vec.resize(n_gpu_eff);
 
         // 计算每个GPU的总事件数
         // std::vector<int> nEvents_per_gpu(n_gpus_, 0);
@@ -1300,8 +1302,11 @@ private:
         size_t amp_elem_bytes = float_amps_ ? sizeof(float2) : sizeof(ctComplex);
         for (int gpu = 0; gpu < n_gpu_eff; ++gpu) {
             if (amp_offsets_[gpu].back() > 0) {
-                ctpwa::ensure_device(gpu);
-                cudaMalloc(&d_all_amplitudes_vec[gpu], amp_offsets_[gpu].back() * amp_elem_bytes);
+                d_all_amplitudes_vec.at(gpu).allocate_bytes(gpu,
+                    (size_t)amp_offsets_[gpu].back() * amp_elem_bytes);
+                TORCH_CHECK(d_all_amplitudes_vec[gpu],
+                    "振幅表分配失败 gpu=", gpu, " bytes=",
+                    (size_t)amp_offsets_[gpu].back() * amp_elem_bytes);
             }
         }
         // ctpwa::ensure_device(0);
@@ -1543,7 +1548,7 @@ private:
                 // 调用多GPU版本的getAmps函数
                 for (const auto resonance : resonance_combinations)
                 {
-                    cas->getAmps(d_all_amplitudes_vec, resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_, float_amps_);
+                    cas->getAmps(d_all_amplitudes_vec.data(), resonance, gls_index, n_amplitudes_, events_offsets_, amp_offsets_, float_amps_);
 
                     // 如果有 scan 配置且 amp_calc 非空，注册到 AmpCalc
                     if (amp_calc)

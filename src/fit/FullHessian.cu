@@ -96,7 +96,7 @@ torch::Tensor getHessian(FullHessianCtx& ctx, const torch::Tensor& params)
         if (!ctx.phsp_freed)
             ctpwa::rebuildPhspGram((*ctx.d_all_amplitudes), (*ctx.events),
                                    (*ctx.phsp_weights), ctx.float_amps, ctx.n_amplitudes,
-                                   ctx.n_polar, ctx.primary_dev, &ctx.d_phsp_matrix,
+                                   ctx.n_polar, ctx.primary_dev, ctx.d_phsp_matrix,
                                    [] { return 150000; });
         // （原内联重建代码已抽成 rebuildPhspGram()）
 

@@ -36,7 +36,7 @@ public:
     ~DevBuffer() { reset(); }
 
     DevBuffer(DevBuffer&& other) noexcept
-        : ptr_(other.ptr_), dev_(other.dev_), n_(other.n_)
+        : ptr_(other.ptr_), dev_(other.dev_), n_(other.n_), bytes_(other.bytes_)
     {
         other.ptr_ = nullptr;
         other.n_ = 0;
@@ -102,6 +102,7 @@ public:
             ptr_ = static_cast<T*>(p);
             dev_ = dev;
             n_ = n;
+            bytes_ = ask * sizeof(T);
         }
     }
 

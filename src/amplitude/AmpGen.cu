@@ -688,7 +688,15 @@ void AmpCasDecay::computeSLAmps(const std::vector<std::map<std::string, std::vec
                 if (err != cudaSuccess)
                 {
                     std::cerr << "CUDA error in computeSLAmp: "
-                        << cudaGetErrorString(err) << std::endl;
+                        << cudaGetErrorString(err)
+                        << " (gpu=" << i << " sigma=" << s
+                        << " nEvents=" << nEvents_[i]
+                        << " nSL=" << desc_.nSLCombs()
+                        << " nPol=" << nPolarizations_
+                        << " nPolTotal=" << nPolarizations_total_
+                        << " batch=" << n_events
+                        << " scratch=" << scratch_per_sl
+                        << " numBlocks=" << numBlocks << ")" << std::endl;
                 }
 
                 cudaFree(d_amp_buffer);

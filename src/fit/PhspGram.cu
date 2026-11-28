@@ -23,7 +23,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
                      const std::vector<std::vector<int>>& events,
                      const std::vector<double*>& phsp_weights,
                      bool float_amps, int n_amplitudes, int n_polar, int primary_dev,
-                     ctComplex** d_matrix_io,
+                     ctComplex* d_matrix_io,
                      std::function<int()> batch_events)
 {
             // 每次调用只恢复一次（不是逐批/逐事件操作），避免 reCalcAmp 后
@@ -48,7 +48,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
             if (W_total <= 0.0) W_total = 1.0;
 
             ctpwa::ensure_device(primary_dev);
-            cudaMemset((*d_matrix_io), 0, n_amplitudes * n_amplitudes * sizeof(ctComplex));
+            cudaMemset(d_matrix_io, 0, n_amplitudes * n_amplitudes * sizeof(ctComplex));
             // B̄ = Σ_ev,p (w/W)·A·A^H：分块构建（峰值 = 单块 scaled，而非整段 6.7GB 拷贝）。
             // 与构造期流式模式同法：scalePhspAmpsKernel 的 evt 从 0 计 → 权重指针偏移 d_w+c0。
             for (size_t gpu = 0; gpu < d_all_amplitudes.size(); ++gpu) {
@@ -94,7 +94,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
 
                     if (gpu == (size_t)primary_dev) {
                         ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex((*d_matrix_io), d_phsp_gpu, one, n_amplitudes * n_amplitudes);
+                        axpyComplex(d_matrix_io, d_phsp_gpu, one, n_amplitudes * n_amplitudes);
                         cudaFree(d_phsp_gpu);
                     } else {
                         ctpwa::ensure_device(primary_dev);
@@ -106,7 +106,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
                         cudaFree(d_phsp_gpu);
                         ctpwa::ensure_device(primary_dev);
                         ctComplex one = ctMake(1.0f, 0.0f);
-                        axpyComplex((*d_matrix_io), d_temp, one, n_amplitudes * n_amplitudes);
+                        axpyComplex(d_matrix_io, d_temp, one, n_amplitudes * n_amplitudes);
                         cudaFree(d_temp);
                         ctpwa::ensure_device(gpu);
                     }

@@ -60,7 +60,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
             if (nt > 0) {
                 auto theta = params.slice(0, 2 * ncf, params.size(0));
                 theta_cur_ = theta.detach().clone();
-                amp_calc_.reComputeAmps(d_all_amplitudes_,
+                amp_calc_.reComputeAmps(d_all_amplitudes_.data(),
                     reinterpret_cast<const double*>(theta.data_ptr()),
                     n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
                     dev.index());
@@ -261,7 +261,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                                 amp_offsets_[g] = {0, n_polar_ * n_amplitudes_};
                             }
                         }
-                        std::vector<ctComplex*> d_chunk = calculateAmplitudes(Vp4_chunk);
+                        ctpwa::MultiGpuStorage<ctComplex> d_chunk = calculateAmplitudes(Vp4_chunk);
                         ctpwa::ensure_device(gpu);
                         double* d_ct;
                         cudaMalloc(&d_ct, nch * sizeof(double));
@@ -295,8 +295,7 @@ void analysis::writeResult(torch::Tensor params, const std::string& filename,
                                        cudaMemcpyDeviceToDevice);
                         cudaFree(d_ct);
                         cudaFree(d_cp);
-                        for (int g = 0; g < n_gpus_; ++g)
-                            if (d_chunk[g]) { ctpwa::ensure_device(g); cudaFree(d_chunk[g]); }
+                        d_chunk.clear();
                         ctpwa::ensure_device(gpu);
                     }
                     events_offsets_ = saved_ev;
@@ -1609,7 +1608,7 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
             if (nt > 0) {
                 auto theta = params.slice(0, 2 * ncf, params.size(0));
                 theta_cur_ = theta.detach().clone();
-                amp_calc_.reComputeAmps(d_all_amplitudes_,
+                amp_calc_.reComputeAmps(d_all_amplitudes_.data(),
                     reinterpret_cast<const double*>(theta.data_ptr()),
                     n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
                     dev.index());
@@ -1708,7 +1707,7 @@ void analysis::writeInterfResult(torch::Tensor params, const std::string& filena
                             amp_offsets_[g] = {0, n_polar_ * n_amplitudes_};
                         }
                     }
-                    std::vector<ctComplex*> d_chunk = calculateAmplitudes(Vp4_chunk);
+                    ctpwa::MultiGpuStorage<ctComplex> d_chunk = calculateAmplitudes(Vp4_chunk);
                     ctpwa::ensure_device(gpu);
                     double* d_ct;
                     cudaMalloc(&d_ct, nch * sizeof(double));

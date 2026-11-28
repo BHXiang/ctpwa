@@ -15,24 +15,11 @@ void analysis::release()
             return;
         }
 
-        for (size_t g = 0; g < d_all_amplitudes_.size(); ++g) {
-            ctpwa::ensure_device(static_cast<int>(g));
-            if (d_all_amplitudes_[g]) {
-                cudaFree(d_all_amplitudes_[g]);
-                d_all_amplitudes_[g] = nullptr;
-            }
-        }
         d_all_amplitudes_.clear();
 
         ctpwa::ensure_device(primary_dev_);
-        if (d_phsp_matrix_) {
-            cudaFree(d_phsp_matrix_);
-            d_phsp_matrix_ = nullptr;
-        }
-        if (d_phsp_matrix_double_) {
-            cudaFree(d_phsp_matrix_double_);
-            d_phsp_matrix_double_ = nullptr;
-        }
+        d_phsp_matrix_.reset();
+        d_phsp_matrix_double_.reset();
         auto free_weights = [](std::vector<double*>& weights) {
             for (size_t g = 0; g < weights.size(); ++g) {
                 ctpwa::ensure_device(static_cast<int>(g));
@@ -109,8 +96,8 @@ std::vector<torch::Tensor> analysis::computeMatrixErrors(
         ctx.events = &events_;
         ctx.phsp_weights = &phsp_weights_;
         ctx.n_slvectors = &nSLvectors_;
-        ctx.d_phsp_matrix = d_phsp_matrix_;
-        ctx.d_phsp_matrix_double = d_phsp_matrix_double_;
+        ctx.d_phsp_matrix = d_phsp_matrix_.data();
+        ctx.d_phsp_matrix_double = d_phsp_matrix_double_.data();
         ctx.n_amplitudes = n_amplitudes_;
         ctx.n_theta = params_.nFreeTheta();
         ctx.primary_dev = primary_dev_;
@@ -172,14 +159,14 @@ torch::Tensor analysis::getHessian(torch::Tensor params)
         // P4：实现已搬到 ctpwa::getHessian（include/FullHessian.h）。
         // 十二轮的"先搬底层"到这里收口：它曾经的 12 个依赖只剩 1 个还需要回调。
         ctpwa::FullHessianCtx ctx;
-        ctx.d_all_amplitudes = &d_all_amplitudes_;
+        ctx.d_all_amplitudes = &d_all_amplitudes_.data();
         ctx.events = &events_;
         ctx.events_offsets = &events_offsets_;
         ctx.amp_offsets = &amp_offsets_;
         ctx.data_weights = &data_weights_;
         ctx.bkg_weights = &bkg_weights_;
         ctx.phsp_weights = &phsp_weights_;
-        ctx.d_phsp_matrix = d_phsp_matrix_;
+        ctx.d_phsp_matrix = d_phsp_matrix_.data();
         ctx.params = &params_;
         ctx.amp_calc = &amp_calc_;
         ctx.n_amplitudes = n_amplitudes_;
@@ -213,8 +200,8 @@ torch::Tensor analysis::getNLL(torch::Tensor params)
                 theta_cur_ = params.slice(0, 2 * n_cpl, params.size(0)).detach().clone();
         }
 
-        return NLLFunction::apply(params, &params_, d_all_amplitudes_, &amp_calc_,
-            d_phsp_matrix_, d_phsp_matrix_double_, events_, events_offsets_, amp_offsets_,
+        return NLLFunction::apply(params, &params_, d_all_amplitudes_.data(), &amp_calc_,
+            d_phsp_matrix_.data(), d_phsp_matrix_double_.data(), events_, events_offsets_, amp_offsets_,
             data_weights_, phsp_weights_, bkg_weights_, bkg_integral_, n_amplitudes_, n_polar_);
     
 }
@@ -224,12 +211,12 @@ torch::Tensor analysis::computeCouplingHessian(torch::Tensor vector)
 
         // P4：实现已搬到 ctpwa::computeCouplingHessian（include/CouplingHessian.h）
         ctpwa::CouplingHessianCtx ctx;
-        ctx.d_all_amplitudes = &d_all_amplitudes_;
+        ctx.d_all_amplitudes = &d_all_amplitudes_.data();
         ctx.events = &events_;
         ctx.amp_offsets = &amp_offsets_;
         ctx.data_weights = &data_weights_;
         ctx.bkg_weights = &bkg_weights_;
-        ctx.d_phsp_matrix = d_phsp_matrix_;
+        ctx.d_phsp_matrix = d_phsp_matrix_.data();
         ctx.params = &params_;
         ctx.n_amplitudes = n_amplitudes_;
         ctx.n_polar = n_polar_;
@@ -254,7 +241,7 @@ void analysis::reCalcAmp(torch::Tensor params)
             ", expected ", amp_calc_.nFreeResParams());
 
         theta_cur_ = params.detach().clone();
-        amp_calc_.reComputeAmps(d_all_amplitudes_,
+        amp_calc_.reComputeAmps(d_all_amplitudes_.data(),
             reinterpret_cast<const double*>(params.data_ptr()),
             n_amplitudes_, events_offsets_, amp_offsets_, n_polar_,
             params.device().index());

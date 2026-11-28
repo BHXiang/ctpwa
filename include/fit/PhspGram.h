@@ -35,7 +35,7 @@ void rebuildPhspGram(const std::vector<ctComplex*>& d_all_amplitudes,
                      const std::vector<std::vector<int>>& events,
                      const std::vector<double*>& phsp_weights,
                      bool float_amps, int n_amplitudes, int n_polar, int primary_dev,
-                     ctComplex** d_matrix_io,
+                     ctComplex* d_matrix_io,
                      std::function<int()> batch_events);
 
 // B̄ 收缩成 npartials×npartials 归一化干涉矩阵 M[p][q]。
