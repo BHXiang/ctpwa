@@ -69,7 +69,7 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
 
 ## 1. 运行前提
 
-- 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求的 ctpwa 最低版本：
+- 需要 **ctpwa 包**与 **NVIDIA GPU**（默认）。本版本要求 **ctpwa ≥ 0.3.26**，各功能对应的最低版本：
   - `≥ 0.3.10`：`ctpwa.analysis(config, fit_mode)`（`--fit-mode`）；
   - `≥ 0.3.15`：新门面 `import ctpwa`（单 wheel 双后端）+ `build_info()`/`backend()`；
   - `≥ 0.3.17`：`ctpwa.diagnostics`（可行子空间 PD 判据，见 §7/§8）；
@@ -79,7 +79,8 @@ python -u fit.py --optimizer reparam --amp-max 1000 --amp-lambda 1e-3  # 可选�
   - `≥ 0.3.25`：多 LS 分波（`nSL > npart`）时 `interference_rec_err` 不再是 0；
   - `≥ 0.3.26`：Hessian 病态时 `writeResult` 不被 `eigvalsh` 异常中断；耦合误差按**完整自由
     Hessian** 的耦合块（θ 边际化）；流式 `phsp` 的 Gram 归一化修正。
-  本机当前：**0.3.24**（本地编译版；本次同步后需重编到 0.3.26）。
+  具体安装版本用 `python -c "import ctpwa; print(ctpwa.__version__)"` 查看；`≥ 0.3.27` 另附带
+  双卡内存预检、大 n Hessian、大模型 SL 峰值与 BWR `q0=0` 的稳定性修复，推荐使用。
 - **从源码编译**：`setup.py` 与上游一致（`-std=c++17` + 可选的 `CTPWA_GLIBCXX_ASSERTIONS=1`）。
   ⚠ 若用 torch ≥ 2.13 编译，其 C++ 头文件需要 C++20——此时需**在本机编译目录**临时把三处
   `-std=c++17` 改成 `-std=c++20`（不要提交）。
